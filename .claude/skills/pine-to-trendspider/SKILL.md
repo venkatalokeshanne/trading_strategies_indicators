@@ -125,7 +125,12 @@ its artefact, not at an exit code (LESSONS L9):
 | Recorded | `python tools/progress.py set <id> … --status FULL\|PARTIAL` accepted (it re-checks the gates) |
 | Pushed | `git log origin/main -1` shows the commit |
 
-- Write the output to `converted/<id>-<slug>.trendspider.js`.
+- The original is `TradingView/indicators/<id>-<slug>.pine` or
+  `TradingView/strategies/<id>-<slug>.pine` (placed by its own `indicator()`/`strategy()`
+  declaration). Write the conversion to the matching
+  `TrendSpider/indicators/<id>-<slug>.trendspider.js` or
+  `TrendSpider/strategies/<id>-<slug>.trendspider.js` — same id and slug as the original.
+  A strategy split into LONG/SHORT gets `<id>-<slug>-long.trendspider.js` / `-short`.
 - **Commit and push after every script**:
   `git add -A && git commit -m "Convert <slug>: <status>" && git push`. The user works
   across sessions and accounts; unpushed work is lost work.
@@ -181,11 +186,11 @@ This repository is the source of truth across sessions and Claude accounts.
    separately with a message saying what you learnt. A new mistake goes into `LESSONS.md`
    with its check, in a commit starting `Lesson NN:`.
 4. **What is committed:** the skill, tools, `progress/` and **every conversion in
-   `converted/`** (the user's instruction, 2026-10-08: every indicator and strategy is saved
-   in git and in TrendSpider). Keep the original author's credit and declared licence in
-   each header. The original Pine sources in `pine/` stay out of git until the user says
-   otherwise — the repository is public and 75 % of the sources declare no licence. Never
-   commit TrendSpider's engine bundle or market-data fixtures.
+   `TrendSpider/`** (the user's instruction, 2026-10-08: every indicator and strategy is
+   saved in git and in TrendSpider). Keep the original author's credit and declared licence
+   in each header. The original Pine sources in `TradingView/` are kept locally and are
+   **not** committed while the repository is public (75 % declare no licence). Never commit
+   TrendSpider's engine bundle or market-data fixtures.
 
 ## Final self-audit checklist
 

@@ -2,11 +2,11 @@
 Conversion backlog tracker — the shared state that lets any session or Claude account
 continue where the last one stopped. It is bookkeeping, not a converter.
 
-    python tools/progress.py sync      # add any new pine/*.pine files as `pending`
+    python tools/progress.py sync      # add any new TradingView/**/*.pine files as `pending`
     python tools/progress.py stats     # counts by status, type and validation level
     python tools/progress.py next [N]  # the next N pending scripts, in queue order
     python tools/progress.py set <id> --status PARTIAL --validation oracle --notes "..."
-    python tools/progress.py set <id> --ts-name "RSI Divergence_TV" --live-tested AAPL:D                                       --ts-saved yes            # or: --ts-saved no --ts-save-error "HTTP 500"
+    python tools/progress.py set <id> --ts-name "RSI Divergence_TV" --live-tested AAPL:D --ts-saved yes            # or: --ts-saved no --ts-save-error "HTTP 500"
     python tools/progress.py check <id>  # the done-gates for one script (also run by `set --status`)
 
 Queue order: strategies before indicators, and within each, shortest source first — the
@@ -30,7 +30,8 @@ for _s in (sys.stdout, sys.stderr):           # Windows consoles default to cp12
         pass
 
 ROOT = Path(__file__).resolve().parents[1]
-PINE = ROOT / "pine"
+PINE = ROOT / "TradingView"          # indicators/ and strategies/ — local only while the repo is public
+META = PINE / "_meta"                # the extractor's *.results.json files
 PROGRESS = ROOT / "progress" / "progress.json"
 STATUSES = ("pending", "in_progress", "FULL", "PARTIAL", "NOT CONVERTIBLE")
 LEVELS = ("none", "static", "syntax", "oracle", "tv-parity", "live")
@@ -61,7 +62,7 @@ def save(data: dict) -> None:
 def metadata() -> dict:
     """Title / author / URL from the extractor's results.json files, keyed by script id."""
     meta = {}
-    for results in PINE.rglob("results.json"):
+    for results in META.glob("*results.json"):
         try:
             for r in json.loads(results.read_text(encoding="utf-8")):
                 f = r.get("file")
@@ -73,10 +74,10 @@ def metadata() -> dict:
 
 
 def classify(text: str) -> tuple[str, str]:
-    head = text[:6000]
-    kind = ("strategy" if re.search(r"^\s*strategy\s*\(", head, re.M) else
-            "indicator" if re.search(r"^\s*(indicator|study)\s*\(", head, re.M) else "library/other")
-    m = re.search(r"//@version\s*=\s*(\d+)", head)
+    # the declaration can sit after a long licence header, so read the whole file
+    d = re.search(r"^\s*(strategy|indicator|study)\s*\(", text, re.M)
+    kind = "strategy" if d and d.group(1) == "strategy" else "indicator" if d else "library/other"
+    m = re.search(r"//@version\s*=\s*(\d+)", text)
     return kind, (f"v{m.group(1)}" if m else "unknown")
 
 

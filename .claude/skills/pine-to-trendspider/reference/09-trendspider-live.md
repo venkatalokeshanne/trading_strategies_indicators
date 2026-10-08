@@ -25,10 +25,10 @@ the "Yours" list, and the chart was returned to its previous state.
 
 ### 0. Prepare (local)
 ```bash
-python tools/lint_trendspider.py converted/<file>.trendspider.js      # must be clean of ERRORs
-python tools/ts_live_payload.py apply  converted/<file>.trendspider.js > <scratch>/apply.js
-python tools/ts_live_payload.py find   converted/<file>.trendspider.js > <scratch>/find.js
-python tools/ts_live_payload.py remove converted/<file>.trendspider.js > <scratch>/remove.js
+python tools/lint_trendspider.py TrendSpider/<indicators|strategies>/<file>.trendspider.js      # must be clean of ERRORs
+python tools/ts_live_payload.py apply  TrendSpider/<indicators|strategies>/<file>.trendspider.js > <scratch>/apply.js
+python tools/ts_live_payload.py find   TrendSpider/<indicators|strategies>/<file>.trendspider.js > <scratch>/find.js
+python tools/ts_live_payload.py remove TrendSpider/<indicators|strategies>/<file>.trendspider.js > <scratch>/remove.js
 ```
 Read each generated file and paste its text into `javascript_exec` unchanged. The script is
 embedded as a JSON string, so it arrives byte-for-byte (LESSONS L15).

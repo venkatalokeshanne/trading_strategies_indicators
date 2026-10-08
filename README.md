@@ -63,15 +63,31 @@ These validate and track. None of them converts anything.
 machine that captured it and is never committed. Elsewhere, validate against TradingView
 exports instead (`reference/08-validation.md`, level 4).
 
+## Layout
+
+| Folder | Holds | In git |
+|---|---|---|
+| `TradingView/indicators/` | original Pine indicators (924) | no — local only, see below |
+| `TradingView/strategies/` | original Pine strategies (1,053) | no — local only |
+| `TradingView/_meta/` | the extractor's title/author/URL records | no — local only |
+| `TrendSpider/indicators/` | converted indicators, `<id>-<slug>.trendspider.js` | **yes** |
+| `TrendSpider/strategies/` | converted strategies | **yes** |
+
+A script's folder follows its own declaration (`indicator()` / `strategy()`), not the
+TradingView listing it was collected from. A conversion keeps the original's id and slug.
+
 ## What is — and is not — in this repository
 
 This repository is **public**. It contains the skill, references, templates, tools, the
-progress log and **every conversion** (`converted/`). Each converted file credits the
+progress log and **every conversion** (`TrendSpider/`). Each converted file credits the
 original author and carries the licence the source declared. Every conversion is also
 saved in the owner's TrendSpider account under the same `<Title>_TV` name.
 
-It does **not** contain the 1,977 original Pine sources (`pine/`): 75 % declare no licence
-and only 23 % are MPL 2.0, so they stay local until the owner decides otherwise.
+The original Pine sources (`TradingView/`) are other authors' work — 75 % declare no
+licence and only 23 % are MPL 2.0 — so they are kept locally and listed in `.gitignore`.
+To version them here, make the repository private first, then remove `TradingView/` from
+`.gitignore`. Another session or account without the local copy can still find every
+source: `progress/progress.json` records each script's TradingView URL.
 
 The validation outputs and market-data fixtures are excluded too, as is TrendSpider's
 proprietary engine bundle (only the list of names and limits extracted from it,
@@ -82,9 +98,8 @@ proprietary engine bundle (only the list of names and limits extracted from it,
 | | Count |
 |---|---|
 | Pine scripts collected | 1,977 |
-| Strategies | 1,052 |
-| Indicators | 917 |
-| Other (no recognisable declaration) | 8 |
+| Strategies | 1,053 |
+| Indicators | 924 |
 | Import a Pine library (needs the library's source) | 41 |
 
 Queue order: strategies first, then indicators; within each, shortest source first, so the

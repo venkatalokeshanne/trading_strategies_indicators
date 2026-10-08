@@ -5,9 +5,9 @@ The converted script is embedded as a JSON string, so it reaches the editor byte
 no hand copying, no escaping by eye (LESSONS L15). Each snippet is pasted into the browser
 tool's javascript_exec on charts.trendspider.com and returns a small JSON report.
 
-    python tools/ts_live_payload.py apply  converted/X.trendspider.js   > apply.js
-    python tools/ts_live_payload.py find   converted/X.trendspider.js   # is the _TV name already saved?
-    python tools/ts_live_payload.py remove converted/X.trendspider.js   # take it off the chart after the test
+    python tools/ts_live_payload.py apply  TrendSpider/strategies/X.trendspider.js   > apply.js
+    python tools/ts_live_payload.py find   TrendSpider/strategies/X.trendspider.js   # is the _TV name already saved?
+    python tools/ts_live_payload.py remove TrendSpider/strategies/X.trendspider.js   # take it off the chart after the test
 
 The lint must be clean first; `apply` refuses a file that has lint errors.
 """

@@ -13,10 +13,10 @@ TS_ORACLE_DIR and TS_BUNDLE environment variables.
 
 Usage
 -----
-    python tools/oracle_run.py converted/X.trendspider.js --bars bars/AAPL_D.csv
-    python tools/oracle_run.py converted/X.trendspider.js --bars tv_export.csv \\
+    python tools/oracle_run.py TrendSpider/strategies/X.trendspider.js --bars bars/AAPL_D.csv
+    python tools/oracle_run.py TrendSpider/strategies/X.trendspider.js --bars tv_export.csv \\
         --compare "Basis=Basis,Upper=Upper" --warmup 200
-    python tools/oracle_run.py converted/X.trendspider.js --bars spy.csv \\
+    python tools/oracle_run.py TrendSpider/strategies/X.trendspider.js --bars spy.csv \\
         --history "QQQ|D=qqq.csv" --inputs '{"length": 20}' --resolution 15
 """
 

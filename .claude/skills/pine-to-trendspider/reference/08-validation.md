@@ -19,7 +19,7 @@ step-3 inventory must be accounted for — mapped, approximated or listed as a d
 ## Level 2 — syntax and sandbox lint
 
 ```bash
-python tools/lint_trendspider.py converted/<file>.trendspider.js
+python tools/lint_trendspider.py TrendSpider/<indicators|strategies>/<file>.trendspider.js
 ```
 
 It wraps the script in an async function and runs `node --check` (catching parse errors,
@@ -42,7 +42,7 @@ proprietary code: it lives outside every repository and must **never** be commit
 another machine or account, skip to level 4.
 
 ```bash
-python tools/oracle_run.py converted/<file>.trendspider.js --bars bars/<SYMBOL>_<TF>.csv
+python tools/oracle_run.py TrendSpider/<indicators|strategies>/<file>.trendspider.js --bars bars/<SYMBOL>_<TF>.csv
 ```
 
 - `--bars` is a CSV with `time` (Unix seconds or ISO), `open`, `high`, `low`, `close`,
@@ -69,7 +69,7 @@ The real test: same symbol, same timeframe, same bars, compare the numbers.
    the data licence forbids redistribution.
 3. Run the oracle on **those same bars**, comparing your outputs with the TradingView columns:
    ```bash
-   python tools/oracle_run.py converted/<file>.trendspider.js \
+   python tools/oracle_run.py TrendSpider/<indicators|strategies>/<file>.trendspider.js \
        --bars validation/<slug>/tradingview.csv \
        --compare "Basis=Basis,Upper=Upper" --warmup 200
    ```

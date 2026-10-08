@@ -1,0 +1,1409 @@
+//@version=6
+indicator("Auction Regime Engine [v1.4 Historical Auction Spans]", shorttitle="ARE v1.4", overlay=true, behind_chart=true,
+     max_boxes_count=500, max_lines_count=300, max_labels_count=200, max_bars_back=1800)
+
+// ============================================================================
+// AUCTION REGIME ENGINE v1.4 — HISTORICAL AUCTION SPANS
+//
+// Two-speed architecture:
+//   A) HIGH-RES CURRENT MAP (last bar; clean visual hierarchy)
+//      - broad adaptive footprint profile
+//      - Gaussian-smoothed volume concentrations
+//      - local cluster VAH / POC / VAL
+//      - right-side context profile
+//      - condensed historical "cluster capsules" placed where value formed
+//
+//   B) STATEFUL EVENT TAPE (recent history)
+//      - lower-cost footprint VA/POC proxy profile refreshed periodically
+//      - frozen structural snapshot between refreshes
+//      - Balance -> Compression -> Probe -> Accept/Fail -> Migration/Rotation
+//      - collision-managed candle markers with event priority/cooldowns
+//
+// The heavy map is exact to the requested footprint rows. The historical event
+// engine intentionally uses a lower-cost proxy made from each bar's footprint
+// VA + POC so it can run statefully across recent chart history.
+//
+// request.footprint() requires TradingView footprint access (Premium/Ultimate
+// at the time this version was written).
+// ============================================================================
+
+// ---------- Inputs -----------------------------------------------------------
+string G_AUTO = "1. Adaptive Engine"
+bool adaptiveMode = input.bool(true, "Adaptive mode", group=G_AUTO,
+     tooltip="Recommended. Automatically chooses broad profile horizon, price resolution, smoothing, cluster selectivity, event refresh cadence and expansion thresholds.")
+
+string G_MANUAL = "2. Advanced — Manual Overrides (Adaptive OFF)"
+int manualLookbackBars = input.int(576, "Map lookback bars", minval=80, maxval=1200, group=G_MANUAL)
+int manualPriceBins = input.int(110, "Map price rows", minval=40, maxval=160, group=G_MANUAL)
+float manualGaussianSigma = input.float(2.4, "Gaussian smoothing", minval=0.8, maxval=6.0, step=0.1, group=G_MANUAL)
+int manualMaxClusters = input.int(4, "Maximum clusters", minval=1, maxval=5, group=G_MANUAL)
+float manualExpansionScoreMin = input.float(62.0, "Accepted expansion score", minval=40, maxval=90, step=1, group=G_MANUAL)
+int manualAcceptBars = input.int(2, "Closes outside value", minval=1, maxval=4, group=G_MANUAL)
+float manualCompRvolMax = input.float(0.80, "Compression max RVOL", minval=0.2, maxval=1.5, step=0.05, group=G_MANUAL)
+float manualCompRangeMax = input.float(0.80, "Compression max Range/ATR", minval=0.2, maxval=2.0, step=0.05, group=G_MANUAL)
+
+string G_FP = "3. Footprint Source"
+int fpTicks = input.int(10, "Footprint ticks / source row", minval=1, group=G_FP,
+     tooltip="Source footprint row size. The map re-bins these rows into adaptive profile rows.")
+int imbalancePct = input.int(300, "Footprint imbalance %", minval=100, maxval=1000, step=25, group=G_FP)
+
+string G_VIS = "4. Auction Map Visuals"
+string visualMode = input.string("Clean", "Visual mode", options=["Clean", "Full"], group=G_VIS,
+     tooltip="Clean is designed for live trading: active structure, the context profile, top historical capsules and sparse resolution events. Full exposes diagnostic structure and secondary events.")
+bool showProfile = input.bool(true, "Right-side context profile", group=G_VIS)
+int profileWidthBars = input.int(46, "Context profile width", minval=20, maxval=90, group=G_VIS)
+int profileGapBars = input.int(5, "Context profile gap", minval=1, maxval=25, group=G_VIS)
+bool showCapsules = input.bool(true, "Historical cluster capsules", group=G_VIS,
+     tooltip="Compact profiles are docked around the historical segment where each value concentration was most strongly built. Clean mode hides the active capsule because the active profile is already shown on the right.")
+int capsuleRows = input.int(12, "Capsule rows", minval=8, maxval=20, group=G_VIS)
+bool showValueExtensions = input.bool(true, "Subtle VA/POC extensions", group=G_VIS)
+bool showClusterLabels = input.bool(true, "Cluster labels / volume mass", group=G_VIS)
+bool showTargetPath = input.bool(true, "Current auction target path", group=G_VIS)
+bool showDashboard = input.bool(true, "Dashboard", group=G_VIS)
+bool showEvents = input.bool(true, "Candle event tape", group=G_VIS)
+bool showCompressionEvents = input.bool(false, "Show compression-start markers", group=G_VIS)
+bool tintLiveBar = input.bool(false, "Tint current bar by regime", group=G_VIS)
+
+bool cleanMode = visualMode == "Clean"
+bool fullMode = visualMode == "Full"
+
+// ---------- Helpers ----------------------------------------------------------
+f_clamp(float x, float lo, float hi) =>
+    math.max(lo, math.min(hi, x))
+
+f_norm(float x, float lo, float hi) =>
+    hi == lo ? 0.0 : f_clamp((x - lo) / (hi - lo), 0.0, 1.0)
+
+f_cluster_color(int idx) =>
+    idx % 6 == 0 ? color.aqua :
+     idx % 6 == 1 ? color.orange :
+     idx % 6 == 2 ? color.fuchsia :
+     idx % 6 == 3 ? color.lime :
+     idx % 6 == 4 ? color.blue : color.yellow
+
+f_gaussian(array<float> a, int idx, float sigma) =>
+    int n = array.size(a)
+    if n == 0
+        0.0
+    else
+        int radius = math.max(1, int(math.ceil(sigma * 3.0)))
+        int lo = math.max(0, idx - radius)
+        int hi = math.min(n - 1, idx + radius)
+        float weighted = 0.0
+        float weights = 0.0
+        for j = lo to hi
+            float d = float(j - idx) / sigma
+            float w = math.exp(-0.5 * d * d)
+            weighted += array.get(a, j) * w
+            weights += w
+        weights > 0 ? weighted / weights : 0.0
+
+f_sum_range(array<float> a, int lo, int hi) =>
+    float s = 0.0
+    if array.size(a) > 0 and hi >= lo
+        for j = lo to hi
+            s += array.get(a, j)
+    s
+
+f_max_idx(array<float> a, int lo, int hi) =>
+    int best = lo
+    float bestV = -1.0
+    if array.size(a) > 0 and hi >= lo
+        for j = lo to hi
+            float v = array.get(a, j)
+            if v > bestV
+                bestV := v
+                best := j
+    best
+
+f_valley_idx(array<float> a, int lo, int hi) =>
+    int best = lo
+    float bestV = 1e100
+    if array.size(a) > 0 and hi >= lo
+        for j = lo to hi
+            float v = array.get(a, j)
+            if v < bestV
+                bestV := v
+                best := j
+    best
+
+f_bin_bottom(float lo, float size, int idx) =>
+    lo + float(idx) * size
+
+f_auto_map_lookback() =>
+    float sec = timeframe.in_seconds()
+    sec <= 60 ? 1080 :
+     sec <= 180 ? 720 :
+     sec <= 300 ? 576 :
+     sec <= 900 ? 384 :
+     sec <= 3600 ? 240 : 180
+
+f_auto_event_lookback() =>
+    float sec = timeframe.in_seconds()
+    sec <= 60 ? 420 :
+     sec <= 180 ? 336 :
+     sec <= 300 ? 288 :
+     sec <= 900 ? 216 :
+     sec <= 3600 ? 144 : 108
+
+f_auto_refresh() =>
+    float sec = timeframe.in_seconds()
+    sec <= 60 ? 12 :
+     sec <= 300 ? 8 :
+     sec <= 900 ? 6 : 4
+
+f_auto_visual_gap() =>
+    float sec = timeframe.in_seconds()
+    sec <= 60 ? 10 :
+     sec <= 300 ? 7 :
+     sec <= 900 ? 5 : 4
+
+f_state_name(int s) =>
+    s == 0 ? "BALANCE" :
+     s == 1 ? "COMPRESSION" :
+     s == 2 ? "PROBE ↑" :
+     s == 3 ? "PROBE ↓" :
+     s == 4 ? "ACCEPTED ↑" :
+     s == 5 ? "ACCEPTED ↓" :
+     s == 6 ? "ROTATING ↓" :
+     s == 7 ? "ROTATING ↑" :
+     s == 8 ? "MIGRATED ↑" :
+     s == 9 ? "MIGRATED ↓" : "WAITING"
+
+f_state_color(int s) =>
+    s == 1 ? color.blue :
+     s == 2 or s == 3 ? color.yellow :
+     s == 4 or s == 8 ? color.lime :
+     s == 5 or s == 9 ? color.red :
+     s == 6 ? color.red :
+     s == 7 ? color.lime : color.gray
+
+// ---------- ONE native footprint request ------------------------------------
+float valueAreaPct = 70.0
+footprint fp = request.footprint(fpTicks, valueAreaPct, imbalancePct)
+bool hasFp = not na(fp)
+float fpTotal = hasFp ? fp.total_volume() : na
+float fpDelta = hasFp ? fp.delta() : na
+float deltaPct = hasFp and fpTotal > 0 ? fpDelta / fpTotal : na
+
+volume_row curPocRow = hasFp ? fp.poc() : na
+volume_row curVahRow = hasFp ? fp.vah() : na
+volume_row curValRow = hasFp ? fp.val() : na
+float currentBarPOC = not na(curPocRow) ? math.avg(curPocRow.up_price(), curPocRow.down_price()) : na
+float currentBarVAH = not na(curVahRow) ? curVahRow.up_price() : na
+float currentBarVAL = not na(curValRow) ? curValRow.down_price() : na
+
+float atr = ta.atr(14)
+int rvolLen = timeframe.in_seconds() <= 300 ? 30 : 20
+float flowVol = hasFp ? fpTotal : volume
+float avgFlowVol = ta.sma(flowVol, rvolLen)[1]
+float rvol = not na(flowVol) and not na(avgFlowVol) and avgFlowVol > 0 ? flowVol / avgFlowVol : na
+float rangeFactor = atr > 0 ? (high - low) / atr : na
+
+// ============================================================================
+// B) STATEFUL EVENT TAPE — frozen lower-cost structural snapshot
+// ============================================================================
+const int ST_BAL = 0
+const int ST_COMP = 1
+const int ST_PROBE_UP = 2
+const int ST_PROBE_DN = 3
+const int ST_ACCEPT_UP = 4
+const int ST_ACCEPT_DN = 5
+const int ST_ROTATE_DN = 6
+const int ST_ROTATE_UP = 7
+const int ST_MIGRATE_UP = 8
+const int ST_MIGRATE_DN = 9
+
+int mapLbSimple = adaptiveMode ? f_auto_map_lookback() : manualLookbackBars
+int eventLbSimple = adaptiveMode ? f_auto_event_lookback() : math.max(80, int(math.round(manualLookbackBars * 0.55)))
+int refreshBars = adaptiveMode ? f_auto_refresh() : 8
+int eventBins = adaptiveMode ? 48 : 52
+int eventMaxClusters = adaptiveMode ? 4 : math.min(manualMaxClusters, 4)
+int eventHistoryBars = math.min(1400, math.max(650, mapLbSimple * 2))
+float acceptThreshold = adaptiveMode ? 62.0 : manualExpansionScoreMin
+int acceptBars = adaptiveMode ? 2 : manualAcceptBars
+float compRvolMax = adaptiveMode ? 0.78 : manualCompRvolMax
+float compRangeMax = adaptiveMode ? 0.78 : manualCompRangeMax
+int maxStructureLockBars = adaptiveMode ? math.max(14, refreshBars * 3) : 24
+
+var float evVAL = na
+var float evVAH = na
+var float evPOC = na
+var float evTargetUp = na
+var float evTargetDn = na
+var int evCluster = na
+var int evClusterCount = 0
+var int evSnapshotBar = na
+var int smState = ST_BAL
+var int smAge = 0
+
+bool tapeWindow = bar_index >= math.max(0, last_bar_index - eventHistoryBars)
+bool migrationState = smState == ST_MIGRATE_UP or smState == ST_MIGRATE_DN
+bool lockedState = smState == ST_PROBE_UP or smState == ST_PROBE_DN or smState == ST_ACCEPT_UP or smState == ST_ACCEPT_DN
+bool lockExpired = lockedState and smAge > maxStructureLockBars
+bool mayRefresh = smState == ST_BAL or smState == ST_COMP or smState == ST_ROTATE_DN or smState == ST_ROTATE_UP or migrationState or lockExpired
+bool scheduledRefresh = tapeWindow and bar_index > eventLbSimple + 5 and bar_index % refreshBars == 0
+bool doEventRefresh = tapeWindow and mayRefresh and (scheduledRefresh or migrationState or lockExpired or na(evVAL))
+
+// Build a cheap, stateful auction proxy from each historical bar's footprint VA + POC.
+// Each bar contributes 70% of its volume across five VA samples and a 30% POC boost.
+if doEventRefresh
+    int eLb = math.min(eventLbSimple, math.max(20, bar_index - 2))
+    float eLow = 1e100
+    float eHigh = -1e100
+    for h = 1 to eLb
+        if not na(low[h])
+            eLow := math.min(eLow, low[h])
+            eHigh := math.max(eHigh, high[h])
+
+    if eHigh > eLow and eLow < 1e99
+        float eBin = math.max((eHigh - eLow) / float(eventBins), syminfo.mintick)
+        array<float> eRaw = array.new_float(eventBins, 0.0)
+
+        for h = 1 to eLb
+            footprint hf = fp[h]
+            if not na(hf)
+                float hv = hf.total_volume()
+                volume_row hpocR = hf.poc()
+                volume_row hvahR = hf.vah()
+                volume_row hvalR = hf.val()
+                if hv > 0 and not na(hpocR) and not na(hvahR) and not na(hvalR)
+                    float hpoc = math.avg(hpocR.up_price(), hpocR.down_price())
+                    float hvah = hvahR.up_price()
+                    float hval = hvalR.down_price()
+                    if hvah > hval
+                        for s = 0 to 4
+                            float px = hval + (hvah - hval) * float(s) / 4.0
+                            int bi = int(math.floor((px - eLow) / eBin))
+                            bi := math.max(0, math.min(eventBins - 1, bi))
+                            array.set(eRaw, bi, array.get(eRaw, bi) + hv * 0.14)
+                        int pi = int(math.floor((hpoc - eLow) / eBin))
+                        pi := math.max(0, math.min(eventBins - 1, pi))
+                        array.set(eRaw, pi, array.get(eRaw, pi) + hv * 0.30)
+
+        array<float> eSmooth = array.new_float(eventBins, 0.0)
+        float eMax = 0.0
+        int eMaxIdx = 0
+        float eTotal = 0.0
+        for i = 0 to eventBins - 1
+            eTotal += array.get(eRaw, i)
+            float sv = f_gaussian(eRaw, i, 1.55)
+            array.set(eSmooth, i, sv)
+            if sv > eMax
+                eMax := sv
+                eMaxIdx := i
+
+        float eMean = eTotal / float(eventBins)
+        array<int> eCandidates = array.new_int()
+        for i = 1 to eventBins - 2
+            float v = array.get(eSmooth, i)
+            bool local = v >= array.get(eSmooth, i - 1) and v > array.get(eSmooth, i + 1)
+            bool strong = v >= math.max(eMean * 1.10, eMax * 0.18)
+            if local and strong
+                array.push(eCandidates, i)
+
+        array<int> ePeaks = array.new_int()
+        int eSep = math.max(4, int(math.round(float(eventBins) * 0.10)))
+        if array.size(eCandidates) > 0
+            for pick = 0 to eventMaxClusters - 1
+                int best = na
+                float bestV = -1.0
+                for ci = 0 to array.size(eCandidates) - 1
+                    int cand = array.get(eCandidates, ci)
+                    bool far = true
+                    if array.size(ePeaks) > 0
+                        for p = 0 to array.size(ePeaks) - 1
+                            if math.abs(cand - array.get(ePeaks, p)) < eSep
+                                far := false
+                    float cv = array.get(eSmooth, cand)
+                    if far and cv > bestV
+                        best := cand
+                        bestV := cv
+                if na(best)
+                    break
+                array.push(ePeaks, best)
+        if array.size(ePeaks) == 0
+            array.push(ePeaks, eMaxIdx)
+        array.sort(ePeaks, order.ascending)
+
+        int en = array.size(ePeaks)
+        array<int> eLo = array.new_int()
+        array<int> eHi = array.new_int()
+        int nextLo = 0
+        for c = 0 to en - 1
+            int hi = eventBins - 1
+            if c < en - 1
+                hi := f_valley_idx(eSmooth, array.get(ePeaks, c), array.get(ePeaks, c + 1))
+            array.push(eLo, nextLo)
+            array.push(eHi, hi)
+            nextLo := math.min(eventBins - 1, hi + 1)
+
+        array<float> eVals = array.new_float()
+        array<float> eVahs = array.new_float()
+        array<float> ePocs = array.new_float()
+        for c = 0 to en - 1
+            int lo = array.get(eLo, c)
+            int hi = array.get(eHi, c)
+            float mass = f_sum_range(eRaw, lo, hi)
+            int poc = f_max_idx(eSmooth, lo, hi)
+            int vaLo = poc
+            int vaHi = poc
+            float inc = array.get(eRaw, poc)
+            float tgt = mass * 0.70
+            int safety = 0
+            while inc < tgt and (vaLo > lo or vaHi < hi) and safety < 200
+                float lv = vaLo > lo ? array.get(eRaw, vaLo - 1) : -1.0
+                float rv = vaHi < hi ? array.get(eRaw, vaHi + 1) : -1.0
+                if rv > lv
+                    vaHi += 1
+                    inc += math.max(rv, 0.0)
+                else
+                    vaLo -= 1
+                    inc += math.max(lv, 0.0)
+                safety += 1
+            array.push(eVals, f_bin_bottom(eLow, eBin, vaLo))
+            array.push(eVahs, f_bin_bottom(eLow, eBin, vaHi + 1))
+            array.push(ePocs, f_bin_bottom(eLow, eBin, poc) + eBin * 0.5)
+
+        int chosen = na
+        float refPrice = close[1]
+        for c = 0 to en - 1
+            if na(chosen) and refPrice >= array.get(eVals, c) and refPrice <= array.get(eVahs, c)
+                chosen := c
+        if na(chosen)
+            float bestDist = 1e100
+            for c = 0 to en - 1
+                float d = math.abs(refPrice - array.get(ePocs, c))
+                if d < bestDist
+                    bestDist := d
+                    chosen := c
+
+        if not na(chosen)
+            evCluster := chosen
+            evClusterCount := en
+            evVAL := array.get(eVals, chosen)
+            evVAH := array.get(eVahs, chosen)
+            evPOC := array.get(ePocs, chosen)
+            evTargetUp := chosen < en - 1 ? array.get(ePocs, chosen + 1) : na
+            evTargetDn := chosen > 0 ? array.get(ePocs, chosen - 1) : na
+            evSnapshotBar := bar_index
+
+            // A completed migration / stale accepted lock starts a fresh auction state.
+            if migrationState or lockExpired
+                smState := ST_BAL
+                smAge := 0
+
+// Event metrics vs the FROZEN event snapshot.
+float evOutUpVol = 0.0
+float evOutDnVol = 0.0
+if hasFp and not na(evVAH) and not na(evVAL)
+    array<volume_row> nowRows = fp.rows()
+    for row in nowRows
+        float mid = math.avg(row.up_price(), row.down_price())
+        float rv = row.total_volume()
+        if mid > evVAH
+            evOutUpVol += rv
+        if mid < evVAL
+            evOutDnVol += rv
+float evOutUp = hasFp and fpTotal > 0 ? evOutUpVol / fpTotal : 0.0
+float evOutDn = hasFp and fpTotal > 0 ? evOutDnVol / fpTotal : 0.0
+
+int evOutsideClosesUp = 0
+int evOutsideClosesDn = 0
+for k = 0 to acceptBars - 1
+    if not na(evVAH) and not na(close[k]) and close[k] > evVAH
+        evOutsideClosesUp += 1
+    if not na(evVAL) and not na(close[k]) and close[k] < evVAL
+        evOutsideClosesDn += 1
+float evHoldUpPct = float(evOutsideClosesUp) / float(acceptBars)
+float evHoldDnPct = float(evOutsideClosesDn) / float(acceptBars)
+
+float evRvolN = f_norm(nz(rvol, 0.0), 0.75, 2.00)
+float evRangeN = f_norm(nz(rangeFactor, 0.0), 0.65, 1.80)
+float evDeltaUpN = f_norm(nz(deltaPct, 0.0), 0.00, 0.35)
+float evDeltaDnN = f_norm(-nz(deltaPct, 0.0), 0.00, 0.35)
+float evOutsideUpN = f_norm(evOutUp, 0.08, 0.68)
+float evOutsideDnN = f_norm(evOutDn, 0.08, 0.68)
+float evPartUp = 100.0 * (0.55 * evRvolN + 0.45 * evDeltaUpN)
+float evPartDn = 100.0 * (0.55 * evRvolN + 0.45 * evDeltaDnN)
+float evExpand = 100.0 * evRangeN
+float evAcceptUpScore = 100.0 * (0.62 * evOutsideUpN + 0.20 * (not na(currentBarPOC) and not na(evVAH) and currentBarPOC > evVAH ? 1.0 : 0.0) + 0.18 * evHoldUpPct)
+float evAcceptDnScore = 100.0 * (0.62 * evOutsideDnN + 0.20 * (not na(currentBarPOC) and not na(evVAL) and currentBarPOC < evVAL ? 1.0 : 0.0) + 0.18 * evHoldDnPct)
+float evScoreUp = 0.40 * evPartUp + 0.25 * evExpand + 0.35 * evAcceptUpScore
+float evScoreDn = 0.40 * evPartDn + 0.25 * evExpand + 0.35 * evAcceptDnScore
+
+bool eventReady = tapeWindow and hasFp and not na(evVAH) and not na(evVAL)
+float edgeTol = atr * 0.10
+bool evInside = eventReady and close >= evVAL and close <= evVAH
+bool evCompressionCond = evInside and nz(rvol, 99) <= compRvolMax and nz(rangeFactor, 99) <= compRangeMax
+bool evBreakUp = eventReady and high > evVAH and close > evVAH
+bool evBreakDn = eventReady and low < evVAL and close < evVAL
+bool evHoldUp = evOutsideClosesUp >= acceptBars
+bool evHoldDn = evOutsideClosesDn >= acceptBars
+bool evAcceptedUpCond = evBreakUp and evHoldUp and evScoreUp >= acceptThreshold
+bool evAcceptedDnCond = evBreakDn and evHoldDn and evScoreDn >= acceptThreshold
+bool evRejectUpCond = eventReady and high >= evVAH - edgeTol and close <= evVAH and close < open and evScoreUp < acceptThreshold
+bool evRejectDnCond = eventReady and low <= evVAL + edgeTol and close >= evVAL and close > open and evScoreDn < acceptThreshold
+
+// Per-bar event outputs. These are series bools used by plotshape() below.
+bool evtCompression = false
+bool evtProbeUp = false
+bool evtProbeDn = false
+bool evtAcceptUp = false
+bool evtAcceptDn = false
+bool evtFailUp = false
+bool evtFailDn = false
+bool evtRejectUp = false
+bool evtRejectDn = false
+bool evtMigrateUp = false
+bool evtMigrateDn = false
+
+if barstate.isconfirmed and eventReady
+    smAge += 1
+
+    if smState == ST_BAL
+        if evRejectUpCond
+            evtRejectUp := true
+            smState := ST_ROTATE_DN
+            smAge := 0
+        else if evRejectDnCond
+            evtRejectDn := true
+            smState := ST_ROTATE_UP
+            smAge := 0
+        else if evBreakUp
+            evtProbeUp := true
+            smState := ST_PROBE_UP
+            smAge := 0
+        else if evBreakDn
+            evtProbeDn := true
+            smState := ST_PROBE_DN
+            smAge := 0
+        else if evCompressionCond
+            evtCompression := true
+            smState := ST_COMP
+            smAge := 0
+
+    else if smState == ST_COMP
+        if evBreakUp
+            evtProbeUp := true
+            smState := ST_PROBE_UP
+            smAge := 0
+        else if evBreakDn
+            evtProbeDn := true
+            smState := ST_PROBE_DN
+            smAge := 0
+        else if evRejectUpCond
+            evtRejectUp := true
+            smState := ST_ROTATE_DN
+            smAge := 0
+        else if evRejectDnCond
+            evtRejectDn := true
+            smState := ST_ROTATE_UP
+            smAge := 0
+        else if not evCompressionCond
+            smState := ST_BAL
+            smAge := 0
+
+    else if smState == ST_PROBE_UP
+        if close <= evVAH
+            evtFailUp := true
+            smState := ST_ROTATE_DN
+            smAge := 0
+        else if evAcceptedUpCond
+            evtAcceptUp := true
+            smState := ST_ACCEPT_UP
+            smAge := 0
+
+    else if smState == ST_PROBE_DN
+        if close >= evVAL
+            evtFailDn := true
+            smState := ST_ROTATE_UP
+            smAge := 0
+        else if evAcceptedDnCond
+            evtAcceptDn := true
+            smState := ST_ACCEPT_DN
+            smAge := 0
+
+    else if smState == ST_ACCEPT_UP
+        if close <= evVAH
+            evtFailUp := true
+            smState := ST_ROTATE_DN
+            smAge := 0
+        else if not na(evTargetUp) and high >= evTargetUp - atr * 0.15
+            evtMigrateUp := true
+            smState := ST_MIGRATE_UP
+            smAge := 0
+
+    else if smState == ST_ACCEPT_DN
+        if close >= evVAL
+            evtFailDn := true
+            smState := ST_ROTATE_UP
+            smAge := 0
+        else if not na(evTargetDn) and low <= evTargetDn + atr * 0.15
+            evtMigrateDn := true
+            smState := ST_MIGRATE_DN
+            smAge := 0
+
+    else if smState == ST_ROTATE_DN
+        if evBreakDn
+            evtProbeDn := true
+            smState := ST_PROBE_DN
+            smAge := 0
+        else if close <= evPOC or smAge > math.max(8, refreshBars * 2)
+            smState := ST_BAL
+            smAge := 0
+
+    else if smState == ST_ROTATE_UP
+        if evBreakUp
+            evtProbeUp := true
+            smState := ST_PROBE_UP
+            smAge := 0
+        else if close >= evPOC or smAge > math.max(8, refreshBars * 2)
+            smState := ST_BAL
+            smAge := 0
+
+// Event tape visual manager. The state machine above remains untouched; this
+// layer only decides WHICH transitions deserve ink on the chart.
+// Priority: Migration > Accept/Fail > Probe > Rejection > Compression.
+// Strong resolution events may appear immediately after a probe; low-priority
+// events obey an adaptive cooldown so the chart does not become a debug log.
+int visualGap = adaptiveMode ? f_auto_visual_gap() : 6
+var int lastVisualEventBar = na
+var int lastVisualKind = 0  // 1=probe, 2=strong resolution, 3=secondary
+var int lastProbeBar = na
+var int lastStrongUpBar = na
+var int lastStrongDnBar = na
+
+bool rawStrongUp = evtMigrateUp or evtAcceptUp or evtFailUp
+bool rawStrongDn = evtMigrateDn or evtAcceptDn or evtFailDn
+bool rawProbeUp = evtProbeUp
+bool rawProbeDn = evtProbeDn
+bool rawSecondaryUp = evtRejectUp
+bool rawSecondaryDn = evtRejectDn
+bool rawCompression = evtCompression
+
+bool gapReady = na(lastVisualEventBar) or bar_index - lastVisualEventBar >= visualGap
+bool probeGapReady = na(lastProbeBar) or bar_index - lastProbeBar >= visualGap
+int strongGap = math.max(3, int(math.ceil(float(visualGap) * 0.60)))
+bool strongGlobalReady = na(lastVisualEventBar) or lastVisualKind == 1 or bar_index - lastVisualEventBar >= strongGap
+bool strongUpReady = strongGlobalReady and (na(lastStrongUpBar) or bar_index - lastStrongUpBar >= strongGap)
+bool strongDnReady = strongGlobalReady and (na(lastStrongDnBar) or bar_index - lastStrongDnBar >= strongGap)
+
+bool visMigrateUp = showEvents and evtMigrateUp and strongUpReady
+bool visMigrateDn = showEvents and evtMigrateDn and strongDnReady
+bool visAcceptUp = showEvents and not visMigrateUp and evtAcceptUp and strongUpReady
+bool visAcceptDn = showEvents and not visMigrateDn and evtAcceptDn and strongDnReady
+bool visFailUp = showEvents and not visMigrateUp and not visAcceptUp and evtFailUp and strongUpReady
+bool visFailDn = showEvents and not visMigrateDn and not visAcceptDn and evtFailDn and strongDnReady
+bool anyStrongVisual = visMigrateUp or visMigrateDn or visAcceptUp or visAcceptDn or visFailUp or visFailDn
+
+bool visProbeUp = showEvents and not anyStrongVisual and rawProbeUp and probeGapReady and gapReady
+bool visProbeDn = showEvents and not anyStrongVisual and rawProbeDn and probeGapReady and gapReady
+bool anyProbeVisual = visProbeUp or visProbeDn
+
+bool visRejectUp = showEvents and fullMode and not anyStrongVisual and not anyProbeVisual and rawSecondaryUp and gapReady
+bool visRejectDn = showEvents and fullMode and not anyStrongVisual and not anyProbeVisual and rawSecondaryDn and gapReady
+bool visCompression = showEvents and fullMode and showCompressionEvents and not anyStrongVisual and not anyProbeVisual and not visRejectUp and not visRejectDn and rawCompression and gapReady
+
+if barstate.isconfirmed
+    if visMigrateUp or visAcceptUp or visFailUp
+        lastStrongUpBar := bar_index
+    if visMigrateDn or visAcceptDn or visFailDn
+        lastStrongDnBar := bar_index
+    if anyProbeVisual
+        lastProbeBar := bar_index
+    if anyStrongVisual
+        lastVisualEventBar := bar_index
+        lastVisualKind := 2
+    else if anyProbeVisual
+        lastVisualEventBar := bar_index
+        lastVisualKind := 1
+    else if visRejectUp or visRejectDn or visCompression
+        lastVisualEventBar := bar_index
+        lastVisualKind := 3
+
+// CLEAN mode: probes are unobtrusive triangles; only resolved auction events
+// earn text labels. FULL mode additionally exposes rejection/compression markers.
+plotshape(visProbeUp, title="Probe up", style=shape.triangleup, location=location.belowbar, color=color.new(color.yellow, 0), size=size.tiny, text="", textcolor=color.black)
+plotshape(visProbeDn, title="Probe down", style=shape.triangledown, location=location.abovebar, color=color.new(color.yellow, 0), size=size.tiny, text="", textcolor=color.black)
+plotshape(visAcceptUp, title="Accepted up", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 4), size=size.tiny, text="A↑", textcolor=color.white)
+plotshape(visAcceptDn, title="Accepted down", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 4), size=size.tiny, text="A↓", textcolor=color.white)
+plotshape(visFailUp, title="Failed break up", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 8), size=size.tiny, text="F↑", textcolor=color.white)
+plotshape(visFailDn, title="Failed break down", style=shape.labelup, location=location.belowbar, color=color.new(color.lime, 8), size=size.tiny, text="F↓", textcolor=color.white)
+plotshape(visMigrateUp, title="Migration up target reached", style=shape.diamond, location=location.abovebar, color=color.new(color.lime, 0), size=size.tiny, text="M↑", textcolor=color.white)
+plotshape(visMigrateDn, title="Migration down target reached", style=shape.diamond, location=location.belowbar, color=color.new(color.red, 0), size=size.tiny, text="M↓", textcolor=color.white)
+plotshape(visRejectUp, title="VAH rejection", style=shape.xcross, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="", textcolor=color.orange)
+plotshape(visRejectDn, title="VAL rejection", style=shape.xcross, location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny, text="", textcolor=color.orange)
+plotshape(visCompression, title="Compression begins", style=shape.circle, location=location.belowbar, color=color.new(color.blue, 15), size=size.tiny, text="", textcolor=color.white)
+
+// ============================================================================
+// A) HIGH-RES CURRENT AUCTION MAP — calculated only on last bar
+// ============================================================================
+var float profileLow = na
+var float profileHigh = na
+var float globalPOC = na
+var int detectedClusters = 0
+var int activeCluster = na
+var float activeVAL = na
+var float activeVAH = na
+var float activePOC = na
+var float activeMassPct = na
+var float targetPOC = na
+var float outsideUpShare = 0.0
+var float outsideDnShare = 0.0
+var float partUp = 0.0
+var float partDn = 0.0
+var float expandScore = 0.0
+var float acceptUpScore = 0.0
+var float acceptDnScore = 0.0
+var float finalUp = 0.0
+var float finalDn = 0.0
+var int activeLookback = na
+var int activeBins = na
+var float activeSigma = na
+var string mapRegime = "WAITING"
+var color mapRegimeColor = color.gray
+
+var array<box> mapBoxes = array.new_box()
+var array<line> mapLines = array.new_line()
+var array<label> mapLabels = array.new_label()
+
+if barstate.islast
+    // Clear current-map drawings. Event tape uses plotshape() and is unaffected.
+    while array.size(mapBoxes) > 0
+        box.delete(array.pop(mapBoxes))
+    while array.size(mapLines) > 0
+        line.delete(array.pop(mapLines))
+    while array.size(mapLabels) > 0
+        label.delete(array.pop(mapLabels))
+
+    int requestedLb = adaptiveMode ? f_auto_map_lookback() : manualLookbackBars
+    int lb = math.min(requestedLb, math.max(1, bar_index - 1))
+    profileLow := 1e100
+    profileHigh := -1e100
+    for h = 1 to lb
+        if not na(low[h])
+            profileLow := math.min(profileLow, low[h])
+            profileHigh := math.max(profileHigh, high[h])
+
+    bool validRange = profileHigh > profileLow and profileLow < 1e99
+    float profileRange = validRange ? profileHigh - profileLow : syminfo.mintick
+    float atrContext = math.max(nz(ta.sma(atr, 50), atr), syminfo.mintick)
+    float binsFromSamples = math.sqrt(float(math.max(lb, 1))) * 5.0
+    float binsFromVolatility = profileRange / math.max(atrContext * 0.60, syminfo.mintick)
+    int autoBins = int(math.round(f_clamp(math.min(binsFromSamples, math.max(78.0, binsFromVolatility)), 78.0, 138.0)))
+    int bins = adaptiveMode ? autoBins : manualPriceBins
+    float sigma = adaptiveMode ? f_clamp(float(bins) / 45.0, 1.7, 3.2) : manualGaussianSigma
+    int peakSeparation = adaptiveMode ? math.max(5, int(math.round(float(bins) * 0.065))) : math.max(5, int(math.round(float(bins) * 0.065)))
+    int massRadius = adaptiveMode ? math.max(3, int(math.round(float(bins) * 0.045))) : math.max(3, int(math.round(float(bins) * 0.045)))
+    int clusterCap = adaptiveMode ? 5 : manualMaxClusters
+    float enhanceStrength = adaptiveMode ? 0.45 : 0.45
+    float binSize = validRange ? math.max(profileRange / float(bins), syminfo.mintick) : syminfo.mintick
+
+    activeLookback := lb
+    activeBins := bins
+    activeSigma := sigma
+
+    array<float> raw = array.new_float(bins, 0.0)
+    if validRange
+        for h = 1 to lb
+            footprint histFp = fp[h]
+            if not na(histFp)
+                array<volume_row> histRows = histFp.rows()
+                for row in histRows
+                    float rowMid = math.avg(row.up_price(), row.down_price())
+                    float rowVol = row.total_volume()
+                    int idx = int(math.floor((rowMid - profileLow) / binSize))
+                    idx := math.max(0, math.min(bins - 1, idx))
+                    array.set(raw, idx, array.get(raw, idx) + rowVol)
+
+    float totalVol = 0.0
+    float rawMax = 0.0
+    int rawMaxIdx = 0
+    for i = 0 to bins - 1
+        float v = array.get(raw, i)
+        totalVol += v
+        if v > rawMax
+            rawMax := v
+            rawMaxIdx := i
+    float avgBinVol = bins > 0 ? totalVol / float(bins) : 0.0
+
+    array<float> smooth = array.new_float(bins, 0.0)
+    float smoothMax = 0.0
+    int smoothMaxIdx = rawMaxIdx
+    for i = 0 to bins - 1
+        float sv = f_gaussian(raw, i, sigma)
+        array.set(smooth, i, sv)
+        if sv > smoothMax
+            smoothMax := sv
+            smoothMaxIdx := i
+
+    float smoothMean = 0.0
+    for i = 0 to bins - 1
+        smoothMean += array.get(smooth, i)
+    smoothMean := bins > 0 ? smoothMean / float(bins) : 0.0
+    float smoothVar = 0.0
+    for i = 0 to bins - 1
+        float dv = array.get(smooth, i) - smoothMean
+        smoothVar += dv * dv
+    float smoothStd = bins > 0 ? math.sqrt(smoothVar / float(bins)) : 0.0
+    float profileCV = smoothMean > 0 ? smoothStd / smoothMean : 0.0
+
+    float peakVsAvg = adaptiveMode ? f_clamp(1.08 + profileCV * 0.18, 1.10, 1.40) : 1.25
+    float peakPctMax = adaptiveMode ? f_clamp(13.0 + profileCV * 7.0, 14.0, 26.0) : 20.0
+    float minMassPct = adaptiveMode ? f_clamp(3.5 + profileCV * 0.8, 3.5, 6.0) : 5.0
+
+    array<int> candidates = array.new_int()
+    if smoothMax > 0 and totalVol > 0
+        for i = 1 to bins - 2
+            float cur = array.get(smooth, i)
+            int mLo = math.max(0, i - massRadius)
+            int mHi = math.min(bins - 1, i + massRadius)
+            float localMassPct = totalVol > 0 ? f_sum_range(raw, mLo, mHi) / totalVol * 100.0 : 0.0
+            bool localPeak = cur >= array.get(smooth, i - 1) and cur > array.get(smooth, i + 1)
+            bool activeEnough = cur >= avgBinVol * peakVsAvg
+            bool strongEnough = cur >= smoothMax * peakPctMax / 100.0
+            bool enoughMass = localMassPct >= minMassPct
+            if localPeak and activeEnough and strongEnough and enoughMass
+                array.push(candidates, i)
+
+    array<int> peaks = array.new_int()
+    if array.size(candidates) > 0
+        for pick = 0 to clusterCap - 1
+            int bestIdx = na
+            float bestV = -1.0
+            for c = 0 to array.size(candidates) - 1
+                int cand = array.get(candidates, c)
+                bool farEnough = true
+                if array.size(peaks) > 0
+                    for p = 0 to array.size(peaks) - 1
+                        if math.abs(cand - array.get(peaks, p)) < peakSeparation
+                            farEnough := false
+                float cv = array.get(smooth, cand)
+                if farEnough and cv > bestV
+                    bestV := cv
+                    bestIdx := cand
+            if na(bestIdx)
+                break
+            array.push(peaks, bestIdx)
+    if array.size(peaks) == 0 and smoothMax > 0
+        array.push(peaks, smoothMaxIdx)
+    array.sort(peaks, order.ascending)
+
+    array<float> enhanced = array.new_float(bins, 0.0)
+    float enhancedMax = 0.0
+    for i = 0 to bins - 1
+        float ev = array.get(smooth, i)
+        if array.size(peaks) > 0
+            for p = 0 to array.size(peaks) - 1
+                int pk = array.get(peaks, p)
+                float d = float(i - pk) / sigma
+                ev += array.get(smooth, pk) * math.exp(-0.5 * d * d) * enhanceStrength
+        array.set(enhanced, i, ev)
+        enhancedMax := math.max(enhancedMax, ev)
+
+    globalPOC := validRange ? f_bin_bottom(profileLow, binSize, f_max_idx(enhanced, 0, bins - 1)) + binSize * 0.5 : na
+
+    int nC = array.size(peaks)
+    array<int> cLo = array.new_int()
+    array<int> cHi = array.new_int()
+    int nextLo = 0
+    if nC > 0
+        for c = 0 to nC - 1
+            int hi = bins - 1
+            if c < nC - 1
+                hi := f_valley_idx(smooth, array.get(peaks, c), array.get(peaks, c + 1))
+            array.push(cLo, nextLo)
+            array.push(cHi, hi)
+            nextLo := math.min(bins - 1, hi + 1)
+
+    array<float> cVAL = array.new_float()
+    array<float> cVAH = array.new_float()
+    array<float> cPOC = array.new_float()
+    array<float> cMass = array.new_float()
+
+    if nC > 0
+        for c = 0 to nC - 1
+            int lo = array.get(cLo, c)
+            int hi = array.get(cHi, c)
+            float mass = f_sum_range(raw, lo, hi)
+            float massPct = totalVol > 0 ? mass / totalVol * 100.0 : 0.0
+            int poc = f_max_idx(enhanced, lo, hi)
+            int vaLo = poc
+            int vaHi = poc
+            float included = array.get(raw, poc)
+            float target = mass * valueAreaPct / 100.0
+            int safety = 0
+            while included < target and (vaLo > lo or vaHi < hi) and safety < 500
+                float lv = vaLo > lo ? array.get(raw, vaLo - 1) : -1.0
+                float rv = vaHi < hi ? array.get(raw, vaHi + 1) : -1.0
+                if rv > lv
+                    vaHi += 1
+                    included += math.max(rv, 0.0)
+                else
+                    vaLo -= 1
+                    included += math.max(lv, 0.0)
+                safety += 1
+            array.push(cVAL, f_bin_bottom(profileLow, binSize, vaLo))
+            array.push(cVAH, f_bin_bottom(profileLow, binSize, vaHi + 1))
+            array.push(cPOC, f_bin_bottom(profileLow, binSize, poc) + binSize * 0.5)
+            array.push(cMass, massPct)
+
+    detectedClusters := nC
+    activeCluster := na
+    if nC > 0
+        for c = 0 to nC - 1
+            if na(activeCluster) and close >= array.get(cVAL, c) and close <= array.get(cVAH, c)
+                activeCluster := c
+        if na(activeCluster) and validRange and close >= profileLow and close <= profileHigh
+            int pxIdx = int(math.floor((close - profileLow) / binSize))
+            pxIdx := math.max(0, math.min(bins - 1, pxIdx))
+            for c = 0 to nC - 1
+                if na(activeCluster) and pxIdx >= array.get(cLo, c) and pxIdx <= array.get(cHi, c)
+                    activeCluster := c
+        if na(activeCluster)
+            float bestDist = 1e100
+            for c = 0 to nC - 1
+                float d = math.abs(close - array.get(cPOC, c))
+                if d < bestDist
+                    bestDist := d
+                    activeCluster := c
+
+    activeVAL := not na(activeCluster) ? array.get(cVAL, activeCluster) : na
+    activeVAH := not na(activeCluster) ? array.get(cVAH, activeCluster) : na
+    activePOC := not na(activeCluster) ? array.get(cPOC, activeCluster) : na
+    activeMassPct := not na(activeCluster) ? array.get(cMass, activeCluster) : na
+
+    bool hasHigher = not na(activeCluster) and activeCluster < nC - 1
+    bool hasLower = not na(activeCluster) and activeCluster > 0
+    targetPOC := activePOC
+    if not na(activeCluster)
+        if close > activeVAH and hasHigher
+            targetPOC := array.get(cPOC, activeCluster + 1)
+        else if close < activeVAL and hasLower
+            targetPOC := array.get(cPOC, activeCluster - 1)
+
+    // Current high-res auction scoring.
+    float outUpVol = 0.0
+    float outDnVol = 0.0
+    if hasFp and not na(activeVAH) and not na(activeVAL)
+        array<volume_row> curRows2 = fp.rows()
+        for row in curRows2
+            float mid = math.avg(row.up_price(), row.down_price())
+            float rv = row.total_volume()
+            if mid > activeVAH
+                outUpVol += rv
+            if mid < activeVAL
+                outDnVol += rv
+    outsideUpShare := hasFp and fpTotal > 0 ? outUpVol / fpTotal : 0.0
+    outsideDnShare := hasFp and fpTotal > 0 ? outDnVol / fpTotal : 0.0
+
+    int closesUp = 0
+    int closesDn = 0
+    for k = 0 to acceptBars - 1
+        if not na(activeVAH) and not na(close[k]) and close[k] > activeVAH
+            closesUp += 1
+        if not na(activeVAL) and not na(close[k]) and close[k] < activeVAL
+            closesDn += 1
+    float holdUpPct = float(closesUp) / float(acceptBars)
+    float holdDnPct = float(closesDn) / float(acceptBars)
+
+    float rvolN = f_norm(nz(rvol, 0.0), 0.75, 2.00)
+    float rangeN = f_norm(nz(rangeFactor, 0.0), 0.65, 1.80)
+    float deltaUpN = f_norm(nz(deltaPct, 0.0), 0.00, 0.35)
+    float deltaDnN = f_norm(-nz(deltaPct, 0.0), 0.00, 0.35)
+    float outUpN = f_norm(outsideUpShare, 0.08, 0.68)
+    float outDnN = f_norm(outsideDnShare, 0.08, 0.68)
+    partUp := 100.0 * (0.55 * rvolN + 0.45 * deltaUpN)
+    partDn := 100.0 * (0.55 * rvolN + 0.45 * deltaDnN)
+    expandScore := 100.0 * rangeN
+    acceptUpScore := 100.0 * (0.62 * outUpN + 0.20 * (not na(currentBarPOC) and not na(activeVAH) and currentBarPOC > activeVAH ? 1.0 : 0.0) + 0.18 * holdUpPct)
+    acceptDnScore := 100.0 * (0.62 * outDnN + 0.20 * (not na(currentBarPOC) and not na(activeVAL) and currentBarPOC < activeVAL ? 1.0 : 0.0) + 0.18 * holdDnPct)
+    finalUp := 0.40 * partUp + 0.25 * expandScore + 0.35 * acceptUpScore
+    finalDn := 0.40 * partDn + 0.25 * expandScore + 0.35 * acceptDnScore
+
+    bool insideValue = not na(activeVAL) and not na(activeVAH) and close >= activeVAL and close <= activeVAH
+    bool compressionNow = insideValue and nz(rvol, 99) <= compRvolMax and nz(rangeFactor, 99) <= compRangeMax
+    bool breakUpNow = not na(activeVAH) and high > activeVAH and close > activeVAH
+    bool breakDnNow = not na(activeVAL) and low < activeVAL and close < activeVAL
+    bool acceptedUpNow = breakUpNow and closesUp >= acceptBars and finalUp >= acceptThreshold
+    bool acceptedDnNow = breakDnNow and closesDn >= acceptBars and finalDn >= acceptThreshold
+    bool failedUpNow = not na(activeVAH) and high > activeVAH and close <= activeVAH
+    bool failedDnNow = not na(activeVAL) and low < activeVAL and close >= activeVAL
+    bool rejectUpNow = not na(activeVAH) and high >= activeVAH - atr * 0.10 and close < activeVAH and close < open and finalUp < acceptThreshold
+    bool rejectDnNow = not na(activeVAL) and low <= activeVAL + atr * 0.10 and close > activeVAL and close > open and finalDn < acceptThreshold
+
+    mapRegime := "BALANCE IN VALUE"
+    mapRegimeColor := color.gray
+    if compressionNow
+        mapRegime := "COMPRESSION"
+        mapRegimeColor := color.blue
+    if rejectUpNow
+        mapRegime := "REJECT VAH → POC"
+        mapRegimeColor := color.orange
+    if rejectDnNow
+        mapRegime := "REJECT VAL → POC"
+        mapRegimeColor := color.orange
+    if failedUpNow
+        mapRegime := "FAILED BREAK ↑ → POC"
+        mapRegimeColor := color.red
+    if failedDnNow
+        mapRegime := "FAILED BREAK ↓ → POC"
+        mapRegimeColor := color.lime
+    if breakUpNow and not acceptedUpNow
+        mapRegime := hasHigher ? "PROBE ↑ → NEXT VALUE" : "PROBE ABOVE TOP VALUE ↑"
+        mapRegimeColor := color.yellow
+    if breakDnNow and not acceptedDnNow
+        mapRegime := hasLower ? "PROBE ↓ → NEXT VALUE" : "PROBE BELOW LOW VALUE ↓"
+        mapRegimeColor := color.yellow
+    if acceptedUpNow
+        mapRegime := hasHigher ? "ACCEPTED MIGRATION ↑" : "ACCEPTED EXPANSION ↑"
+        mapRegimeColor := color.lime
+    if acceptedDnNow
+        mapRegime := hasLower ? "ACCEPTED MIGRATION ↓" : "ACCEPTED EXPANSION ↓"
+        mapRegimeColor := color.red
+
+    // ------------------------------------------------------------------------
+    // VISUAL LAYER 1: subtle value extensions + current context profile
+    // ------------------------------------------------------------------------
+    int xBase = bar_index + profileGapBars
+    int xRight = xBase + profileWidthBars
+    int xExtLeft = math.max(0, bar_index - math.min(lb, cleanMode ? 180 : 420))
+
+    if showValueExtensions and nC > 0
+        for c = 0 to nC - 1
+            color cc = f_cluster_color(c)
+            float cval = array.get(cVAL, c)
+            float cvah = array.get(cVAH, c)
+            float cpoc = array.get(cPOC, c)
+            bool isActive = c == activeCluster
+            bool drawExtension = fullMode or isActive
+            if drawExtension
+                box z = box.new(left=xExtLeft, top=cvah, right=xBase - 1, bottom=cval, xloc=xloc.bar_index,
+                     bgcolor=color.new(cc, isActive ? 96 : 98), border_color=color.new(cc, isActive ? 84 : 94), border_width=1)
+                array.push(mapBoxes, z)
+                line pl = line.new(x1=xExtLeft, y1=cpoc, x2=xRight + 2, y2=cpoc, xloc=xloc.bar_index,
+                     color=color.new(cc, isActive ? 30 : 76), width=isActive ? 2 : 1, style=line.style_dotted)
+                array.push(mapLines, pl)
+
+    if showProfile and validRange and enhancedMax > 0
+        for i = 0 to bins - 1
+            float yBottom = f_bin_bottom(profileLow, binSize, i)
+            float yTop = f_bin_bottom(profileLow, binSize, i + 1)
+            float ev = array.get(enhanced, i)
+            int width = math.max(1, int(math.round(ev / enhancedMax * profileWidthBars)))
+            int owner = 0
+            if nC > 0
+                for c = 0 to nC - 1
+                    if i >= array.get(cLo, c) and i <= array.get(cHi, c)
+                        owner := c
+            color cc = f_cluster_color(owner)
+            bool rowInVA = nC > 0 and yBottom < array.get(cVAH, owner) and yTop > array.get(cVAL, owner)
+            bool activeOwner = nC > 0 and owner == activeCluster
+            int alpha = rowInVA ? (activeOwner ? 28 : 48) : (activeOwner ? 55 : 72)
+            box vb = box.new(left=xBase, top=yTop, right=xBase + width, bottom=yBottom, xloc=xloc.bar_index,
+                 bgcolor=color.new(cc, alpha), border_color=color.new(cc, 100))
+            array.push(mapBoxes, vb)
+
+    if nC > 0
+        for c = 0 to nC - 1
+            color cc = f_cluster_color(c)
+            float cval = array.get(cVAL, c)
+            float cvah = array.get(cVAH, c)
+            float cpoc = array.get(cPOC, c)
+            float cmass = array.get(cMass, c)
+            bool isActive = c == activeCluster
+            int profileLineLeft = cleanMode ? xBase : xBase - 2
+            line vahL = line.new(x1=profileLineLeft, y1=cvah, x2=xRight + 2, y2=cvah, xloc=xloc.bar_index,
+                 color=color.new(cc, isActive ? 8 : (cleanMode ? 68 : 48)), width=isActive ? 2 : 1)
+            line valL = line.new(x1=profileLineLeft, y1=cval, x2=xRight + 2, y2=cval, xloc=xloc.bar_index,
+                 color=color.new(cc, isActive ? 8 : (cleanMode ? 68 : 48)), width=isActive ? 2 : 1)
+            array.push(mapLines, vahL)
+            array.push(mapLines, valL)
+            if showClusterLabels
+                string tag = "C" + str.tostring(c + 1) + (isActive ? " ACTIVE" : "") + " • " + str.tostring(cmass, "#.0") + "%"
+                label cl = label.new(xRight + 3, cpoc, tag, xloc=xloc.bar_index, style=label.style_label_left,
+                     color=color.new(cc, isActive ? 5 : 32), textcolor=color.white, size=size.tiny)
+                array.push(mapLabels, cl)
+
+    // ------------------------------------------------------------------------
+    // ------------------------------------------------------------------------
+    // VISUAL LAYER 2: full historical auction spans + docked episode profiles
+    //
+    // Each broad price cluster may contain several separate time auctions.
+    // v1.4 keeps short excursions inside the same episode, draws the FULL
+    // historical VA span from first accepted bar to last accepted bar, then
+    // docks a compact episode-specific footprint profile inside that span.
+    // Labels are intentionally trader-readable: BASE / VOL +/-N% / POC up/down.
+    if showCapsules and nC > 0 and validRange
+        int maxEpisodesPerCluster = cleanMode ? 3 : 4
+        int minEpisodeBars = cleanMode ? 4 : 3
+        int gapToleranceBars = cleanMode ? 2 : 3
+        int profileDockBars = cleanMode ? 11 : 15
+        float overlapThreshold = cleanMode ? 0.24 : 0.18
+
+        for c = 0 to nC - 1
+            float cmass = array.get(cMass, c)
+            int importanceRank = 1
+            for q = 0 to nC - 1
+                if q != c and array.get(cMass, q) > cmass
+                    importanceRank += 1
+            bool drawClusterEpisodes = fullMode or importanceRank <= 3
+
+            if drawClusterEpisodes
+                int lo = array.get(cLo, c)
+                int hi = array.get(cHi, c)
+                float cval = array.get(cVAL, c)
+                float cvah = array.get(cVAH, c)
+                float cpoc = array.get(cPOC, c)
+                color cc = f_cluster_color(c)
+                int clusterBinCount = hi - lo + 1
+                float broadBottom = f_bin_bottom(profileLow, binSize, lo)
+                float broadTop = f_bin_bottom(profileLow, binSize, hi + 1)
+
+                // --- Detect time episodes, allowing brief excursions ---------
+                array<int> epOldest = array.new_int()
+                array<int> epNewest = array.new_int()
+                array<float> epScore = array.new_float()
+
+                bool inSeg = false
+                int segOldest = na
+                int lastMemberOff = na
+                int gapBars = 0
+                float segScore = 0.0
+
+                for off = lb to 1
+                    float br = math.max(high[off] - low[off], syminfo.mintick)
+                    float overlap = math.max(0.0, math.min(high[off], cvah) - math.max(low[off], cval))
+                    float overlapFrac = overlap / br
+                    bool insideClose = close[off] >= cval and close[off] <= cvah
+                    bool member = insideClose or overlapFrac >= overlapThreshold
+                    float barVol = nz(volume[off], 0.0)
+                    float pocNear = math.abs(close[off] - cpoc) <= math.max(cvah - cval, syminfo.mintick) * 0.35 ? 1.10 : 1.0
+                    float scoreAdd = barVol * math.max(overlapFrac, insideClose ? 0.62 : 0.20) * (insideClose ? 1.22 : 1.0) * pocNear
+
+                    if member
+                        if not inSeg
+                            inSeg := true
+                            segOldest := off
+                            segScore := 0.0
+                        lastMemberOff := off
+                        gapBars := 0
+                        segScore += scoreAdd
+                    else if inSeg
+                        gapBars += 1
+                        if gapBars > gapToleranceBars
+                            int segNewest = lastMemberOff
+                            int span = segOldest - segNewest + 1
+                            if span >= minEpisodeBars
+                                array.push(epOldest, segOldest)
+                                array.push(epNewest, segNewest)
+                                array.push(epScore, segScore)
+                            inSeg := false
+                            segOldest := na
+                            lastMemberOff := na
+                            gapBars := 0
+                            segScore := 0.0
+
+                if inSeg and not na(lastMemberOff)
+                    int spanTail = segOldest - lastMemberOff + 1
+                    if spanTail >= minEpisodeBars
+                        array.push(epOldest, segOldest)
+                        array.push(epNewest, lastMemberOff)
+                        array.push(epScore, segScore)
+
+                // --- Keep the strongest distinct episodes --------------------
+                array<int> chosen = array.new_int()
+                if array.size(epScore) > 0
+                    for pick = 0 to maxEpisodesPerCluster - 1
+                        int bestIdx = na
+                        float bestSc = -1.0
+                        for e = 0 to array.size(epScore) - 1
+                            bool already = false
+                            if array.size(chosen) > 0
+                                for z = 0 to array.size(chosen) - 1
+                                    if e == array.get(chosen, z)
+                                        already := true
+                            if not already
+                                int eOld = array.get(epOldest, e)
+                                int eNew = array.get(epNewest, e)
+                                int eCenter = int(math.floor((eOld + eNew) * 0.50))
+                                bool farEnough = true
+                                if array.size(chosen) > 0
+                                    for z = 0 to array.size(chosen) - 1
+                                        int prev = array.get(chosen, z)
+                                        int pOld = array.get(epOldest, prev)
+                                        int pNew = array.get(epNewest, prev)
+                                        int pCenter = int(math.floor((pOld + pNew) * 0.50))
+                                        if math.abs(eCenter - pCenter) < minEpisodeBars + gapToleranceBars + 2
+                                            farEnough := false
+                                float sc = array.get(epScore, e)
+                                if farEnough and sc > bestSc
+                                    bestSc := sc
+                                    bestIdx := e
+                        if na(bestIdx)
+                            break
+                        array.push(chosen, bestIdx)
+
+                // chronological order: oldest -> newest
+                if array.size(chosen) > 1
+                    for a = 0 to array.size(chosen) - 2
+                        for b = a + 1 to array.size(chosen) - 1
+                            int ea = array.get(chosen, a)
+                            int eb = array.get(chosen, b)
+                            if array.get(epOldest, ea) < array.get(epOldest, eb)
+                                array.set(chosen, a, eb)
+                                array.set(chosen, b, ea)
+
+                float prevEpPoc = na
+                float prevEpIntensity = na
+                int prevSpanRight = na
+
+                if array.size(chosen) > 0
+                    for s = 0 to array.size(chosen) - 1
+                        int e = array.get(chosen, s)
+                        int eOld = array.get(epOldest, e)
+                        int eNew = array.get(epNewest, e)
+                        int eBars = math.max(1, eOld - eNew + 1)
+                        int spanLeft = bar_index - eOld
+                        int spanRight = bar_index - eNew
+
+                        // Episode-specific profile built from actual historical
+                        // footprint rows. If a historical footprint is missing,
+                        // fall back to candle-volume distribution for that bar.
+                        array<float> epBins = array.new_float(clusterBinCount, 0.0)
+                        float epShapeVol = 0.0
+                        for off = eNew to eOld
+                            bool usedNative = false
+                            footprint epFp = fp[off]
+                            if not na(epFp)
+                                array<volume_row> epRows = epFp.rows()
+                                if array.size(epRows) > 0
+                                    for erow in epRows
+                                        float mid = math.avg(erow.up_price(), erow.down_price())
+                                        if mid >= broadBottom and mid <= broadTop
+                                            int idxAbs = int(math.floor((mid - profileLow) / binSize))
+                                            idxAbs := math.max(lo, math.min(hi, idxAbs))
+                                            float rv = erow.total_volume()
+                                            int localIdx = idxAbs - lo
+                                            array.set(epBins, localIdx, array.get(epBins, localIdx) + rv)
+                                            epShapeVol += rv
+                                    usedNative := true
+                            if not usedNative
+                                float br2 = math.max(high[off] - low[off], syminfo.mintick)
+                                float overlap2 = math.max(0.0, math.min(high[off], broadTop) - math.max(low[off], broadBottom))
+                                float overlapFrac2 = overlap2 / br2
+                                float effVol = nz(volume[off], 0.0) * overlapFrac2
+                                int loIdx = int(math.floor((math.max(low[off], broadBottom) - profileLow) / binSize))
+                                int hiIdx = int(math.floor((math.min(high[off], broadTop) - profileLow) / binSize))
+                                loIdx := math.max(lo, math.min(hi, loIdx))
+                                hiIdx := math.max(loIdx, math.min(hi, hiIdx))
+                                int touched = math.max(1, hiIdx - loIdx + 1)
+                                float perBin = effVol / float(touched)
+                                for bi = loIdx to hiIdx
+                                    int localIdx = bi - lo
+                                    array.set(epBins, localIdx, array.get(epBins, localIdx) + perBin)
+                                epShapeVol += effVol
+
+                        // Skip an empty episode profile safely.
+                        if epShapeVol > 0 and clusterBinCount > 0
+                            int epPocIdx = f_max_idx(epBins, 0, clusterBinCount - 1)
+                            int epVaLo = epPocIdx
+                            int epVaHi = epPocIdx
+                            float epIncluded = array.get(epBins, epPocIdx)
+                            float epTarget = epShapeVol * valueAreaPct / 100.0
+                            int guard = 0
+                            while epIncluded < epTarget and (epVaLo > 0 or epVaHi < clusterBinCount - 1) and guard < 500
+                                float lv = epVaLo > 0 ? array.get(epBins, epVaLo - 1) : -1.0
+                                float rv = epVaHi < clusterBinCount - 1 ? array.get(epBins, epVaHi + 1) : -1.0
+                                if rv > lv
+                                    epVaHi += 1
+                                    epIncluded += math.max(rv, 0.0)
+                                else
+                                    epVaLo -= 1
+                                    epIncluded += math.max(lv, 0.0)
+                                guard += 1
+
+                            float epVAL = f_bin_bottom(profileLow, binSize, lo + epVaLo)
+                            float epVAH = f_bin_bottom(profileLow, binSize, lo + epVaHi + 1)
+                            float epPOC = f_bin_bottom(profileLow, binSize, lo + epPocIdx) + binSize * 0.5
+                            float eIntensity = epShapeVol / float(eBars)
+
+                            // 1) FULL historical accepted-value span.
+                            box spanBox = box.new(left=spanLeft, top=epVAH, right=spanRight, bottom=epVAL, xloc=xloc.bar_index,
+                                 bgcolor=color.new(cc, cleanMode ? 91 : 87), border_color=color.new(cc, cleanMode ? 76 : 64), border_width=1)
+                            array.push(mapBoxes, spanBox)
+
+                            // 2) Dock the mini profile at the right side of the
+                            // full span. The span remains visible behind it.
+                            int spanWidth = math.max(1, spanRight - spanLeft + 1)
+                            int dockWidth = math.max(5, math.min(profileDockBars, spanWidth))
+                            int capRight = spanRight
+                            int capLeft = math.max(spanLeft, capRight - dockWidth + 1)
+                            int innerLeft = capLeft + 1
+                            int innerRight = math.max(innerLeft + 1, capRight - 1)
+                            int innerWidth = math.max(1, innerRight - innerLeft)
+
+                            float epVaHeight = math.max(epVAH - epVAL, binSize * 3.0)
+                            float capBottom = math.max(broadBottom, epVAL - epVaHeight * 0.16)
+                            float capTop = math.min(broadTop, epVAH + epVaHeight * 0.16)
+                            int drawLo = int(math.floor((capBottom - profileLow) / binSize))
+                            int drawHi = int(math.ceil((capTop - profileLow) / binSize)) - 1
+                            drawLo := math.max(lo, math.min(hi, drawLo))
+                            drawHi := math.max(drawLo, math.min(hi, drawHi))
+                            int drawBinCount = drawHi - drawLo + 1
+
+                            box frame = box.new(left=capLeft, top=capTop, right=capRight, bottom=capBottom, xloc=xloc.bar_index,
+                                 bgcolor=color.new(cc, 100), border_color=color.new(cc, cleanMode ? 58 : 46), border_width=1)
+                            array.push(mapBoxes, frame)
+
+                            int rows = math.min(capsuleRows, math.max(4, drawBinCount))
+                            array<float> capVols = array.new_float(rows, 0.0)
+                            float capMax = 0.0
+                            for r = 0 to rows - 1
+                                int srcLo = drawLo + int(math.floor(float(r) * float(drawBinCount) / float(rows)))
+                                int srcHi = drawLo + int(math.floor(float(r + 1) * float(drawBinCount) / float(rows))) - 1
+                                srcHi := math.max(srcLo, math.min(drawHi, srcHi))
+                                float rv = 0.0
+                                for bi = srcLo to srcHi
+                                    rv += array.get(epBins, bi - lo)
+                                array.set(capVols, r, rv)
+                                capMax := math.max(capMax, rv)
+
+                            for r = 0 to rows - 1
+                                float y0 = capBottom + (capTop - capBottom) * float(r) / float(rows)
+                                float y1 = capBottom + (capTop - capBottom) * float(r + 1) / float(rows)
+                                float rv = array.get(capVols, r)
+                                int w = capMax > 0 ? math.max(1, int(math.round(rv / capMax * float(innerWidth)))) : 1
+                                int rowLeft = math.max(innerLeft, innerRight - w)
+                                bool inVa = y0 < epVAH and y1 > epVAL
+                                box rb = box.new(left=rowLeft, top=y1, right=innerRight, bottom=y0, xloc=xloc.bar_index,
+                                     bgcolor=color.new(cc, inVa ? (cleanMode ? 36 : 28) : (cleanMode ? 68 : 56)), border_color=color.new(cc, 100))
+                                array.push(mapBoxes, rb)
+
+                            // POC traverses the whole historical auction span;
+                            // VAH/VAL remain the span boundaries themselves.
+                            line pocLine = line.new(x1=spanLeft, y1=epPOC, x2=spanRight, y2=epPOC, xloc=xloc.bar_index,
+                                 color=color.new(cc, cleanMode ? 24 : 14), width=2, style=line.style_dotted)
+                            array.push(mapLines, pocLine)
+
+                            // Connect related historical auctions in the same
+                            // broad cluster. Color expresses volume participation:
+                            // green = stronger revisit, orange = weaker revisit.
+                            if not na(prevSpanRight) and not na(prevEpPoc)
+                                float dV = not na(prevEpIntensity) and prevEpIntensity > 0 ? (eIntensity - prevEpIntensity) / prevEpIntensity * 100.0 : 0.0
+                                color linkColor = dV >= 0 ? color.lime : color.orange
+                                line link = line.new(x1=prevSpanRight, y1=prevEpPoc, x2=spanLeft, y2=epPOC, xloc=xloc.bar_index,
+                                     color=color.new(linkColor, cleanMode ? 55 : 38), width=1, style=line.style_dotted)
+                                array.push(mapLines, link)
+
+                            if showClusterLabels
+                                string epName = "C" + str.tostring(c + 1) + (s == 0 ? "A" : s == 1 ? "B" : s == 2 ? "C" : "D")
+                                string tag = epName + (s == 0 ? "  BASE" : "")
+                                if s > 0 and not na(prevEpIntensity)
+                                    float dVol = prevEpIntensity > 0 ? (eIntensity - prevEpIntensity) / prevEpIntensity * 100.0 : 0.0
+                                    string pocMove = epPOC > prevEpPoc + binSize * 0.5 ? "POC ↑" : epPOC < prevEpPoc - binSize * 0.5 ? "POC ↓" : "POC ="
+                                    tag := epName + "  VOL " + (dVol >= 0 ? "+" : "") + str.tostring(dVol, "#.0") + "%  " + pocMove
+                                label capLabel = label.new(spanLeft, epVAH, tag, xloc=xloc.bar_index, style=label.style_label_down,
+                                     color=color.new(cc, cleanMode ? 22 : 12), textcolor=color.white, size=size.tiny)
+                                array.push(mapLabels, capLabel)
+
+                            prevSpanRight := spanRight
+                            prevEpPoc := epPOC
+                            prevEpIntensity := eIntensity
+    // VISUAL LAYER 3: current expected auction path
+    // ------------------------------------------------------------------------
+    if showTargetPath and not na(activePOC) and not na(activeVAH) and not na(activeVAL)
+        float pathTarget = na
+        color pathColor = color.gray
+        string pathText = ""
+        if close > activeVAH
+            pathTarget := hasHigher ? array.get(cPOC, activeCluster + 1) : close + atr * 1.5
+            pathColor := color.lime
+            pathText := hasHigher ? "NEXT POC" : "DISCOVERY"
+        else if close < activeVAL
+            pathTarget := hasLower ? array.get(cPOC, activeCluster - 1) : close - atr * 1.5
+            pathColor := color.red
+            pathText := hasLower ? "NEXT POC" : "DISCOVERY"
+        else if rejectUpNow or failedUpNow
+            pathTarget := activePOC
+            pathColor := color.orange
+            pathText := "ROTATE → POC"
+        else if rejectDnNow or failedDnNow
+            pathTarget := activePOC
+            pathColor := color.orange
+            pathText := "ROTATE → POC"
+
+        if not na(pathTarget)
+            int pathBars = cleanMode ? math.max(3, profileGapBars - 1) : 14
+            int pathX2 = bar_index + pathBars
+            line path = line.new(x1=bar_index, y1=close, x2=pathX2, y2=pathTarget, xloc=xloc.bar_index,
+                 color=color.new(pathColor, cleanMode ? 26 : 18), width=2, style=line.style_arrow_right)
+            array.push(mapLines, path)
+            if fullMode
+                label pt = label.new(pathX2, pathTarget, pathText + "  " + str.tostring(pathTarget, format.mintick),
+                     xloc=xloc.bar_index, style=label.style_label_left, color=color.new(pathColor, 18), textcolor=color.white, size=size.tiny)
+                array.push(mapLabels, pt)
+
+    if validRange and fullMode
+        label wl = label.new(xBase, profileHigh, "MAP  " + str.tostring(lb) + " bars • " + str.tostring(bins) + " rows • " + str.tostring(nC) + " clusters",
+             xloc=xloc.bar_index, style=label.style_label_down, color=color.new(color.gray, 42), textcolor=color.white, size=size.tiny)
+        array.push(mapLabels, wl)
+
+barcolor(tintLiveBar and barstate.islast ? color.new(mapRegimeColor, 38) : na)
+
+// ---------- Dashboard --------------------------------------------------------
+var table dash = table.new(position.top_right, 2, 10, border_width=1)
+if barstate.islast
+    if showDashboard
+        color bg = color.new(color.black, 14)
+        color stateColor = f_state_color(smState)
+        string deltaText = na(deltaPct) ? "—" : (deltaPct > 0 ? "+" : "") + str.tostring(deltaPct * 100, "#.0") + "%"
+        string flowText = (na(rvol) ? "—" : str.tostring(rvol, "#.00") + "x") + " | " + deltaText
+        string clusterText = na(activeCluster) ? "—" : "C" + str.tostring(activeCluster + 1) + " / " + str.tostring(detectedClusters)
+        string auctionState = na(activeCluster) ? "—" : close > activeVAH ? clusterText + " • ABOVE VALUE" : close < activeVAL ? clusterText + " • BELOW VALUE" : clusterText + " • BALANCED"
+        string valueText = na(activeVAL) ? "—" : str.tostring(activeVAL, format.mintick) + " ↔ " + str.tostring(activeVAH, format.mintick)
+        string scoreText = "↑ " + str.tostring(partUp, "#") + "/" + str.tostring(expandScore, "#") + "/" + str.tostring(acceptUpScore, "#") + "   ↓ " + str.tostring(partDn, "#") + "/" + str.tostring(expandScore, "#") + "/" + str.tostring(acceptDnScore, "#")
+        string finalText = str.tostring(finalUp, "#") + " ↑   " + str.tostring(finalDn, "#") + " ↓"
+        string targetText = na(targetPOC) ? "—" : "POC " + str.tostring(targetPOC, format.mintick)
+        string snapshotText = na(evVAL) ? "—" : str.tostring(evVAL, format.mintick) + " ↔ " + str.tostring(evVAH, format.mintick)
+
+        table.cell(dash, 0, 0, "MARKET", bgcolor=mapRegimeColor, text_color=color.white, text_size=size.small)
+        table.cell(dash, 1, 0, mapRegime, bgcolor=mapRegimeColor, text_color=color.white, text_size=size.small)
+        table.cell(dash, 0, 1, "AUCTION", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+        table.cell(dash, 1, 1, auctionState, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 0, 2, "MAP", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+        table.cell(dash, 1, 2, str.tostring(activeLookback) + "b/" + str.tostring(activeBins) + "r", bgcolor=bg, text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 0, 3, "ACTIVE VALUE", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+        table.cell(dash, 1, 3, valueText + (na(activeMassPct) ? "" : " • " + str.tostring(activeMassPct, "#.0") + "%"), bgcolor=bg, text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 0, 4, "FLOW", bgcolor=stateColor, text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 1, 4, f_state_name(smState) + "  •  " + flowText, bgcolor=stateColor, text_color=color.white, text_size=size.tiny)
+        table.cell(dash, 0, 5, "P/E/A", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+        table.cell(dash, 1, 5, scoreText, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+        if cleanMode
+            table.cell(dash, 0, 6, "TARGET", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+            table.cell(dash, 1, 6, targetText, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+            table.clear(dash, 0, 7, 1, 9)
+        else
+            table.cell(dash, 0, 6, "FINAL", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+            table.cell(dash, 1, 6, finalText, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+            table.cell(dash, 0, 7, "OUTSIDE VA", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+            table.cell(dash, 1, 7, str.tostring(outsideUpShare * 100, "#") + "% ↑   " + str.tostring(outsideDnShare * 100, "#") + "% ↓", bgcolor=bg, text_color=color.white, text_size=size.tiny)
+            table.cell(dash, 0, 8, "TARGET", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+            table.cell(dash, 1, 8, targetText, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+            table.cell(dash, 0, 9, "FROZEN REF", bgcolor=bg, text_color=color.gray, text_size=size.tiny)
+            table.cell(dash, 1, 9, snapshotText, bgcolor=bg, text_color=color.white, text_size=size.tiny)
+    else
+        table.clear(dash, 0, 0, 1, 9)
+
+// ---------- Alerts -----------------------------------------------------------
+alertcondition(evtProbeUp, "ARE Probe Up", "Auction Regime Engine: probe above frozen active value")
+alertcondition(evtProbeDn, "ARE Probe Down", "Auction Regime Engine: probe below frozen active value")
+alertcondition(evtAcceptUp, "ARE Accepted Up", "Auction Regime Engine: accepted expansion/migration above value")
+alertcondition(evtAcceptDn, "ARE Accepted Down", "Auction Regime Engine: accepted expansion/migration below value")
+alertcondition(evtFailUp, "ARE Failed Break Up", "Auction Regime Engine: failed break above value, rotation risk")
+alertcondition(evtFailDn, "ARE Failed Break Down", "Auction Regime Engine: failed break below value, rotation risk")
+alertcondition(evtRejectUp, "ARE VAH Rejection", "Auction Regime Engine: VAH rejection / mean-reversion condition")
+alertcondition(evtRejectDn, "ARE VAL Rejection", "Auction Regime Engine: VAL rejection / mean-reversion condition")
+alertcondition(evtMigrateUp, "ARE Migration Up Target", "Auction Regime Engine: accepted move reached next upper cluster POC")
+alertcondition(evtMigrateDn, "ARE Migration Down Target", "Auction Regime Engine: accepted move reached next lower cluster POC")

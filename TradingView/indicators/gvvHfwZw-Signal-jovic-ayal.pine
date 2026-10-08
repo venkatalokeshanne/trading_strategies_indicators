@@ -1,0 +1,554 @@
+//@version=6
+indicator("Fabio Valentini AMT LONG SHORT - NQ/MNQ", overlay=true, max_labels_count=500)
+
+// ============================================================================
+// FABIO VALENTINI INSPIRED AMT MODEL
+// Market State -> Location -> Aggression
+// Approximation for TradingView / Pine Script
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+groupSession = "1. SESSION"
+tradeSession = input.session("0930-1600", "New York Session", group=groupSession)
+useSession    = input.bool(true, "Only signal during NY session", group=groupSession)
+
+groupTrend = "2. MARKET STATE"
+trendTF          = input.timeframe("30", "Structure timeframe", group=groupTrend)
+emaLength        = input.int(21, "30m EMA length", minval=5, group=groupTrend)
+atrFastLength    = input.int(5, "Fast ATR", group=groupTrend)
+atrSlowLength    = input.int(20, "Slow ATR", group=groupTrend)
+imbalanceRatio   = input.float(1.05, "ATR expansion threshold", step=0.01, group=groupTrend)
+
+groupVP = "3. VOLUME PROFILE / LOCATION"
+vpLookback       = input.int(50, "Profile lookback bars", minval=20, maxval=200, group=groupVP)
+vpBins           = input.int(24, "Profile rows", minval=10, maxval=50, group=groupVP)
+lvnThreshold     = input.float(0.60, "LVN threshold", minval=0.10, maxval=0.90, step=0.05, group=groupVP)
+locationATR      = input.float(0.30, "Level proximity (ATR)", minval=0.05, step=0.05, group=groupVP)
+
+groupVolume = "4. AGGRESSION"
+volLength        = input.int(20, "Volume average", group=groupVolume)
+aggrVolMult      = input.float(1.50, "Aggression volume multiplier", step=0.1, group=groupVolume)
+minBodyPercent   = input.float(0.55, "Minimum candle body %", minval=0.2, maxval=0.9, step=0.05, group=groupVolume)
+closeStrength    = input.float(0.70, "Close position strength", minval=0.5, maxval=0.95, step=0.05, group=groupVolume)
+
+groupAAA = "5. TRIPLE-A FILTER"
+useAAA           = input.bool(true, "Require recent Absorption / Accumulation", group=groupAAA)
+absVolMultiplier = input.float(1.70, "Absorption volume", step=0.1, group=groupAAA)
+absRangeATR      = input.float(0.65, "Max absorption candle ATR", step=0.05, group=groupAAA)
+aaaLookback      = input.int(10, "Absorption lookback", minval=3, maxval=30, group=groupAAA)
+
+groupSignals = "6. SIGNAL QUALITY"
+strictMode       = input.bool(true, "STRICT mode", group=groupSignals)
+cooldownBars     = input.int(8, "Bars between signals", minval=1, group=groupSignals)
+useVWAP          = input.bool(true, "Use VWAP confirmation", group=groupSignals)
+useORB           = input.bool(true, "Use 30-min Opening Range", group=groupSignals)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SESSION
+// ─────────────────────────────────────────────────────────────────────────────
+
+inSession = not na(time(timeframe.period, tradeSession, "America/New_York"))
+sessionOK = not useSession or inSession
+
+newDay = ta.change(time("D")) != 0
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+vwapValue = ta.vwap(hlc3)
+
+plot(
+     vwapValue,
+     "VWAP",
+     color=color.new(color.yellow, 0),
+     linewidth=2
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30 MINUTE OPENING RANGE
+// ─────────────────────────────────────────────────────────────────────────────
+
+inORB = not na(time(timeframe.period, "0930-1000", "America/New_York"))
+
+var float orbHigh = na
+var float orbLow  = na
+
+if newDay
+    orbHigh := na
+    orbLow  := na
+
+if inORB
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow, low)
+
+plot(
+     orbHigh,
+     "30m OR High",
+     color=color.new(color.green, 35),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+plot(
+     orbLow,
+     "30m OR Low",
+     color=color.new(color.red, 35),
+     linewidth=1,
+     style=plot.style_linebr
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30-MINUTE STRUCTURE - COMPLETED CANDLES ONLY
+// helps reduce repainting
+// ─────────────────────────────────────────────────────────────────────────────
+
+close30 = request.security(
+     syminfo.tickerid,
+     trendTF,
+     close[1],
+     lookahead=barmerge.lookahead_on
+)
+
+ema30 = request.security(
+     syminfo.tickerid,
+     trendTF,
+     ta.ema(close, emaLength)[1],
+     lookahead=barmerge.lookahead_on
+)
+
+ema30Previous = request.security(
+     syminfo.tickerid,
+     trendTF,
+     ta.ema(close, emaLength)[2],
+     lookahead=barmerge.lookahead_on
+)
+
+trendBull = close30 > ema30 and ema30 > ema30Previous
+trendBear = close30 < ema30 and ema30 < ema30Previous
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BALANCE / IMBALANCE
+// ─────────────────────────────────────────────────────────────────────────────
+
+atr = ta.atr(14)
+
+fastATR = ta.sma(
+     ta.tr(true),
+     atrFastLength
+)
+
+slowATR = ta.sma(
+     ta.tr(true),
+     atrSlowLength
+)
+
+expansion = fastATR > slowATR * imbalanceRatio
+
+bullImbalance =
+     expansion and
+     trendBull
+
+bearImbalance =
+     expansion and
+     trendBear
+
+balance =
+     not bullImbalance and
+     not bearImbalance
+
+
+// Background = auction state
+
+bgcolor(
+     balance
+     ? color.new(color.yellow, 92)
+     : bullImbalance
+     ? color.new(color.blue, 93)
+     : bearImbalance
+     ? color.new(color.red, 93)
+     : na
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// APPROXIMATE ROLLING VOLUME PROFILE
+// Find POC and nearest LVN
+// ─────────────────────────────────────────────────────────────────────────────
+
+profileLow  = ta.lowest(low, vpLookback)
+profileHigh = ta.highest(high, vpLookback)
+
+profileRange = profileHigh - profileLow
+binSize = profileRange > 0 ? profileRange / vpBins : syminfo.mintick
+
+var volumeBins = array.new_float(0)
+
+if array.size(volumeBins) != vpBins
+    array.clear(volumeBins)
+    for x = 0 to vpBins - 1
+        array.push(volumeBins, 0.0)
+
+array.fill(volumeBins, 0.0)
+
+if bar_index > vpLookback
+    for i = 0 to vpLookback - 1
+
+        pricePoint = hlc3[i]
+
+        rawBin = int(
+             math.floor(
+                 (pricePoint - profileLow) / binSize
+             )
+        )
+
+        safeBin = math.max(
+             0,
+             math.min(vpBins - 1, rawBin)
+        )
+
+        existingVolume = array.get(
+             volumeBins,
+             safeBin
+        )
+
+        array.set(
+             volumeBins,
+             safeBin,
+             existingVolume + volume[i]
+        )
+
+
+// Find POC
+
+float highestBinVolume = 0.0
+int pocIndex = 0
+float totalProfileVolume = 0.0
+
+for j = 0 to vpBins - 1
+
+    binVolume = array.get(volumeBins, j)
+
+    totalProfileVolume += binVolume
+
+    if binVolume > highestBinVolume
+        highestBinVolume := binVolume
+        pocIndex := j
+
+poc =
+     profileLow +
+     (pocIndex + 0.5) * binSize
+
+
+// Average volume per bin
+
+averageBinVolume =
+     vpBins > 0
+     ? totalProfileVolume / vpBins
+     : 0
+
+
+// Find nearest LVN to current price
+
+float nearestLVN = na
+float nearestDistance = 100000000.0
+
+for j = 0 to vpBins - 1
+
+    binVolume = array.get(volumeBins, j)
+
+    binPrice =
+         profileLow +
+         (j + 0.5) * binSize
+
+    isLVN =
+         binVolume > 0 and
+         binVolume < averageBinVolume * lvnThreshold
+
+    distance =
+         math.abs(close - binPrice)
+
+    if isLVN and distance < nearestDistance
+        nearestDistance := distance
+        nearestLVN := binPrice
+
+
+plot(
+     poc,
+     "Approx POC",
+     color=color.orange,
+     linewidth=2
+)
+
+plot(
+     nearestLVN,
+     "Nearest LVN",
+     color=color.new(color.fuchsia, 15),
+     linewidth=1,
+     style=plot.style_circles
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOCATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+nearLVN =
+     not na(nearestLVN) and
+     math.abs(close - nearestLVN) <= atr * locationATR
+
+nearVWAP =
+     math.abs(close - vwapValue) <= atr * locationATR
+
+nearORBHigh =
+     not na(orbHigh) and
+     math.abs(close - orbHigh) <= atr * locationATR
+
+nearORBLow =
+     not na(orbLow) and
+     math.abs(close - orbLow) <= atr * locationATR
+
+
+longLocation =
+     nearLVN or
+     (useVWAP and nearVWAP) or
+     (useORB and nearORBHigh)
+
+shortLocation =
+     nearLVN or
+     (useVWAP and nearVWAP) or
+     (useORB and nearORBLow)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ORDER-FLOW AGGRESSION PROXY
+// ─────────────────────────────────────────────────────────────────────────────
+
+volumeAverage = ta.sma(volume, volLength)
+
+candleRange =
+     math.max(
+         high - low,
+         syminfo.mintick
+     )
+
+body =
+     math.abs(close - open)
+
+bodyPercent =
+     body / candleRange
+
+closePosition =
+     (close - low) / candleRange
+
+bullVolume =
+     volume > volumeAverage * aggrVolMult
+
+bearVolume =
+     volume > volumeAverage * aggrVolMult
+
+
+buyerAggression =
+     bullVolume and
+     close > open and
+     bodyPercent >= minBodyPercent and
+     closePosition >= closeStrength
+
+sellerAggression =
+     bearVolume and
+     close < open and
+     bodyPercent >= minBodyPercent and
+     closePosition <= (1.0 - closeStrength)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TRIPLE-A
+// ABSORPTION -> ACCUMULATION -> AGGRESSION
+// ─────────────────────────────────────────────────────────────────────────────
+
+absorption =
+     volume > volumeAverage * absVolMultiplier and
+     candleRange < atr * absRangeATR
+
+barsFromAbsorption =
+     ta.barssince(absorption)
+
+recentAbsorption =
+     not na(barsFromAbsorption) and
+     barsFromAbsorption <= aaaLookback
+
+
+rangeAverage5 =
+     ta.sma(high - low, 5)
+
+accumulation =
+     rangeAverage5 < atr * 0.85
+
+
+aaaReady =
+     recentAbsorption or
+     accumulation
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VWAP DIRECTION FILTER
+// ─────────────────────────────────────────────────────────────────────────────
+
+vwapBull =
+     close > vwapValue
+
+vwapBear =
+     close < vwapValue
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RAW SETUPS
+// Market State + Location + Aggression
+// ─────────────────────────────────────────────────────────────────────────────
+
+longSetup =
+     sessionOK and
+     bullImbalance and
+     longLocation and
+     buyerAggression and
+     (not useVWAP or vwapBull) and
+     (not useAAA or aaaReady)
+
+shortSetup =
+     sessionOK and
+     bearImbalance and
+     shortLocation and
+     sellerAggression and
+     (not useVWAP or vwapBear) and
+     (not useAAA or aaaReady)
+
+
+// STRICT MODE:
+// Requires additional breakout / continuation behavior.
+
+strictLong =
+     longSetup and
+     close > high[1]
+
+strictShort =
+     shortSetup and
+     close < low[1]
+
+rawLong =
+     strictMode
+     ? strictLong
+     : longSetup
+
+rawShort =
+     strictMode
+     ? strictShort
+     : shortSetup
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNAL COOLDOWN
+// ─────────────────────────────────────────────────────────────────────────────
+
+var int lastSignalBar = na
+
+canSignal =
+     na(lastSignalBar) or
+     bar_index - lastSignalBar >= cooldownBars
+
+LONG =
+     rawLong and
+     canSignal and
+     barstate.isconfirmed
+
+SHORT =
+     rawShort and
+     canSignal and
+     barstate.isconfirmed
+
+if LONG or SHORT
+    lastSignalBar := bar_index
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUAL SIGNALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+plotshape(
+     LONG,
+     title="LONG",
+     text="LONG",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.new(color.lime, 0),
+     textcolor=color.black,
+     size=size.small
+)
+
+plotshape(
+     SHORT,
+     title="SHORT",
+     text="SHORT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.new(color.red, 0),
+     textcolor=color.white,
+     size=size.small
+)
+
+
+// Aggression dots
+
+plotshape(
+     buyerAggression and not LONG,
+     title="Buyer Aggression",
+     style=shape.circle,
+     location=location.belowbar,
+     color=color.new(color.blue, 25),
+     size=size.tiny
+)
+
+plotshape(
+     sellerAggression and not SHORT,
+     title="Seller Aggression",
+     style=shape.circle,
+     location=location.abovebar,
+     color=color.new(color.red, 25),
+     size=size.tiny
+)
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(
+     LONG,
+     title="FABIO AMT LONG",
+     message="FABIO AMT LONG signal on {{ticker}} @ {{close}}"
+)
+
+alertcondition(
+     SHORT,
+     title="FABIO AMT SHORT",
+     message="FABIO AMT SHORT signal on {{ticker}} @ {{close}}"
+)
+
+alertcondition(
+     buyerAggression,
+     title="Buyer Aggression",
+     message="Strong BUY aggression detected on {{ticker}}"
+)
+
+alertcondition(
+     sellerAggression,
+     title="Seller Aggression",
+     message="Strong SELL aggression detected on {{ticker}}"
+)

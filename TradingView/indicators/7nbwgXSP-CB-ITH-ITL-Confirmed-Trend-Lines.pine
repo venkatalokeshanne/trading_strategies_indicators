@@ -1,0 +1,1378 @@
+//@version=6
+indicator("CB ITH / ITL Confirmed Trend Lines", overlay = true, max_lines_count = 500)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Fixed limits
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const int BAR_BUFFER_SIZE = 12000
+const int MAX_ACTIVE_ANCHORS = 1200
+
+// Explicit time-series history buffer for old xloc.bar_index drawings.
+max_bars_back(time, 4200)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Input groups
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+const string GROUP_LOGIC = "Trend-Line Logic"
+const string GROUP_DOWN  = "Down-Sloping ITH Lines"
+const string GROUP_UP    = "Up-Sloping ITL Lines"
+const string GROUP_COUNT = "Displayed Lines"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Logic inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+confirmBars = input.int(
+     10,
+     "Required Closes After Second Fractal",
+     minval = 5,
+     maxval = 300,
+     group = GROUP_LOGIC,
+     tooltip = "The X bars begin immediately after the second fractal. Down-sloping lines require all X closes below the projected line. Up-sloping lines require all X closes above the projected line."
+)
+
+minimumBarsBetween = input.int(
+     0,
+     "Minimum Bars Between ITH / ITL and Second Fractal",
+     minval = 0,
+     maxval = 200,
+     group = GROUP_LOGIC,
+     tooltip = "Minimum number of complete bars strictly between the ITH/ITL anchor and the qualifying second fractal. Example: 20 requires at least 20 bars between the two pivot bars. 0 preserves the original behavior."
+)
+
+extensionMultiple = input.float(
+     1.0,
+     "Extension Multiple",
+     minval = 1.0,
+     maxval = 5.0,
+     step = 0.1,
+     group = GROUP_LOGIC,
+     tooltip = "1.0x ends X bars after the second fractal. Values increase by 0.1. Fractional results are rounded to the nearest whole bar because bar indices cannot be fractional."
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Down-line inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+showDownLines = input.bool(
+     true,
+     "Show Down-Sloping ITH Lines",
+     group = GROUP_DOWN
+)
+
+downLineColor = input.color(
+     color.red,
+     "Color",
+     group = GROUP_DOWN
+)
+
+downLineWidth = input.int(
+     2,
+     "Width",
+     minval = 1,
+     maxval = 5,
+     group = GROUP_DOWN
+)
+
+downLineStyleInput = input.string(
+     "Solid",
+     "Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = GROUP_DOWN
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Up-line inputs
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+showUpLines = input.bool(
+     true,
+     "Show Up-Sloping ITL Lines",
+     group = GROUP_UP
+)
+
+upLineColor = input.color(
+     color.lime,
+     "Color",
+     group = GROUP_UP
+)
+
+upLineWidth = input.int(
+     2,
+     "Width",
+     minval = 1,
+     maxval = 5,
+     group = GROUP_UP
+)
+
+upLineStyleInput = input.string(
+     "Solid",
+     "Style",
+     options = ["Solid", "Dashed", "Dotted"],
+     group = GROUP_UP
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Display-count input
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+linesToShow = input.int(
+     50,
+     "Most Recent Trend Lines To Show",
+     minval = 1,
+     maxval = 500,
+     group = GROUP_COUNT,
+     tooltip = "Keeps only this many of the most recently confirmed trend lines, counting up-sloping and down-sloping lines together."
+)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Style helper
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_lineStyle(string value) =>
+    switch value
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+downLineStyle = f_lineStyle(downLineStyleInput)
+upLineStyle   = f_lineStyle(upLineStyleInput)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Circular close buffer
+//
+// We use an explicit bar buffer so a newly identified ITH/ITL can
+// reconstruct the close geometry that already occurred between the
+// structural anchor and the right-side fractal that confirmed it.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var bufferedBars = array.new_int(BAR_BUFFER_SIZE)
+var bufferedCloses = array.new_float(BAR_BUFFER_SIZE)
+
+int currentBufferSlot = bar_index % BAR_BUFFER_SIZE
+
+array.set(bufferedBars, currentBufferSlot, bar_index)
+array.set(bufferedCloses, currentBufferSlot, close)
+
+f_barIsBuffered(int targetBar) =>
+    bool valid = false
+
+    if targetBar >= 0 and
+       targetBar <= bar_index and
+       bar_index - targetBar < BAR_BUFFER_SIZE
+
+        int slot = targetBar % BAR_BUFFER_SIZE
+
+        valid := array.get(bufferedBars, slot) == targetBar
+
+    valid
+
+f_getBufferedClose(int targetBar) =>
+    float result = na
+
+    if f_barIsBuffered(targetBar)
+        result := array.get(
+             bufferedCloses,
+             targetBar % BAR_BUFFER_SIZE
+        )
+
+    result
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Standard three-bar wick fractals
+//
+// These match the supplied ITH / ITL finder:
+//
+// High fractal:
+//     high[1] > high[2] and high[1] > high
+//
+// Low fractal:
+//     low[1] < low[2] and low[1] < low
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool isFractalHigh =
+     bar_index >= 2 and
+     high[1] > high[2] and
+     high[1] > high
+
+bool isFractalLow =
+     bar_index >= 2 and
+     low[1] < low[2] and
+     low[1] < low
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Last three confirmed HIGH fractals
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var highBars = array.new_int()
+var highPrices = array.new_float()
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Last three confirmed LOW fractals
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var lowBars = array.new_int()
+var lowPrices = array.new_float()
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Active ITH anchors
+//
+// maxSlopePrev:
+//     Maximum slope from the ITH wick to all closes through
+//     TWO bars before the current bar.
+//
+// maxSlopeCurr:
+//     Maximum slope from the ITH wick to all closes through
+//     ONE bar before the current bar.
+//
+// On a bar that confirms a high fractal at bar_index - 1,
+// maxSlopePrev therefore covers exactly the closes strictly
+// BETWEEN anchor #1 and anchor #2.
+//
+// Down-line requirement:
+//     close < projected line
+//
+// Rearranged:
+//     (close - anchorPrice) / (bar - anchorBar) < lineSlope
+//
+// Therefore:
+//     lineSlope > maximum intervening close slope
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var downAnchorIds = array.new_int()
+var downAnchorBars = array.new_int()
+var downAnchorPrices = array.new_float()
+var downMaxSlopePrev = array.new_float()
+var downMaxSlopeCurr = array.new_float()
+
+// The structural pivot bar_index itself is used as the unique
+// anchor ID, so no mutable global ID counter is required.
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Active ITL anchors
+//
+// Up-line requirement:
+//     close > projected line
+//
+// Rearranged:
+//     (close - anchorPrice) / (bar - anchorBar) > lineSlope
+//
+// Therefore:
+//     lineSlope < minimum intervening close slope
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var upAnchorIds = array.new_int()
+var upAnchorBars = array.new_int()
+var upAnchorPrices = array.new_float()
+var upMinSlopePrev = array.new_float()
+var upMinSlopeCurr = array.new_float()
+
+// The ITL pivot bar_index likewise serves as its unique anchor ID.
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Pending down-line candidates
+//
+// Multiple second-fractal candidates may be alive for one ITH at the
+// same time. This prevents an earlier candidate that is still waiting
+// for X closes from blocking a later candidate.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var pDownAnchorIds = array.new_int()
+var pDownStartBars = array.new_int()
+var pDownStartPrices = array.new_float()
+var pDownSecondBars = array.new_int()
+var pDownSecondPrices = array.new_float()
+var pDownSlopes = array.new_float()
+var pDownCounts = array.new_int()
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Pending up-line candidates
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var pUpAnchorIds = array.new_int()
+var pUpStartBars = array.new_int()
+var pUpStartPrices = array.new_float()
+var pUpSecondBars = array.new_int()
+var pUpSecondPrices = array.new_float()
+var pUpSlopes = array.new_float()
+var pUpCounts = array.new_int()
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Finished drawing storage
+//
+// Lines are stored chronologically. The queue deletes the oldest line
+// whenever the user-selected "Most Recent" count is exceeded.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var trendLines = array.new_line()
+var trendTargetEndBars = array.new_int()
+var trendSecondBars = array.new_int()
+var trendSecondPrices = array.new_float()
+var trendSlopes = array.new_float()
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Anchor initialization helpers
+//
+// When an ITH/ITL becomes known, bars between that structural pivot
+// and the current right-side confirming fractal already exist.
+// These helpers reconstruct the required slope envelope once.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_initialDownSlopeLimits(
+     int anchorBar,
+     float anchorPrice
+) =>
+    float prevLimit = na
+    float currLimit = na
+
+    int lastForPrev = bar_index - 2
+    int lastForCurr = bar_index - 1
+    int firstBar = anchorBar + 1
+
+    if firstBar <= lastForCurr
+        for testBar = firstBar to lastForCurr
+            float testClose = f_getBufferedClose(testBar)
+
+            if not na(testClose)
+                float testSlope =
+                     (testClose - anchorPrice) /
+                     float(testBar - anchorBar)
+
+                if na(currLimit) or testSlope > currLimit
+                    currLimit := testSlope
+
+                if testBar <= lastForPrev
+                    if na(prevLimit) or testSlope > prevLimit
+                        prevLimit := testSlope
+
+    [prevLimit, currLimit]
+
+f_initialUpSlopeLimits(
+     int anchorBar,
+     float anchorPrice
+) =>
+    float prevLimit = na
+    float currLimit = na
+
+    int lastForPrev = bar_index - 2
+    int lastForCurr = bar_index - 1
+    int firstBar = anchorBar + 1
+
+    if firstBar <= lastForCurr
+        for testBar = firstBar to lastForCurr
+            float testClose = f_getBufferedClose(testBar)
+
+            if not na(testClose)
+                float testSlope =
+                     (testClose - anchorPrice) /
+                     float(testBar - anchorBar)
+
+                if na(currLimit) or testSlope < currLimit
+                    currLimit := testSlope
+
+                if testBar <= lastForPrev
+                    if na(prevLimit) or testSlope < prevLimit
+                        prevLimit := testSlope
+
+    [prevLimit, currLimit]
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Pending-candidate removal helpers
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_removePendingDownAt(int index) =>
+    array.remove(pDownAnchorIds, index)
+    array.remove(pDownStartBars, index)
+    array.remove(pDownStartPrices, index)
+    array.remove(pDownSecondBars, index)
+    array.remove(pDownSecondPrices, index)
+    array.remove(pDownSlopes, index)
+    array.remove(pDownCounts, index)
+
+f_removePendingUpAt(int index) =>
+    array.remove(pUpAnchorIds, index)
+    array.remove(pUpStartBars, index)
+    array.remove(pUpStartPrices, index)
+    array.remove(pUpSecondBars, index)
+    array.remove(pUpSecondPrices, index)
+    array.remove(pUpSlopes, index)
+    array.remove(pUpCounts, index)
+
+f_removeAllPendingDownForAnchor(int anchorId) =>
+    int i = array.size(pDownAnchorIds) - 1
+
+    while i >= 0
+        if array.get(pDownAnchorIds, i) == anchorId
+            f_removePendingDownAt(i)
+
+        i -= 1
+
+f_removeAllPendingUpForAnchor(int anchorId) =>
+    int i = array.size(pUpAnchorIds) - 1
+
+    while i >= 0
+        if array.get(pUpAnchorIds, i) == anchorId
+            f_removePendingUpAt(i)
+
+        i -= 1
+
+f_hasPendingDown(int anchorId) =>
+    bool found = false
+
+    int i = 0
+
+    while i < array.size(pDownAnchorIds)
+        if array.get(pDownAnchorIds, i) == anchorId
+            found := true
+            break
+
+        i += 1
+
+    found
+
+f_hasPendingUp(int anchorId) =>
+    bool found = false
+
+    int i = 0
+
+    while i < array.size(pUpAnchorIds)
+        if array.get(pUpAnchorIds, i) == anchorId
+            found := true
+            break
+
+        i += 1
+
+    found
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Active-anchor removal helpers
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_removeDownAnchorAt(int index) =>
+    array.remove(downAnchorIds, index)
+    array.remove(downAnchorBars, index)
+    array.remove(downAnchorPrices, index)
+    array.remove(downMaxSlopePrev, index)
+    array.remove(downMaxSlopeCurr, index)
+
+f_removeUpAnchorAt(int index) =>
+    array.remove(upAnchorIds, index)
+    array.remove(upAnchorBars, index)
+    array.remove(upAnchorPrices, index)
+    array.remove(upMinSlopePrev, index)
+    array.remove(upMinSlopeCurr, index)
+
+f_removeDownAnchorById(int anchorId) =>
+    int i = array.size(downAnchorIds) - 1
+
+    while i >= 0
+        if array.get(downAnchorIds, i) == anchorId
+            f_removeDownAnchorAt(i)
+            break
+
+        i -= 1
+
+f_removeUpAnchorById(int anchorId) =>
+    int i = array.size(upAnchorIds) - 1
+
+    while i >= 0
+        if array.get(upAnchorIds, i) == anchorId
+            f_removeUpAnchorAt(i)
+            break
+
+        i -= 1
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Add structural anchors
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_addDownAnchor(
+     int anchorBar,
+     float anchorPrice
+) =>
+    int anchorId = anchorBar
+
+    [prevLimit, currLimit] =
+         f_initialDownSlopeLimits(
+              anchorBar,
+              anchorPrice
+         )
+
+    array.push(downAnchorIds, anchorId)
+    array.push(downAnchorBars, anchorBar)
+    array.push(downAnchorPrices, anchorPrice)
+    array.push(downMaxSlopePrev, prevLimit)
+    array.push(downMaxSlopeCurr, currLimit)
+
+    if array.size(downAnchorIds) > MAX_ACTIVE_ANCHORS
+        int oldId = array.get(downAnchorIds, 0)
+
+        f_removeDownAnchorAt(0)
+        f_removeAllPendingDownForAnchor(oldId)
+
+f_addUpAnchor(
+     int anchorBar,
+     float anchorPrice
+) =>
+    int anchorId = anchorBar
+
+    [prevLimit, currLimit] =
+         f_initialUpSlopeLimits(
+              anchorBar,
+              anchorPrice
+         )
+
+    array.push(upAnchorIds, anchorId)
+    array.push(upAnchorBars, anchorBar)
+    array.push(upAnchorPrices, anchorPrice)
+    array.push(upMinSlopePrev, prevLimit)
+    array.push(upMinSlopeCurr, currLimit)
+
+    if array.size(upAnchorIds) > MAX_ACTIVE_ANCHORS
+        int oldId = array.get(upAnchorIds, 0)
+
+        f_removeUpAnchorAt(0)
+        f_removeAllPendingUpForAnchor(oldId)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Finished trend-line creation
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+f_storeTrendLine(
+     int startBar,
+     float startPrice,
+     int secondBar,
+     float secondPrice,
+     float slope,
+     bool isDownLine
+) =>
+    // Delete BEFORE creating so the script never transiently exceeds
+    // the requested number of retained line objects.
+    while array.size(trendLines) >= linesToShow
+        line oldestLine = array.shift(trendLines)
+
+        line.delete(oldestLine)
+
+        array.shift(trendTargetEndBars)
+        array.shift(trendSecondBars)
+        array.shift(trendSecondPrices)
+        array.shift(trendSlopes)
+
+    // extensionMultiple is a float, but chart bar positions are integers.
+    // Round the requested extension to the nearest whole number of bars.
+    int extensionBars =
+         int(
+              math.round(
+                   confirmBars * extensionMultiple
+              )
+         )
+
+    int targetEndBar =
+         secondBar +
+         extensionBars
+
+    // xloc.bar_index can project only 500 bars into the future.
+    // If the requested target is farther away, the visible endpoint
+    // advances as future bars arrive until the exact target is reached.
+    int visibleEndBar =
+         math.min(
+              targetEndBar,
+              bar_index + 500
+         )
+
+    float visibleEndPrice =
+         secondPrice +
+         slope *
+         float(visibleEndBar - secondBar)
+
+    color drawColor =
+         isDownLine ?
+         downLineColor :
+         upLineColor
+
+    int drawWidth =
+         isDownLine ?
+         downLineWidth :
+         upLineWidth
+
+    string drawStyle =
+         isDownLine ?
+         downLineStyle :
+         upLineStyle
+
+    line newLine =
+         line.new(
+              x1 = startBar,
+              y1 = startPrice,
+              x2 = visibleEndBar,
+              y2 = visibleEndPrice,
+              xloc = xloc.bar_index,
+              extend = extend.none,
+              color = drawColor,
+              style = drawStyle,
+              width = drawWidth
+         )
+
+    array.push(trendLines, newLine)
+    array.push(trendTargetEndBars, targetEndBar)
+    array.push(trendSecondBars, secondBar)
+    array.push(trendSecondPrices, secondPrice)
+    array.push(trendSlopes, slope)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Update projected endpoints
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if array.size(trendLines) > 0
+    for i = 0 to array.size(trendLines) - 1
+        int targetEndBar =
+             array.get(
+                  trendTargetEndBars,
+                  i
+             )
+
+        // Once the exact target has been reached, stop touching the
+        // line. This also avoids needless operations on very old lines.
+        if bar_index <= targetEndBar
+            int secondBar =
+                 array.get(
+                      trendSecondBars,
+                      i
+                 )
+
+            float secondPrice =
+                 array.get(
+                      trendSecondPrices,
+                      i
+                 )
+
+            float slope =
+                 array.get(
+                      trendSlopes,
+                      i
+                 )
+
+            int visibleEndBar =
+                 math.min(
+                      targetEndBar,
+                      bar_index + 500
+                 )
+
+            float visibleEndPrice =
+                 secondPrice +
+                 slope *
+                 float(visibleEndBar - secondBar)
+
+            line.set_xy2(
+                 array.get(trendLines, i),
+                 visibleEndBar,
+                 visibleEndPrice
+            )
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Confirm EXISTING pending down-line candidates
+//
+// These candidates were created on earlier bars, and already counted
+// the first close immediately after their second fractal.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed and array.size(pDownAnchorIds) > 0
+    int i = array.size(pDownAnchorIds) - 1
+
+    while i >= 0
+        int anchorId =
+             array.get(
+                  pDownAnchorIds,
+                  i
+             )
+
+        int secondBar =
+             array.get(
+                  pDownSecondBars,
+                  i
+             )
+
+        float secondPrice =
+             array.get(
+                  pDownSecondPrices,
+                  i
+             )
+
+        float slope =
+             array.get(
+                  pDownSlopes,
+                  i
+             )
+
+        float projectedPrice =
+             secondPrice +
+             slope *
+             float(bar_index - secondBar)
+
+        // Strictly BELOW means equality is not accepted.
+        bool closePasses =
+             close < projectedPrice
+
+        if not closePasses
+            f_removePendingDownAt(i)
+
+        else
+            int newCount =
+                 array.get(
+                      pDownCounts,
+                      i
+                 ) + 1
+
+            if newCount >= confirmBars
+                int startBar =
+                     array.get(
+                          pDownStartBars,
+                          i
+                     )
+
+                float startPrice =
+                     array.get(
+                          pDownStartPrices,
+                          i
+                     )
+
+                if showDownLines
+                    f_storeTrendLine(
+                         startBar,
+                         startPrice,
+                         secondBar,
+                         secondPrice,
+                         slope,
+                         true
+                    )
+
+                // The earliest candidate that actually completes X
+                // qualifying closes resolves this ITH.
+                f_removeDownAnchorById(anchorId)
+                f_removeAllPendingDownForAnchor(anchorId)
+
+                i :=
+                     math.min(
+                          i - 1,
+                          array.size(pDownAnchorIds) - 1
+                     )
+
+                continue
+
+            else
+                array.set(
+                     pDownCounts,
+                     i,
+                     newCount
+                )
+
+        i -= 1
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Confirm EXISTING pending up-line candidates
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed and array.size(pUpAnchorIds) > 0
+    int i = array.size(pUpAnchorIds) - 1
+
+    while i >= 0
+        int anchorId =
+             array.get(
+                  pUpAnchorIds,
+                  i
+             )
+
+        int secondBar =
+             array.get(
+                  pUpSecondBars,
+                  i
+             )
+
+        float secondPrice =
+             array.get(
+                  pUpSecondPrices,
+                  i
+             )
+
+        float slope =
+             array.get(
+                  pUpSlopes,
+                  i
+             )
+
+        float projectedPrice =
+             secondPrice +
+             slope *
+             float(bar_index - secondBar)
+
+        // Strictly ABOVE means equality is not accepted.
+        bool closePasses =
+             close > projectedPrice
+
+        if not closePasses
+            f_removePendingUpAt(i)
+
+        else
+            int newCount =
+                 array.get(
+                      pUpCounts,
+                      i
+                 ) + 1
+
+            if newCount >= confirmBars
+                int startBar =
+                     array.get(
+                          pUpStartBars,
+                          i
+                     )
+
+                float startPrice =
+                     array.get(
+                          pUpStartPrices,
+                          i
+                     )
+
+                if showUpLines
+                    f_storeTrendLine(
+                         startBar,
+                         startPrice,
+                         secondBar,
+                         secondPrice,
+                         slope,
+                         false
+                    )
+
+                f_removeUpAnchorById(anchorId)
+                f_removeAllPendingUpForAnchor(anchorId)
+
+                i :=
+                     math.min(
+                          i - 1,
+                          array.size(pUpAnchorIds) - 1
+                     )
+
+                continue
+
+            else
+                array.set(
+                     pUpCounts,
+                     i,
+                     newCount
+                )
+
+        i -= 1
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// HIGH-fractal processing
+//
+// Exact supplied finder rule:
+//     Store three consecutive confirmed HIGH fractals.
+//     Middle fractal is ITH when:
+//         middleHigh > leftHigh
+//         middleHigh > rightHigh
+//
+// The newly confirmed right-side high fractal is ALSO allowed to be
+// the second anchor of a trend line from that newly identified ITH.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed and isFractalHigh
+    int fractalBar =
+         bar_index - 1
+
+    float fractalPrice =
+         high[1]
+
+    array.push(
+         highBars,
+         fractalBar
+    )
+
+    array.push(
+         highPrices,
+         fractalPrice
+    )
+
+    if array.size(highBars) > 3
+        array.shift(highBars)
+        array.shift(highPrices)
+
+    if array.size(highPrices) == 3
+        int midBar =
+             array.get(
+                  highBars,
+                  1
+             )
+
+        float leftHigh =
+             array.get(
+                  highPrices,
+                  0
+             )
+
+        float midHigh =
+             array.get(
+                  highPrices,
+                  1
+             )
+
+        float rightHigh =
+             array.get(
+                  highPrices,
+                  2
+             )
+
+        bool isITH =
+             midHigh > leftHigh and
+             midHigh > rightHigh
+
+        if isITH
+            f_addDownAnchor(
+                 midBar,
+                 midHigh
+            )
+
+    // Test THIS ordinary high fractal as anchor #2 for every active ITH.
+    //
+    // Interior rule for a down-sloping line:
+    //     Every close strictly between anchor #1 and anchor #2
+    //     must remain BELOW the line.
+    //
+    // Then the current bar (the first bar immediately after anchor #2)
+    // is tested as confirmation close #1.
+
+    if array.size(downAnchorIds) > 0
+        for i = 0 to array.size(downAnchorIds) - 1
+            int anchorId =
+                 array.get(
+                      downAnchorIds,
+                      i
+                 )
+
+            int anchorBar =
+                 array.get(
+                      downAnchorBars,
+                      i
+                 )
+
+            float anchorPrice =
+                 array.get(
+                      downAnchorPrices,
+                      i
+                 )
+
+            // Leave enough room to finish X confirmation closes before
+            // the 10,000-bar xloc.bar_index past-reference boundary.
+            bool startStillDrawable =
+                 bar_index - anchorBar <=
+                 10001 - confirmBars
+
+            int barsBetween =
+                 fractalBar -
+                 anchorBar -
+                 1
+
+            bool enoughBarsBetween =
+                 barsBetween >=
+                 minimumBarsBetween
+
+            bool validGeometry =
+                 startStillDrawable and
+                 fractalBar > anchorBar and
+                 enoughBarsBetween and
+                 fractalPrice < anchorPrice
+
+            if validGeometry
+                float slope =
+                     (fractalPrice - anchorPrice) /
+                     float(fractalBar - anchorBar)
+
+                float maxInterveningCloseSlope =
+                     array.get(
+                          downMaxSlopePrev,
+                          i
+                     )
+
+                bool interiorPasses =
+                     na(maxInterveningCloseSlope) or
+                     slope > maxInterveningCloseSlope
+
+                if interiorPasses
+                    float firstProjectedPrice =
+                         anchorPrice +
+                         slope *
+                         float(bar_index - anchorBar)
+
+                    bool firstPostAnchorClosePasses =
+                         close < firstProjectedPrice
+
+                    if firstPostAnchorClosePasses
+                        array.push(
+                             pDownAnchorIds,
+                             anchorId
+                        )
+
+                        array.push(
+                             pDownStartBars,
+                             anchorBar
+                        )
+
+                        array.push(
+                             pDownStartPrices,
+                             anchorPrice
+                        )
+
+                        array.push(
+                             pDownSecondBars,
+                             fractalBar
+                        )
+
+                        array.push(
+                             pDownSecondPrices,
+                             fractalPrice
+                        )
+
+                        array.push(
+                             pDownSlopes,
+                             slope
+                        )
+
+                        // Current bar is the first bar immediately
+                        // after the second fractal.
+                        array.push(
+                             pDownCounts,
+                             1
+                        )
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LOW-fractal processing
+//
+// Exact supplied finder rule:
+//     Store three consecutive confirmed LOW fractals.
+//     Middle fractal is ITL when:
+//         middleLow < leftLow
+//         middleLow < rightLow
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed and isFractalLow
+    int fractalBar =
+         bar_index - 1
+
+    float fractalPrice =
+         low[1]
+
+    array.push(
+         lowBars,
+         fractalBar
+    )
+
+    array.push(
+         lowPrices,
+         fractalPrice
+    )
+
+    if array.size(lowBars) > 3
+        array.shift(lowBars)
+        array.shift(lowPrices)
+
+    if array.size(lowPrices) == 3
+        int midBar =
+             array.get(
+                  lowBars,
+                  1
+             )
+
+        float leftLow =
+             array.get(
+                  lowPrices,
+                  0
+             )
+
+        float midLow =
+             array.get(
+                  lowPrices,
+                  1
+             )
+
+        float rightLow =
+             array.get(
+                  lowPrices,
+                  2
+             )
+
+        bool isITL =
+             midLow < leftLow and
+             midLow < rightLow
+
+        if isITL
+            f_addUpAnchor(
+                 midBar,
+                 midLow
+            )
+
+    // Test THIS ordinary low fractal as anchor #2 for every active ITL.
+    //
+    // Interior rule for an up-sloping line:
+    //     Every close strictly between anchor #1 and anchor #2
+    //     must remain ABOVE the line.
+    //
+    // Current bar is confirmation close #1.
+
+    if array.size(upAnchorIds) > 0
+        for i = 0 to array.size(upAnchorIds) - 1
+            int anchorId =
+                 array.get(
+                      upAnchorIds,
+                      i
+                 )
+
+            int anchorBar =
+                 array.get(
+                      upAnchorBars,
+                      i
+                 )
+
+            float anchorPrice =
+                 array.get(
+                      upAnchorPrices,
+                      i
+                 )
+
+            bool startStillDrawable =
+                 bar_index - anchorBar <=
+                 10001 - confirmBars
+
+            int barsBetween =
+                 fractalBar -
+                 anchorBar -
+                 1
+
+            bool enoughBarsBetween =
+                 barsBetween >=
+                 minimumBarsBetween
+
+            bool validGeometry =
+                 startStillDrawable and
+                 fractalBar > anchorBar and
+                 enoughBarsBetween and
+                 fractalPrice > anchorPrice
+
+            if validGeometry
+                float slope =
+                     (fractalPrice - anchorPrice) /
+                     float(fractalBar - anchorBar)
+
+                float minInterveningCloseSlope =
+                     array.get(
+                          upMinSlopePrev,
+                          i
+                     )
+
+                bool interiorPasses =
+                     na(minInterveningCloseSlope) or
+                     slope < minInterveningCloseSlope
+
+                if interiorPasses
+                    float firstProjectedPrice =
+                         anchorPrice +
+                         slope *
+                         float(bar_index - anchorBar)
+
+                    bool firstPostAnchorClosePasses =
+                         close > firstProjectedPrice
+
+                    if firstPostAnchorClosePasses
+                        array.push(
+                             pUpAnchorIds,
+                             anchorId
+                        )
+
+                        array.push(
+                             pUpStartBars,
+                             anchorBar
+                        )
+
+                        array.push(
+                             pUpStartPrices,
+                             anchorPrice
+                        )
+
+                        array.push(
+                             pUpSecondBars,
+                             fractalBar
+                        )
+
+                        array.push(
+                             pUpSecondPrices,
+                             fractalPrice
+                        )
+
+                        array.push(
+                             pUpSlopes,
+                             slope
+                        )
+
+                        array.push(
+                             pUpCounts,
+                             1
+                        )
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Advance close-slope envelopes through CURRENT bar
+//
+// After this update:
+//
+//     Prev = through previous bar
+//     Curr = through current bar
+//
+// Therefore, on the next bar, Prev correctly represents all closes
+// through two bars before that next bar, which is exactly what is
+// required when that next bar confirms a fractal at [1].
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed
+    if array.size(downAnchorIds) > 0
+        for i = 0 to array.size(downAnchorIds) - 1
+            int anchorBar =
+                 array.get(
+                      downAnchorBars,
+                      i
+                 )
+
+            float anchorPrice =
+                 array.get(
+                      downAnchorPrices,
+                      i
+                 )
+
+            float oldCurr =
+                 array.get(
+                      downMaxSlopeCurr,
+                      i
+                 )
+
+            float newCurr =
+                 oldCurr
+
+            if bar_index > anchorBar
+                float currentSlope =
+                     (close - anchorPrice) /
+                     float(bar_index - anchorBar)
+
+                if na(newCurr) or currentSlope > newCurr
+                    newCurr := currentSlope
+
+            array.set(
+                 downMaxSlopePrev,
+                 i,
+                 oldCurr
+            )
+
+            array.set(
+                 downMaxSlopeCurr,
+                 i,
+                 newCurr
+            )
+
+    if array.size(upAnchorIds) > 0
+        for i = 0 to array.size(upAnchorIds) - 1
+            int anchorBar =
+                 array.get(
+                      upAnchorBars,
+                      i
+                 )
+
+            float anchorPrice =
+                 array.get(
+                      upAnchorPrices,
+                      i
+                 )
+
+            float oldCurr =
+                 array.get(
+                      upMinSlopeCurr,
+                      i
+                 )
+
+            float newCurr =
+                 oldCurr
+
+            if bar_index > anchorBar
+                float currentSlope =
+                     (close - anchorPrice) /
+                     float(bar_index - anchorBar)
+
+                if na(newCurr) or currentSlope < newCurr
+                    newCurr := currentSlope
+
+            array.set(
+                 upMinSlopePrev,
+                 i,
+                 oldCurr
+            )
+
+            array.set(
+                 upMinSlopeCurr,
+                 i,
+                 newCurr
+            )
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Prune structural anchors that can no longer begin a drawable line.
+//
+// An anchor with a live pending candidate is retained until that
+// candidate either succeeds or fails.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if barstate.isconfirmed
+    int maxUncommittedAnchorAge =
+         10001 - confirmBars
+
+    int i = array.size(downAnchorIds) - 1
+
+    while i >= 0
+        int anchorId =
+             array.get(
+                  downAnchorIds,
+                  i
+             )
+
+        int anchorBar =
+             array.get(
+                  downAnchorBars,
+                  i
+             )
+
+        bool tooOld =
+             bar_index - anchorBar >
+             maxUncommittedAnchorAge
+
+        if tooOld and not f_hasPendingDown(anchorId)
+            f_removeDownAnchorAt(i)
+
+        i -= 1
+
+    i := array.size(upAnchorIds) - 1
+
+    while i >= 0
+        int anchorId =
+             array.get(
+                  upAnchorIds,
+                  i
+             )
+
+        int anchorBar =
+             array.get(
+                  upAnchorBars,
+                  i
+             )
+
+        bool tooOld =
+             bar_index - anchorBar >
+             maxUncommittedAnchorAge
+
+        if tooOld and not f_hasPendingUp(anchorId)
+            f_removeUpAnchorAt(i)
+
+        i -= 1

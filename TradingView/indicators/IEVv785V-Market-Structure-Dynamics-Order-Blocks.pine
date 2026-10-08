@@ -1,0 +1,349 @@
+//@version=6
+// Professional Market Dynamics & Order Block Engine
+// Based on Market Structure Concepts (Inspired by LuxAlgo Design Principles)
+// Optimized for Light Background Charts
+
+indicator("Market Structure Dynamics & Order Blocks", "MS Dynamics & OBs", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------
+// Color Palette (Light Background Friendly)
+//---------------------------------------------------------------------------------------------------------------------
+color COLOR_BULL         = #059669 // Emerald Green
+color COLOR_BEAR         = #DC2626 // Crimson Red
+color COLOR_HPZ_BULL     = #0284C7 // Sky Blue
+color COLOR_HPZ_BEAR     = #D97706 // Amber
+color COLOR_NEUTRAL      = #6B7280 // Slate Gray
+
+// Table Aesthetics for Light Theme
+color DASH_BG            = #FFFFFF
+color DASH_BORDER        = #E5E7EB
+color DASH_TEXT_PRIMARY  = #111827
+color DASH_TEXT_MUTED    = #6B7280
+
+//---------------------------------------------------------------------------------------------------------------------
+// User Inputs
+//---------------------------------------------------------------------------------------------------------------------
+string G_DASH            = "Analytics Panel"
+string G_MS              = "Market Structure"
+string G_OB              = "Institutional Blocks"
+string G_SESS            = "Trading Sessions"
+string G_WEEKLY          = "Weekly Levels"
+string G_SIGNALS         = "Buy / Sell Signals"
+
+// Dashboard Options
+bool   cfgShowDash       = input.bool(true, "Show Analytics Panel", group = G_DASH)
+string cfgDashPos        = input.string("Top Right", "Panel Position", options = ["Top Right", "Bottom Right", "Bottom Left"], group = G_DASH)
+string cfgDashSize       = input.string("Small", "Panel Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
+
+// Structure Settings
+int    cfgPivotLength    = input.int(7, "Pivot Lookback Period", minval = 1, group = G_MS)
+float  cfgBreakThreshold = input.float(0.5, "Break Momentum Threshold (Z-Score)", minval = 0.1, step = 0.1, group = G_MS)
+
+// Order Block Settings
+string cfgDisplayMode    = input.string("Historical", "View Mode", options = ["Historical", "Active Only"], group = G_OB)
+int    cfgMaxBlocks      = input.int(10, "Maximum Active Blocks", minval = 1, maxval = 100, group = G_OB)
+bool   cfgKeepMitigated  = input.bool(false, "Extend Mitigated Blocks", group = G_OB)
+bool   cfgFilterOverlap  = input.bool(true, "Filter Overlapping Blocks", group = G_OB)
+
+// Session Settings
+bool   cfgShowSessions   = input.bool(true, "Highlight Trading Sessions", group = G_SESS)
+bool   cfgLondonActive   = input.bool(false, "London Session", group = G_SESS)
+string cfgLondonTime     = input.session("0800-1700:1234567", "London Schedule", group = G_SESS)
+color  cfgLondonColor    = input.color(#2563EB, "London Color", group = G_SESS, inline = "LON")
+
+bool   cfgNYActive       = input.bool(false, "New York Session", group = G_SESS)
+string cfgNYTime         = input.session("1300-2200:1234567", "New York Schedule", group = G_SESS)
+color  cfgNYColor        = input.color(#EA580C, "NY Color", group = G_SESS, inline = "NY")
+
+bool   cfgTokyoActive    = input.bool(false, "Tokyo Session", group = G_SESS)
+string cfgTokyoTime      = input.session("0000-0900:1234567", "Tokyo Schedule", group = G_SESS)
+color  cfgTokyoColor     = input.color(#E11D48, "Tokyo Color", group = G_SESS, inline = "TYO")
+
+bool   cfgSydneyActive   = input.bool(false, "Sydney Session", group = G_SESS)
+string cfgSydneyTime     = input.session("2100-0600:1234567", "Sydney Schedule", group = G_SESS)
+color  cfgSydneyColor    = input.color(#CA8A04, "Sydney Color", group = G_SESS, inline = "SYD")
+
+// Weekly High/Low Settings
+bool   cfgShowWeekly     = input.bool(true, "Show Prev Weekly High / Low", group = G_WEEKLY)
+color  cfgWhColor        = input.color(#7C3AED, "Weekly High Color", group = G_WEEKLY, inline = "WH")
+color  cfgWlColor        = input.color(#0D9488, "Weekly Low Color", group = G_WEEKLY, inline = "WL")
+
+// Signal Settings
+bool   cfgShowSignals    = input.bool(true, "Show Buy / Sell Signals", group = G_SIGNALS)
+
+//---------------------------------------------------------------------------------------------------------------------
+// Data Types & Storage
+//---------------------------------------------------------------------------------------------------------------------
+type StructureBlock
+    box   boxRef
+    label labelRef
+    line  pocRef
+    float score
+    float topVal
+    float btmVal
+    bool  isBullish
+    bool  isHighProb
+    bool  isMitigated
+    int   mitigationIndex
+
+var array<StructureBlock> activeBlocks = array.new<StructureBlock>()
+
+//---------------------------------------------------------------------------------------------------------------------
+// Helper Functions
+//---------------------------------------------------------------------------------------------------------------------
+getPosition(string posStr) =>
+    switch posStr
+        "Top Right"    => position.top_right
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+getSize(string sizeStr) =>
+    switch sizeStr
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.small
+
+renderSessionRange(bool isEnabled, string sessionPattern, color sessionColor, string sessionLabel) =>
+    var box   rangeBox   = na
+    var label rangeLabel = na
+    var float highPrice  = na
+    var float lowPrice   = na
+
+    bool inSessionNow = not na(time(timeframe.period, sessionPattern))
+    bool sessionStarted = inSessionNow and not inSessionNow[1]
+
+    if isEnabled and inSessionNow
+        if sessionStarted
+            highPrice  := high
+            lowPrice   := low
+            rangeBox   := box.new(bar_index, highPrice, bar_index, lowPrice, border_color = sessionColor, border_style = line.style_dotted, bgcolor = color.new(sessionColor, 94))
+            rangeLabel := label.new(bar_index, highPrice, sessionLabel, style = label.style_none, textcolor = sessionColor, size = size.small, textalign = text.align_center)
+        else
+            highPrice := math.max(highPrice, high)
+            lowPrice  := math.min(lowPrice, low)
+            rangeBox.set_top(highPrice)
+            rangeBox.set_bottom(lowPrice)
+            rangeBox.set_right(bar_index)
+            rangeLabel.set_xy(math.round(math.avg(rangeBox.get_left(), bar_index)), highPrice)
+    float(na)
+
+//---------------------------------------------------------------------------------------------------------------------
+// Core Indicator Logic
+//---------------------------------------------------------------------------------------------------------------------
+// Weekly High/Low Calculations
+float prevWeeklyHigh = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+float prevWeeklyLow  = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
+
+var line  weeklyHighLine  = na
+var line  weeklyLowLine   = na
+var label weeklyHighLabel = na
+var label weeklyLowLabel  = na
+
+if cfgShowWeekly
+    if na(weeklyHighLine)
+        weeklyHighLine  := line.new(bar_index, prevWeeklyHigh, bar_index + 10, prevWeeklyHigh, color = cfgWhColor, width = 1, style = line.style_dashed)
+        weeklyLowLine   := line.new(bar_index, prevWeeklyLow,  bar_index + 10, prevWeeklyLow,  color = cfgWlColor, width = 1, style = line.style_dashed)
+        weeklyHighLabel := label.new(bar_index + 12, prevWeeklyHigh, "PWH", color = color.new(cfgWhColor, 100), textcolor = cfgWhColor, style = label.style_none, size = size.small)
+        weeklyLowLabel  := label.new(bar_index + 12, prevWeeklyLow,  "PWL", color = color.new(cfgWlColor, 100), textcolor = cfgWlColor, style = label.style_none, size = size.small)
+    else
+        weeklyHighLine.set_xy1(bar_index - 50, prevWeeklyHigh)
+        weeklyHighLine.set_xy2(bar_index + 10, prevWeeklyHigh)
+        weeklyLowLine.set_xy1(bar_index - 50, prevWeeklyLow)
+        weeklyLowLine.set_xy2(bar_index + 10, prevWeeklyLow)
+        
+        weeklyHighLabel.set_xy(bar_index + 12, prevWeeklyHigh)
+        weeklyLowLabel.set_xy(bar_index + 12, prevWeeklyLow)
+
+// Momentum and Volatility Metrics
+float priceDiff   = ta.change(close)
+float meanDiff    = ta.sma(priceDiff, 50)
+float stdDevDiff  = ta.stdev(priceDiff, 50)
+float zScore      = (priceDiff - meanDiff) / stdDevDiff
+float volPercent  = ta.percentrank(volume, 100)
+
+// High/Low Swings
+float highPivot = ta.pivothigh(high, cfgPivotLength, cfgPivotLength)
+float lowPivot  = ta.pivotlow(low, cfgPivotLength, cfgPivotLength)
+
+var float recentHighPivot = na
+var float recentLowPivot  = na
+var int   recentHighIndex = na
+var int   recentLowIndex  = na
+
+if not na(highPivot)
+    recentHighPivot := highPivot
+    recentHighIndex := bar_index - cfgPivotLength
+
+if not na(lowPivot)
+    recentLowPivot := lowPivot
+    recentLowIndex := bar_index - cfgPivotLength
+
+// Draw Sessions
+if cfgShowSessions
+    renderSessionRange(cfgLondonActive, cfgLondonTime, cfgLondonColor, "London")
+    renderSessionRange(cfgNYActive,     cfgNYTime,     cfgNYColor,     "New York")
+    renderSessionRange(cfgTokyoActive,  cfgTokyoTime,  cfgTokyoColor,  "Tokyo")
+    renderSessionRange(cfgSydneyActive, cfgSydneyTime, cfgSydneyColor, "Sydney")
+
+// Market Structure Break Conditions
+bool bullishBreak = close > recentHighPivot and close[1] <= recentHighPivot and zScore > cfgBreakThreshold
+bool bearishBreak = close < recentLowPivot and close[1] >= recentLowPivot and zScore < -cfgBreakThreshold
+
+if bullishBreak
+    int midPoint = math.round(math.avg(recentHighIndex, bar_index))
+    line.new(recentHighIndex, recentHighPivot, bar_index, recentHighPivot, color = COLOR_BULL, width = 1)
+    label.new(midPoint, recentHighPivot, "BOS", color = color.new(COLOR_BULL, 100), textcolor = COLOR_BULL, style = label.style_label_down, size = size.small)
+
+if bearishBreak
+    int midPoint = math.round(math.avg(recentLowIndex, bar_index))
+    line.new(recentLowIndex, recentLowPivot, bar_index, recentLowPivot, color = COLOR_BEAR, width = 1)
+    label.new(midPoint, recentLowPivot, "BOS", color = color.new(COLOR_BEAR, 100), textcolor = COLOR_BEAR, style = label.style_label_up, size = size.small)
+
+// Order Block Generation
+if bullishBreak or bearishBreak
+    int candleOffset = 0
+    for i = 1 to 10
+        if (bullishBreak and close[i] < open[i]) or (bearishBreak and close[i] > open[i])
+            candleOffset := i
+            break
+
+    float blockTop = high[candleOffset]
+    float blockBtm = low[candleOffset]
+    float blockPoc = math.avg(blockTop, blockBtm)
+
+    // Calculate Block Quality
+    float qualityRating = math.min(100, (math.abs(zScore) * 20) + (volPercent * 0.5))
+    bool  isHighProbability = qualityRating > 80
+
+    color primaryColor   = bullishBreak ? COLOR_BULL : COLOR_BEAR
+    color highProbColor  = bullishBreak ? COLOR_HPZ_BULL : COLOR_HPZ_BEAR
+
+    box   blockBox   = na
+    label blockLabel = na
+    line  blockLine  = na
+
+    // Check for overlapping zones
+    bool isOverlapping = false
+    if cfgFilterOverlap and activeBlocks.size() > 0
+        for i = 0 to activeBlocks.size() - 1
+            StructureBlock current = activeBlocks.get(i)
+            if not current.isMitigated and ((blockTop <= current.topVal and blockTop >= current.btmVal) or (blockBtm <= current.topVal and blockBtm >= current.btmVal))
+                isOverlapping := true
+                break
+
+    if not isOverlapping
+        color finalColor = isHighProbability ? highProbColor : primaryColor
+        int   bgTransparency = isHighProbability ? 88 : 92
+
+        blockBox   := box.new(bar_index[candleOffset], blockTop, bar_index + 12, blockBtm, border_color = color.new(finalColor, 30), bgcolor = color.new(finalColor, bgTransparency), border_width = 1, border_style = line.style_dotted)
+        blockLine  := line.new(bar_index[candleOffset], blockPoc, bar_index + 12, blockPoc, color = color.new(finalColor, 40), width = 1, style = line.style_dotted)
+        blockLabel := label.new(bar_index + 14, blockPoc, str.tostring(qualityRating, "#") + "%", color = color.new(finalColor, 100), textcolor = finalColor, style = label.style_none, size = size.tiny, textalign = text.align_left)
+
+        StructureBlock newBlock = StructureBlock.new(blockBox, blockLabel, blockLine, qualityRating, blockTop, blockBtm, bullishBreak, isHighProbability, false, 0)
+        activeBlocks.push(newBlock)
+
+    if bullishBreak 
+        recentHighPivot := na 
+    else 
+        recentLowPivot := na
+
+// Buy / Sell Signals Plotting
+plotshape(cfgShowSignals and bullishBreak, title = "Buy Signal", style = shape.triangleup, location = location.belowbar, color = COLOR_BULL, size = size.small, text = "BUY", textcolor = COLOR_BULL)
+plotshape(cfgShowSignals and bearishBreak, title = "Sell Signal", style = shape.triangledown, location = location.abovebar, color = COLOR_BEAR, size = size.small, text = "SELL", textcolor = COLOR_BEAR)
+
+// TradingView Alerts Setup
+alertcondition(bullishBreak, title = "Bullish BOS Signal", message = "Bullish Market Structure Break Detected on {{ticker}}!")
+alertcondition(bearishBreak, title = "Bearish BOS Signal", message = "Bearish Market Structure Break Detected on {{ticker}}!")
+
+// Life-cycle Management of Order Blocks
+var float totalMitigatedCount = 0.0
+var float totalCreatedCount   = 0.0
+
+if (bullishBreak or bearishBreak)
+    totalCreatedCount += 1
+
+if activeBlocks.size() > 0
+    int mitigateTracker = 0
+    for i = activeBlocks.size() - 1 to 0
+        StructureBlock item = activeBlocks.get(i)
+        if not item.isMitigated
+            item.boxRef.set_right(bar_index + 12)
+            item.labelRef.set_x(bar_index + 14)
+            item.pocRef.set_x2(bar_index + 12)
+
+            bool isMitigatedNow = item.isBullish ? low < item.btmVal : high > item.topVal
+            if isMitigatedNow
+                item.isMitigated := true
+                item.mitigationIndex := bar_index
+                totalMitigatedCount += 1
+                
+                if cfgDisplayMode == "Active Only"
+                    item.boxRef.delete()
+                    item.labelRef.delete()
+                    item.pocRef.delete()
+                else
+                    item.boxRef.set_bgcolor(color.new(COLOR_NEUTRAL, 95))
+                    item.boxRef.set_border_color(color.new(COLOR_NEUTRAL, 80))
+                    item.labelRef.set_textcolor(color.new(COLOR_NEUTRAL, 60))
+                    item.pocRef.set_color(color.new(COLOR_NEUTRAL, 85))
+
+                    item.boxRef.set_right(bar_index)
+                    item.labelRef.set_x(bar_index)
+                    item.pocRef.set_x2(bar_index)
+        else
+            mitigateTracker += 1
+            bool keepVisible = cfgKeepMitigated and mitigateTracker <= 2 and (bar_index - item.mitigationIndex <= 50)
+
+            if cfgDisplayMode == "Active Only"
+                item.boxRef.delete()
+                item.labelRef.delete()
+                item.pocRef.delete()
+            else if keepVisible
+                item.boxRef.set_right(bar_index + 12)
+                item.labelRef.set_x(bar_index + 14)
+                item.pocRef.set_x2(bar_index + 12)
+            else
+                item.boxRef.set_right(item.mitigationIndex)
+                item.labelRef.set_x(item.mitigationIndex)
+                item.pocRef.set_x2(item.mitigationIndex)
+
+    if activeBlocks.size() > cfgMaxBlocks
+        StructureBlock oldest = activeBlocks.shift()
+        oldest.boxRef.delete()
+        oldest.labelRef.delete()
+        oldest.pocRef.delete()
+
+//---------------------------------------------------------------------------------------------------------------------
+// Light-Theme Analytics Dashboard
+//---------------------------------------------------------------------------------------------------------------------
+var table dashTable = table.new(getPosition(cfgDashPos), 2, 3, bgcolor = DASH_BG, border_width = 1, border_color = DASH_BORDER, frame_color = DASH_BORDER, frame_width = 1)
+
+if cfgShowDash and barstate.islast
+    float successRatio = totalCreatedCount > 0 ? (totalMitigatedCount / totalCreatedCount) * 100 : 0.0
+    int highProbCount = 0
+    
+    if activeBlocks.size() > 0
+        for i = 0 to activeBlocks.size() - 1
+            if activeBlocks.get(i).isHighProb and not activeBlocks.get(i).isMitigated
+                highProbCount += 1
+
+    // Header
+    dashTable.merge_cells(0, 0, 1, 0)
+    dashTable.cell(0, 0, "Structure Analytics", text_color = DASH_TEXT_PRIMARY, text_size = getSize(cfgDashSize), text_halign = text.align_center, bgcolor = #F3F4F6)
+
+    // Row 1: Mitigation Ratio
+    dashTable.cell(0, 1, "Mitigation Rate", text_color = DASH_TEXT_MUTED, text_size = getSize(cfgDashSize), text_halign = text.align_left)
+    dashTable.cell(1, 1, str.tostring(successRatio, "#.#") + "%", text_color = successRatio >= 50 ? COLOR_BULL : COLOR_BEAR, text_size = getSize(cfgDashSize), text_halign = text.align_right)
+
+    // Row 2: High Prob Count
+    dashTable.cell(0, 2, "Active HP Blocks", text_color = DASH_TEXT_MUTED, text_size = getSize(cfgDashSize), text_halign = text.align_left)
+    dashTable.cell(1, 2, str.tostring(highProbCount), text_color = DASH_TEXT_PRIMARY, text_size = getSize(cfgDashSize), text_halign = text.align_right)
+
+
+
+
+
+

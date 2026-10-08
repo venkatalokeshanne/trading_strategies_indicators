@@ -1,0 +1,660 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  Volume Profile Pullback Sniper
+//  ---------------------------------------------------------------------------
+//  Selbst berechnetes Volume Profile (POC / VAH / VAL / LVN) aus den OHLCV-
+//  Daten des Charts. Das native Volume-Profile-Tool von TradingView ist eine
+//  reine Chart-Zeichnung und in Pine Script nicht auslesbar.
+//
+//  Setups:  A) POC-Pullback            B) VAH/VAL-Pullback
+//           C) LVN-Rejection           D) LVN-Breakaway
+//           E) Failed Auction (VA-Ausbruch scheitert)
+//           F) Naked-POC-Retest (nur Session-Modus)
+//  Kontext: Poor High/Low, Value-Area-Migration, HTF-POC-Bias,
+//           Volumen-Divergenz gegenüber dem letzten Test desselben Levels
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Volume Profile Pullback Sniper", "VP Sniper", overlay = true, max_bars_back = 500, max_lines_count = 200, max_labels_count = 100, max_boxes_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1) INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+string GRP_VP   = "Volume Profile"
+string GRP_SET  = "Setups"
+string GRP_SIG  = "Signal-Feinjustierung"
+string GRP_FILT = "Filter & Kontext"
+string GRP_VIS  = "Darstellung · Profil"
+string GRP_VSIG = "Darstellung · Signale"
+string GRP_COL  = "Farben"
+
+// --- Profil-Berechnung -----------------------------------------------------
+string profileMode    = input.string("Fixed Range", "Berechnungsmodus", options = ["Fixed Range", "Session"], group = GRP_VP, tooltip = "Fixed Range: rollierendes Fenster der letzten N Bars.\nSession: Profil wird bei jedem Session-Start neu aufgebaut (Voraussetzung für Naked POC).")
+int    lookbackBars   = input.int(100, "Lookback Bars (Fixed Range)", minval = 10, maxval = 1000, group = GRP_VP, tooltip = "Wie viele Bars ins Profil einfliessen.")
+string sessionPeriod  = input.string("Daily", "Session-Periodizität", options = ["Daily", "Weekly"], group = GRP_VP)
+int    sessionMaxBars = input.int(500, "Max. Bars pro Session", minval = 50, maxval = 2000, group = GRP_VP, tooltip = "Performance-Limit: die ältesten Bars fallen aus dem Session-Profil heraus.")
+int    binCount       = input.int(50, "Anzahl Preis-Bins", minval = 10, maxval = 200, group = GRP_VP, tooltip = "Auflösung des Profils = Anzahl der Balken im Histogramm.\n24–30 = stabiler POC, 50–100 = feineres Bild, aber sprunghafterer POC.")
+float  vaPercent      = input.float(70.0, "Value Area (%)", minval = 30.0, maxval = 95.0, step = 1.0, group = GRP_VP)
+
+// --- Setups ----------------------------------------------------------------
+bool   useSetupPOC    = input.bool(true,  "A · POC-Pullback", group = GRP_SET)
+bool   useSetupVA     = input.bool(true,  "B · VAH/VAL-Pullback", group = GRP_SET)
+bool   useSetupLVN    = input.bool(true,  "C · LVN-Rejection", group = GRP_SET, tooltip = "Reaktion an einem Low Volume Node (Preisbereich ohne Konsens).")
+bool   useSetupBreak  = input.bool(false, "D · LVN-Breakaway", group = GRP_SET, tooltip = "Impulsiver Durchbruch durch einen LVN – Trendfortsetzung statt Reversal. Bewusst per Default aus.")
+bool   useSetupFA     = input.bool(true,  "E · Failed Auction (VA-Rückkehr)", group = GRP_SET, tooltip = "Preis verlässt die Value Area, hält sich nicht und kehrt zurück.")
+bool   useSetupNP     = input.bool(true,  "F · Naked-POC-Retest", group = GRP_SET, tooltip = "Nur im Session-Modus: unberührte POCs alter Sessions als Magnet-Level.")
+
+// --- Signal-Feinjustierung --------------------------------------------------
+string confirmMode    = input.string("Wick oder Close", "Reaktions-Bestätigung", options = ["Wick-Rejection", "Close-Bestätigung", "Wick oder Close"], group = GRP_SIG)
+float  wickRatio      = input.float(0.33, "Min. Wick-Anteil an Bar-Range", minval = 0.05, maxval = 0.90, step = 0.01, group = GRP_SIG)
+string tolMode        = input.string("Prozent", "Toleranz-Modus", options = ["Prozent", "Ticks"], group = GRP_SIG)
+float  tolPercent     = input.float(0.10, "Toleranz (%)", minval = 0.0, step = 0.01, group = GRP_SIG)
+int    tolTicks       = input.int(10, "Toleranz (Ticks)", minval = 0, group = GRP_SIG)
+int    approachBars   = input.int(5, "Approach-Bars", minval = 1, maxval = 50, group = GRP_SIG, tooltip = "So viele Bars vor dem Signal muss der Preis sauber auf der Ausgangsseite der Zone gelegen haben.")
+int    cooldownBars   = input.int(10, "Cooldown-Bars je Signaltyp", minval = 0, maxval = 200, group = GRP_SIG)
+int    minProfileBars = input.int(20, "Min. Bars im Profil für Signale", minval = 5, maxval = 500, group = GRP_SIG)
+float  lvnPct         = input.float(25.0, "LVN-Schwelle (% des POC-Volumens)", minval = 5.0, maxval = 60.0, step = 1.0, group = GRP_SIG, tooltip = "Bins unter dieser Schwelle gelten als Low Volume Node.")
+int    lvnMax         = input.int(3, "Max. LVN-Level", minval = 1, maxval = 8, group = GRP_SIG, tooltip = "Es werden die dem Preis am nächsten liegenden LVNs verwendet.")
+float  breakBodyRatio = input.float(0.60, "Breakaway · Min. Körperanteil", minval = 0.3, maxval = 1.0, step = 0.05, group = GRP_SIG)
+float  breakVolMult   = input.float(1.3, "Breakaway · Volumen-Faktor", minval = 0.5, step = 0.1, group = GRP_SIG)
+int    faMaxBars      = input.int(6, "Failed Auction · max. Bars ausserhalb", minval = 1, maxval = 30, group = GRP_SIG)
+int    npMax          = input.int(5, "Naked POC · max. offene Level", minval = 1, maxval = 20, group = GRP_SIG)
+
+// --- Filter & Kontext -------------------------------------------------------
+bool   useTrendFilter = input.bool(true, "Trend-Filter (MA)", group = GRP_FILT, tooltip = "Long nur über der MA, Short nur darunter.")
+string maType         = input.string("EMA", "MA-Typ", options = ["EMA", "SMA"], group = GRP_FILT)
+int    maLength       = input.int(200, "MA Länge", minval = 1, group = GRP_FILT)
+bool   useVolFilter   = input.bool(false, "Volumen-Filter (über Durchschnitt)", group = GRP_FILT)
+int    volMaLength    = input.int(20, "Volumen-MA Länge", minval = 1, group = GRP_FILT)
+float  volMult        = input.float(1.2, "Volumen-Faktor", minval = 0.1, step = 0.1, group = GRP_FILT)
+bool   useDivFilter   = input.bool(false, "Volumen-Divergenz zum letzten Test", group = GRP_FILT, tooltip = "Die Reaktionskerze muss mehr Volumen haben als der vorherige Test desselben Levels – trennt starke von schwachen Wiederholungstests.")
+bool   usePoorFilter  = input.bool(true, "Poor-High/Low-Filter", group = GRP_FILT, tooltip = "Poor High (kein Excess oben) unterdrückt Shorts am VAH, Poor Low unterdrückt Longs am VAL – der Markt hat dort noch keinen Widerstand gefunden.")
+float  poorPct        = input.float(15.0, "Poor-Schwelle (% des POC-Volumens)", minval = 3.0, maxval = 50.0, step = 1.0, group = GRP_FILT)
+bool   useMigFilter   = input.bool(false, "Value-Area-Migration als Filter", group = GRP_FILT, tooltip = "Longs nur bei aufwärts wandernder oder stabiler Value Area, Shorts spiegelbildlich.")
+int    migLookback    = input.int(50, "Migration · Vergleichsfenster (Bars)", minval = 5, maxval = 500, group = GRP_FILT, tooltip = "Nur im Fixed-Range-Modus. Im Session-Modus wird automatisch mit der Vorsession verglichen.")
+bool   useHtfFilter   = input.bool(false, "HTF-POC-Bias als Filter", group = GRP_FILT, tooltip = "Longs nur über dem POC des höheren Timeframes, Shorts nur darunter.")
+string htfTf          = input.timeframe("D", "HTF Timeframe", group = GRP_FILT)
+int    htfLookback    = input.int(20, "HTF · Anzahl Bars im Profil", minval = 5, maxval = 100, group = GRP_FILT)
+
+// --- Darstellung Profil ----------------------------------------------------
+bool   showHistogram  = input.bool(true, "Volume-Profile-Histogramm", group = GRP_VIS)
+bool   histRight      = input.bool(false, "Histogramm rechts vom letzten Bar", group = GRP_VIS, tooltip = "Aus: halbtransparent über den letzten Kerzen (wie das native Tool).\nEin: rechts neben dem Chart.")
+int    histWidth      = input.int(100, "Histogramm-Breite (Bars)", minval = 5, maxval = 300, group = GRP_VIS, tooltip = "Wie breit der grösste Volumen-Balken gezeichnet wird.")
+bool   showLevelLines = input.bool(true, "POC / VAH / VAL Linien", group = GRP_VIS)
+bool   showLvnLines   = input.bool(true, "LVN-Linien", group = GRP_VIS)
+bool   showNpLines    = input.bool(true, "Naked-POC-Linien", group = GRP_VIS)
+bool   showHtfLevel   = input.bool(true, "HTF-POC-Linie", group = GRP_VIS)
+bool   showVaBox      = input.bool(true, "Value-Area-Box", group = GRP_VIS)
+bool   showLevelTags  = input.bool(true, "Preis-Tags am rechten Rand", group = GRP_VIS)
+bool   showPoorTags   = input.bool(true, "Poor-High/Low markieren", group = GRP_VIS)
+bool   showLevelPlots = input.bool(false, "Verlauf der Level plotten (Historie)", group = GRP_VIS)
+bool   showInfoTable  = input.bool(true, "Info-Panel anzeigen", group = GRP_VIS)
+string tablePos       = input.string("Oben rechts", "Position Info-Panel", options = ["Oben rechts", "Oben links", "Unten rechts", "Unten links"], group = GRP_VIS)
+bool   showMaLine     = input.bool(false, "Trend-MA zeichnen", group = GRP_VIS)
+
+// --- Darstellung Signale ---------------------------------------------------
+bool   showMarkers    = input.bool(true, "Signal-Marker", group = GRP_VSIG, tooltip = "▲▼ POC · ● VA · ◆ LVN · ⬆⬇ Breakaway · ■ Failed Auction · ✕ Naked POC")
+bool   colorSigBar    = input.bool(true, "Signalkerze einfärben", group = GRP_VSIG)
+bool   showSigLines   = input.bool(true, "Long/Short-Linie am Signalpreis", group = GRP_VSIG)
+bool   sigLineExtend  = input.bool(true, "Signal-Linien nach rechts verlängern", group = GRP_VSIG)
+int    sigLineLength  = input.int(30, "Länge in Bars (ohne Verlängerung)", minval = 1, maxval = 500, group = GRP_VSIG)
+int    sigLineKeep    = input.int(1, "Anzahl Linien je Richtung", minval = 1, maxval = 20, group = GRP_VSIG)
+bool   showSigLabels  = input.bool(true, "Beschriftung LONG / SHORT", group = GRP_VSIG)
+
+// --- Farben ----------------------------------------------------------------
+color  pocColor       = input.color(#FF9800, "POC", group = GRP_COL, inline = "c1")
+color  vaColor        = input.color(#2196F3, "VAH / VAL", group = GRP_COL, inline = "c1")
+color  lvnColor       = input.color(#9575CD, "LVN", group = GRP_COL, inline = "c2")
+color  npColor        = input.color(#FFCA28, "Naked POC", group = GRP_COL, inline = "c2")
+color  htfColor       = input.color(#E040FB, "HTF POC", group = GRP_COL, inline = "c2")
+color  vaFillColor    = input.color(color.new(#2196F3, 94), "Value-Area-Fläche", group = GRP_COL)
+color  histVaColor    = input.color(color.new(#2196F3, 70), "Histogramm · in VA", group = GRP_COL, inline = "c3")
+color  histOutColor   = input.color(color.new(#787B86, 82), "ausserhalb", group = GRP_COL, inline = "c3")
+color  longLineColor  = input.color(#00C853, "Long", group = GRP_COL, inline = "c4")
+color  shortLineColor = input.color(#FF1744, "Short", group = GRP_COL, inline = "c4")
+color  maColor        = input.color(color.new(#787B86, 40), "Trend-MA", group = GRP_COL)
+int    pocWidth       = input.int(2, "Linienstärke POC", minval = 1, maxval = 5, group = GRP_COL)
+int    vaWidth        = input.int(1, "Linienstärke VAH/VAL", minval = 1, maxval = 5, group = GRP_COL)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2) VOLUME PROFILE BERECHNUNG
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Rollierendes Datenfenster: nur diese Bars fliessen ins aktuelle Profil ein.
+var array<float> srcHigh   = array.new<float>()
+var array<float> srcLow    = array.new<float>()
+var array<float> srcVol    = array.new<float>()
+// Bin-Puffer werden einmalig allokiert und pro Bar nur überschrieben.
+var array<float> binVolume = array.new<float>(binCount, 0.0)
+var array<float> htfBins   = array.new<float>(binCount, 0.0)
+var array<float> lvnLevels = array.new<float>()
+
+bool   isSessionMode = profileMode == "Session"
+string sessionTf     = sessionPeriod == "Weekly" ? "W" : "D"
+bool   isNewSession  = isSessionMode and timeframe.change(sessionTf)
+
+// Session-Reset: Profil zu jedem Perioden-Start leeren.
+if isNewSession
+    array.clear(srcHigh)
+    array.clear(srcLow)
+    array.clear(srcVol)
+
+array.push(srcHigh, high)
+array.push(srcLow,  low)
+array.push(srcVol,  nz(volume))
+
+// Fenstergrösse begrenzen (Fixed Range: Lookback, Session: Performance-Cap).
+int maxWindowBars = isSessionMode ? sessionMaxBars : lookbackBars
+while array.size(srcHigh) > maxWindowBars
+    array.shift(srcHigh)
+    array.shift(srcLow)
+    array.shift(srcVol)
+
+// Verteilt das Volumen jedes Bars gleichmässig auf alle Bins zwischen seinem
+// Low und High und leitet daraus POC, VAH und VAL ab.
+// Rückgabe zusätzlich: Profil-Untergrenze und Bin-Höhe (für Histogramm/LVN).
+buildProfile(hArr, lArr, vArr, binVol, vaPct) =>
+    int   bins    = array.size(binVol)
+    int   n       = array.size(hArr)
+    float poc     = na
+    float vah     = na
+    float val     = na
+    float profLo  = na
+    float binSize = na
+    if n > 0
+        float pHigh = array.max(hArr)
+        float pLow  = array.min(lArr)
+        float rng   = pHigh - pLow
+        if rng > 0
+            profLo  := pLow
+            binSize := rng / bins
+            array.fill(binVol, 0.0)
+            // --- Volumen auf die Bins verteilen ---------------------------
+            for i = 0 to n - 1
+                float bh = array.get(hArr, i)
+                float bl = array.get(lArr, i)
+                float bv = array.get(vArr, i)
+                // Bin-Index von Low und High, hart auf [0 .. bins-1] geklemmt
+                int idxLo = int(math.max(0, math.min(bins - 1, math.floor((bl - pLow) / binSize))))
+                int idxHi = int(math.max(0, math.min(bins - 1, math.floor((bh - pLow) / binSize))))
+                float volPerBin = bv / (idxHi - idxLo + 1)
+                for b = idxLo to idxHi
+                    array.set(binVol, b, array.get(binVol, b) + volPerBin)
+            // --- POC = Bin mit dem höchsten Volumen -----------------------
+            int   pocIdx    = array.indexof(binVol, array.max(binVol))
+            float targetVol = array.sum(binVol) * vaPct / 100.0
+            // --- Value Area: vom POC aus immer zur volumenstärkeren Seite
+            //     erweitern, bis der Ziel-Prozentsatz erreicht ist.
+            float accVol = array.get(binVol, pocIdx)
+            int   upIdx  = pocIdx
+            int   dnIdx  = pocIdx
+            while accVol < targetVol and (upIdx < bins - 1 or dnIdx > 0)
+                float volUp = upIdx < bins - 1 ? array.get(binVol, upIdx + 1) : -1.0
+                float volDn = dnIdx > 0        ? array.get(binVol, dnIdx - 1) : -1.0
+                if volUp >= volDn
+                    upIdx  += 1
+                    accVol += volUp
+                else
+                    dnIdx  -= 1
+                    accVol += volDn
+            poc := pLow + (pocIdx + 0.5) * binSize  // Mitte des POC-Bins
+            vah := pLow + (upIdx + 1) * binSize     // Oberkante des obersten VA-Bins
+            val := pLow + dnIdx * binSize           // Unterkante des untersten VA-Bins
+    [poc, vah, val, profLo, binSize]
+
+// Sucht Low Volume Nodes (lokale Volumen-Minima unter der Schwelle) und prüft
+// auf fehlendes Excess an den Profil-Rändern (Poor High / Poor Low).
+analyzeProfile(binVol, profLo, binSize, lvnArr, lvnThreshPct, maxLvn, poorThreshPct) =>
+    array.clear(lvnArr)
+    bool  poorHi = false
+    bool  poorLo = false
+    int   bins   = array.size(binVol)
+    float maxVol = array.max(binVol)
+    if maxVol > 0 and not na(binSize)
+        float lvnThr = maxVol * lvnThreshPct / 100.0
+        // Randbins bleiben aussen vor – dort ist wenig Volumen normal.
+        for i = 1 to bins - 2
+            float v = array.get(binVol, i)
+            if v < lvnThr and v <= array.get(binVol, i - 1) and v <= array.get(binVol, i + 1)
+                array.push(lvnArr, profLo + (i + 0.5) * binSize)
+        // Nur die dem Preis nächstliegenden LVNs behalten
+        while array.size(lvnArr) > maxLvn
+            int   farIdx  = 0
+            float farDist = -1.0
+            for i = 0 to array.size(lvnArr) - 1
+                float d = math.abs(array.get(lvnArr, i) - close)
+                if d > farDist
+                    farDist := d
+                    farIdx  := i
+            array.remove(lvnArr, farIdx)
+        // Poor High / Poor Low: Randbin trägt zu viel Volumen -> kein Tail
+        poorHi := array.get(binVol, bins - 1) >= maxVol * poorThreshPct / 100.0
+        poorLo := array.get(binVol, 0)        >= maxVol * poorThreshPct / 100.0
+    [poorHi, poorLo]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3) POC / VAH / VAL / LVN ERMITTLUNG
+// ═══════════════════════════════════════════════════════════════════════════
+[pocPrice, vahPrice, valPrice, profileLow, binStep] = buildProfile(srcHigh, srcLow, srcVol, binVolume, vaPercent)
+[poorHigh, poorLow] = analyzeProfile(binVolume, profileLow, binStep, lvnLevels, lvnPct, lvnMax, poorPct)
+
+int  profileBars  = array.size(srcHigh)
+bool profileValid = profileBars >= minProfileBars and not na(pocPrice) and not na(vahPrice) and not na(valPrice)
+
+// na-sichere Referenzwerte für alle Vergleiche.
+float pocRef = nz(pocPrice, close)
+float vahRef = nz(vahPrice, close)
+float valRef = nz(valPrice, close)
+
+// --- Higher-Timeframe-Profil (eigene Bar-Sammlung aus HTF-Daten) ------------
+var array<float> htfHighs = array.new<float>()
+var array<float> htfLows  = array.new<float>()
+var array<float> htfVols  = array.new<float>()
+
+bool  htfTfOk = timeframe.in_seconds(htfTf) > timeframe.in_seconds(timeframe.period)
+float htfBarH = request.security(syminfo.tickerid, htfTf, high[1],   lookahead = barmerge.lookahead_on)
+float htfBarL = request.security(syminfo.tickerid, htfTf, low[1],    lookahead = barmerge.lookahead_on)
+float htfBarV = request.security(syminfo.tickerid, htfTf, volume[1], lookahead = barmerge.lookahead_on)
+
+// Jede abgeschlossene HTF-Bar einmal ins HTF-Fenster übernehmen.
+if htfTfOk and timeframe.change(htfTf) and not na(htfBarH) and not na(htfBarL)
+    array.push(htfHighs, htfBarH)
+    array.push(htfLows,  htfBarL)
+    array.push(htfVols,  nz(htfBarV))
+    while array.size(htfHighs) > htfLookback
+        array.shift(htfHighs)
+        array.shift(htfLows)
+        array.shift(htfVols)
+
+[htfPoc, htfVah, htfVal, _htfLo, _htfStep] = buildProfile(htfHighs, htfLows, htfVols, htfBins, vaPercent)
+float htfPocRef = nz(htfPoc, close)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4) SIGNAL-LOGIK
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Toleranzband um die Zonen (exaktes Berühren kommt praktisch nie vor).
+float tolValue = tolMode == "Ticks" ? tolTicks * syminfo.mintick : close * tolPercent / 100.0
+
+// Anlauf-Fenster: wo lag der Preis vor der aktuellen Kerze?
+float lowestPrev  = ta.lowest(low, approachBars)[1]
+float highestPrev = ta.highest(high, approachBars)[1]
+
+// Trend- und Volumenkontext
+float emaValue = ta.ema(close, maLength)
+float smaValue = ta.sma(close, maLength)
+float maValue  = nz(maType == "EMA" ? emaValue : smaValue, close)
+float volAvg   = ta.sma(volume, volMaLength)
+
+bool trendOkLong  = not useTrendFilter or close > maValue
+bool trendOkShort = not useTrendFilter or close < maValue
+bool volumeOk     = not useVolFilter   or nz(volume) > nz(volAvg) * volMult
+
+// --- Value-Area-Migration ---------------------------------------------------
+var float prevSessPoc = na
+if isNewSession
+    prevSessPoc := pocPrice[1]
+
+float migRef   = isSessionMode ? nz(prevSessPoc, pocRef) : nz(pocPrice[migLookback], pocRef)
+float migThr   = math.max((vahRef - valRef) * 0.15, tolValue)
+int   migState = pocRef - migRef > migThr ? 1 : migRef - pocRef > migThr ? -1 : 0
+bool  migOkLong  = not useMigFilter or migState >= 0
+bool  migOkShort = not useMigFilter or migState <= 0
+
+// --- HTF-Bias ---------------------------------------------------------------
+bool htfUsable  = useHtfFilter and htfTfOk and not na(htfPoc)
+bool htfOkLong  = not htfUsable or close > htfPocRef
+bool htfOkShort = not htfUsable or close < htfPocRef
+
+// --- Poor High / Poor Low als Kontextfilter ---------------------------------
+bool poorOkLong  = not usePoorFilter or not poorLow
+bool poorOkShort = not usePoorFilter or not poorHigh
+
+// Preis kam sauber von oben / von unten an die Zone heran.
+cameFromAbove(level) => nz(lowestPrev,  -1e12) > level + tolValue
+cameFromBelow(level) => nz(highestPrev,  1e12) < level - tolValue
+
+// Bullische Reaktion an einem Level: Zone von oben angetestet, Kerze dreht.
+bullReaction(level) =>
+    float barRange  = high - low
+    float lowerWick = math.min(open, close) - low
+    bool  touched   = low <= level + tolValue
+    bool  wickOk    = touched and barRange > 0 and lowerWick >= wickRatio * barRange and close > level
+    bool  closeOk   = touched and close > level and close > open
+    confirmMode == "Wick-Rejection" ? wickOk : confirmMode == "Close-Bestätigung" ? closeOk : (wickOk or closeOk)
+
+// Bearische Reaktion an einem Level: Zone von unten angetestet, Kerze dreht.
+bearReaction(level) =>
+    float barRange  = high - low
+    float upperWick = high - math.max(open, close)
+    bool  touched   = high >= level - tolValue
+    bool  wickOk    = touched and barRange > 0 and upperWick >= wickRatio * barRange and close < level
+    bool  closeOk   = touched and close < level and close < open
+    confirmMode == "Wick-Rejection" ? wickOk : confirmMode == "Close-Bestätigung" ? closeOk : (wickOk or closeOk)
+
+// --- Volumen-Divergenz: Test gegen den vorherigen Test desselben Levels -----
+var float lastVolPoc = 0.0
+var int   lastBarPoc = -99999
+var float lastVolVal = 0.0
+var int   lastBarVal = -99999
+var float lastVolVah = 0.0
+var int   lastBarVah = -99999
+
+bool touchPoc = profileValid and low <= pocRef + tolValue and high >= pocRef - tolValue
+bool touchVal = profileValid and low <= valRef + tolValue and high >= valRef - tolValue
+bool touchVah = profileValid and low <= vahRef + tolValue and high >= vahRef - tolValue
+
+bool divOkPoc = not useDivFilter or nz(volume) > lastVolPoc
+bool divOkVal = not useDivFilter or nz(volume) > lastVolVal
+bool divOkVah = not useDivFilter or nz(volume) > lastVolVah
+
+// --- Basisbedingungen -------------------------------------------------------
+bool baseLong  = profileValid and trendOkLong  and volumeOk and migOkLong  and htfOkLong
+bool baseShort = profileValid and trendOkShort and volumeOk and migOkShort and htfOkShort
+
+// --- Setup A: POC-Pullback --------------------------------------------------
+bool pocLongRaw  = useSetupPOC and baseLong  and divOkPoc and cameFromAbove(pocRef) and bullReaction(pocRef)
+bool pocShortRaw = useSetupPOC and baseShort and divOkPoc and cameFromBelow(pocRef) and bearReaction(pocRef)
+
+// --- Setup B: VAL als Support / VAH als Resistance --------------------------
+bool valLongRaw  = useSetupVA and baseLong  and divOkVal and poorOkLong  and cameFromAbove(valRef) and bullReaction(valRef)
+bool vahShortRaw = useSetupVA and baseShort and divOkVah and poorOkShort and cameFromBelow(vahRef) and bearReaction(vahRef)
+
+// --- Setup C/D: LVN-Rejection und LVN-Breakaway -----------------------------
+float barBody   = math.abs(close - open)
+float barRangeF = high - low
+bool  strongBar = barRangeF > 0 and barBody >= breakBodyRatio * barRangeF and nz(volume) > nz(volAvg) * breakVolMult
+
+bool  lvnLongRaw   = false
+bool  lvnShortRaw  = false
+bool  brkLongRaw   = false
+bool  brkShortRaw  = false
+
+if profileValid and array.size(lvnLevels) > 0
+    for i = 0 to array.size(lvnLevels) - 1
+        float lv = array.get(lvnLevels, i)
+        // Rejection: Anlauf von einer Seite, Umkehr direkt am LVN
+        if useSetupLVN and baseLong and cameFromAbove(lv) and bullReaction(lv)
+            lvnLongRaw := true
+        if useSetupLVN and baseShort and cameFromBelow(lv) and bearReaction(lv)
+            lvnShortRaw := true
+        // Breakaway: impulsiver Durchbruch (kein Konsens = schnelle Bewegung)
+        if useSetupBreak and baseLong and strongBar and close > open and close > lv + tolValue and close[1] <= lv + tolValue
+            brkLongRaw := true
+        if useSetupBreak and baseShort and strongBar and close < open and close < lv - tolValue and close[1] >= lv - tolValue
+            brkShortRaw := true
+
+// --- Setup E: Failed Auction (VA verlassen, nicht gehalten, zurück) ---------
+bool outsideUp   = profileValid and high > vahRef + tolValue
+bool outsideDown = profileValid and low  < valRef - tolValue
+int  sinceUp     = nz(ta.barssince(outsideUp),   9999)
+int  sinceDown   = nz(ta.barssince(outsideDown), 9999)
+
+bool faShortRaw = useSetupFA and baseShort and sinceUp   <= faMaxBars and close < vahRef - tolValue and close > valRef and (close[1] > vahRef or outsideUp)
+bool faLongRaw  = useSetupFA and baseLong  and sinceDown <= faMaxBars and close > valRef + tolValue and close < vahRef and (close[1] < valRef or outsideDown)
+
+// --- Setup F: Naked POC (nur Session-Modus) ---------------------------------
+var array<float> npLevels = array.new<float>()
+var array<line>  npLines  = array.new<line>()
+
+bool npLongRaw  = false
+bool npShortRaw = false
+
+if useSetupNP and isSessionMode
+    // POC der gerade abgeschlossenen Session sichern
+    if isNewSession and not na(pocPrice[1]) and profileBars[1] >= minProfileBars
+        array.push(npLevels, pocPrice[1])
+        array.push(npLines, line.new(bar_index - 1, pocPrice[1], bar_index, pocPrice[1], color = color.new(npColor, 25), width = 1, style = line.style_dashed, extend = showNpLines ? extend.right : extend.none))
+        while array.size(npLevels) > npMax
+            array.shift(npLevels)
+            line.delete(array.shift(npLines))
+    // Berührung prüfen: ein berührter POC ist nicht mehr "naked"
+    int npIdx = 0
+    while npIdx < array.size(npLevels)
+        float lvl = array.get(npLevels, npIdx)
+        if low <= lvl and high >= lvl
+            if baseLong and cameFromAbove(lvl) and bullReaction(lvl)
+                npLongRaw := true
+            if baseShort and cameFromBelow(lvl) and bearReaction(lvl)
+                npShortRaw := true
+            array.remove(npLevels, npIdx)
+            line.delete(array.remove(npLines, npIdx))
+        else
+            npIdx += 1
+
+// --- Cooldown je Signaltyp (Sniper statt Signal-Spam) -----------------------
+// 0 pocL 1 pocS 2 valL 3 vahS 4 lvnL 5 lvnS 6 brkL 7 brkS 8 faL 9 faS 10 npL 11 npS
+var array<int> lastSigBars = array.new<int>(12, -99999)
+
+gate(idx, raw) =>
+    bool ok = raw and bar_index - array.get(lastSigBars, idx) >= cooldownBars
+    if ok
+        array.set(lastSigBars, idx, bar_index)
+    ok
+
+bool isPocLong  = gate(0,  pocLongRaw)
+bool isPocShort = gate(1,  pocShortRaw)
+bool isValLong  = gate(2,  valLongRaw)
+bool isVahShort = gate(3,  vahShortRaw)
+bool isLvnLong  = gate(4,  lvnLongRaw)
+bool isLvnShort = gate(5,  lvnShortRaw)
+bool isBrkLong  = gate(6,  brkLongRaw)
+bool isBrkShort = gate(7,  brkShortRaw)
+bool isFaLong   = gate(8,  faLongRaw)
+bool isFaShort  = gate(9,  faShortRaw)
+bool isNpLong   = gate(10, npLongRaw)
+bool isNpShort  = gate(11, npShortRaw)
+
+bool isAnyLong  = isPocLong  or isValLong  or isLvnLong  or isBrkLong  or isFaLong  or isNpLong
+bool isAnyShort = isPocShort or isVahShort or isLvnShort or isBrkShort or isFaShort or isNpShort
+
+// Test-Volumen erst NACH der Signalauswertung fortschreiben (Divergenz-Filter).
+if touchPoc and bar_index - lastBarPoc > 1
+    lastVolPoc := nz(volume)
+    lastBarPoc := bar_index
+if touchVal and bar_index - lastBarVal > 1
+    lastVolVal := nz(volume)
+    lastBarVal := bar_index
+if touchVah and bar_index - lastBarVah > 1
+    lastVolVah := nz(volume)
+    lastBarVah := bar_index
+
+// Letztes Signal für das Info-Panel merken.
+var string lastSigTxt   = "–"
+var color  lastSigColor = color.gray
+var int    lastSigBar   = na
+if isAnyLong
+    lastSigTxt   := isPocLong ? "LONG · POC" : isValLong ? "LONG · VAL" : isLvnLong ? "LONG · LVN" : isBrkLong ? "LONG · Breakaway" : isFaLong ? "LONG · Failed Auction" : "LONG · Naked POC"
+    lastSigColor := longLineColor
+    lastSigBar   := bar_index
+if isAnyShort
+    lastSigTxt   := isPocShort ? "SHORT · POC" : isVahShort ? "SHORT · VAH" : isLvnShort ? "SHORT · LVN" : isBrkShort ? "SHORT · Breakaway" : isFaShort ? "SHORT · Failed Auction" : "SHORT · Naked POC"
+    lastSigColor := shortLineColor
+    lastSigBar   := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5) PLOTTING / VISUALISIERUNG
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Kontext-Plots ----------------------------------------------------------
+plot(showMaLine and useTrendFilter ? maValue : na, "Trend MA", color = maColor, linewidth = 1)
+plot(showHtfLevel and htfTfOk and not na(htfPoc) ? htfPoc : na, "HTF POC", color = color.new(htfColor, 20), linewidth = 2, style = plot.style_linebr)
+
+pHistVah = plot(showLevelPlots and profileValid ? vahPrice : na, "VAH Verlauf", color = color.new(vaColor, 55),  linewidth = 1, style = plot.style_linebr)
+pHistVal = plot(showLevelPlots and profileValid ? valPrice : na, "VAL Verlauf", color = color.new(vaColor, 55),  linewidth = 1, style = plot.style_linebr)
+plot(showLevelPlots and profileValid ? pocPrice : na, "POC Verlauf", color = color.new(pocColor, 35), linewidth = 1, style = plot.style_linebr)
+fill(pHistVah, pHistVal, color = showLevelPlots ? vaFillColor : na, title = "Value Area Verlauf")
+
+// --- Signalkerze und Marker -------------------------------------------------
+barcolor(colorSigBar and isAnyLong ? longLineColor : colorSigBar and isAnyShort ? shortLineColor : na, title = "Signalkerze")
+
+plotshape(showMarkers and isPocLong,  "Long · POC",            shape.triangleup,   location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isValLong,  "Long · VAL",            shape.circle,       location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isLvnLong,  "Long · LVN",            shape.diamond,      location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isBrkLong,  "Long · Breakaway",      shape.arrowup,      location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isFaLong,   "Long · Failed Auction", shape.square,       location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isNpLong,   "Long · Naked POC",      shape.xcross,       location.belowbar, longLineColor,  size = size.tiny)
+plotshape(showMarkers and isPocShort, "Short · POC",            shape.triangledown, location.abovebar, shortLineColor, size = size.tiny)
+plotshape(showMarkers and isVahShort, "Short · VAH",            shape.circle,       location.abovebar, shortLineColor, size = size.tiny)
+plotshape(showMarkers and isLvnShort, "Short · LVN",            shape.diamond,      location.abovebar, shortLineColor, size = size.tiny)
+plotshape(showMarkers and isBrkShort, "Short · Breakaway",      shape.arrowdown,    location.abovebar, shortLineColor, size = size.tiny)
+plotshape(showMarkers and isFaShort,  "Short · Failed Auction", shape.square,       location.abovebar, shortLineColor, size = size.tiny)
+plotshape(showMarkers and isNpShort,  "Short · Naked POC",      shape.xcross,       location.abovebar, shortLineColor, size = size.tiny)
+
+// --- Signal-Linien am Einstiegspreis ----------------------------------------
+var array<line>  longLines   = array.new<line>()
+var array<line>  shortLines  = array.new<line>()
+var array<label> longLabels  = array.new<label>()
+var array<label> shortLabels = array.new<label>()
+
+drawSignalLine(price, lineCol, txt, lineArr, labelArr) =>
+    line ln = line.new(bar_index, price, bar_index + sigLineLength, price, color = color.new(lineCol, 25), width = 1, style = line.style_solid, extend = sigLineExtend ? extend.right : extend.none)
+    array.push(lineArr, ln)
+    while array.size(lineArr) > sigLineKeep
+        line.delete(array.shift(lineArr))
+    if showSigLabels
+        array.push(labelArr, label.new(bar_index, price, txt, style = label.style_none, textcolor = lineCol, size = size.tiny, textalign = text.align_right))
+    while array.size(labelArr) > sigLineKeep
+        label.delete(array.shift(labelArr))
+    ln
+
+if showSigLines and isAnyLong
+    drawSignalLine(close, longLineColor, "LONG", longLines, longLabels)
+if showSigLines and isAnyShort
+    drawSignalLine(close, shortLineColor, "SHORT", shortLines, shortLabels)
+
+// --- Profil-Zeichnung (nur auf der letzten Bar, hält den Chart schlank) -----
+var array<box>   histBoxes = array.new<box>()
+var array<line>  lvnLines  = array.new<line>()
+var box   vaBox  = na
+var line  lnPoc  = na
+var line  lnVah  = na
+var line  lnVal  = na
+var label tagPoc = na
+var label tagVah = na
+var label tagVal = na
+var label tagPoorHi = na
+var label tagPoorLo = na
+
+if barstate.islast
+    // Alte Objekte der vorherigen Zeichnung entfernen
+    while array.size(histBoxes) > 0
+        box.delete(array.pop(histBoxes))
+    while array.size(lvnLines) > 0
+        line.delete(array.pop(lvnLines))
+    box.delete(vaBox)
+    line.delete(lnPoc)
+    line.delete(lnVah)
+    line.delete(lnVal)
+    label.delete(tagPoc)
+    label.delete(tagVah)
+    label.delete(tagVal)
+    label.delete(tagPoorHi)
+    label.delete(tagPoorLo)
+
+    if profileValid
+        int xLeft  = bar_index - profileBars + 1
+        int xRight = bar_index
+
+        // --- Value-Area-Fläche --------------------------------------------
+        if showVaBox
+            vaBox := box.new(xLeft, vahPrice, xRight, valPrice, border_color = color.new(vaColor, 80), border_width = 1, bgcolor = vaFillColor)
+
+        // --- Histogramm: eine Box je Bin, Breite = Anteil am Max-Volumen ---
+        if showHistogram and nz(binStep) > 0
+            float maxBinVol = array.max(binVolume)
+            if maxBinVol > 0
+                int   bins = array.size(binVolume)
+                float pad  = binStep * 0.12  // kleine Lücke zwischen den Bins
+                for i = 0 to bins - 1
+                    float bv = array.get(binVolume, i)
+                    if bv > 0
+                        float yLo    = profileLow + i * binStep
+                        float yMid   = yLo + binStep * 0.5
+                        int   w      = math.max(1, int(math.round(bv / maxBinVol * histWidth)))
+                        int   bx1    = histRight ? xRight + 3     : xRight - w
+                        int   bx2    = histRight ? xRight + 3 + w : xRight
+                        bool  isPocB = math.abs(yMid - pocPrice) < binStep * 0.25
+                        bool  inVa   = yMid > valPrice and yMid < vahPrice
+                        color bCol   = isPocB ? color.new(pocColor, 45) : inVa ? histVaColor : histOutColor
+                        array.push(histBoxes, box.new(bx1, yLo + binStep - pad, bx2, yLo + pad, border_width = 0, border_color = color.new(color.gray, 100), bgcolor = bCol))
+
+        // --- Level-Linien ---------------------------------------------------
+        if showLevelLines
+            lnPoc := line.new(xLeft, pocPrice, xRight, pocPrice, color = pocColor, width = pocWidth)
+            lnVah := line.new(xLeft, vahPrice, xRight, vahPrice, color = color.new(vaColor, 20), width = vaWidth, style = line.style_dashed)
+            lnVal := line.new(xLeft, valPrice, xRight, valPrice, color = color.new(vaColor, 20), width = vaWidth, style = line.style_dashed)
+
+        // --- LVN-Linien -----------------------------------------------------
+        if showLvnLines and array.size(lvnLevels) > 0
+            for i = 0 to array.size(lvnLevels) - 1
+                float lv = array.get(lvnLevels, i)
+                array.push(lvnLines, line.new(xLeft, lv, xRight, lv, color = color.new(lvnColor, 30), width = 1, style = line.style_dotted))
+
+        // --- Preis-Tags am rechten Rand -------------------------------------
+        if showLevelTags
+            tagPoc := label.new(xRight, pocPrice, "POC  " + str.tostring(pocPrice, format.mintick), style = label.style_label_left, color = color.new(pocColor, 88), textcolor = pocColor, size = size.small)
+            tagVah := label.new(xRight, vahPrice, "VAH  " + str.tostring(vahPrice, format.mintick), style = label.style_label_left, color = color.new(vaColor, 90),  textcolor = vaColor,  size = size.tiny)
+            tagVal := label.new(xRight, valPrice, "VAL  " + str.tostring(valPrice, format.mintick), style = label.style_label_left, color = color.new(vaColor, 90),  textcolor = vaColor,  size = size.tiny)
+
+        // --- Poor High / Poor Low markieren ---------------------------------
+        if showPoorTags and nz(binStep) > 0
+            if poorHigh
+                tagPoorHi := label.new(xLeft + int((xRight - xLeft) * 0.5), profileLow + binStep * array.size(binVolume), "Poor High", style = label.style_label_down, color = color.new(shortLineColor, 85), textcolor = shortLineColor, size = size.tiny)
+            if poorLow
+                tagPoorLo := label.new(xLeft + int((xRight - xLeft) * 0.5), profileLow, "Poor Low", style = label.style_label_up, color = color.new(longLineColor, 85), textcolor = longLineColor, size = size.tiny)
+
+// --- Info-Panel --------------------------------------------------------------
+var table infoTbl = showInfoTable ? table.new(tablePos == "Oben links" ? position.top_left : tablePos == "Unten rechts" ? position.bottom_right : tablePos == "Unten links" ? position.bottom_left : position.top_right, 2, 10, bgcolor = color.new(chart.bg_color, 15), frame_color = color.new(chart.fg_color, 80), frame_width = 1, border_color = color.new(chart.fg_color, 90), border_width = 1) : na
+
+if showInfoTable and barstate.islast
+    string modeTxt = isSessionMode ? "Session · " + sessionPeriod : "Fixed · " + str.tostring(lookbackBars) + " Bars"
+    string posTxt  = not profileValid ? "–" : close > vahRef ? "über VA" : close < valRef ? "unter VA" : "in VA"
+    color  posCol  = not profileValid ? chart.fg_color : close > vahRef ? longLineColor : close < valRef ? shortLineColor : chart.fg_color
+    string migTxt  = not profileValid ? "–" : migState == 1 ? "aufwärts" : migState == -1 ? "abwärts" : "Balance"
+    color  migCol  = migState == 1 ? longLineColor : migState == -1 ? shortLineColor : color.new(chart.fg_color, 25)
+    string poorTxt = poorHigh and poorLow ? "Poor High + Low" : poorHigh ? "Poor High" : poorLow ? "Poor Low" : "Excess ok"
+    color  poorCol = poorHigh and not poorLow ? shortLineColor : poorLow and not poorHigh ? longLineColor : color.new(chart.fg_color, 25)
+    string lvnTxt  = "–"
+    if array.size(lvnLevels) > 0
+        lvnTxt := str.tostring(array.size(lvnLevels)) + " · " + str.tostring(array.get(lvnLevels, 0), format.mintick)
+    string npTxt   = not (useSetupNP and isSessionMode) ? "–" : str.tostring(array.size(npLevels)) + " offen"
+    string htfTxt  = not htfTfOk or na(htfPoc) ? "–" : str.tostring(htfPoc, format.mintick)
+    string sigTxt  = na(lastSigBar) ? "–" : lastSigTxt + "  (" + str.tostring(bar_index - lastSigBar) + ")"
+
+    table.cell(infoTbl, 0, 0, "VP SNIPER", text_color = chart.fg_color, text_size = size.small, text_halign = text.align_left, bgcolor = color.new(chart.fg_color, 92))
+    table.cell(infoTbl, 1, 0, modeTxt,     text_color = color.new(chart.fg_color, 25), text_size = size.tiny, text_halign = text.align_right, bgcolor = color.new(chart.fg_color, 92))
+    table.cell(infoTbl, 0, 1, "VAH", text_color = vaColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 1, profileValid ? str.tostring(vahPrice, format.mintick) : "–", text_color = vaColor, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 2, "POC", text_color = pocColor, text_size = size.small, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 2, profileValid ? str.tostring(pocPrice, format.mintick) : "–", text_color = pocColor, text_size = size.small, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 3, "VAL", text_color = vaColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 3, profileValid ? str.tostring(valPrice, format.mintick) : "–", text_color = vaColor, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 4, "LVN", text_color = lvnColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 4, lvnTxt, text_color = lvnColor, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 5, "HTF POC", text_color = htfColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 5, htfTxt, text_color = htfColor, text_size = size.tiny, text_halign = text.align_right, tooltip = na(htfVah) or na(htfVal) ? "HTF-Profil noch nicht gefüllt" : "HTF Value Area: " + str.tostring(htfVal, format.mintick) + " – " + str.tostring(htfVah, format.mintick))
+    table.cell(infoTbl, 0, 6, "Naked POC", text_color = npColor, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 6, npTxt, text_color = npColor, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 7, "Preis / Migration", text_color = color.new(chart.fg_color, 25), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 7, posTxt + " · " + migTxt, text_color = migState == 0 ? posCol : migCol, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 8, "Struktur", text_color = color.new(chart.fg_color, 25), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 8, poorTxt, text_color = poorCol, text_size = size.tiny, text_halign = text.align_right)
+    table.cell(infoTbl, 0, 9, "Signal", text_color = color.new(chart.fg_color, 25), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(infoTbl, 1, 9, sigTxt, text_color = lastSigColor, text_size = size.tiny, text_halign = text.align_right)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6) ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+alertcondition(isPocLong,  "VP Sniper: Long · POC-Pullback",   "{{ticker}} LONG | POC-Pullback | Preis {{close}}")
+alertcondition(isPocShort, "VP Sniper: Short · POC-Pullback",  "{{ticker}} SHORT | POC-Pullback | Preis {{close}}")
+alertcondition(isValLong,  "VP Sniper: Long · VAL-Pullback",   "{{ticker}} LONG | VAL-Pullback (Value Area Support) | Preis {{close}}")
+alertcondition(isVahShort, "VP Sniper: Short · VAH-Pullback",  "{{ticker}} SHORT | VAH-Pullback (Value Area Resistance) | Preis {{close}}")
+alertcondition(isLvnLong,  "VP Sniper: Long · LVN-Rejection",  "{{ticker}} LONG | LVN-Rejection | Preis {{close}}")
+alertcondition(isLvnShort, "VP Sniper: Short · LVN-Rejection", "{{ticker}} SHORT | LVN-Rejection | Preis {{close}}")
+alertcondition(isBrkLong,  "VP Sniper: Long · LVN-Breakaway",  "{{ticker}} LONG | LVN-Breakaway | Preis {{close}}")
+alertcondition(isBrkShort, "VP Sniper: Short · LVN-Breakaway", "{{ticker}} SHORT | LVN-Breakaway | Preis {{close}}")
+alertcondition(isFaLong,   "VP Sniper: Long · Failed Auction", "{{ticker}} LONG | Failed Auction unter VAL | Preis {{close}}")
+alertcondition(isFaShort,  "VP Sniper: Short · Failed Auction","{{ticker}} SHORT | Failed Auction über VAH | Preis {{close}}")
+alertcondition(isNpLong,   "VP Sniper: Long · Naked POC",      "{{ticker}} LONG | Naked-POC-Retest | Preis {{close}}")
+alertcondition(isNpShort,  "VP Sniper: Short · Naked POC",     "{{ticker}} SHORT | Naked-POC-Retest | Preis {{close}}")
+alertcondition(isAnyLong,  "VP Sniper: Any Long Signal",       "{{ticker}} LONG | Volume Profile Setup | Preis {{close}}")
+alertcondition(isAnyShort, "VP Sniper: Any Short Signal",      "{{ticker}} SHORT | Volume Profile Setup | Preis {{close}}")

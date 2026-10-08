@@ -1,0 +1,331 @@
+//@version=6
+indicator("Order Flow Footprint & Delta", shorttitle="Order Flow Footprint & Delta", overlay=true, max_labels_count=200, max_boxes_count=50, max_lines_count=50)
+
+// ═══════════════════════════════════════════════════════════════════
+// DESCRIPTION (copy into TradingView Publish → Description)
+// Works best with: "Fluid Liquidity Zones - CHoCH + Mitigation + HTF | Xcelerate Trade"
+// ═══════════════════════════════════════════════════════════════════
+//
+// ORDER FLOW FOOTPRINT & DELTA - XCELERATE TRADE
+// Candle + volume proxy scanner (NOT real bid/ask footprint). Dashboard: Proxy = no footprint.
+// Works best with: "Fluid Liquidity Zones - CHoCH + Mitigation + HTF | Xcelerate Trade"
+// (or "Fluid Liquidity Zones - CHoCH | Xcelerate Trade")
+// Use SUPPLY / DEMAND + CHoCH / structure first, then OF labels as confirmation.//
+// GOLDEN RULE
+// Zone (SUPPLY/DEMAND) + structure → then OF1/OF2/OF3 as confirmation — never the reverse.
+// Recommended timeframes: 15m–1h (1m/3m are noisy; more false signals).
+//
+// ── HOW THE 3 SETUPS WORK ──────────────────────────────────────────
+//
+// OF1 — CONTINUATION (cyan)
+// Idea: trend + stacked impulse + pullback + continuation.
+// Long OF1 when:
+//   1) Bull bias (HH/HL + HTF up if enabled)
+//   2) A bullish impulse / stacked strong bars existed
+//   3) Price pulled back into the impulse zone
+//   4) Confirmation (bullish bar / positive delta proxy)
+// Short OF1: mirror (bear bias + down impulse + pullback + down confirm).
+//
+// OF2 — ABSORPTION REVERSAL (violet)
+// Idea: sweep of a level + absorption + reclaim.
+// Long OF2 when:
+//   1) Sweep below a low / level (wick down)
+//   2) Absorption (high volume, little progress)
+//   3) Reclaim above the level + upside aggression
+// Short OF2: sweep above a high → reclaim down.
+//
+// OF3 — BREAK & RETEST (green long / red short)
+// Idea: real volume break → retest → reject.
+// Long OF3: break up → retest broken level as support → rejection up.
+// Short OF3: break down → retest as resistance → rejection down.
+//
+// ── HOW TO READ THE CHART (WITH FLUID LIQUIDITY ZONES) ─────────────
+// 1) Bias / structure (HH HL / LH LL, CHoCH) — higher-level direction
+// 2) Where price is: DEMAND = long bias area, SUPPLY = short bias area
+// 3) Then OF labels:
+//      DEMAND + OF2 or green OF3  → long candidates
+//      SUPPLY + OF2 or red OF3   → short candidates
+//      OF1 only with the trend (not counter-trend in a range)
+// 4) Dashboard "wait" = no signal on the current bar; older labels stay on history
+//
+// SKIP WHEN
+// - Bias = RANGE and you are not clearly on a zone
+// - Label in the middle of a range with no level
+// - OF1 against SUPPLY/DEMAND
+// - Chaotic OF1+OF2+OF3 overlap with no clear level
+//
+// EXAMPLES
+// DEMAND + green OF3 / OF2     → look for LONG (after reclaim/confirm)
+// SUPPLY + red OF3 / OF2       → look for SHORT
+// Cyan OF1 in uptrend, pullback into DEMAND → continuation LONG
+// Label only, no zone/structure → DO NOT ENTER
+//
+// LIMITATION
+// TradingView has no true footprint. Signals are proxies and can be wrong,
+// especially on 1m/3m timeframes. Use with Fluid Liquidity Zones for context.
+// ═══════════════════════════════════════════════════════════════════
+
+// Xcelerate Trade — Order Flow playbook setups (approx. for TradingView)
+// OF1 Continuation | OF2 Absorption reversal | OF3 Break-retest
+
+groupSetup = "Setups"
+showOF1 = input.bool(true, "Show OF1 — Continuation", group=groupSetup)
+showOF2 = input.bool(true, "Show OF2 — Absorption reversal", group=groupSetup)
+showOF3 = input.bool(true, "Show OF3 — Break & retest", group=groupSetup)
+
+groupStruct = "Structure bias"
+swingLen = input.int(5, "Swing lookback", minval=2, maxval=20, group=groupStruct)
+htfTf = input.timeframe("60", "HTF for bias (optional)", group=groupStruct)
+useHtfBias = input.bool(true, "Require HTF bias for OF1", group=groupStruct)
+
+groupVol = "Volume / delta proxy"
+volMaLen = input.int(20, "Volume MA length", minval=5, group=groupVol)
+volImpulseMult = input.float(1.3, "Impulse volume x MA", minval=1.0, step=0.1, group=groupVol)
+bodyImbalance = input.float(0.55, "Strong body ratio (imbalance proxy)", minval=0.35, maxval=0.9, step=0.05, group=groupVol)
+stackBars = input.int(3, "Stacked imbalance bars", minval=2, maxval=6, group=groupVol)
+absorbVolMult = input.float(1.8, "Absorption volume x MA", minval=1.2, step=0.1, group=groupVol)
+absorbBodyMax = input.float(0.35, "Absorption max body ratio", minval=0.1, maxval=0.6, step=0.05, group=groupVol)
+
+groupOF1 = "OF1 — Continuation"
+of1PullbackBars = input.int(12, "Max bars for pullback after impulse", minval=3, maxval=40, group=groupOF1)
+of1ZonePad = input.float(0.15, "Pullback zone pad (ATR x)", minval=0.0, step=0.05, group=groupOF1)
+
+groupOF2 = "OF2 — Reversal"
+of2SweepLookback = input.int(20, "Level lookback for sweep", minval=5, maxval=80, group=groupOF2)
+of2ConfirmBars = input.int(3, "Bars to reclaim after sweep", minval=1, maxval=8, group=groupOF2)
+
+groupOF3 = "OF3 — Break & retest"
+of3RangeBars = input.int(30, "Range length for break", minval=8, maxval=80, group=groupOF3)
+of3RetestBars = input.int(12, "Max bars for retest after break", minval=3, maxval=40, group=groupOF3)
+of3MinBreakVol = input.float(1.5, "Break volume x MA", minval=1.0, step=0.1, group=groupOF3)
+of3Cooldown = input.int(20, "OF3 cooldown bars", minval=5, maxval=100, group=groupOF3)
+
+groupVis = "Display"
+showDashboard = input.bool(true, "Dashboard", group=groupVis)
+showBreakLines = input.bool(true, "Show break level lines", group=groupVis)
+coolDownBars = input.int(12, "Min bars between OF1/OF2 signals", minval=1, maxval=50, group=groupVis)
+
+atr = ta.atr(14)
+volMa = ta.sma(volume, volMaLen)
+rng = math.max(high - low, syminfo.mintick)
+
+// ── Delta / imbalance proxies ──────────────────────────────────────
+barDelta = close > open ? volume : close < open ? -volume : 0.0
+bodyRatio = rng > 0 ? math.abs(close - open) / rng : 0.0
+bullImb = close > open and bodyRatio >= bodyImbalance and volume >= volMa * volImpulseMult
+bearImb = close < open and bodyRatio >= bodyImbalance and volume >= volMa * volImpulseMult
+
+// stackBars is input — unroll so Pine gets a const-friendly chain
+bullStack = stackBars <= 2 ? bullImb and bullImb[1] : stackBars == 3 ? bullImb and bullImb[1] and bullImb[2] : stackBars == 4 ? bullImb and bullImb[1] and bullImb[2] and bullImb[3] : stackBars == 5 ? bullImb and bullImb[1] and bullImb[2] and bullImb[3] and bullImb[4] : bullImb and bullImb[1] and bullImb[2] and bullImb[3] and bullImb[4] and bullImb[5]
+bearStack = stackBars <= 2 ? bearImb and bearImb[1] : stackBars == 3 ? bearImb and bearImb[1] and bearImb[2] : stackBars == 4 ? bearImb and bearImb[1] and bearImb[2] and bearImb[3] : stackBars == 5 ? bearImb and bearImb[1] and bearImb[2] and bearImb[3] and bearImb[4] : bearImb and bearImb[1] and bearImb[2] and bearImb[3] and bearImb[4] and bearImb[5]
+
+absorptionBull = volume >= volMa * absorbVolMult and bodyRatio <= absorbBodyMax and close >= open
+absorptionBear = volume >= volMa * absorbVolMult and bodyRatio <= absorbBodyMax and close <= open
+
+// ── Structure (chart TF) ───────────────────────────────────────────
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+var float lastPh = na
+var float prevPh = na
+var float lastPl = na
+var float prevPl = na
+if not na(ph)
+    prevPh := lastPh
+    lastPh := ph
+if not na(pl)
+    prevPl := lastPl
+    lastPl := pl
+
+bullStruct = not na(lastPh) and not na(prevPh) and not na(lastPl) and not na(prevPl) and lastPh > prevPh and lastPl > prevPl
+bearStruct = not na(lastPh) and not na(prevPh) and not na(lastPl) and not na(prevPl) and lastPh < prevPh and lastPl < prevPl
+
+htfClose = request.security(syminfo.tickerid, htfTf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+htfBull = htfClose > htfEma
+htfBear = htfClose < htfEma
+biasBull = useHtfBias ? bullStruct and htfBull : bullStruct
+biasBear = useHtfBias ? bearStruct and htfBear : bearStruct
+
+// ── OF1: impulse stack → pullback into zone → continuation confirm ─
+var float of1BullTop = na
+var float of1BullBot = na
+var int of1BullBar = na
+var float of1BearTop = na
+var float of1BearBot = na
+var int of1BearBar = na
+var int lastOf1Bull = na
+var int lastOf1Bear = na
+
+if bullStack
+    of1BullTop := ta.highest(high, stackBars)
+    of1BullBot := ta.lowest(low, stackBars)
+    of1BullBar := bar_index
+if bearStack
+    of1BearTop := ta.highest(high, stackBars)
+    of1BearBot := ta.lowest(low, stackBars)
+    of1BearBar := bar_index
+
+pad = atr * of1ZonePad
+inBullPull = not na(of1BullBar) and (bar_index - of1BullBar) <= of1PullbackBars and (bar_index - of1BullBar) >= 1 and low <= of1BullTop + pad and low >= of1BullBot - pad
+inBearPull = not na(of1BearBar) and (bar_index - of1BearBar) <= of1PullbackBars and (bar_index - of1BearBar) >= 1 and high >= of1BearBot - pad and high <= of1BearTop + pad
+
+of1LongRaw = showOF1 and biasBull and inBullPull and (bullImb or (barDelta > 0 and close > open and volume > volMa))
+of1ShortRaw = showOF1 and biasBear and inBearPull and (bearImb or (barDelta < 0 and close < open and volume > volMa))
+of1Long = of1LongRaw and (na(lastOf1Bull) or bar_index - lastOf1Bull >= coolDownBars)
+of1Short = of1ShortRaw and (na(lastOf1Bear) or bar_index - lastOf1Bear >= coolDownBars)
+if of1Long
+    lastOf1Bull := bar_index
+if of1Short
+    lastOf1Bear := bar_index
+
+// ── OF2: sweep level + absorption + reclaim ────────────────────────
+swingHi = ta.highest(high, of2SweepLookback)[1]
+swingLo = ta.lowest(low, of2SweepLookback)[1]
+sessionHi = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+sessionLo = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+
+levelHi = math.max(swingHi, nz(sessionHi, swingHi))
+levelLo = math.min(swingLo, nz(sessionLo, swingLo))
+
+var float sweepHiExt = na
+var int sweepHiBar = na
+var float sweepLoExt = na
+var int sweepLoBar = na
+var int lastOf2Bull = na
+var int lastOf2Bear = na
+
+bullSweep = high > levelHi and close < levelHi
+bearSweep = low < levelLo and close > levelLo
+if bullSweep
+    sweepHiExt := high
+    sweepHiBar := bar_index
+if bearSweep
+    sweepLoExt := low
+    sweepLoBar := bar_index
+
+of2ShortRaw = showOF2 and not na(sweepHiBar) and (bar_index - sweepHiBar) <= of2ConfirmBars and (bar_index - sweepHiBar) >= 1 and close < levelHi and (absorptionBear or bearImb) and high <= sweepHiExt
+of2LongRaw = showOF2 and not na(sweepLoBar) and (bar_index - sweepLoBar) <= of2ConfirmBars and (bar_index - sweepLoBar) >= 1 and close > levelLo and (absorptionBull or bullImb) and low >= sweepLoExt
+
+of2Long = of2LongRaw and (na(lastOf2Bull) or bar_index - lastOf2Bull >= coolDownBars)
+of2Short = of2ShortRaw and (na(lastOf2Bear) or bar_index - lastOf2Bear >= coolDownBars)
+if of2Long
+    lastOf2Bull := bar_index
+if of2Short
+    lastOf2Bear := bar_index
+
+// site message (fixed — not in Settings; mid-script so it is not at file end)
+showSitePromo = true
+promoIntervalMin = 7
+promoHighlightSec = 30
+promoMsg = "For more indicators & strategies\nvisit trading.xcelerate.trade"
+promoIntervalMs = promoIntervalMin * 60 * 1000
+promoVisibleMs = promoHighlightSec * 1000
+var table sitePromoTbl = na
+varip int promoHiddenAnchorMs = -1
+varip int promoVisibleAnchorMs = -1
+if showSitePromo and barstate.islast
+    if na(sitePromoTbl)
+        sitePromoTbl := table.new(position.middle_center, 1, 1, border_width=0, frame_color=color.new(color.black, 100), bgcolor=color.new(color.black, 100))
+    nowMs = na(timenow) ? time_close : timenow
+    if promoHiddenAnchorMs < 0 and promoVisibleAnchorMs < 0
+        promoHiddenAnchorMs := nowMs
+    if promoVisibleAnchorMs >= 0
+        if nowMs - promoVisibleAnchorMs >= promoVisibleMs
+            promoHiddenAnchorMs := nowMs
+            promoVisibleAnchorMs := -1
+    else if promoHiddenAnchorMs >= 0 and nowMs - promoHiddenAnchorMs >= promoIntervalMs
+        promoVisibleAnchorMs := nowMs
+    showPromoNow = promoVisibleAnchorMs >= 0 and nowMs - promoVisibleAnchorMs < promoVisibleMs
+    if showPromoNow
+        table.cell(sitePromoTbl, 0, 0, promoMsg, text_color=color.white, text_size=size.large, bgcolor=color.new(color.black, 25), text_halign=text.align_center)
+    else
+        table.cell(sitePromoTbl, 0, 0, "", bgcolor=color.new(color.black, 100), text_color=color.new(color.white, 100), text_size=size.large)
+
+// ── OF3: range break with volume → retest → rejection ──────────────
+rangeHi = ta.highest(high, of3RangeBars)[1]
+rangeLo = ta.lowest(low, of3RangeBars)[1]
+// Need a decisive close beyond the range (not a tiny wick poke)
+breakUp = close > rangeHi + atr * 0.1 and volume >= volMa * of3MinBreakVol and close > open and bodyRatio >= 0.45
+breakDn = close < rangeLo - atr * 0.1 and volume >= volMa * of3MinBreakVol and close < open and bodyRatio >= 0.45
+
+var float brkLvl = na
+var bool brkBull = false
+var int brkBar = na
+var bool of3Used = false
+var int lastOf3Bull = na
+var int lastOf3Bear = na
+var line brkLine = na
+
+if breakUp
+    brkLvl := rangeHi
+    brkBull := true
+    brkBar := bar_index
+    of3Used := false
+    if showBreakLines
+        if not na(brkLine)
+            line.delete(brkLine)
+        brkLine := line.new(bar_index, brkLvl, bar_index + of3RetestBars, brkLvl, color=color.new(#fbbf24, 20), width=1, style=line.style_dashed)
+if breakDn
+    brkLvl := rangeLo
+    brkBull := false
+    brkBar := bar_index
+    of3Used := false
+    if showBreakLines
+        if not na(brkLine)
+            line.delete(brkLine)
+        brkLine := line.new(bar_index, brkLvl, bar_index + of3RetestBars, brkLvl, color=color.new(#fbbf24, 20), width=1, style=line.style_dashed)
+
+of3Window = showOF3 and not na(brkBar) and not na(brkLvl) and not of3Used and (bar_index - brkBar) <= of3RetestBars and (bar_index - brkBar) >= 2
+of3LongRaw = of3Window and brkBull and low <= brkLvl + atr * 0.1 and close > brkLvl and volume > volMa and (bullImb or (barDelta > 0 and bodyRatio >= 0.4))
+of3ShortRaw = of3Window and not brkBull and high >= brkLvl - atr * 0.1 and close < brkLvl and volume > volMa and (bearImb or (barDelta < 0 and bodyRatio >= 0.4))
+
+of3Long = of3LongRaw and (na(lastOf3Bull) or bar_index - lastOf3Bull >= of3Cooldown)
+of3Short = of3ShortRaw and (na(lastOf3Bear) or bar_index - lastOf3Bear >= of3Cooldown)
+if of3Long
+    lastOf3Bull := bar_index
+    of3Used := true
+if of3Short
+    lastOf3Bear := bar_index
+    of3Used := true
+
+// ── Visuals (labels only — no bgcolor vertical strips) ─────────────
+// Default Style colors (as set on chart before republish)
+plotshape(of1Long, title="OF1 Long", style=shape.labelup, location=location.belowbar, color=color.new(#00897B, 0), text="OF1", textcolor=color.white, size=size.small)
+plotshape(of1Short, title="OF1 Short", style=shape.labeldown, location=location.abovebar, color=color.new(#FF5252, 0), text="OF1", textcolor=color.white, size=size.small)
+plotshape(of2Long, title="OF2 Long", style=shape.labelup, location=location.belowbar, color=color.new(#4DB6AC, 0), text="OF2", textcolor=color.white, size=size.small)
+plotshape(of2Short, title="OF2 Short", style=shape.labeldown, location=location.abovebar, color=color.new(#FF8A80, 0), text="OF2", textcolor=color.white, size=size.small)
+plotshape(of3Long, title="OF3 Long", style=shape.labelup, location=location.belowbar, color=color.new(#00E676, 0), text="OF3", textcolor=color.black, size=size.small)
+plotshape(of3Short, title="OF3 Short", style=shape.labeldown, location=location.abovebar, color=color.new(#FF8A80, 0), text="OF3", textcolor=color.white, size=size.small)
+
+// ── Dashboard ──────────────────────────────────────────────────────
+var table dash = na
+if showDashboard and barstate.islast
+    if na(dash)
+        dash := table.new(position.top_right, 2, 8, bgcolor=color.new(#020617, 15), border_color=color.new(#334155, 0), border_width=1)
+    table.cell(dash, 0, 0, "OF Footprint Delta", text_color=color.white, bgcolor=color.new(#0ea5e9, 40), text_size=size.small)
+    table.merge_cells(dash, 0, 0, 1, 0)
+    biasTxt = biasBull ? "BULL" : biasBear ? "BEAR" : "RANGE"
+    biasCol = biasBull ? #34d399 : biasBear ? #f87171 : #94a3b8
+    table.cell(dash, 0, 1, "Bias", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 1, biasTxt, text_color=biasCol, text_size=size.tiny)
+    table.cell(dash, 0, 2, "dBar", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 2, str.tostring(math.round(barDelta)), text_color=barDelta >= 0 ? #34d399 : #f87171, text_size=size.tiny)
+    table.cell(dash, 0, 3, "Stack", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 3, bullStack ? "BULL x" + str.tostring(stackBars) : bearStack ? "BEAR x" + str.tostring(stackBars) : "-", text_color=bullStack ? #22d3ee : bearStack ? #f87171 : #64748b, text_size=size.tiny)
+    table.cell(dash, 0, 4, "OF1", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 4, of1Long ? "LONG" : of1Short ? "SHORT" : "wait", text_color=of1Long or of1Short ? #22d3ee : #64748b, text_size=size.tiny)
+    table.cell(dash, 0, 5, "OF2", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 5, of2Long ? "LONG" : of2Short ? "SHORT" : "wait", text_color=of2Long or of2Short ? #a78bfa : #64748b, text_size=size.tiny)
+    table.cell(dash, 0, 6, "OF3", text_color=#94a3b8, text_size=size.tiny)
+    table.cell(dash, 1, 6, of3Long ? "LONG" : of3Short ? "SHORT" : "wait", text_color=of3Long or of3Short ? #34d399 : #64748b, text_size=size.tiny)
+    table.cell(dash, 0, 7, "Proxy", text_color=#64748b, text_size=size.tiny)
+    table.cell(dash, 1, 7, "no footprint", text_color=#64748b, text_size=size.tiny)
+
+// ── Alerts ─────────────────────────────────────────────────────────
+alertcondition(of1Long, "OF1 Long", "Xcelerate OF1 Continuation LONG on {{ticker}} {{interval}}")
+alertcondition(of1Short, "OF1 Short", "Xcelerate OF1 Continuation SHORT on {{ticker}} {{interval}}")
+alertcondition(of2Long, "OF2 Long", "Xcelerate OF2 Absorption LONG on {{ticker}} {{interval}}")
+alertcondition(of2Short, "OF2 Short", "Xcelerate OF2 Absorption SHORT on {{ticker}} {{interval}}")
+alertcondition(of3Long, "OF3 Long", "Xcelerate OF3 Break-Retest LONG on {{ticker}} {{interval}}")
+alertcondition(of3Short, "OF3 Short", "Xcelerate OF3 Break-Retest SHORT on {{ticker}} {{interval}}")
+

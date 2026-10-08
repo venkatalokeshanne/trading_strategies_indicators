@@ -1,0 +1,203 @@
+//@version=5
+strategy(title="MNQ ORB – A+ Retest (Inspired)", overlay=true, initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1, commission_type=strategy.commission.cash_per_contract, commission_value=0.37)
+
+// ── INPUTS ───────────────────────────────────────────────────
+orbMinutes  = input.int(15,     "ORB Minutes",                  group="ORB")
+minORBpts   = input.float(20.0, "Min ORB Range (points)",       group="ORB")
+maxORBpts   = input.float(100.0,"Max ORB Range (points)",       group="ORB")
+slMult      = input.float(1.0,  "SL × ATR",        step=0.1,   group="Risk")
+tpORB       = input.float(1.5,  "TP ORB × ATR",    step=0.1,   group="Risk")
+tpSweep     = input.float(2.0,  "TP Sweep × ATR",  step=0.1,   group="Risk")
+riskDollars = input.float(500.0,"Base Risk ($)",                group="Risk")
+maxLoss     = input.float(800.0,"Max Daily Loss ($)",           group="Risk")
+tpTicker    = input.string("MNQ1!", "Ticker",                   group="Alerts")
+
+// ── TIME ─────────────────────────────────────────────────────
+nyHour   = hour(time, "America/New_York")
+nyMinute = minute(time, "America/New_York")
+nyT      = nyHour * 100 + nyMinute
+
+isPreMarket   = nyT < 930
+inOrbWindow   = nyT >= 930 and nyT < (930 + orbMinutes)
+inTradeWindow = nyT >= (930 + orbMinutes) and nyT < 1550
+
+// ── PREVIOUS DAY H/L ─────────────────────────────────────────
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+
+// ── ORB ──────────────────────────────────────────────────────
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbSet  = false
+
+if isPreMarket
+    orbHigh := na
+    orbLow  := na
+    orbSet  := false
+
+if inOrbWindow
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+if nyT == (930 + orbMinutes)
+    orbSet := true
+
+orbRange   = orbHigh - orbLow
+orbRangeOk = orbRange >= minORBpts and orbRange <= maxORBpts
+
+// ── INDICATORS ───────────────────────────────────────────────
+atr = ta.atr(14)
+
+// ── DAILY TRACKING ───────────────────────────────────────────
+var float dayStart    = na
+var bool  tradedToday = false
+
+if isPreMarket
+    dayStart    := strategy.equity
+    tradedToday := false
+
+dailyPnL      = na(dayStart) ? 0.0 : strategy.equity - dayStart
+dailyLimitHit = dailyPnL <= -maxLoss
+
+if dailyLimitHit and strategy.position_size != 0
+    strategy.close_all(comment="Daily Limit")
+
+// ── SIZING ───────────────────────────────────────────────────
+contracts = math.max(1, math.min(math.floor(riskDollars / (atr * slMult * 2.0)), 4))
+
+// ── SWEEP DETECTION ──────────────────────────────────────────
+// PDL Sweep = wick below PDL, close back above = long setup
+// PDH Sweep = wick above PDH, close back below = short setup
+pdlSweepBar = low < pdl and close > pdl
+pdhSweepBar = high > pdh and close < pdh
+
+// ── ARM STATE ────────────────────────────────────────────────
+// 0 = none, 1 = orb long, 2 = orb short, 3 = sweep long, 4 = sweep short
+var int   armState    = 0
+var float armLevel    = na   // the level to retest
+
+if isPreMarket
+    armState := 0
+    armLevel := na
+
+if orbSet and inTradeWindow and not tradedToday and not dailyLimitHit
+    // Sweeps take highest priority and override ORB arms
+    if pdlSweepBar
+        armState := 3
+        armLevel := pdl
+    else if pdhSweepBar
+        armState := 4
+        armLevel := pdh
+    // ORB breakout arms (only if no sweep active)
+    else if armState == 0
+        if close > orbHigh and orbRangeOk
+            armState := 1
+            armLevel := orbHigh
+        else if close < orbLow and orbRangeOk
+            armState := 2
+            armLevel := orbLow
+
+// Invalidation — price moves too far against arm
+if armState == 1 and close < orbLow
+    armState := 0
+if armState == 2 and close > orbHigh
+    armState := 0
+if armState == 3 and close < pdl - atr * 1.5
+    armState := 0
+if armState == 4 and close > pdh + atr * 1.5
+    armState := 0
+
+// ── RETEST ZONE ──────────────────────────────────────────────
+buf = atr * 0.4
+
+orbLongRetest   = armState == 1 and low  <= armLevel + buf and close >= armLevel - buf and close > orbLow
+orbShortRetest  = armState == 2 and high >= armLevel - buf and close <= armLevel + buf and close < orbHigh
+sweepLongRetest = armState == 3 and low  <= armLevel + buf and close >= armLevel - buf
+sweepShortRetest= armState == 4 and high >= armLevel - buf and close <= armLevel + buf
+
+canTrade = strategy.position_size == 0 and not tradedToday and not dailyLimitHit and inTradeWindow
+
+longSignal       = orbLongRetest   and canTrade
+shortSignal      = orbShortRetest  and canTrade
+sweepLongSignal  = sweepLongRetest  and canTrade
+sweepShortSignal = sweepShortRetest and canTrade
+
+// ── ALERTS ───────────────────────────────────────────────────
+longMsg  = '{"ticker": "' + tpTicker + '", "action": "buy",  "sentiment": "bullish"}'
+shortMsg = '{"ticker": "' + tpTicker + '", "action": "sell", "sentiment": "bearish"}'
+exitMsg  = '{"ticker": "' + tpTicker + '", "action": "exit"}'
+
+// ── EXECUTE ──────────────────────────────────────────────────
+if longSignal
+    strategy.entry("ORB Long", strategy.long, qty=contracts, alert_message=longMsg)
+    strategy.exit("LX", "ORB Long", stop=close - atr * slMult, limit=close + atr * tpORB, alert_message=exitMsg)
+    tradedToday := true
+    armState    := 0
+    alert(longMsg, alert.freq_once_per_bar)
+
+if shortSignal
+    strategy.entry("ORB Short", strategy.short, qty=contracts, alert_message=shortMsg)
+    strategy.exit("SX", "ORB Short", stop=close + atr * slMult, limit=close - atr * tpORB, alert_message=exitMsg)
+    tradedToday := true
+    armState    := 0
+    alert(shortMsg, alert.freq_once_per_bar)
+
+if sweepLongSignal
+    strategy.entry("Sweep Long", strategy.long, qty=contracts, alert_message=longMsg)
+    strategy.exit("SLX", "Sweep Long", stop=close - atr * slMult, limit=close + atr * tpSweep, alert_message=exitMsg)
+    tradedToday := true
+    armState    := 0
+    alert(longMsg, alert.freq_once_per_bar)
+
+if sweepShortSignal
+    strategy.entry("Sweep Short", strategy.short, qty=contracts, alert_message=shortMsg)
+    strategy.exit("SSX", "Sweep Short", stop=close + atr * slMult, limit=close - atr * tpSweep, alert_message=exitMsg)
+    tradedToday := true
+    armState    := 0
+    alert(shortMsg, alert.freq_once_per_bar)
+
+if nyT >= 1550 and strategy.position_size != 0
+    strategy.close_all(comment="EOD", alert_message=exitMsg)
+
+// ── VISUALS ──────────────────────────────────────────────────
+plot(orbSet ? orbHigh : na, "ORB High", color=color.green,                 linewidth=2, style=plot.style_linebr)
+plot(orbSet ? orbLow  : na, "ORB Low",  color=color.red,                   linewidth=2, style=plot.style_linebr)
+plot(pdh,                   "PDH",      color=color.new(color.yellow, 30), linewidth=1, style=plot.style_linebr)
+plot(pdl,                   "PDL",      color=color.new(color.orange, 30), linewidth=1, style=plot.style_linebr)
+
+plotshape(longSignal,        location=location.belowbar, style=shape.triangleup,   color=color.green,  size=size.small,  title="ORB Long")
+plotshape(shortSignal,       location=location.abovebar, style=shape.triangledown, color=color.red,    size=size.small,  title="ORB Short")
+plotshape(sweepLongSignal,   location=location.belowbar, style=shape.triangleup,   color=color.aqua,   size=size.normal, title="Sweep Long")
+plotshape(sweepShortSignal,  location=location.abovebar, style=shape.triangledown, color=color.aqua,   size=size.normal, title="Sweep Short")
+
+// State label
+armLabel = armState == 1 ? "🟢 ORB Long Armed" : armState == 2 ? "🔴 ORB Short Armed" : armState == 3 ? "🔵 Sweep Long Armed" : armState == 4 ? "🟣 Sweep Short Armed" : ""
+bgcolor(armState == 1 ? color.new(color.green,  93) : armState == 2 ? color.new(color.red,    93) : armState == 3 ? color.new(color.aqua,   90) : armState == 4 ? color.new(color.purple, 90) : na)
+bgcolor(dailyLimitHit ? color.new(color.red, 85) : na)
+
+// TP/SL lines on entry
+var line slLine = na
+var line tpLine = na
+
+if longSignal or sweepLongSignal
+    tpM = sweepLongSignal ? tpSweep : tpORB
+    line.delete(slLine)
+    line.delete(tpLine)
+    slLine := line.new(bar_index, close - atr * slMult, bar_index + 30, close - atr * slMult, color=color.red,   width=2, style=line.style_dashed)
+    tpLine := line.new(bar_index, close + atr * tpM,    bar_index + 30, close + atr * tpM,    color=color.green, width=2, style=line.style_dashed)
+
+if shortSignal or sweepShortSignal
+    tpM = sweepShortSignal ? tpSweep : tpORB
+    line.delete(slLine)
+    line.delete(tpLine)
+    slLine := line.new(bar_index, close + atr * slMult, bar_index + 30, close + atr * slMult, color=color.red,   width=2, style=line.style_dashed)
+    tpLine := line.new(bar_index, close - atr * tpM,    bar_index + 30, close - atr * tpM,    color=color.green, width=2, style=line.style_dashed)
+
+// Range label
+if orbSet
+    rangeColor = orbRangeOk ? color.new(color.green, 60) : color.new(color.red, 60)
+    label.new(bar_index, orbHigh, str.tostring(math.round(orbRange)) + "pts " + (orbRangeOk ? "✓" : "✗"), color=rangeColor, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+p1 = plot(orbSet ? orbHigh : na, display=display.none)
+p2 = plot(orbSet ? orbLow  : na, display=display.none)
+fill(p1, p2, color=color.new(color.blue, 88))

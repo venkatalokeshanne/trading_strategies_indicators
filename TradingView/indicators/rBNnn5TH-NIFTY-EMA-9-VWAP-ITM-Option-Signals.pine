@@ -1,0 +1,422 @@
+//@version=6
+indicator("NIFTY EMA 9 + VWAP | ITM Option Signals", overlay=true)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// INPUTS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+emaLength = input.int(9, "EMA Length")
+strikeStep = input.int(50, "NIFTY Strike Interval")
+profitPct = input.float(8.0, "Premium Target %", step=0.1)
+
+// Current weekly option contracts.
+// These are ONLY used for actual premium data.
+// Strike displayed on chart is calculated automatically
+// from the live NIFTY price.
+ceSymbol = input.symbol("NSE:NIFTY260818C24350", "CE Premium Contract")
+peSymbol = input.symbol("NSE:NIFTY260818P24450", "PE Premium Contract")
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// NIFTY EMA + VWAP
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ema9 = ta.ema(close, emaLength)
+vwap = ta.vwap(hlc3)
+plot(ema9, "9 EMA", color=color.orange, linewidth=2)
+plot(vwap, "VWAP", color=color.blue, linewidth=2)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIVE NIFTY STRIKE CALCULATION
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Nearest ATM 50-point strike
+atmStrike = math.round(close / strikeStep) * strikeStep
+
+// 1 strike ITM
+liveCEStrike = atmStrike - strikeStep
+livePEStrike = atmStrike + strikeStep
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ACTUAL OPTION PREMIUM DATA
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ceClose = request.security(
+     ceSymbol,
+     timeframe.period,
+     close,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+ceHigh = request.security(
+     ceSymbol,
+     timeframe.period,
+     high,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+peClose = request.security(
+     peSymbol,
+     timeframe.period,
+     close,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+peHigh = request.security(
+     peSymbol,
+     timeframe.period,
+     high,
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EMA / VWAP CROSS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+emaCrossDown = ta.crossunder(ema9, vwap)
+emaCrossUp   = ta.crossover(ema9, vwap)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// POSITION STATE
+//
+//  0 = No position
+//  1 = CE
+// -1 = PE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var int position = 0
+
+var float entryPremium = na
+var float targetPremium = na
+
+// Store the actual strike entered
+var float entryStrike = na
+var string entryOption = ""
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SIGNAL FLAGS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+bool buyAlert = false
+bool exitAlert = false
+
+bool buyCE = false
+bool buyPE = false
+
+bool exitCE = false
+bool exitPE = false
+
+bool targetExit = false
+bool reversalExit = false
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EXIT INFORMATION
+//
+// These variables are deliberately separate from
+// the active position so the EXIT label retains
+// the old strike even after a reversal.
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var float exitStrike = na
+var float exitPremium = na
+var string exitOption = ""
+var string exitReason = ""
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 8% TARGET
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ceTargetHit =
+     position == 1 and
+     not na(targetPremium) and
+     ceHigh >= targetPremium
+
+peTargetHit =
+     position == -1 and
+     not na(targetPremium) and
+     peHigh >= targetPremium
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TARGET EXIT
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if ceTargetHit
+
+    // SAVE EXIT INFORMATION FIRST
+    exitStrike := entryStrike
+    exitOption := "CE"
+    exitPremium := targetPremium
+    exitReason := "8% TARGET"
+
+    exitCE := true
+    exitAlert := true
+    targetExit := true
+
+    // NOW CLEAR POSITION
+    position := 0
+    entryPremium := na
+    targetPremium := na
+    entryStrike := na
+    entryOption := ""
+
+if peTargetHit
+
+    // SAVE EXIT INFORMATION FIRST
+    exitStrike := entryStrike
+    exitOption := "PE"
+    exitPremium := targetPremium
+    exitReason := "8% TARGET"
+
+    exitPE := true
+    exitAlert := true
+    targetExit := true
+
+    // NOW CLEAR POSITION
+    position := 0
+    entryPremium := na
+    targetPremium := na
+    entryStrike := na
+    entryOption := ""
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EMA CROSS BELOW VWAP
+//
+// EXIT CE
+// BUY 1 ITM PE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if emaCrossDown
+
+    // First exit existing CE
+    if position == 1
+
+        // SAVE OLD CE INFORMATION
+        exitStrike := entryStrike
+        exitOption := "CE"
+        exitPremium := ceClose
+        exitReason := "EMA/VWAP REVERSAL"
+
+        exitCE := true
+        exitAlert := true
+        reversalExit := true
+
+    // BUY PE
+    if not na(peClose)
+
+        buyPE := true
+        buyAlert := true
+
+        position := -1
+
+        entryPremium := peClose
+
+        targetPremium :=
+             entryPremium * (1 + profitPct / 100)
+
+        // IMPORTANT:
+        // Strike comes from LIVE NIFTY price
+        entryStrike := livePEStrike
+        entryOption := "PE"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EMA CROSS ABOVE VWAP
+//
+// EXIT PE
+// BUY 1 ITM CE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if emaCrossUp
+
+    // First exit existing PE
+    if position == -1
+
+        // SAVE OLD PE INFORMATION
+        exitStrike := entryStrike
+        exitOption := "PE"
+        exitPremium := peClose
+        exitReason := "EMA/VWAP REVERSAL"
+
+        exitPE := true
+        exitAlert := true
+        reversalExit := true
+
+    // BUY CE
+    if not na(ceClose)
+
+        buyCE := true
+        buyAlert := true
+
+        position := 1
+
+        entryPremium := ceClose
+
+        targetPremium :=
+             entryPremium * (1 + profitPct / 100)
+
+        // IMPORTANT:
+        // Strike comes from LIVE NIFTY price
+        entryStrike := liveCEStrike
+        entryOption := "CE"
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUY LABEL — PE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if buyPE
+
+    label.new(
+         bar_index,
+         low,
+         "BUY PE\n" +
+         "Strike: " +
+         str.tostring(entryStrike, "#") +
+         "\nEntry: ₹" +
+         str.tostring(entryPremium, "#.##") +
+         "\n8% Target: ₹" +
+         str.tostring(targetPremium, "#.##"),
+         style=label.style_label_up,
+         color=color.red,
+         textcolor=color.white,
+         size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// BUY LABEL — CE
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if buyCE
+
+    label.new(
+         bar_index,
+         low,
+         "BUY CE\n" +
+         "Strike: " +
+         str.tostring(entryStrike, "#") +
+         "\nEntry: ₹" +
+         str.tostring(entryPremium, "#.##") +
+         "\n8% Target: ₹" +
+         str.tostring(targetPremium, "#.##"),
+         style=label.style_label_up,
+         color=color.green,
+         textcolor=color.white,
+         size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// EXIT LABEL
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if exitAlert
+
+    label.new(
+         bar_index,
+         high,
+         "EXIT " +
+         exitOption +
+         "\nStrike: " +
+         str.tostring(exitStrike, "#") +
+         "\nExit: ₹" +
+         str.tostring(exitPremium, "#.##") +
+         "\nReason: " +
+         exitReason,
+         style=label.style_label_down,
+         color=targetExit ? color.blue : color.orange,
+         textcolor=color.white,
+         size=size.small)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LIVE STRIKE DISPLAY
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+var table strikeTable = table.new(
+     position.top_right,
+     2,
+     4,
+     bgcolor=color.new(color.black, 20),
+     border_width=1)
+
+if barstate.islast
+
+    table.cell(
+         strikeTable,
+         0,
+         0,
+         "NIFTY",
+         text_color=color.white,
+         bgcolor=color.gray)
+
+    table.cell(
+         strikeTable,
+         1,
+         0,
+         str.tostring(close, "#.##"),
+         text_color=color.white,
+         bgcolor=color.gray)
+
+    table.cell(
+         strikeTable,
+         0,
+         1,
+         "ATM",
+         text_color=color.white)
+
+    table.cell(
+         strikeTable,
+         1,
+         1,
+         str.tostring(atmStrike, "#"),
+         text_color=color.yellow)
+
+    table.cell(
+         strikeTable,
+         0,
+         2,
+         "1 ITM CE",
+         text_color=color.white)
+
+    table.cell(
+         strikeTable,
+         1,
+         2,
+         str.tostring(liveCEStrike, "#"),
+         text_color=color.lime)
+
+    table.cell(
+         strikeTable,
+         0,
+         3,
+         "1 ITM PE",
+         text_color=color.white)
+
+    table.cell(
+         strikeTable,
+         1,
+         3,
+         str.tostring(livePEStrike, "#"),
+         text_color=color.red)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DATA WINDOW
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+plot(
+     position != 0 ? entryPremium : na,
+     "Entry Premium",
+     color=color.yellow,
+     display=display.data_window)
+
+plot(
+     position != 0 ? targetPremium : na,
+     "8% Target Premium",
+     color=color.aqua,
+     display=display.data_window)
+
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ONLY TWO ALERT CONDITIONS
+//━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+alertcondition(
+     buyAlert,
+     title="NIFTY OPTION BUY",
+     message="NIFTY OPTION BUY")
+
+alertcondition(
+     exitAlert,
+     title="NIFTY OPTION EXIT",
+     message="NIFTY OPTION EXIT")

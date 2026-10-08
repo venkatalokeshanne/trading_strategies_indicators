@@ -1,0 +1,341 @@
+//@version=5
+strategy("ES Master Flow Swing [Strategy]",
+     shorttitle="Master Flow Strat",
+     overlay=true,
+     initial_capital=50000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=2.50,
+     slippage=1,
+     max_labels_count=50,
+     max_lines_count=50)
+
+// ════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ════════════════════════════════════════════════════════════════
+const color COLOR_BULL    = #089981
+const color COLOR_BEAR    = #f23645
+const color COLOR_NEUTRAL = #5b9cf6
+const color COLOR_GRAY    = #606060
+const color COLOR_IB      = #ff9800
+const color COLOR_VWAP    = #9c27b0
+const color COLOR_EMA9    = #2196f3
+const color COLOR_EMA20   = #ffeb3b
+const color COLOR_MRC     = #ffeb3b
+
+// ════════════════════════════════════════════════════════════════
+// INPUTS
+// ════════════════════════════════════════════════════════════════
+group_ma = "Moving Averages"
+showEma920   = input.bool(true,  "Show Short-Term EMAs (9 & 20)",      group=group_ma)
+showEma50200 = input.bool(true,  "Show Institutional EMAs (50 & 200)", group=group_ma)
+ema9Len      = input.int(9,   "EMA 9 Length",   minval=1, group=group_ma)
+ema20Len     = input.int(20,  "EMA 20 Length",  minval=1, group=group_ma)
+ema50Len     = input.int(50,  "EMA 50 Length",  minval=1, group=group_ma)
+ema200Len    = input.int(200, "EMA 200 Length", minval=1, group=group_ma)
+
+group_mrc = "Mean Reversion Channel (MRC)"
+showMrc  = input.bool(true,  "Show MRC Mean & Bands", group=group_mrc)
+mrcLen   = input.int(50,     "MRC Length",  minval=1, group=group_mrc)
+mrcMult  = input.float(2.0,  "MRC Multiplier", minval=0.1, step=0.1, group=group_mrc)
+
+group_vwap = "VWAP & IB"
+showVwap = input.bool(true, "Show VWAP",                   group=group_vwap)
+showIB   = input.bool(true, "Show Initial Balance (1hr)",  group=group_vwap)
+
+group_trigger = "Breakout & Signals"
+showKC      = input.bool(true,  "Show Keltner Channels",       group=group_trigger)
+showSignals = input.bool(true,  "Show Buy/Sell Signal Labels", group=group_trigger)
+kcLen       = input.int(20,     "KC Length",                   group=group_trigger)
+kcMult      = input.float(2.0,  "KC Multiplier",               group=group_trigger)
+
+group_vol = "Volume Visualization"
+showVolColor = input.bool(true, "Volume-Based Candle Coloring", group=group_vol)
+volMaLen     = input.int(20,    "Volume MA Length", minval=1,   group=group_vol)
+
+group_risk = "Swing Management"
+slAtrMult = input.float(3.0, "Stop Loss (ATR Multiplier)",     step=0.1, group=group_risk)
+trailMult = input.float(2.5, "Trailing Stop (ATR Multiplier)", step=0.1, group=group_risk)
+adxThresh = input.int(12,    "Min ADX (Trending Threshold)",   minval=1, group=group_risk)
+
+group_risk2 = "Risk Controls"
+use_session    = input.bool(true,    "Session Filter (Cash Only)",    group=group_risk2)
+use_daily_loss = input.bool(true,    "Daily Loss Limit",              group=group_risk2)
+max_daily_loss = input.float(1000.0, "Max Daily Loss ($)", step=50.0, group=group_risk2)
+use_consec     = input.bool(true,    "Consecutive Loss Breaker",      group=group_risk2)
+max_consec     = input.int(3,        "Max Consecutive Losses",        group=group_risk2)
+
+group_ui = "Display"
+showPriceLabels = input.bool(true, "Show Indicator Labels (Right)", group=group_ui)
+showDashboard   = input.bool(true, "Show Performance Dashboard",    group=group_ui)
+
+// ════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ════════════════════════════════════════════════════════════════
+ema9   = ta.ema(close, ema9Len)
+ema20  = ta.ema(close, ema20Len)
+ema50  = ta.ema(close, ema50Len)
+ema200 = ta.ema(close, ema200Len)
+
+mrcMean  = ta.linreg(close, mrcLen, 0)
+mrcStdev = ta.stdev(close, mrcLen)
+mrcUpper = mrcMean + mrcStdev * mrcMult
+mrcLower = mrcMean - mrcStdev * mrcMult
+
+vwapVal = ta.vwap(close)
+atr     = ta.atr(14)
+
+// Initial Balance — first 60 mins of session
+isNewSession = ta.change(time("D")) != 0
+var float ibHigh     = na
+var float ibLow      = na
+var int   ibStartBar = 0
+
+if isNewSession
+    ibHigh     := high
+    ibLow      := low
+    ibStartBar := bar_index
+else if bar_index - ibStartBar < 60 / (timeframe.isintraday ? timeframe.multiplier : 1)
+    ibHigh := math.max(high, nz(ibHigh, high))
+    ibLow  := math.min(low,  nz(ibLow,  low))
+
+// Bias
+biasBull = close > ema200 and close > ema50
+biasBear = close < ema200 and close < ema50
+
+// Keltner Channel
+[basis, upper, lower] = ta.kc(close, kcLen, kcMult)
+breakoutBull = ta.crossover(close,  upper)
+breakoutBear = ta.crossunder(close, lower)
+
+// ADX trend filter
+[_, _, adxVal] = ta.dmi(14, 14)
+isTrending = adxVal > adxThresh
+
+// ════════════════════════════════════════════════════════════════
+// SESSION FILTER
+// ════════════════════════════════════════════════════════════════
+in_session = not use_session or
+             not na(time(timeframe.period, "0930-1515", "America/New_York"))
+eod_exit   = use_session and
+             not na(time(timeframe.period, "1510-1515", "America/New_York"))
+
+// ════════════════════════════════════════════════════════════════
+// RISK CONTROLS
+// ════════════════════════════════════════════════════════════════
+var float day_start_equity = strategy.equity
+var float daily_pnl        = 0.0
+var bool  daily_halted     = false
+var int   consec_losses    = 0
+var int   last_trade_count = 0
+
+if ta.change(time("D")) != 0
+    day_start_equity := strategy.equity
+    daily_pnl        := 0.0
+    daily_halted     := false
+
+daily_pnl := strategy.equity - day_start_equity
+
+if use_daily_loss and daily_pnl <= -max_daily_loss
+    daily_halted := true
+
+if strategy.closedtrades > last_trade_count
+    last_profit      = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    consec_losses   := last_profit < 0 ? consec_losses + 1 : 0
+    last_trade_count := strategy.closedtrades
+
+consec_halted = use_consec and consec_losses >= max_consec
+risk_ok       = not daily_halted and not consec_halted
+
+// ════════════════════════════════════════════════════════════════
+// SIGNAL CONDITIONS
+// ════════════════════════════════════════════════════════════════
+confirmed    = barstate.isconfirmed
+longTrigger  = biasBull and isTrending and breakoutBull
+shortTrigger = biasBear and isTrending and breakoutBear
+
+longSignal  = confirmed and longTrigger  and in_session and risk_ok and
+              strategy.position_size == 0
+shortSignal = confirmed and shortTrigger and in_session and risk_ok and
+              strategy.position_size == 0
+
+// ════════════════════════════════════════════════════════════════
+// TRAILING STOP STATE
+// ════════════════════════════════════════════════════════════════
+var float trailStop = na
+
+if strategy.position_size > 0
+    newTrail  = low - (atr * trailMult)
+    trailStop := na(trailStop) ? low - (atr * slAtrMult) :
+                 math.max(trailStop, newTrail)
+
+if strategy.position_size < 0
+    newTrail  = high + (atr * trailMult)
+    trailStop := na(trailStop) ? high + (atr * slAtrMult) :
+                 math.min(trailStop, newTrail)
+
+if strategy.position_size == 0
+    trailStop := na
+
+trail_hit_long  = confirmed and strategy.position_size > 0 and
+                  not na(trailStop) and low  <= trailStop
+trail_hit_short = confirmed and strategy.position_size < 0 and
+                  not na(trailStop) and high >= trailStop
+
+// ════════════════════════════════════════════════════════════════
+// EXECUTION
+// ════════════════════════════════════════════════════════════════
+if longSignal
+    strategy.entry("Long",  strategy.long,  comment="BUY")
+    trailStop := low - (atr * slAtrMult)
+
+if shortSignal
+    strategy.entry("Short", strategy.short, comment="SELL")
+    trailStop := high + (atr * slAtrMult)
+
+if trail_hit_long
+    strategy.close("Long",  comment="Trail Exit")
+
+if trail_hit_short
+    strategy.close("Short", comment="Trail Exit")
+
+if eod_exit
+    strategy.close_all(comment="EOD")
+
+if (daily_halted or consec_halted) and strategy.position_size != 0
+    strategy.close_all(comment="Risk Halt")
+
+// ════════════════════════════════════════════════════════════════
+// PLOTS
+// ════════════════════════════════════════════════════════════════
+// Volume candle coloring
+volAvg      = ta.sma(volume, volMaLen)
+isHighVol   = volume > volAvg
+candleColor = close > open ?
+     (isHighVol ? #00ffbb : COLOR_BULL) :
+     (isHighVol ? #ff0055 : COLOR_BEAR)
+barcolor(showVolColor ? candleColor : na)
+
+// EMAs
+plot(showEma920   ? ema9   : na, "EMA 9",
+     color=color.new(COLOR_EMA9,  30), linewidth=1)
+plot(showEma920   ? ema20  : na, "EMA 20",
+     color=color.new(COLOR_EMA20, 30), linewidth=1)
+plot(showEma50200 ? ema50  : na, "50 EMA",
+     color=biasBull ? color.new(COLOR_BULL, 40) : color.new(COLOR_BEAR, 40), linewidth=2)
+plot(showEma50200 ? ema200 : na, "200 EMA",
+     color=color.new(COLOR_GRAY, 20), linewidth=2)
+
+// MRC
+plot(showMrc ? mrcMean  : na, "MRC Mean",
+     color=color.new(COLOR_MRC, 20), linewidth=2)
+p_mrcU = plot(showMrc ? mrcUpper : na, "MRC Upper",
+     color=color.new(COLOR_MRC, 60), style=plot.style_linebr)
+p_mrcL = plot(showMrc ? mrcLower : na, "MRC Lower",
+     color=color.new(COLOR_MRC, 60), style=plot.style_linebr)
+fill(p_mrcU, p_mrcL, color.new(COLOR_MRC, 95), "MRC Fill")
+
+// VWAP
+plot(showVwap ? vwapVal : na, "VWAP",
+     color=color.new(COLOR_VWAP, 20), linewidth=2, style=plot.style_linebr)
+
+// IB
+p_ibH = plot(showIB ? ibHigh : na, "IB High",
+     color=color.new(COLOR_IB, 30), style=plot.style_linebr)
+p_ibL = plot(showIB ? ibLow  : na, "IB Low",
+     color=color.new(COLOR_IB, 30), style=plot.style_linebr)
+fill(p_ibH, p_ibL, color.new(COLOR_IB, 95), "IB Fill")
+
+// KC
+p_upper = plot(showKC ? upper : na, "KC Upper",
+     color=color.new(COLOR_NEUTRAL, 80))
+p_lower = plot(showKC ? lower : na, "KC Lower",
+     color=color.new(COLOR_NEUTRAL, 80))
+fill(p_upper, p_lower, color.new(COLOR_NEUTRAL, 95), "KC Fill")
+
+// Signals
+plotshape(showSignals and longSignal,  "Buy",
+     shape.labelup,   location.belowbar, COLOR_BULL,
+     size=size.small, text="BUY",  textcolor=color.white)
+plotshape(showSignals and shortSignal, "Sell",
+     shape.labeldown, location.abovebar, COLOR_BEAR,
+     size=size.small, text="SELL", textcolor=color.white)
+
+// Active trail stop line
+plot(not na(trailStop) ? trailStop : na,
+     "Trail Stop", color=color.new(color.yellow, 0),
+     linewidth=2, style=plot.style_linebr)
+
+// Risk halt backgrounds
+bgcolor(daily_halted  ? color.new(color.red,    88) : na, title="Daily Loss Halt")
+bgcolor(consec_halted ? color.new(color.orange, 90) : na, title="Consec Loss Halt")
+
+// ════════════════════════════════════════════════════════════════
+// PRICE LABELS — right side, last bar only
+// ════════════════════════════════════════════════════════════════
+f_drawLabel(_show, _val, _text, _col) =>
+    var label l = na
+    if _show and barstate.islast
+        label.delete(l)
+        l := label.new(bar_index + 2, _val,
+             _text + ": " + str.tostring(_val, format.mintick),
+             color=#00000000, textcolor=_col,
+             style=label.style_label_left, size=size.small)
+
+if showPriceLabels
+    f_drawLabel(showEma920,   ema9,    "EMA 9",   COLOR_EMA9)
+    f_drawLabel(showEma920,   ema20,   "EMA 20",  COLOR_EMA20)
+    f_drawLabel(showEma50200, ema50,   "EMA 50",  biasBull ? COLOR_BULL : COLOR_BEAR)
+    f_drawLabel(showEma50200, ema200,  "EMA 200", COLOR_GRAY)
+    f_drawLabel(showVwap,     vwapVal, "VWAP",    COLOR_VWAP)
+    f_drawLabel(showMrc,      mrcMean, "MRC",     COLOR_MRC)
+
+// ════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ════════════════════════════════════════════════════════════════
+totalTrades = strategy.closedtrades
+wins        = strategy.wintrades
+winRate     = totalTrades > 0 ? (wins / totalTrades) * 100 : 0.0
+netPoints   = strategy.netprofit / 50.0
+
+float gross_loss = math.abs(strategy.grossloss)
+float pf         = gross_loss > 0 ? strategy.grossprofit / gross_loss : 0.0
+
+var table board = table.new(position.top_right, 2, 8,
+     border_width=1, border_color=COLOR_GRAY, frame_color=COLOR_GRAY)
+
+if barstate.islast and showDashboard
+    table.cell(board, 0, 0, "Master Flow Metrics",
+         bgcolor=COLOR_GRAY, text_color=color.white)
+    table.cell(board, 1, 0, "Value",
+         bgcolor=COLOR_GRAY, text_color=color.white)
+
+    table.cell(board, 0, 1, "Win Rate",
+         bgcolor=winRate >= 50 ? COLOR_BULL : COLOR_BEAR, text_color=color.white)
+    table.cell(board, 1, 1, str.tostring(winRate, "#.##") + "%")
+
+    table.cell(board, 0, 2, "Net Points",
+         bgcolor=netPoints >= 0 ? COLOR_BULL : COLOR_BEAR, text_color=color.white)
+    table.cell(board, 1, 2, str.tostring(netPoints, "#.##") + " pts")
+
+    table.cell(board, 0, 3, "Net P&L ($)",
+         bgcolor=strategy.netprofit >= 0 ? COLOR_BULL : COLOR_BEAR, text_color=color.white)
+    table.cell(board, 1, 3, "$" + str.tostring(strategy.netprofit, "#.##"))
+
+    table.cell(board, 0, 4, "Total Trades",
+         bgcolor=COLOR_GRAY, text_color=color.white)
+    table.cell(board, 1, 4, str.tostring(totalTrades))
+
+    table.cell(board, 0, 5, "Profit Factor",
+         bgcolor=pf >= 1.0 ? COLOR_BULL : COLOR_BEAR, text_color=color.white)
+    table.cell(board, 1, 5, str.tostring(pf, "#.##"))
+
+    table.cell(board, 0, 6, "Current Bias",
+         bgcolor=biasBull ? COLOR_BULL : biasBear ? COLOR_BEAR : COLOR_GRAY,
+         text_color=color.white)
+    table.cell(board, 1, 6, biasBull ? "BULLISH" : biasBear ? "BEARISH" : "NEUTRAL")
+
+    table.cell(board, 0, 7, "Market State",
+         bgcolor=isTrending ? COLOR_BULL : COLOR_GRAY, text_color=color.white)
+    table.cell(board, 1, 7, isTrending ? "TRENDING" : "CHOP")

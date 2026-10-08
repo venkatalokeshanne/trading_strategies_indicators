@@ -1,0 +1,1359 @@
+//@version=6
+indicator("EZ$ Powell RB", shorttitle="EZ$Powell", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+//====================================================================
+// EZ$ POWELL RB v2.0
+//
+// CLEANUP:
+// - Keeps the 9:30 -> 10:00 New York context and Powell fib model.
+// - Powell Fib / OTE are REFERENCE ONLY and do not generate entries.
+// - Removes the old OTE/70.5-touch LONG/SHORT signal engine.
+// - Adds multi-timeframe Rejection Blocks: 1M / 5M / 15M / 1H / 4H.
+// - A+ RB = confirmed rejection block followed by same-direction FVG.
+// - Any chart uses its own timeframe + higher-timeframe RBs.
+// - Signals require an actual rejection of the RB on the execution chart.
+// - If the RB is later invalidated, its signal label is deleted.
+// - Adds unswept bearish-pivot (red) and bullish-pivot (green) target lines.
+//====================================================================
+
+//------------------------- INPUTS ------------------------------------
+grpTime = "1. Time / Powell Context"
+tz               = input.string("America/New_York", "Time Zone", group=grpTime)
+accStartHour     = input.int(9, "Accumulation Start Hour", minval=0, maxval=23, group=grpTime, inline="acc")
+accStartMinute   = input.int(30, "Minute", minval=0, maxval=59, group=grpTime, inline="acc")
+keyHour          = input.int(10, "Key Open Hour", minval=0, maxval=23, group=grpTime, inline="ko")
+keyMinute        = input.int(0, "Minute", minval=0, maxval=59, group=grpTime, inline="ko")
+expireHour       = input.int(14, "Powell Context Expiration Hour", minval=0, maxval=23, group=grpTime)
+showOpen         = input.bool(true, "Show 10:00 Open", group=grpTime)
+showPhases       = input.bool(true, "Show Accumulation / Manipulation", group=grpTime)
+
+grpMOLeg = "2. Market Open Leg"
+marketHour       = input.int(9, "Market Open Hour", minval=0, maxval=23, group=grpMOLeg, inline="mo")
+marketMinute     = input.int(30, "Minute", minval=0, maxval=59, group=grpMOLeg, inline="mo")
+showMarketOpen   = input.bool(true, "Show 9:30 Market Open", group=grpMOLeg)
+showMarketOpenLeg= input.bool(true, "Show 9:30 -> 10:00 Market Open Leg", group=grpMOLeg)
+showMOLegLabel   = input.bool(true, "Show Market Open Leg Label", group=grpMOLeg)
+showMORange      = input.bool(false, "Show 9:30 -> 10:00 Full Range", group=grpMOLeg)
+
+grpPowell = "3. Powell Fib / OTE (REFERENCE ONLY)"
+showFib          = input.bool(false, "Show Powell Fib", group=grpPowell)
+showFibLabels    = input.bool(false, "Show Fib Labels + Prices", group=grpPowell)
+showOTE          = input.bool(false, "Highlight 62%-79% OTE", group=grpPowell, tooltip="REFERENCE ONLY. OTE does not gate or create RB signals.")
+show705          = input.bool(true, "Show 70.5% Level", group=grpPowell)
+sweepReference   = input.string("Both", "Manipulation Must Sweep", options=["Both", "Accumulation Edge", "10:00 Open"], group=grpPowell)
+sweepBufferPts   = input.float(1.0, "Minimum Sweep (points)", minval=0.0, step=0.25, group=grpPowell)
+atrLen           = input.int(14, "ATR Length", minval=1, group=grpPowell)
+dispAtrMult      = input.float(0.50, "Reclaim Displacement Body x ATR", minval=0.0, step=0.05, group=grpPowell)
+minDistPts       = input.float(15.0, "Minimum Distribution Leg (points)", minval=0.0, step=0.25, group=grpPowell)
+minDistBars      = input.int(2, "Minimum Distribution Bars", minval=1, maxval=20, group=grpPowell)
+lockRetracePct   = input.float(35.0, "Lock Distribution Leg After Retrace %", minval=5.0, maxval=60.0, step=1.0, group=grpPowell)
+
+grpOpenRB = "4. 10:00 Open RB (Powell Context)"
+showOpenRB       = input.bool(true, "Show 10:00 Open Rejection Blocks", group=grpOpenRB)
+openRbMinPen     = input.float(1.0, "Minimum Penetration Through Open (points)", minval=0.0, step=0.25, group=grpOpenRB)
+openRbStrongPct  = input.float(0.65, "Strong Close %", minval=0.50, maxval=0.95, step=0.05, group=grpOpenRB)
+openRbExtendBars = input.int(20, "Extend Open RB (bars)", minval=1, maxval=200, group=grpOpenRB)
+openRbMaxSide    = input.int(2, "Maximum Open RBs Per Direction / Day", minval=1, maxval=5, group=grpOpenRB)
+
+grpRB = "5. Multi-TF Rejection Blocks"
+showMTFRB        = input.bool(true, "Show Multi-TF RBs", group=grpRB)
+showRBLabels     = input.bool(true, "Show RB Timeframe Labels", group=grpRB)
+rbLookback       = input.int(3, "RB Sweep Lookback", minval=1, maxval=20, group=grpRB, tooltip="RB candle must take the prior lookback high/low and reject.")
+rbWickBody       = input.float(0.60, "Minimum Rejection Wick / Body", minval=0.0, step=0.10, group=grpRB)
+rbStrongClosePct = input.float(0.65, "RB Strong Close %", minval=0.50, maxval=0.95, step=0.05, group=grpRB)
+fvgMinPts        = input.float(0.25, "Minimum A+ FVG Size (points)", minval=0.0, step=0.25, group=grpRB)
+signalQuality    = input.string("A+ RB + FVG", "Signal Quality", options=["A+ RB + FVG", "Any Confirmed RB"], group=grpRB)
+invalidMode      = input.string("Close Beyond RB", "RB Invalidation", options=["Close Beyond RB", "Wick Beyond RB"], group=grpRB)
+invalidBufferPts = input.float(0.0, "Invalidation Buffer (points)", minval=0.0, step=0.25, group=grpRB)
+deleteInvalidRB  = input.bool(true, "Delete Invalidated RB Box", group=grpRB)
+showSignals      = input.bool(true, "Show BUY / SELL RB Signals", group=grpRB)
+
+use1m            = input.bool(true, "Use 1M RB", group=grpRB, inline="tf1")
+use5m            = input.bool(true, "Use 5M RB", group=grpRB, inline="tf1")
+use15m           = input.bool(true, "Use 15M RB", group=grpRB, inline="tf2")
+use1h            = input.bool(true, "Use 1H RB", group=grpRB, inline="tf2")
+use4h            = input.bool(true, "Use 4H RB", group=grpRB, inline="tf3")
+
+grpExec = "6. RB Reaction / Execution"
+execStrongPct    = input.float(0.60, "Execution Strong Close %", minval=0.50, maxval=0.95, step=0.05, group=grpExec)
+requireCandleDir = input.bool(true, "Require Bull Candle for BUY / Bear Candle for SELL", group=grpExec)
+oneSignalPerRB   = input.bool(true, "One Signal Per RB", group=grpExec)
+
+grpTargets = "7. Pivot TP / Liquidity Lines"
+showTargets      = input.bool(true, "Show Pivot Target Lines", group=grpTargets)
+pivotLen         = input.int(3, "Pivot Strength", minval=1, maxval=20, group=grpTargets)
+maxTargetsSide   = input.int(8, "Maximum Live Targets Per Side", minval=1, maxval=30, group=grpTargets)
+deleteHitTargets = input.bool(true, "Remove Target After Price Sweeps It", group=grpTargets)
+
+grpStyle = "8. Style"
+openColor        = input.color(color.black, "10:00 Open", group=grpStyle)
+marketOpenColor  = input.color(color.black, "9:30 Market Open", group=grpStyle)
+marketLegColor   = input.color(color.new(color.gray, 88), "Market Open Leg", group=grpStyle)
+marketRangeColor = input.color(color.new(color.gray, 94), "Market Open Range", group=grpStyle)
+accColor         = input.color(color.new(color.green, 78), "Accumulation", group=grpStyle)
+manipColor       = input.color(color.new(color.red, 78), "Manipulation", group=grpStyle)
+rbBullColor      = input.color(color.new(color.green, 86), "Bullish RB", group=grpStyle)
+rbBearColor      = input.color(color.new(color.red, 86), "Bearish RB", group=grpStyle)
+oteColor         = input.color(color.new(color.gray, 90), "OTE Zone", group=grpStyle)
+
+fibColor = color.black
+
+//------------------------- HELPERS -----------------------------------
+f_tfAllowed(string tf) =>
+    chartSec = timeframe.in_seconds(timeframe.period)
+    srcSec = timeframe.in_seconds(tf)
+    na(chartSec) or na(srcSec) ? true : srcSec >= chartSec
+
+// Returns:
+// bull origin time, bull top, bull bottom,
+// bear origin time, bear top, bear bottom,
+// bull A+ upgrade origin time, bear A+ upgrade origin time.
+f_rbSource() =>
+    rng = high - low
+    body = math.abs(close - open)
+    bodySafe = math.max(body, syminfo.mintick)
+    bodyTop = math.max(open, close)
+    bodyBottom = math.min(open, close)
+    lowerWick = bodyBottom - low
+    upperWick = high - bodyTop
+    loc = rng > 0 ? (close - low) / rng : 0.50
+
+    priorLow = ta.lowest(low[1], rbLookback)
+    priorHigh = ta.highest(high[1], rbLookback)
+
+    bullCand = barstate.isconfirmed and low < priorLow and close > open and loc >= rbStrongClosePct and lowerWick >= bodySafe * rbWickBody
+    bearCand = barstate.isconfirmed and high > priorHigh and close < open and loc <= (1.0 - rbStrongClosePct) and upperWick >= bodySafe * rbWickBody
+
+    bullFvgNow = barstate.isconfirmed and low > high[2] + fvgMinPts
+    bearFvgNow = barstate.isconfirmed and high < low[2] - fvgMinPts
+
+    bullOrigin = bullCand ? time : na
+    bullTop = bullCand ? bodyBottom : na
+    bullBottom = bullCand ? low : na
+
+    bearOrigin = bearCand ? time : na
+    bearTop = bearCand ? high : na
+    bearBottom = bearCand ? bodyTop : na
+
+    bullUpgrade = bullCand[1] and bullFvgNow ? time[1] : na
+    bearUpgrade = bearCand[1] and bearFvgNow ? time[1] : na
+
+    [bullOrigin, bullTop, bullBottom, bearOrigin, bearTop, bearBottom, bullUpgrade, bearUpgrade]
+
+//------------------------- TIME --------------------------------------
+nyH = hour(time, tz)
+nyM = minute(time, tz)
+curMinutes = nyH * 60 + nyM
+accMinutes = accStartHour * 60 + accStartMinute
+marketMinutes = marketHour * 60 + marketMinute
+keyMinutes = keyHour * 60 + keyMinute
+expMinutes = expireHour * 60
+
+inAccum = curMinutes >= accMinutes and curMinutes < keyMinutes
+inMarketLeg = curMinutes >= marketMinutes and curMinutes < keyMinutes
+isMarketOpen = nyH == marketHour and nyM == marketMinute
+isKeyOpen = nyH == keyHour and nyM == keyMinute
+afterKey = curMinutes >= keyMinutes and curMinutes < expMinutes
+isExpired = curMinutes >= expMinutes
+
+newNyDay = na(time[1]) or dayofmonth(time, tz) != dayofmonth(time[1], tz) or month(time, tz) != month(time[1], tz) or year(time, tz) != year(time[1], tz)
+
+//------------------------- POWELL CONTEXT STATE -----------------------
+var float accHigh = na
+var float accLow = na
+var float keyOpen = na
+var float marketOpen = na
+var float marketLegHigh = na
+var float marketLegLow = na
+
+var int state = 0
+var int direction = 0
+var float manipExtreme = na
+var float distExtreme = na
+var int distStartBar = na
+var int distExtremeBar = na
+
+var float fib0p = na
+var float fib35p = na
+var float fib50p = na
+var float fib62p = na
+var float fib705p = na
+var float fib79p = na
+var float fib100p = na
+
+var int bullOpenRbCount = 0
+var int bearOpenRbCount = 0
+
+var box accBox = na
+var box manipBox = na
+var box marketLegBox = na
+var box marketRangeBox = na
+var box oteBox = na
+
+var line openLine = na
+var label openLabel = na
+var line marketOpenLine = na
+var label marketOpenLabel = na
+var label marketLegLabel = na
+
+var line fib0Line = na
+var line fib35Line = na
+var line fib50Line = na
+var line fib62Line = na
+var line fib705Line = na
+var line fib79Line = na
+var line fib100Line = na
+
+var label fib0Label = na
+var label fib35Label = na
+var label fib50Label = na
+var label fib62Label = na
+var label fib705Label = na
+var label fib79Label = na
+var label fib100Label = na
+
+atr = ta.atr(atrLen)
+bodyNow = math.abs(close - open)
+barRangeNow = high - low
+closeLocationNow = barRangeNow > 0 ? (close - low) / barRangeNow : 0.50
+
+if newNyDay
+    accHigh := na
+    accLow := na
+    keyOpen := na
+    marketOpen := na
+    marketLegHigh := na
+    marketLegLow := na
+    state := 0
+    direction := 0
+    manipExtreme := na
+    distExtreme := na
+    distStartBar := na
+    distExtremeBar := na
+    fib0p := na
+    fib35p := na
+    fib50p := na
+    fib62p := na
+    fib705p := na
+    fib79p := na
+    fib100p := na
+    bullOpenRbCount := 0
+    bearOpenRbCount := 0
+
+//------------------------- 9:30 -> 10:00 ------------------------------
+if isMarketOpen
+    marketOpen := open
+    marketLegHigh := high
+    marketLegLow := low
+
+    if showMarketOpen
+        marketOpenLine := line.new(bar_index, marketOpen, bar_index, marketOpen, color=marketOpenColor, width=1, style=line.style_dashed)
+        marketOpenLabel := label.new(bar_index, marketOpen, "9:30 open", style=label.style_none, textcolor=marketOpenColor, size=size.tiny)
+
+    if showMarketOpenLeg
+        marketLegBox := box.new(bar_index, marketOpen, bar_index, marketOpen, bgcolor=marketLegColor, border_color=color.new(marketOpenColor, 55))
+
+    if showMORange
+        marketRangeBox := box.new(bar_index, marketLegHigh, bar_index, marketLegLow, bgcolor=marketRangeColor, border_color=color.new(marketOpenColor, 80))
+
+if inMarketLeg and not na(marketOpen)
+    marketLegHigh := na(marketLegHigh) ? high : math.max(marketLegHigh, high)
+    marketLegLow := na(marketLegLow) ? low : math.min(marketLegLow, low)
+
+    if showMarketOpen and not na(marketOpenLine)
+        line.set_x2(marketOpenLine, bar_index)
+        label.set_x(marketOpenLabel, bar_index)
+
+    if showMarketOpenLeg and not na(marketLegBox)
+        box.set_right(marketLegBox, bar_index)
+        box.set_top(marketLegBox, math.max(marketOpen, close))
+        box.set_bottom(marketLegBox, math.min(marketOpen, close))
+
+    if showMORange and not na(marketRangeBox)
+        box.set_right(marketRangeBox, bar_index)
+        box.set_top(marketRangeBox, marketLegHigh)
+        box.set_bottom(marketRangeBox, marketLegLow)
+
+if isKeyOpen and not na(marketOpen)
+    if showMarketOpen and not na(marketOpenLine)
+        line.set_x2(marketOpenLine, bar_index)
+
+    if showMarketOpenLeg and not na(marketLegBox)
+        box.set_right(marketLegBox, bar_index)
+        box.set_top(marketLegBox, math.max(marketOpen, open))
+        box.set_bottom(marketLegBox, math.min(marketOpen, open))
+
+    if showMORange and not na(marketRangeBox)
+        box.set_right(marketRangeBox, bar_index)
+        box.set_top(marketRangeBox, marketLegHigh)
+        box.set_bottom(marketRangeBox, marketLegLow)
+
+    if showMOLegLabel
+        legTxt = open > marketOpen ? "MO LEG ↑" : open < marketOpen ? "MO LEG ↓" : "MO LEG ="
+        marketLegLabel := label.new(bar_index, (marketOpen + open) / 2.0, legTxt, style=label.style_none, textcolor=marketOpenColor, size=size.tiny)
+
+//------------------------- ACCUMULATION ------------------------------
+accJustStarted = inAccum and not inAccum[1]
+
+if accJustStarted
+    accHigh := high
+    accLow := low
+    if showPhases
+        accBox := box.new(bar_index, accHigh, bar_index, accLow, bgcolor=accColor, border_color=color.new(color.green, 55))
+else if inAccum
+    accHigh := na(accHigh) ? high : math.max(accHigh, high)
+    accLow := na(accLow) ? low : math.min(accLow, low)
+    if showPhases and not na(accBox)
+        box.set_right(accBox, bar_index)
+        box.set_top(accBox, accHigh)
+        box.set_bottom(accBox, accLow)
+
+//------------------------- 10:00 KEY OPEN ----------------------------
+if isKeyOpen
+    keyOpen := open
+    state := 1
+    direction := 0
+    manipExtreme := na
+    distExtreme := na
+    distStartBar := na
+    distExtremeBar := na
+
+    if showPhases and not na(accBox)
+        box.set_right(accBox, bar_index)
+
+    if showOpen
+        openLine := line.new(bar_index, keyOpen, bar_index, keyOpen, color=openColor, width=2)
+        openLabel := label.new(bar_index, keyOpen, "10:00 open", style=label.style_none, textcolor=openColor, size=size.small)
+
+if showOpen and not na(openLine) and not na(keyOpen) and afterKey
+    line.set_x2(openLine, bar_index)
+    label.set_x(openLabel, bar_index)
+    label.set_y(openLabel, keyOpen)
+
+//------------------------- 10:00 OPEN RB -----------------------------
+bullOpenRejection = false
+bearOpenRejection = false
+
+if showOpenRB and afterKey and not na(keyOpen) and barstate.isconfirmed
+    penetratedBelow = low <= keyOpen - openRbMinPen
+    penetratedAbove = high >= keyOpen + openRbMinPen
+
+    bullOpenRejection := penetratedBelow and close > keyOpen and close > open and closeLocationNow >= openRbStrongPct
+    bearOpenRejection := penetratedAbove and close < keyOpen and close < open and closeLocationNow <= (1.0 - openRbStrongPct)
+
+    if bullOpenRejection and bearOpenRejection
+        bullOpenRejection := false
+        bearOpenRejection := false
+
+    if bullOpenRejection and bullOpenRbCount < openRbMaxSide
+        bullOpenRbCount += 1
+        box.new(bar_index, keyOpen, bar_index + openRbExtendBars, low, bgcolor=rbBullColor, border_color=color.black, border_width=1)
+        label.new(bar_index + openRbExtendBars, keyOpen, "10:00 RB ↑", style=label.style_none, textcolor=color.black, size=size.tiny)
+
+    if bearOpenRejection and bearOpenRbCount < openRbMaxSide
+        bearOpenRbCount += 1
+        box.new(bar_index, high, bar_index + openRbExtendBars, keyOpen, bgcolor=rbBearColor, border_color=color.black, border_width=1)
+        label.new(bar_index + openRbExtendBars, keyOpen, "10:00 RB ↓", style=label.style_none, textcolor=color.black, size=size.tiny)
+
+//------------------------- POWELL MANIPULATION -----------------------
+validAcc = not na(accHigh) and not na(accLow)
+
+longRef =
+     sweepReference == "10:00 Open" ? keyOpen :
+     sweepReference == "Accumulation Edge" ? accLow :
+     validAcc ? math.min(accLow, keyOpen) : keyOpen
+
+shortRef =
+     sweepReference == "10:00 Open" ? keyOpen :
+     sweepReference == "Accumulation Edge" ? accHigh :
+     validAcc ? math.max(accHigh, keyOpen) : keyOpen
+
+if state == 1 and afterKey and not na(keyOpen)
+    longSweep = low < longRef - sweepBufferPts
+    shortSweep = high > shortRef + sweepBufferPts
+
+    if longSweep and not shortSweep
+        direction := 1
+        state := 2
+        manipExtreme := low
+        if showPhases
+            manipBox := box.new(bar_index, keyOpen, bar_index, manipExtreme, bgcolor=manipColor, border_color=color.new(color.red, 55))
+    else if shortSweep and not longSweep
+        direction := -1
+        state := 2
+        manipExtreme := high
+        if showPhases
+            manipBox := box.new(bar_index, manipExtreme, bar_index, keyOpen, bgcolor=manipColor, border_color=color.new(color.red, 55))
+
+if state == 2 and afterKey
+    if direction == 1
+        manipExtreme := math.min(manipExtreme, low)
+        if showPhases and not na(manipBox)
+            box.set_right(manipBox, bar_index)
+            box.set_top(manipBox, keyOpen)
+            box.set_bottom(manipBox, manipExtreme)
+    else if direction == -1
+        manipExtreme := math.max(manipExtreme, high)
+        if showPhases and not na(manipBox)
+            box.set_right(manipBox, bar_index)
+            box.set_top(manipBox, manipExtreme)
+            box.set_bottom(manipBox, keyOpen)
+
+    bullReclaim = direction == 1 and close > keyOpen and close > open and bodyNow >= atr * dispAtrMult
+    bearReclaim = direction == -1 and close < keyOpen and close < open and bodyNow >= atr * dispAtrMult
+
+    if bullReclaim
+        state := 3
+        distStartBar := bar_index
+        distExtreme := high
+        distExtremeBar := bar_index
+    else if bearReclaim
+        state := 3
+        distStartBar := bar_index
+        distExtreme := low
+        distExtremeBar := bar_index
+
+//------------------------- DISTRIBUTION / FIB ------------------------
+if state == 3 and afterKey
+    if direction == 1
+        if high >= distExtreme
+            distExtreme := high
+            distExtremeBar := bar_index
+
+        distRange = distExtreme - manipExtreme
+        lockLevel = distExtreme - distRange * (lockRetracePct / 100.0)
+        enoughLeg = distRange >= minDistPts and bar_index - distStartBar >= minDistBars
+        retraced = bar_index > distExtremeBar and low <= lockLevel
+
+        if enoughLeg and retraced
+            state := 4
+            fib0p := distExtreme
+            fib35p := distExtreme - distRange * 0.35
+            fib50p := distExtreme - distRange * 0.50
+            fib62p := distExtreme - distRange * 0.62
+            fib705p := distExtreme - distRange * 0.705
+            fib79p := distExtreme - distRange * 0.79
+            fib100p := manipExtreme
+
+    else if direction == -1
+        if low <= distExtreme
+            distExtreme := low
+            distExtremeBar := bar_index
+
+        distRange = manipExtreme - distExtreme
+        lockLevel = distExtreme + distRange * (lockRetracePct / 100.0)
+        enoughLeg = distRange >= minDistPts and bar_index - distStartBar >= minDistBars
+        retraced = bar_index > distExtremeBar and high >= lockLevel
+
+        if enoughLeg and retraced
+            state := 4
+            fib0p := distExtreme
+            fib35p := distExtreme + distRange * 0.35
+            fib50p := distExtreme + distRange * 0.50
+            fib62p := distExtreme + distRange * 0.62
+            fib705p := distExtreme + distRange * 0.705
+            fib79p := distExtreme + distRange * 0.79
+            fib100p := manipExtreme
+
+fibJustLocked = state == 4 and state[1] == 3
+
+if fibJustLocked and showFib
+    fibLeft = distExtremeBar
+
+    fib0Line := line.new(fibLeft, fib0p, bar_index, fib0p, color=fibColor, width=2)
+    fib35Line := line.new(fibLeft, fib35p, bar_index, fib35p, color=fibColor, width=1)
+    fib50Line := line.new(fibLeft, fib50p, bar_index, fib50p, color=fibColor, width=2)
+    fib62Line := line.new(fibLeft, fib62p, bar_index, fib62p, color=fibColor, width=2)
+    if show705
+        fib705Line := line.new(fibLeft, fib705p, bar_index, fib705p, color=fibColor, width=2)
+    fib79Line := line.new(fibLeft, fib79p, bar_index, fib79p, color=fibColor, width=2)
+    fib100Line := line.new(fibLeft, fib100p, bar_index, fib100p, color=fibColor, width=2)
+
+    if showOTE
+        oteTop = math.max(fib62p, fib79p)
+        oteBottom = math.min(fib62p, fib79p)
+        oteBox := box.new(fibLeft, oteTop, bar_index, oteBottom, bgcolor=oteColor, border_color=color.new(color.black, 65))
+
+    if showFibLabels
+        fib0Label := label.new(bar_index, fib0p, "0.00% (" + str.tostring(fib0p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        fib35Label := label.new(bar_index, fib35p, "35.00% (" + str.tostring(fib35p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        fib50Label := label.new(bar_index, fib50p, "50.00% (" + str.tostring(fib50p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        fib62Label := label.new(bar_index, fib62p, "62.00% (" + str.tostring(fib62p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        if show705
+            fib705Label := label.new(bar_index, fib705p, "70.50% (" + str.tostring(fib705p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        fib79Label := label.new(bar_index, fib79p, "79.00% (" + str.tostring(fib79p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+        fib100Label := label.new(bar_index, fib100p, "100.00% (" + str.tostring(fib100p, format.mintick) + ")", style=label.style_none, textcolor=fibColor, size=size.small)
+
+if state >= 4 and state < 9 and afterKey and showFib
+    if not na(fib0Line)
+        line.set_x2(fib0Line, bar_index)
+        line.set_x2(fib35Line, bar_index)
+        line.set_x2(fib50Line, bar_index)
+        line.set_x2(fib62Line, bar_index)
+        if show705 and not na(fib705Line)
+            line.set_x2(fib705Line, bar_index)
+        line.set_x2(fib79Line, bar_index)
+        line.set_x2(fib100Line, bar_index)
+
+    if showOTE and not na(oteBox)
+        box.set_right(oteBox, bar_index)
+
+    if showFibLabels and not na(fib0Label)
+        label.set_x(fib0Label, bar_index)
+        label.set_x(fib35Label, bar_index)
+        label.set_x(fib50Label, bar_index)
+        label.set_x(fib62Label, bar_index)
+        if show705 and not na(fib705Label)
+            label.set_x(fib705Label, bar_index)
+        label.set_x(fib79Label, bar_index)
+        label.set_x(fib100Label, bar_index)
+
+if isExpired and not na(keyOpen) and state != 9
+    state := 9
+    if showOpen and not na(openLine)
+        line.set_x2(openLine, bar_index)
+    if showPhases and not na(manipBox)
+        box.set_right(manipBox, bar_index)
+
+//====================================================================
+// MULTI-TIMEFRAME REJECTION BLOCK ENGINE
+//====================================================================
+rbLongSignal = false
+rbShortSignal = false
+
+//------------------------- 1M RB --------------------------------
+[tf1BullEvt, tf1BullTopEvt, tf1BullBotEvt, tf1BearEvt, tf1BearTopEvt, tf1BearBotEvt, tf1BullUpgrade, tf1BearUpgrade] = request.security(syminfo.tickerid, "1", f_rbSource(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+tf1Allowed = use1m and f_tfAllowed("1")
+
+var int tf1BullOrigin = na
+var float tf1BullTop = na
+var float tf1BullBot = na
+var bool tf1BullAPlus = false
+var bool tf1BullUsed = false
+var box tf1BullBox = na
+var label tf1BullTag = na
+var label tf1BullSignalLabel = na
+
+var int tf1BearOrigin = na
+var float tf1BearTop = na
+var float tf1BearBot = na
+var bool tf1BearAPlus = false
+var bool tf1BearUsed = false
+var box tf1BearBox = na
+var label tf1BearTag = na
+var label tf1BearSignalLabel = na
+
+tf1NewBull = tf1Allowed and not na(tf1BullEvt) and (na(tf1BullEvt[1]) or tf1BullEvt != tf1BullEvt[1])
+tf1NewBear = tf1Allowed and not na(tf1BearEvt) and (na(tf1BearEvt[1]) or tf1BearEvt != tf1BearEvt[1])
+
+if tf1NewBull
+    if not na(tf1BullBox)
+        box.set_right(tf1BullBox, time)
+    if not na(tf1BullTag)
+        label.delete(tf1BullTag)
+    tf1BullOrigin := tf1BullEvt
+    tf1BullTop := tf1BullTopEvt
+    tf1BullBot := tf1BullBotEvt
+    tf1BullAPlus := false
+    tf1BullUsed := false
+    tf1BullSignalLabel := na
+    if showMTFRB
+        tf1BullBox := box.new(left=tf1BullOrigin, top=tf1BullTop, right=time, bottom=tf1BullBot, xloc=xloc.bar_time, bgcolor=rbBullColor, border_color=color.new(color.green, 20), border_width=1)
+        if showRBLabels
+            tf1BullTag := label.new(time, tf1BullTop, "1M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.green, size=size.tiny)
+
+if tf1NewBear
+    if not na(tf1BearBox)
+        box.set_right(tf1BearBox, time)
+    if not na(tf1BearTag)
+        label.delete(tf1BearTag)
+    tf1BearOrigin := tf1BearEvt
+    tf1BearTop := tf1BearTopEvt
+    tf1BearBot := tf1BearBotEvt
+    tf1BearAPlus := false
+    tf1BearUsed := false
+    tf1BearSignalLabel := na
+    if showMTFRB
+        tf1BearBox := box.new(left=tf1BearOrigin, top=tf1BearTop, right=time, bottom=tf1BearBot, xloc=xloc.bar_time, bgcolor=rbBearColor, border_color=color.new(color.red, 20), border_width=1)
+        if showRBLabels
+            tf1BearTag := label.new(time, tf1BearBot, "1M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.red, size=size.tiny)
+
+// Upgrade the block to A+ only when the next source-TF candle confirms
+// a same-direction 3-candle fair value gap.
+tf1NewBullUpgrade = tf1Allowed and not na(tf1BullUpgrade) and (na(tf1BullUpgrade[1]) or tf1BullUpgrade != tf1BullUpgrade[1])
+tf1NewBearUpgrade = tf1Allowed and not na(tf1BearUpgrade) and (na(tf1BearUpgrade[1]) or tf1BearUpgrade != tf1BearUpgrade[1])
+
+if tf1NewBullUpgrade and tf1BullUpgrade == tf1BullOrigin
+    tf1BullAPlus := true
+    if showMTFRB and not na(tf1BullBox)
+        box.set_border_color(tf1BullBox, color.black)
+        box.set_border_width(tf1BullBox, 2)
+    if showRBLabels
+        if not na(tf1BullTag)
+            label.delete(tf1BullTag)
+        tf1BullTag := label.new(time, tf1BullTop, "1M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf1NewBearUpgrade and tf1BearUpgrade == tf1BearOrigin
+    tf1BearAPlus := true
+    if showMTFRB and not na(tf1BearBox)
+        box.set_border_color(tf1BearBox, color.black)
+        box.set_border_width(tf1BearBox, 2)
+    if showRBLabels
+        if not na(tf1BearTag)
+            label.delete(tf1BearTag)
+        tf1BearTag := label.new(time, tf1BearBot, "1M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf1Allowed and not na(tf1BullOrigin)
+    if showMTFRB and not na(tf1BullBox)
+        box.set_right(tf1BullBox, time)
+
+    bullInvalid_tf1 = invalidMode == "Close Beyond RB" ? close < tf1BullBot - invalidBufferPts : low < tf1BullBot - invalidBufferPts
+
+    if barstate.isconfirmed and bullInvalid_tf1
+        if not na(tf1BullSignalLabel)
+            label.delete(tf1BullSignalLabel)
+            tf1BullSignalLabel := na
+        if showRBLabels and not na(tf1BullTag)
+            label.delete(tf1BullTag)
+            tf1BullTag := na
+        if deleteInvalidRB and not na(tf1BullBox)
+            box.delete(tf1BullBox)
+            tf1BullBox := na
+        else if not na(tf1BullBox)
+            box.set_right(tf1BullBox, time)
+        tf1BullOrigin := na
+        tf1BullTop := na
+        tf1BullBot := na
+        tf1BullAPlus := false
+        tf1BullUsed := false
+    else if barstate.isconfirmed
+        bullTouch_tf1 = low <= tf1BullTop and high >= tf1BullBot
+        bullDir_tf1 = not requireCandleDir or close > open
+        bullReject_tf1 = bullTouch_tf1 and close > tf1BullTop and closeLocationNow >= execStrongPct and bullDir_tf1
+        bullQuality_tf1 = signalQuality == "Any Confirmed RB" or tf1BullAPlus
+        bullCanSignal_tf1 = bullReject_tf1 and bullQuality_tf1 and (not oneSignalPerRB or not tf1BullUsed)
+
+        if bullCanSignal_tf1
+            rbLongSignal := true
+            tf1BullUsed := true
+            if showSignals
+                tf1BullSignalLabel := label.new(bar_index, low, "BUY 1M RB" + (tf1BullAPlus ? " A+" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if tf1Allowed and not na(tf1BearOrigin)
+    if showMTFRB and not na(tf1BearBox)
+        box.set_right(tf1BearBox, time)
+
+    bearInvalid_tf1 = invalidMode == "Close Beyond RB" ? close > tf1BearTop + invalidBufferPts : high > tf1BearTop + invalidBufferPts
+
+    if barstate.isconfirmed and bearInvalid_tf1
+        if not na(tf1BearSignalLabel)
+            label.delete(tf1BearSignalLabel)
+            tf1BearSignalLabel := na
+        if showRBLabels and not na(tf1BearTag)
+            label.delete(tf1BearTag)
+            tf1BearTag := na
+        if deleteInvalidRB and not na(tf1BearBox)
+            box.delete(tf1BearBox)
+            tf1BearBox := na
+        else if not na(tf1BearBox)
+            box.set_right(tf1BearBox, time)
+        tf1BearOrigin := na
+        tf1BearTop := na
+        tf1BearBot := na
+        tf1BearAPlus := false
+        tf1BearUsed := false
+    else if barstate.isconfirmed
+        bearTouch_tf1 = high >= tf1BearBot and low <= tf1BearTop
+        bearDir_tf1 = not requireCandleDir or close < open
+        bearReject_tf1 = bearTouch_tf1 and close < tf1BearBot and closeLocationNow <= (1.0 - execStrongPct) and bearDir_tf1
+        bearQuality_tf1 = signalQuality == "Any Confirmed RB" or tf1BearAPlus
+        bearCanSignal_tf1 = bearReject_tf1 and bearQuality_tf1 and (not oneSignalPerRB or not tf1BearUsed)
+
+        if bearCanSignal_tf1
+            rbShortSignal := true
+            tf1BearUsed := true
+            if showSignals
+                tf1BearSignalLabel := label.new(bar_index, high, "SELL 1M RB" + (tf1BearAPlus ? " A+" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+
+//------------------------- 5M RB --------------------------------
+[tf5BullEvt, tf5BullTopEvt, tf5BullBotEvt, tf5BearEvt, tf5BearTopEvt, tf5BearBotEvt, tf5BullUpgrade, tf5BearUpgrade] = request.security(syminfo.tickerid, "5", f_rbSource(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+tf5Allowed = use5m and f_tfAllowed("5")
+
+var int tf5BullOrigin = na
+var float tf5BullTop = na
+var float tf5BullBot = na
+var bool tf5BullAPlus = false
+var bool tf5BullUsed = false
+var box tf5BullBox = na
+var label tf5BullTag = na
+var label tf5BullSignalLabel = na
+
+var int tf5BearOrigin = na
+var float tf5BearTop = na
+var float tf5BearBot = na
+var bool tf5BearAPlus = false
+var bool tf5BearUsed = false
+var box tf5BearBox = na
+var label tf5BearTag = na
+var label tf5BearSignalLabel = na
+
+tf5NewBull = tf5Allowed and not na(tf5BullEvt) and (na(tf5BullEvt[1]) or tf5BullEvt != tf5BullEvt[1])
+tf5NewBear = tf5Allowed and not na(tf5BearEvt) and (na(tf5BearEvt[1]) or tf5BearEvt != tf5BearEvt[1])
+
+if tf5NewBull
+    if not na(tf5BullBox)
+        box.set_right(tf5BullBox, time)
+    if not na(tf5BullTag)
+        label.delete(tf5BullTag)
+    tf5BullOrigin := tf5BullEvt
+    tf5BullTop := tf5BullTopEvt
+    tf5BullBot := tf5BullBotEvt
+    tf5BullAPlus := false
+    tf5BullUsed := false
+    tf5BullSignalLabel := na
+    if showMTFRB
+        tf5BullBox := box.new(left=tf5BullOrigin, top=tf5BullTop, right=time, bottom=tf5BullBot, xloc=xloc.bar_time, bgcolor=rbBullColor, border_color=color.new(color.green, 20), border_width=1)
+        if showRBLabels
+            tf5BullTag := label.new(time, tf5BullTop, "5M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.green, size=size.tiny)
+
+if tf5NewBear
+    if not na(tf5BearBox)
+        box.set_right(tf5BearBox, time)
+    if not na(tf5BearTag)
+        label.delete(tf5BearTag)
+    tf5BearOrigin := tf5BearEvt
+    tf5BearTop := tf5BearTopEvt
+    tf5BearBot := tf5BearBotEvt
+    tf5BearAPlus := false
+    tf5BearUsed := false
+    tf5BearSignalLabel := na
+    if showMTFRB
+        tf5BearBox := box.new(left=tf5BearOrigin, top=tf5BearTop, right=time, bottom=tf5BearBot, xloc=xloc.bar_time, bgcolor=rbBearColor, border_color=color.new(color.red, 20), border_width=1)
+        if showRBLabels
+            tf5BearTag := label.new(time, tf5BearBot, "5M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.red, size=size.tiny)
+
+// Upgrade the block to A+ only when the next source-TF candle confirms
+// a same-direction 3-candle fair value gap.
+tf5NewBullUpgrade = tf5Allowed and not na(tf5BullUpgrade) and (na(tf5BullUpgrade[1]) or tf5BullUpgrade != tf5BullUpgrade[1])
+tf5NewBearUpgrade = tf5Allowed and not na(tf5BearUpgrade) and (na(tf5BearUpgrade[1]) or tf5BearUpgrade != tf5BearUpgrade[1])
+
+if tf5NewBullUpgrade and tf5BullUpgrade == tf5BullOrigin
+    tf5BullAPlus := true
+    if showMTFRB and not na(tf5BullBox)
+        box.set_border_color(tf5BullBox, color.black)
+        box.set_border_width(tf5BullBox, 2)
+    if showRBLabels
+        if not na(tf5BullTag)
+            label.delete(tf5BullTag)
+        tf5BullTag := label.new(time, tf5BullTop, "5M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf5NewBearUpgrade and tf5BearUpgrade == tf5BearOrigin
+    tf5BearAPlus := true
+    if showMTFRB and not na(tf5BearBox)
+        box.set_border_color(tf5BearBox, color.black)
+        box.set_border_width(tf5BearBox, 2)
+    if showRBLabels
+        if not na(tf5BearTag)
+            label.delete(tf5BearTag)
+        tf5BearTag := label.new(time, tf5BearBot, "5M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf5Allowed and not na(tf5BullOrigin)
+    if showMTFRB and not na(tf5BullBox)
+        box.set_right(tf5BullBox, time)
+
+    bullInvalid_tf5 = invalidMode == "Close Beyond RB" ? close < tf5BullBot - invalidBufferPts : low < tf5BullBot - invalidBufferPts
+
+    if barstate.isconfirmed and bullInvalid_tf5
+        if not na(tf5BullSignalLabel)
+            label.delete(tf5BullSignalLabel)
+            tf5BullSignalLabel := na
+        if showRBLabels and not na(tf5BullTag)
+            label.delete(tf5BullTag)
+            tf5BullTag := na
+        if deleteInvalidRB and not na(tf5BullBox)
+            box.delete(tf5BullBox)
+            tf5BullBox := na
+        else if not na(tf5BullBox)
+            box.set_right(tf5BullBox, time)
+        tf5BullOrigin := na
+        tf5BullTop := na
+        tf5BullBot := na
+        tf5BullAPlus := false
+        tf5BullUsed := false
+    else if barstate.isconfirmed
+        bullTouch_tf5 = low <= tf5BullTop and high >= tf5BullBot
+        bullDir_tf5 = not requireCandleDir or close > open
+        bullReject_tf5 = bullTouch_tf5 and close > tf5BullTop and closeLocationNow >= execStrongPct and bullDir_tf5
+        bullQuality_tf5 = signalQuality == "Any Confirmed RB" or tf5BullAPlus
+        bullCanSignal_tf5 = bullReject_tf5 and bullQuality_tf5 and (not oneSignalPerRB or not tf5BullUsed)
+
+        if bullCanSignal_tf5
+            rbLongSignal := true
+            tf5BullUsed := true
+            if showSignals
+                tf5BullSignalLabel := label.new(bar_index, low, "BUY 5M RB" + (tf5BullAPlus ? " A+" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if tf5Allowed and not na(tf5BearOrigin)
+    if showMTFRB and not na(tf5BearBox)
+        box.set_right(tf5BearBox, time)
+
+    bearInvalid_tf5 = invalidMode == "Close Beyond RB" ? close > tf5BearTop + invalidBufferPts : high > tf5BearTop + invalidBufferPts
+
+    if barstate.isconfirmed and bearInvalid_tf5
+        if not na(tf5BearSignalLabel)
+            label.delete(tf5BearSignalLabel)
+            tf5BearSignalLabel := na
+        if showRBLabels and not na(tf5BearTag)
+            label.delete(tf5BearTag)
+            tf5BearTag := na
+        if deleteInvalidRB and not na(tf5BearBox)
+            box.delete(tf5BearBox)
+            tf5BearBox := na
+        else if not na(tf5BearBox)
+            box.set_right(tf5BearBox, time)
+        tf5BearOrigin := na
+        tf5BearTop := na
+        tf5BearBot := na
+        tf5BearAPlus := false
+        tf5BearUsed := false
+    else if barstate.isconfirmed
+        bearTouch_tf5 = high >= tf5BearBot and low <= tf5BearTop
+        bearDir_tf5 = not requireCandleDir or close < open
+        bearReject_tf5 = bearTouch_tf5 and close < tf5BearBot and closeLocationNow <= (1.0 - execStrongPct) and bearDir_tf5
+        bearQuality_tf5 = signalQuality == "Any Confirmed RB" or tf5BearAPlus
+        bearCanSignal_tf5 = bearReject_tf5 and bearQuality_tf5 and (not oneSignalPerRB or not tf5BearUsed)
+
+        if bearCanSignal_tf5
+            rbShortSignal := true
+            tf5BearUsed := true
+            if showSignals
+                tf5BearSignalLabel := label.new(bar_index, high, "SELL 5M RB" + (tf5BearAPlus ? " A+" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+
+//------------------------- 15M RB --------------------------------
+[tf15BullEvt, tf15BullTopEvt, tf15BullBotEvt, tf15BearEvt, tf15BearTopEvt, tf15BearBotEvt, tf15BullUpgrade, tf15BearUpgrade] = request.security(syminfo.tickerid, "15", f_rbSource(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+tf15Allowed = use15m and f_tfAllowed("15")
+
+var int tf15BullOrigin = na
+var float tf15BullTop = na
+var float tf15BullBot = na
+var bool tf15BullAPlus = false
+var bool tf15BullUsed = false
+var box tf15BullBox = na
+var label tf15BullTag = na
+var label tf15BullSignalLabel = na
+
+var int tf15BearOrigin = na
+var float tf15BearTop = na
+var float tf15BearBot = na
+var bool tf15BearAPlus = false
+var bool tf15BearUsed = false
+var box tf15BearBox = na
+var label tf15BearTag = na
+var label tf15BearSignalLabel = na
+
+tf15NewBull = tf15Allowed and not na(tf15BullEvt) and (na(tf15BullEvt[1]) or tf15BullEvt != tf15BullEvt[1])
+tf15NewBear = tf15Allowed and not na(tf15BearEvt) and (na(tf15BearEvt[1]) or tf15BearEvt != tf15BearEvt[1])
+
+if tf15NewBull
+    if not na(tf15BullBox)
+        box.set_right(tf15BullBox, time)
+    if not na(tf15BullTag)
+        label.delete(tf15BullTag)
+    tf15BullOrigin := tf15BullEvt
+    tf15BullTop := tf15BullTopEvt
+    tf15BullBot := tf15BullBotEvt
+    tf15BullAPlus := false
+    tf15BullUsed := false
+    tf15BullSignalLabel := na
+    if showMTFRB
+        tf15BullBox := box.new(left=tf15BullOrigin, top=tf15BullTop, right=time, bottom=tf15BullBot, xloc=xloc.bar_time, bgcolor=rbBullColor, border_color=color.new(color.green, 20), border_width=1)
+        if showRBLabels
+            tf15BullTag := label.new(time, tf15BullTop, "15M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.green, size=size.tiny)
+
+if tf15NewBear
+    if not na(tf15BearBox)
+        box.set_right(tf15BearBox, time)
+    if not na(tf15BearTag)
+        label.delete(tf15BearTag)
+    tf15BearOrigin := tf15BearEvt
+    tf15BearTop := tf15BearTopEvt
+    tf15BearBot := tf15BearBotEvt
+    tf15BearAPlus := false
+    tf15BearUsed := false
+    tf15BearSignalLabel := na
+    if showMTFRB
+        tf15BearBox := box.new(left=tf15BearOrigin, top=tf15BearTop, right=time, bottom=tf15BearBot, xloc=xloc.bar_time, bgcolor=rbBearColor, border_color=color.new(color.red, 20), border_width=1)
+        if showRBLabels
+            tf15BearTag := label.new(time, tf15BearBot, "15M RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.red, size=size.tiny)
+
+// Upgrade the block to A+ only when the next source-TF candle confirms
+// a same-direction 3-candle fair value gap.
+tf15NewBullUpgrade = tf15Allowed and not na(tf15BullUpgrade) and (na(tf15BullUpgrade[1]) or tf15BullUpgrade != tf15BullUpgrade[1])
+tf15NewBearUpgrade = tf15Allowed and not na(tf15BearUpgrade) and (na(tf15BearUpgrade[1]) or tf15BearUpgrade != tf15BearUpgrade[1])
+
+if tf15NewBullUpgrade and tf15BullUpgrade == tf15BullOrigin
+    tf15BullAPlus := true
+    if showMTFRB and not na(tf15BullBox)
+        box.set_border_color(tf15BullBox, color.black)
+        box.set_border_width(tf15BullBox, 2)
+    if showRBLabels
+        if not na(tf15BullTag)
+            label.delete(tf15BullTag)
+        tf15BullTag := label.new(time, tf15BullTop, "15M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf15NewBearUpgrade and tf15BearUpgrade == tf15BearOrigin
+    tf15BearAPlus := true
+    if showMTFRB and not na(tf15BearBox)
+        box.set_border_color(tf15BearBox, color.black)
+        box.set_border_width(tf15BearBox, 2)
+    if showRBLabels
+        if not na(tf15BearTag)
+            label.delete(tf15BearTag)
+        tf15BearTag := label.new(time, tf15BearBot, "15M RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf15Allowed and not na(tf15BullOrigin)
+    if showMTFRB and not na(tf15BullBox)
+        box.set_right(tf15BullBox, time)
+
+    bullInvalid_tf15 = invalidMode == "Close Beyond RB" ? close < tf15BullBot - invalidBufferPts : low < tf15BullBot - invalidBufferPts
+
+    if barstate.isconfirmed and bullInvalid_tf15
+        if not na(tf15BullSignalLabel)
+            label.delete(tf15BullSignalLabel)
+            tf15BullSignalLabel := na
+        if showRBLabels and not na(tf15BullTag)
+            label.delete(tf15BullTag)
+            tf15BullTag := na
+        if deleteInvalidRB and not na(tf15BullBox)
+            box.delete(tf15BullBox)
+            tf15BullBox := na
+        else if not na(tf15BullBox)
+            box.set_right(tf15BullBox, time)
+        tf15BullOrigin := na
+        tf15BullTop := na
+        tf15BullBot := na
+        tf15BullAPlus := false
+        tf15BullUsed := false
+    else if barstate.isconfirmed
+        bullTouch_tf15 = low <= tf15BullTop and high >= tf15BullBot
+        bullDir_tf15 = not requireCandleDir or close > open
+        bullReject_tf15 = bullTouch_tf15 and close > tf15BullTop and closeLocationNow >= execStrongPct and bullDir_tf15
+        bullQuality_tf15 = signalQuality == "Any Confirmed RB" or tf15BullAPlus
+        bullCanSignal_tf15 = bullReject_tf15 and bullQuality_tf15 and (not oneSignalPerRB or not tf15BullUsed)
+
+        if bullCanSignal_tf15
+            rbLongSignal := true
+            tf15BullUsed := true
+            if showSignals
+                tf15BullSignalLabel := label.new(bar_index, low, "BUY 15M RB" + (tf15BullAPlus ? " A+" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if tf15Allowed and not na(tf15BearOrigin)
+    if showMTFRB and not na(tf15BearBox)
+        box.set_right(tf15BearBox, time)
+
+    bearInvalid_tf15 = invalidMode == "Close Beyond RB" ? close > tf15BearTop + invalidBufferPts : high > tf15BearTop + invalidBufferPts
+
+    if barstate.isconfirmed and bearInvalid_tf15
+        if not na(tf15BearSignalLabel)
+            label.delete(tf15BearSignalLabel)
+            tf15BearSignalLabel := na
+        if showRBLabels and not na(tf15BearTag)
+            label.delete(tf15BearTag)
+            tf15BearTag := na
+        if deleteInvalidRB and not na(tf15BearBox)
+            box.delete(tf15BearBox)
+            tf15BearBox := na
+        else if not na(tf15BearBox)
+            box.set_right(tf15BearBox, time)
+        tf15BearOrigin := na
+        tf15BearTop := na
+        tf15BearBot := na
+        tf15BearAPlus := false
+        tf15BearUsed := false
+    else if barstate.isconfirmed
+        bearTouch_tf15 = high >= tf15BearBot and low <= tf15BearTop
+        bearDir_tf15 = not requireCandleDir or close < open
+        bearReject_tf15 = bearTouch_tf15 and close < tf15BearBot and closeLocationNow <= (1.0 - execStrongPct) and bearDir_tf15
+        bearQuality_tf15 = signalQuality == "Any Confirmed RB" or tf15BearAPlus
+        bearCanSignal_tf15 = bearReject_tf15 and bearQuality_tf15 and (not oneSignalPerRB or not tf15BearUsed)
+
+        if bearCanSignal_tf15
+            rbShortSignal := true
+            tf15BearUsed := true
+            if showSignals
+                tf15BearSignalLabel := label.new(bar_index, high, "SELL 15M RB" + (tf15BearAPlus ? " A+" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+
+//------------------------- 1H RB --------------------------------
+[tf60BullEvt, tf60BullTopEvt, tf60BullBotEvt, tf60BearEvt, tf60BearTopEvt, tf60BearBotEvt, tf60BullUpgrade, tf60BearUpgrade] = request.security(syminfo.tickerid, "60", f_rbSource(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+tf60Allowed = use1h and f_tfAllowed("60")
+
+var int tf60BullOrigin = na
+var float tf60BullTop = na
+var float tf60BullBot = na
+var bool tf60BullAPlus = false
+var bool tf60BullUsed = false
+var box tf60BullBox = na
+var label tf60BullTag = na
+var label tf60BullSignalLabel = na
+
+var int tf60BearOrigin = na
+var float tf60BearTop = na
+var float tf60BearBot = na
+var bool tf60BearAPlus = false
+var bool tf60BearUsed = false
+var box tf60BearBox = na
+var label tf60BearTag = na
+var label tf60BearSignalLabel = na
+
+tf60NewBull = tf60Allowed and not na(tf60BullEvt) and (na(tf60BullEvt[1]) or tf60BullEvt != tf60BullEvt[1])
+tf60NewBear = tf60Allowed and not na(tf60BearEvt) and (na(tf60BearEvt[1]) or tf60BearEvt != tf60BearEvt[1])
+
+if tf60NewBull
+    if not na(tf60BullBox)
+        box.set_right(tf60BullBox, time)
+    if not na(tf60BullTag)
+        label.delete(tf60BullTag)
+    tf60BullOrigin := tf60BullEvt
+    tf60BullTop := tf60BullTopEvt
+    tf60BullBot := tf60BullBotEvt
+    tf60BullAPlus := false
+    tf60BullUsed := false
+    tf60BullSignalLabel := na
+    if showMTFRB
+        tf60BullBox := box.new(left=tf60BullOrigin, top=tf60BullTop, right=time, bottom=tf60BullBot, xloc=xloc.bar_time, bgcolor=rbBullColor, border_color=color.new(color.green, 20), border_width=1)
+        if showRBLabels
+            tf60BullTag := label.new(time, tf60BullTop, "1H RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.green, size=size.tiny)
+
+if tf60NewBear
+    if not na(tf60BearBox)
+        box.set_right(tf60BearBox, time)
+    if not na(tf60BearTag)
+        label.delete(tf60BearTag)
+    tf60BearOrigin := tf60BearEvt
+    tf60BearTop := tf60BearTopEvt
+    tf60BearBot := tf60BearBotEvt
+    tf60BearAPlus := false
+    tf60BearUsed := false
+    tf60BearSignalLabel := na
+    if showMTFRB
+        tf60BearBox := box.new(left=tf60BearOrigin, top=tf60BearTop, right=time, bottom=tf60BearBot, xloc=xloc.bar_time, bgcolor=rbBearColor, border_color=color.new(color.red, 20), border_width=1)
+        if showRBLabels
+            tf60BearTag := label.new(time, tf60BearBot, "1H RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.red, size=size.tiny)
+
+// Upgrade the block to A+ only when the next source-TF candle confirms
+// a same-direction 3-candle fair value gap.
+tf60NewBullUpgrade = tf60Allowed and not na(tf60BullUpgrade) and (na(tf60BullUpgrade[1]) or tf60BullUpgrade != tf60BullUpgrade[1])
+tf60NewBearUpgrade = tf60Allowed and not na(tf60BearUpgrade) and (na(tf60BearUpgrade[1]) or tf60BearUpgrade != tf60BearUpgrade[1])
+
+if tf60NewBullUpgrade and tf60BullUpgrade == tf60BullOrigin
+    tf60BullAPlus := true
+    if showMTFRB and not na(tf60BullBox)
+        box.set_border_color(tf60BullBox, color.black)
+        box.set_border_width(tf60BullBox, 2)
+    if showRBLabels
+        if not na(tf60BullTag)
+            label.delete(tf60BullTag)
+        tf60BullTag := label.new(time, tf60BullTop, "1H RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf60NewBearUpgrade and tf60BearUpgrade == tf60BearOrigin
+    tf60BearAPlus := true
+    if showMTFRB and not na(tf60BearBox)
+        box.set_border_color(tf60BearBox, color.black)
+        box.set_border_width(tf60BearBox, 2)
+    if showRBLabels
+        if not na(tf60BearTag)
+            label.delete(tf60BearTag)
+        tf60BearTag := label.new(time, tf60BearBot, "1H RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf60Allowed and not na(tf60BullOrigin)
+    if showMTFRB and not na(tf60BullBox)
+        box.set_right(tf60BullBox, time)
+
+    bullInvalid_tf60 = invalidMode == "Close Beyond RB" ? close < tf60BullBot - invalidBufferPts : low < tf60BullBot - invalidBufferPts
+
+    if barstate.isconfirmed and bullInvalid_tf60
+        if not na(tf60BullSignalLabel)
+            label.delete(tf60BullSignalLabel)
+            tf60BullSignalLabel := na
+        if showRBLabels and not na(tf60BullTag)
+            label.delete(tf60BullTag)
+            tf60BullTag := na
+        if deleteInvalidRB and not na(tf60BullBox)
+            box.delete(tf60BullBox)
+            tf60BullBox := na
+        else if not na(tf60BullBox)
+            box.set_right(tf60BullBox, time)
+        tf60BullOrigin := na
+        tf60BullTop := na
+        tf60BullBot := na
+        tf60BullAPlus := false
+        tf60BullUsed := false
+    else if barstate.isconfirmed
+        bullTouch_tf60 = low <= tf60BullTop and high >= tf60BullBot
+        bullDir_tf60 = not requireCandleDir or close > open
+        bullReject_tf60 = bullTouch_tf60 and close > tf60BullTop and closeLocationNow >= execStrongPct and bullDir_tf60
+        bullQuality_tf60 = signalQuality == "Any Confirmed RB" or tf60BullAPlus
+        bullCanSignal_tf60 = bullReject_tf60 and bullQuality_tf60 and (not oneSignalPerRB or not tf60BullUsed)
+
+        if bullCanSignal_tf60
+            rbLongSignal := true
+            tf60BullUsed := true
+            if showSignals
+                tf60BullSignalLabel := label.new(bar_index, low, "BUY 1H RB" + (tf60BullAPlus ? " A+" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if tf60Allowed and not na(tf60BearOrigin)
+    if showMTFRB and not na(tf60BearBox)
+        box.set_right(tf60BearBox, time)
+
+    bearInvalid_tf60 = invalidMode == "Close Beyond RB" ? close > tf60BearTop + invalidBufferPts : high > tf60BearTop + invalidBufferPts
+
+    if barstate.isconfirmed and bearInvalid_tf60
+        if not na(tf60BearSignalLabel)
+            label.delete(tf60BearSignalLabel)
+            tf60BearSignalLabel := na
+        if showRBLabels and not na(tf60BearTag)
+            label.delete(tf60BearTag)
+            tf60BearTag := na
+        if deleteInvalidRB and not na(tf60BearBox)
+            box.delete(tf60BearBox)
+            tf60BearBox := na
+        else if not na(tf60BearBox)
+            box.set_right(tf60BearBox, time)
+        tf60BearOrigin := na
+        tf60BearTop := na
+        tf60BearBot := na
+        tf60BearAPlus := false
+        tf60BearUsed := false
+    else if barstate.isconfirmed
+        bearTouch_tf60 = high >= tf60BearBot and low <= tf60BearTop
+        bearDir_tf60 = not requireCandleDir or close < open
+        bearReject_tf60 = bearTouch_tf60 and close < tf60BearBot and closeLocationNow <= (1.0 - execStrongPct) and bearDir_tf60
+        bearQuality_tf60 = signalQuality == "Any Confirmed RB" or tf60BearAPlus
+        bearCanSignal_tf60 = bearReject_tf60 and bearQuality_tf60 and (not oneSignalPerRB or not tf60BearUsed)
+
+        if bearCanSignal_tf60
+            rbShortSignal := true
+            tf60BearUsed := true
+            if showSignals
+                tf60BearSignalLabel := label.new(bar_index, high, "SELL 1H RB" + (tf60BearAPlus ? " A+" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+
+//------------------------- 4H RB --------------------------------
+[tf240BullEvt, tf240BullTopEvt, tf240BullBotEvt, tf240BearEvt, tf240BearTopEvt, tf240BearBotEvt, tf240BullUpgrade, tf240BearUpgrade] = request.security(syminfo.tickerid, "240", f_rbSource(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+tf240Allowed = use4h and f_tfAllowed("240")
+
+var int tf240BullOrigin = na
+var float tf240BullTop = na
+var float tf240BullBot = na
+var bool tf240BullAPlus = false
+var bool tf240BullUsed = false
+var box tf240BullBox = na
+var label tf240BullTag = na
+var label tf240BullSignalLabel = na
+
+var int tf240BearOrigin = na
+var float tf240BearTop = na
+var float tf240BearBot = na
+var bool tf240BearAPlus = false
+var bool tf240BearUsed = false
+var box tf240BearBox = na
+var label tf240BearTag = na
+var label tf240BearSignalLabel = na
+
+tf240NewBull = tf240Allowed and not na(tf240BullEvt) and (na(tf240BullEvt[1]) or tf240BullEvt != tf240BullEvt[1])
+tf240NewBear = tf240Allowed and not na(tf240BearEvt) and (na(tf240BearEvt[1]) or tf240BearEvt != tf240BearEvt[1])
+
+if tf240NewBull
+    if not na(tf240BullBox)
+        box.set_right(tf240BullBox, time)
+    if not na(tf240BullTag)
+        label.delete(tf240BullTag)
+    tf240BullOrigin := tf240BullEvt
+    tf240BullTop := tf240BullTopEvt
+    tf240BullBot := tf240BullBotEvt
+    tf240BullAPlus := false
+    tf240BullUsed := false
+    tf240BullSignalLabel := na
+    if showMTFRB
+        tf240BullBox := box.new(left=tf240BullOrigin, top=tf240BullTop, right=time, bottom=tf240BullBot, xloc=xloc.bar_time, bgcolor=rbBullColor, border_color=color.new(color.green, 20), border_width=1)
+        if showRBLabels
+            tf240BullTag := label.new(time, tf240BullTop, "4H RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.green, size=size.tiny)
+
+if tf240NewBear
+    if not na(tf240BearBox)
+        box.set_right(tf240BearBox, time)
+    if not na(tf240BearTag)
+        label.delete(tf240BearTag)
+    tf240BearOrigin := tf240BearEvt
+    tf240BearTop := tf240BearTopEvt
+    tf240BearBot := tf240BearBotEvt
+    tf240BearAPlus := false
+    tf240BearUsed := false
+    tf240BearSignalLabel := na
+    if showMTFRB
+        tf240BearBox := box.new(left=tf240BearOrigin, top=tf240BearTop, right=time, bottom=tf240BearBot, xloc=xloc.bar_time, bgcolor=rbBearColor, border_color=color.new(color.red, 20), border_width=1)
+        if showRBLabels
+            tf240BearTag := label.new(time, tf240BearBot, "4H RB", xloc=xloc.bar_time, style=label.style_none, textcolor=color.red, size=size.tiny)
+
+// Upgrade the block to A+ only when the next source-TF candle confirms
+// a same-direction 3-candle fair value gap.
+tf240NewBullUpgrade = tf240Allowed and not na(tf240BullUpgrade) and (na(tf240BullUpgrade[1]) or tf240BullUpgrade != tf240BullUpgrade[1])
+tf240NewBearUpgrade = tf240Allowed and not na(tf240BearUpgrade) and (na(tf240BearUpgrade[1]) or tf240BearUpgrade != tf240BearUpgrade[1])
+
+if tf240NewBullUpgrade and tf240BullUpgrade == tf240BullOrigin
+    tf240BullAPlus := true
+    if showMTFRB and not na(tf240BullBox)
+        box.set_border_color(tf240BullBox, color.black)
+        box.set_border_width(tf240BullBox, 2)
+    if showRBLabels
+        if not na(tf240BullTag)
+            label.delete(tf240BullTag)
+        tf240BullTag := label.new(time, tf240BullTop, "4H RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf240NewBearUpgrade and tf240BearUpgrade == tf240BearOrigin
+    tf240BearAPlus := true
+    if showMTFRB and not na(tf240BearBox)
+        box.set_border_color(tf240BearBox, color.black)
+        box.set_border_width(tf240BearBox, 2)
+    if showRBLabels
+        if not na(tf240BearTag)
+            label.delete(tf240BearTag)
+        tf240BearTag := label.new(time, tf240BearBot, "4H RB A+", xloc=xloc.bar_time, style=label.style_none, textcolor=color.black, size=size.tiny)
+
+if tf240Allowed and not na(tf240BullOrigin)
+    if showMTFRB and not na(tf240BullBox)
+        box.set_right(tf240BullBox, time)
+
+    bullInvalid_tf240 = invalidMode == "Close Beyond RB" ? close < tf240BullBot - invalidBufferPts : low < tf240BullBot - invalidBufferPts
+
+    if barstate.isconfirmed and bullInvalid_tf240
+        if not na(tf240BullSignalLabel)
+            label.delete(tf240BullSignalLabel)
+            tf240BullSignalLabel := na
+        if showRBLabels and not na(tf240BullTag)
+            label.delete(tf240BullTag)
+            tf240BullTag := na
+        if deleteInvalidRB and not na(tf240BullBox)
+            box.delete(tf240BullBox)
+            tf240BullBox := na
+        else if not na(tf240BullBox)
+            box.set_right(tf240BullBox, time)
+        tf240BullOrigin := na
+        tf240BullTop := na
+        tf240BullBot := na
+        tf240BullAPlus := false
+        tf240BullUsed := false
+    else if barstate.isconfirmed
+        bullTouch_tf240 = low <= tf240BullTop and high >= tf240BullBot
+        bullDir_tf240 = not requireCandleDir or close > open
+        bullReject_tf240 = bullTouch_tf240 and close > tf240BullTop and closeLocationNow >= execStrongPct and bullDir_tf240
+        bullQuality_tf240 = signalQuality == "Any Confirmed RB" or tf240BullAPlus
+        bullCanSignal_tf240 = bullReject_tf240 and bullQuality_tf240 and (not oneSignalPerRB or not tf240BullUsed)
+
+        if bullCanSignal_tf240
+            rbLongSignal := true
+            tf240BullUsed := true
+            if showSignals
+                tf240BullSignalLabel := label.new(bar_index, low, "BUY 4H RB" + (tf240BullAPlus ? " A+" : ""), style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+
+if tf240Allowed and not na(tf240BearOrigin)
+    if showMTFRB and not na(tf240BearBox)
+        box.set_right(tf240BearBox, time)
+
+    bearInvalid_tf240 = invalidMode == "Close Beyond RB" ? close > tf240BearTop + invalidBufferPts : high > tf240BearTop + invalidBufferPts
+
+    if barstate.isconfirmed and bearInvalid_tf240
+        if not na(tf240BearSignalLabel)
+            label.delete(tf240BearSignalLabel)
+            tf240BearSignalLabel := na
+        if showRBLabels and not na(tf240BearTag)
+            label.delete(tf240BearTag)
+            tf240BearTag := na
+        if deleteInvalidRB and not na(tf240BearBox)
+            box.delete(tf240BearBox)
+            tf240BearBox := na
+        else if not na(tf240BearBox)
+            box.set_right(tf240BearBox, time)
+        tf240BearOrigin := na
+        tf240BearTop := na
+        tf240BearBot := na
+        tf240BearAPlus := false
+        tf240BearUsed := false
+    else if barstate.isconfirmed
+        bearTouch_tf240 = high >= tf240BearBot and low <= tf240BearTop
+        bearDir_tf240 = not requireCandleDir or close < open
+        bearReject_tf240 = bearTouch_tf240 and close < tf240BearBot and closeLocationNow <= (1.0 - execStrongPct) and bearDir_tf240
+        bearQuality_tf240 = signalQuality == "Any Confirmed RB" or tf240BearAPlus
+        bearCanSignal_tf240 = bearReject_tf240 and bearQuality_tf240 and (not oneSignalPerRB or not tf240BearUsed)
+
+        if bearCanSignal_tf240
+            rbShortSignal := true
+            tf240BearUsed := true
+            if showSignals
+                tf240BearSignalLabel := label.new(bar_index, high, "SELL 4H RB" + (tf240BearAPlus ? " A+" : ""), style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+
+//====================================================================
+// PIVOT TP / LIQUIDITY TARGETS
+// Red = unswept bearish pivot high.
+// Green = unswept bullish pivot low.
+// These are VISUAL TARGETS ONLY and never create an entry.
+//====================================================================
+var bearTargetLines = array.new_line()
+var bearTargetPrices = array.new_float()
+var bullTargetLines = array.new_line()
+var bullTargetPrices = array.new_float()
+
+bearPivot = ta.pivothigh(high, pivotLen, pivotLen)
+bullPivot = ta.pivotlow(low, pivotLen, pivotLen)
+
+if showTargets and not na(bearPivot)
+    ln = line.new(bar_index - pivotLen, bearPivot, bar_index, bearPivot, extend=extend.right, color=color.red, width=1)
+    array.push(bearTargetLines, ln)
+    array.push(bearTargetPrices, bearPivot)
+    if array.size(bearTargetLines) > maxTargetsSide
+        oldLn = array.shift(bearTargetLines)
+        array.shift(bearTargetPrices)
+        line.delete(oldLn)
+
+if showTargets and not na(bullPivot)
+    ln = line.new(bar_index - pivotLen, bullPivot, bar_index, bullPivot, extend=extend.right, color=color.green, width=1)
+    array.push(bullTargetLines, ln)
+    array.push(bullTargetPrices, bullPivot)
+    if array.size(bullTargetLines) > maxTargetsSide
+        oldLn = array.shift(bullTargetLines)
+        array.shift(bullTargetPrices)
+        line.delete(oldLn)
+
+if showTargets and deleteHitTargets and array.size(bearTargetLines) > 0
+    for i = array.size(bearTargetLines) - 1 to 0
+        lvl = array.get(bearTargetPrices, i)
+        if high >= lvl
+            ln = array.get(bearTargetLines, i)
+            line.delete(ln)
+            array.remove(bearTargetLines, i)
+            array.remove(bearTargetPrices, i)
+
+if showTargets and deleteHitTargets and array.size(bullTargetLines) > 0
+    for i = array.size(bullTargetLines) - 1 to 0
+        lvl = array.get(bullTargetPrices, i)
+        if low <= lvl
+            ln = array.get(bullTargetLines, i)
+            line.delete(ln)
+            array.remove(bullTargetLines, i)
+            array.remove(bullTargetPrices, i)
+
+//------------------------- ALERTS ------------------------------------
+alertcondition(condition=rbLongSignal, title="EZ$ Powell RB BUY", message="EZ$ Powell RB bullish rejection confirmed.")
+alertcondition(condition=rbShortSignal, title="EZ$ Powell RB SELL", message="EZ$ Powell RB bearish rejection confirmed.")
+alertcondition(condition=bullOpenRejection, title="Powell Bull 10AM RB", message="Bullish rejection of the 10:00 New York open.")
+alertcondition(condition=bearOpenRejection, title="Powell Bear 10AM RB", message="Bearish rejection of the 10:00 New York open.")
+alertcondition(condition=isMarketOpen, title="Powell 9:30 Open", message="9:30 AM New York market open printed.")
+alertcondition(condition=isKeyOpen, title="Powell 10:00 Open", message="10:00 AM New York key open printed.")

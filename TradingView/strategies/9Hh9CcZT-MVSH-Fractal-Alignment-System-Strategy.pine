@@ -1,0 +1,374 @@
+//@version=6
+strategy(
+  title="Fractal Alignment System Strategy",
+  shorttitle="FAS",
+  overlay=true,
+  initial_capital=10000,
+  default_qty_type=strategy.percent_of_equity,
+  default_qty_value=2,
+  commission_type=strategy.commission.percent,
+  commission_value=0.0002,
+  slippage=2,
+  max_labels_count=500,
+  max_lines_count=500,
+  calc_on_every_tick=false
+)
+
+// ═══════════════════════════════════════════════
+// SECTION 1: INPUTS
+// ═══════════════════════════════════════════════
+
+var string GRP_RISK = "Risk Settings"
+risk_percent   = input.float(2.0,  "Risk Per Trade (%)",             minval=0.1,  maxval=10.0,  step=0.1, group=GRP_RISK)
+sl_pips_input  = input.float(5.0,  "SL Buffer Beyond Pivot (pips)",  minval=1.0,  maxval=20.0,            group=GRP_RISK)
+
+var string GRP_TP = "Take Profit Settings"
+tp1_rr         = input.float(2.0,  "TP1 Risk Reward Ratio",          minval=0.5,  maxval=10.0,  step=0.5, group=GRP_TP)
+tp2_rr         = input.float(4.0,  "TP2 Risk Reward Ratio",          minval=1.0,  maxval=20.0,  step=0.5, group=GRP_TP)
+tp1_pct        = input.float(50.0, "Percent to Close at TP1",        minval=1.0,  maxval=100.0,           group=GRP_TP)
+tp2_pct        = input.float(50.0, "Percent of Remainder at TP2",    minval=1.0,  maxval=100.0,           group=GRP_TP)
+trail_pips_inp = input.float(30.0, "Trailing Stop Pips for Runner",  minval=5.0,  maxval=200.0,           group=GRP_TP)
+
+var string GRP_SESSION = "Session Settings"
+sess_start     = input.int(9,     "Session Start Hour (GMT+3)",      minval=0, maxval=23, group=GRP_SESSION)
+sess_end       = input.int(14,    "Session End Hour (GMT+3)",        minval=0, maxval=23, group=GRP_SESSION)
+use_session    = input.bool(true, "Use Session Filter",              group=GRP_SESSION)
+show_session   = input.bool(true, "Show Session Background",         group=GRP_SESSION)
+
+var string GRP_FILTERS = "Filter Settings"
+use_bias_filter = input.bool(true, "Use Daily Bias Filter",          group=GRP_FILTERS)
+max_trades_day  = input.int(3,     "Max Trades Per Direction Per Day", minval=1, maxval=10, group=GRP_FILTERS)
+
+var string GRP_DISPLAY = "Display Settings"
+show_dash       = input.bool(true, "Show Performance Dashboard",     group=GRP_DISPLAY)
+show_trade_lbls = input.bool(true, "Show Trade Labels",              group=GRP_DISPLAY)
+show_sl_lines   = input.bool(true, "Show SL and TP Lines",           group=GRP_DISPLAY)
+
+// ═══════════════════════════════════════════════
+// SECTION 2: CORE VARIABLES
+// ═══════════════════════════════════════════════
+
+pip        = syminfo.mintick * 10
+sl_buf     = sl_pips_input * pip
+trail_dist = trail_pips_inp * pip
+
+// ═══════════════════════════════════════════════
+// SECTION 3: SESSION DETECTION
+// ═══════════════════════════════════════════════
+
+in_session = hour >= sess_start and hour < sess_end
+session_ok = use_session ? in_session : true
+
+bgcolor(show_session and in_session ? color.new(color.blue, 93) : na, title="London Session")
+
+// ═══════════════════════════════════════════════
+// SECTION 4: DAILY BIAS
+// ═══════════════════════════════════════════════
+
+d_high_1 = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+d_high_2 = request.security(syminfo.tickerid, "D", high[2], lookahead=barmerge.lookahead_on)
+d_high_3 = request.security(syminfo.tickerid, "D", high[3], lookahead=barmerge.lookahead_on)
+d_low_1  = request.security(syminfo.tickerid, "D", low[1],  lookahead=barmerge.lookahead_on)
+d_low_2  = request.security(syminfo.tickerid, "D", low[2],  lookahead=barmerge.lookahead_on)
+d_low_3  = request.security(syminfo.tickerid, "D", low[3],  lookahead=barmerge.lookahead_on)
+
+d_bull_fractal = d_low_2  < d_low_3  and d_low_1  > d_low_2
+d_bear_fractal = d_high_2 > d_high_3 and d_high_1 < d_high_2
+
+var int daily_bias = 0
+if d_bull_fractal
+    daily_bias := 1
+else if d_bear_fractal
+    daily_bias := -1
+
+bias_ok_long  = use_bias_filter ? daily_bias == 1  : true
+bias_ok_short = use_bias_filter ? daily_bias == -1 : true
+
+// ═══════════════════════════════════════════════
+// SECTION 5: TRADE COUNTER
+// ═══════════════════════════════════════════════
+
+var int long_count  = 0
+var int short_count = 0
+var int last_day    = 0
+
+if dayofmonth != last_day
+    long_count  := 0
+    short_count := 0
+    last_day    := dayofmonth
+
+// ═══════════════════════════════════════════════
+// SECTION 6: FRACTAL DETECTION
+// ═══════════════════════════════════════════════
+
+bull_fractal = low[1]  < low[2]  and low[0]  > low[1]
+bear_fractal = high[1] > high[2] and high[0] < high[1]
+
+// ═══════════════════════════════════════════════
+// SECTION 7: ENTRY CONDITIONS
+// ═══════════════════════════════════════════════
+
+no_position = strategy.position_size == 0
+
+long_cond  = bull_fractal and session_ok and bias_ok_long  and long_count  < max_trades_day and no_position
+short_cond = bear_fractal and session_ok and bias_ok_short and short_count < max_trades_day and no_position
+
+// ═══════════════════════════════════════════════
+// SECTION 8: TRADE LEVEL CALCULATIONS
+// ═══════════════════════════════════════════════
+
+l_entry   = close
+l_pivot   = low[1]
+l_sl      = l_pivot - sl_buf
+l_sl_dist = l_entry - l_sl
+l_tp1     = l_entry + l_sl_dist * tp1_rr
+l_tp2     = l_entry + l_sl_dist * tp2_rr
+l_sl_pips = l_sl_dist / pip
+
+s_entry   = close
+s_pivot   = high[1]
+s_sl      = s_pivot + sl_buf
+s_sl_dist = s_sl - s_entry
+s_tp1     = s_entry - s_sl_dist * tp1_rr
+s_tp2     = s_entry - s_sl_dist * tp2_rr
+s_sl_pips = s_sl_dist / pip
+
+// ═══════════════════════════════════════════════
+// SECTION 9: TRADE STATE VARIABLES
+// ═══════════════════════════════════════════════
+
+var float v_entry   = na
+var float v_sl      = na
+var float v_tp1     = na
+var float v_tp2     = na
+var float v_pivot   = na
+var bool  v_tp1_hit = false
+var bool  v_tp2_hit = false
+var int   v_dir     = 0
+
+// ═══════════════════════════════════════════════
+// SECTION 10: LONG ENTRY EXECUTION
+// ═══════════════════════════════════════════════
+
+if long_cond
+    strategy.entry("Long", strategy.long)
+    v_entry   := l_entry
+    v_sl      := l_sl
+    v_tp1     := l_tp1
+    v_tp2     := l_tp2
+    v_pivot   := l_pivot
+    v_tp1_hit := false
+    v_tp2_hit := false
+    v_dir     := 1
+    long_count := long_count + 1
+
+    if show_trade_lbls
+        label.new(bar_index, low - 15 * pip, "LONG\nEntry: " + str.tostring(l_entry, "#.#####") + "\nSL: " + str.tostring(l_sl, "#.#####") + "\nTP1: " + str.tostring(l_tp1, "#.#####") + "\nTP2: " + str.tostring(l_tp2, "#.#####") + "\nSL Pips: " + str.tostring(l_sl_pips, "#.#"), color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+    if show_sl_lines
+        line.new(bar_index, l_sl,    bar_index + 20, l_sl,    color=color.red,                  width=2, style=line.style_dashed)
+        line.new(bar_index, l_tp1,   bar_index + 20, l_tp1,   color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, l_tp2,   bar_index + 20, l_tp2,   color=color.green,                width=2, style=line.style_dashed)
+        line.new(bar_index, l_entry, bar_index + 20, l_entry, color=color.blue,                 width=1, style=line.style_solid)
+
+// ═══════════════════════════════════════════════
+// SECTION 11: SHORT ENTRY EXECUTION
+// ═══════════════════════════════════════════════
+
+if short_cond
+    strategy.entry("Short", strategy.short)
+    v_entry   := s_entry
+    v_sl      := s_sl
+    v_tp1     := s_tp1
+    v_tp2     := s_tp2
+    v_pivot   := s_pivot
+    v_tp1_hit := false
+    v_tp2_hit := false
+    v_dir     := -1
+    short_count := short_count + 1
+
+    if show_trade_lbls
+        label.new(bar_index, high + 15 * pip, "SHORT\nEntry: " + str.tostring(s_entry, "#.#####") + "\nSL: " + str.tostring(s_sl, "#.#####") + "\nTP1: " + str.tostring(s_tp1, "#.#####") + "\nTP2: " + str.tostring(s_tp2, "#.#####") + "\nSL Pips: " + str.tostring(s_sl_pips, "#.#"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+    if show_sl_lines
+        line.new(bar_index, s_sl,    bar_index + 20, s_sl,    color=color.red,                  width=2, style=line.style_dashed)
+        line.new(bar_index, s_tp1,   bar_index + 20, s_tp1,   color=color.new(color.green, 30), width=2, style=line.style_dashed)
+        line.new(bar_index, s_tp2,   bar_index + 20, s_tp2,   color=color.green,                width=2, style=line.style_dashed)
+        line.new(bar_index, s_entry, bar_index + 20, s_entry, color=color.blue,                 width=1, style=line.style_solid)
+
+// ═══════════════════════════════════════════════
+// SECTION 12: LONG TRADE MANAGEMENT
+// ═══════════════════════════════════════════════
+
+if v_dir == 1 and strategy.position_size > 0
+
+    if not v_tp1_hit
+        strategy.exit("L-TP1", "Long", limit=v_tp1, stop=v_sl, qty_percent=tp1_pct, comment="TP1 Hit")
+
+    if not v_tp1_hit and high >= v_tp1
+        v_tp1_hit := true
+        if show_trade_lbls
+            label.new(bar_index, high + 8 * pip, "TP1 HIT\n50% closed\nSL to BE", color=color.green, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+    if v_tp1_hit and not v_tp2_hit
+        strategy.exit("L-BE-TP2", "Long", limit=v_tp2, stop=v_entry, qty_percent=tp2_pct, comment="TP2 Hit")
+
+    if v_tp1_hit and not v_tp2_hit and high >= v_tp2
+        v_tp2_hit := true
+        if show_trade_lbls
+            label.new(bar_index, high + 8 * pip, "TP2 HIT\n25% closed\nRunner on", color=color.green, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+    if v_tp1_hit and v_tp2_hit
+        strategy.exit("L-Trail", "Long", stop=v_entry, trail_price=high, trail_offset=trail_dist / syminfo.mintick, comment="Trail Stop")
+
+// ═══════════════════════════════════════════════
+// SECTION 13: SHORT TRADE MANAGEMENT
+// ═══════════════════════════════════════════════
+
+if v_dir == -1 and strategy.position_size < 0
+
+    if not v_tp1_hit
+        strategy.exit("S-TP1", "Short", limit=v_tp1, stop=v_sl, qty_percent=tp1_pct, comment="TP1 Hit")
+
+    if not v_tp1_hit and low <= v_tp1
+        v_tp1_hit := true
+        if show_trade_lbls
+            label.new(bar_index, low - 8 * pip, "TP1 HIT\n50% closed\nSL to BE", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+    if v_tp1_hit and not v_tp2_hit
+        strategy.exit("S-BE-TP2", "Short", limit=v_tp2, stop=v_entry, qty_percent=tp2_pct, comment="TP2 Hit")
+
+    if v_tp1_hit and not v_tp2_hit and low <= v_tp2
+        v_tp2_hit := true
+        if show_trade_lbls
+            label.new(bar_index, low - 8 * pip, "TP2 HIT\n25% closed\nRunner on", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+    if v_tp1_hit and v_tp2_hit
+        strategy.exit("S-Trail", "Short", stop=v_entry, trail_price=low, trail_offset=trail_dist / syminfo.mintick, comment="Trail Stop")
+
+// ═══════════════════════════════════════════════
+// SECTION 14: RESET ON TRADE CLOSE
+// ═══════════════════════════════════════════════
+
+trade_just_closed = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+if trade_just_closed
+    v_entry   := na
+    v_sl      := na
+    v_tp1     := na
+    v_tp2     := na
+    v_pivot   := na
+    v_tp1_hit := false
+    v_tp2_hit := false
+    v_dir     := 0
+
+// ═══════════════════════════════════════════════
+// SECTION 15: ACTIVE TRADE LEVEL PLOTS
+// ═══════════════════════════════════════════════
+
+plot(strategy.position_size != 0 ? v_sl    : na, "Active SL",    color=color.red,                  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? v_tp1   : na, "Active TP1",   color=color.new(color.green, 30), style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? v_tp2   : na, "Active TP2",   color=color.green,                style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? v_entry : na, "Active Entry", color=color.blue,                 style=plot.style_linebr, linewidth=1)
+
+// ═══════════════════════════════════════════════
+// SECTION 16: PERFORMANCE DASHBOARD
+// ═══════════════════════════════════════════════
+
+var table dash = table.new(position.bottom_right, 2, 17, bgcolor=color.new(color.black, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 20), frame_width=2)
+
+if show_dash and barstate.islast
+
+    int   total_trades = strategy.closedtrades
+    int   wins         = strategy.wintrades
+    int   losses       = strategy.losstrades
+    int   breakevens   = total_trades - wins - losses
+
+    float win_rate     = total_trades > 0 ? wins / total_trades * 100 : 0.0
+    float gross_profit = strategy.grossprofit
+    float gross_loss   = strategy.grossloss
+    float net_profit   = strategy.netprofit
+    float net_pct      = net_profit / strategy.initial_capital * 100
+    float pf           = gross_loss != 0 ? gross_profit / gross_loss : 0.0
+    float avg_win      = wins   > 0 ? gross_profit / wins   : 0.0
+    float avg_loss     = losses > 0 ? gross_loss   / losses : 0.0
+    float avg_rr       = avg_loss != 0 ? avg_win / avg_loss : 0.0
+    float win_r        = win_rate / 100
+    float loss_r       = 1.0 - win_r
+    float expectancy   = win_r * avg_rr - loss_r * 1.0
+    float max_dd       = strategy.max_drawdown_percent
+    float bal          = strategy.equity
+
+    string sys_status  = win_rate >= 40 and expectancy > 0 and pf >= 1.2 ? "EDGE CONFIRMED" : total_trades < 30 ? "NEED MORE DATA" : "REVIEW SYSTEM"
+    color  sys_color   = win_rate >= 40 and expectancy > 0 and pf >= 1.2 ? color.green : total_trades < 30 ? color.orange : color.red
+
+    string stage_str   = bal < 2500 ? "Stage 1: Foundation" : bal < 7500 ? "Stage 2: Development" : bal < 20000 ? "Stage 3: Consistency" : bal < 50000 ? "Stage 4: Scaling" : bal < 200000 ? "Stage 5: Professional" : "Stage 6: Elite"
+    color  stage_col   = bal < 2500 ? color.gray : bal < 7500 ? color.blue : bal < 20000 ? color.teal : bal < 50000 ? color.green : bal < 200000 ? color.purple : color.orange
+
+    string ttl_str     = str.tostring(total_trades)
+    string win_str     = str.tostring(wins)
+    string los_str     = str.tostring(losses)
+    string be_str      = str.tostring(breakevens)
+    string wr_str      = str.tostring(win_rate,    "#.##") + "%"
+    string np_str      = "$" + str.tostring(net_profit, "#.##") + " (" + str.tostring(net_pct, "#.##") + "%)"
+    string pf_str      = str.tostring(pf,           "#.##")
+    string exp_str     = str.tostring(expectancy,   "#.##")
+    string rr_str      = str.tostring(avg_rr,       "#.##") + "R"
+    string dd_str      = str.tostring(max_dd,       "#.##") + "%"
+    string bal_str     = "$" + str.tostring(bal,    "#.##")
+    string bias_str    = daily_bias == 1 ? "BULLISH" : daily_bias == -1 ? "BEARISH" : "NEUTRAL"
+    string sess_str    = in_session ? "LONDON ACTIVE" : "CLOSED"
+    string td_str      = "L:" + str.tostring(long_count) + "/3  S:" + str.tostring(short_count) + "/3"
+
+    color  wr_col      = win_rate    >= 40  ? color.green  : color.red
+    color  np_col      = net_profit  >  0   ? color.green  : color.red
+    color  pf_col      = pf          >= 1.2 ? color.green  : color.red
+    color  exp_col     = expectancy  >  0   ? color.green  : color.red
+    color  rr_col      = avg_rr      >= 2.0 ? color.green  : color.orange
+    color  dd_col      = max_dd      <  10  ? color.green  : color.red
+    color  bias_col    = daily_bias  == 1   ? color.green  : daily_bias == -1 ? color.red : color.gray
+    color  sess_col    = in_session          ? color.green  : color.red
+
+    table.cell(dash, 0, 0,  "FAS STRATEGY",   bgcolor=color.new(color.blue, 20), text_color=color.white,  text_size=size.small, text_halign=text.align_right)
+    table.cell(dash, 1, 0,  "PERFORMANCE",    bgcolor=color.new(color.blue, 20), text_color=color.white,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 0, 1,  "Total Trades",   text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 1,  ttl_str,          text_color=color.white,            text_size=size.small)
+    table.cell(dash, 0, 2,  "Wins",           text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 2,  win_str,          text_color=color.green,            text_size=size.small)
+    table.cell(dash, 0, 3,  "Losses",         text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 3,  los_str,          text_color=color.red,              text_size=size.small)
+    table.cell(dash, 0, 4,  "Breakevens",     text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 4,  be_str,           text_color=color.yellow,           text_size=size.small)
+    table.cell(dash, 0, 5,  "Win Rate",       text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 5,  wr_str,           text_color=wr_col,                 text_size=size.small)
+    table.cell(dash, 0, 6,  "Net Profit",     text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 6,  np_str,           text_color=np_col,                 text_size=size.small)
+    table.cell(dash, 0, 7,  "Profit Factor",  text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 7,  pf_str,           text_color=pf_col,                 text_size=size.small)
+    table.cell(dash, 0, 8,  "Expectancy",     text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 8,  exp_str,          text_color=exp_col,                text_size=size.small)
+    table.cell(dash, 0, 9,  "Avg Win RR",     text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 9,  rr_str,           text_color=rr_col,                 text_size=size.small)
+    table.cell(dash, 0, 10, "Max Drawdown",   text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 10, dd_str,           text_color=dd_col,                 text_size=size.small)
+    table.cell(dash, 0, 11, "Balance",        text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 11, bal_str,          text_color=color.white,            text_size=size.small)
+    table.cell(dash, 0, 12, "System Status",  text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 12, sys_status,       text_color=sys_color,              text_size=size.small)
+    table.cell(dash, 0, 13, "Stage",          text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 13, stage_str,        text_color=stage_col,              text_size=size.small)
+    table.cell(dash, 0, 14, "Daily Bias",     text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 14, bias_str,         text_color=bias_col,               text_size=size.small)
+    table.cell(dash, 0, 15, "Session",        text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 15, sess_str,         text_color=sess_col,               text_size=size.small)
+    table.cell(dash, 0, 16, "Trades Today",   text_color=color.gray,             text_size=size.small)
+    table.cell(dash, 1, 16, td_str,           text_color=color.white,            text_size=size.small)
+
+// ═══════════════════════════════════════════════
+// SECTION 17: ALERTS
+// ═══════════════════════════════════════════════
+
+alertcondition(long_cond,               title="FAS Long Entry",   message="FAS LONG ENTRY on {{ticker}} at {{close}} - Check checklist before entering")
+alertcondition(short_cond,              title="FAS Short Entry",  message="FAS SHORT ENTRY on {{ticker}} at {{close}} - Check checklist before entering")
+alertcondition(long_cond or short_cond, title="FAS Any Entry",    message="FAS ENTRY SIGNAL on {{ticker}} - Check chart now")
+alertcondition(trade_just_closed,       title="FAS Trade Closed", message="FAS TRADE CLOSED on {{ticker}} - Log this trade in your journal")

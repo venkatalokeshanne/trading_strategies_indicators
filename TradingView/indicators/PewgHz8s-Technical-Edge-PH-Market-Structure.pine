@@ -1,0 +1,203 @@
+//@version=6
+indicator("Institutional Sniper v6", overlay = true, max_labels_count = 500)
+
+// ══════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════
+gS = "Signal Engine"
+lookback       = input.int(20,   "Sweep lookback (bars)",            minval = 2,   group = gS)
+sweepTolATR    = input.float(0.10, "Sweep tolerance (ATR mult)",     minval = 0.0, step = 0.05, group = gS)
+requireReclaim = input.bool(true,  "Require close back inside range", group = gS,
+     tooltip = "True sweep: price pierces the prior extreme, then closes back inside it.")
+strictConfirm  = input.bool(true,  "Require BOTH confirmations (AND)", group = gS,
+     tooltip = "Off = original OR logic, which passes almost everything.")
+confirmOnClose = input.bool(true,  "Signal only on confirmed bar",   group = gS)
+
+gT = "Trade Model"
+atrLen  = input.int(14,   "ATR length",     minval = 1,   group = gT)
+slMult  = input.float(1.5, "SL (x ATR)",    minval = 0.1, step = 0.1, group = gT)
+tp1Mult = input.float(1.5, "TP1 (x ATR)",   minval = 0.1, step = 0.1, group = gT)
+tp2Mult = input.float(3.0, "TP2 (x ATR)",   minval = 0.1, step = 0.1, group = gT)
+tp3Mult = input.float(4.5, "TP3 (x ATR)",   minval = 0.1, step = 0.1, group = gT)
+boxLen  = input.int(50,   "Box width (bars)", minval = 5, group = gT)
+
+gX = "Sessions"
+useSessions = input.bool(true, "Enable session filter", group = gX)
+lonSess = input.session("0700-1600", "London  (Europe/London)",    group = gX)
+nySess  = input.session("0800-1700", "New York (America/New_York)", group = gX)
+
+// ══════════════════════════════════════════════════════════════
+// INDICATORS
+// ══════════════════════════════════════════════════════════════
+ema200 = ta.ema(close, 200)
+ema50  = ta.ema(close, 50)
+rsi    = ta.rsi(close, 14)
+atr    = ta.atr(atrLen)
+
+// ══════════════════════════════════════════════════════════════
+// LIQUIDITY  —  prior extremes EXCLUDE the current bar via [1]
+// Tolerance in ATR (price units), not % — broker-agnostic.
+// ══════════════════════════════════════════════════════════════
+prevHigh = ta.highest(high, lookback)[1]
+prevLow  = ta.lowest(low,  lookback)[1]
+tol      = atr * sweepTolATR
+
+buyPierce  = low  <= prevLow  + tol
+sellPierce = high >= prevHigh - tol
+
+buyReclaim  = close > prevLow
+sellReclaim = close < prevHigh
+
+buySweep  = buyPierce  and (not requireReclaim or buyReclaim)
+sellSweep = sellPierce and (not requireReclaim or sellReclaim)
+
+// ══════════════════════════════════════════════════════════════
+// TREND / CONFIRMATION
+// ══════════════════════════════════════════════════════════════
+bull = close > ema200
+bear = close < ema200
+
+bullConfirm = strictConfirm ? (rsi > 45 and close > ema50) : (rsi > 45 or close > ema50)
+bearConfirm = strictConfirm ? (rsi < 55 and close < ema50) : (rsi < 55 or close < ema50)
+
+// ══════════════════════════════════════════════════════════════
+// SESSION FILTER  —  explicit timezones
+// ══════════════════════════════════════════════════════════════
+inLondon  = not na(time(timeframe.period, lonSess, "Europe/London"))
+inNY      = not na(time(timeframe.period, nySess,  "America/New_York"))
+sessionOK = not useSessions or inLondon or inNY
+
+// ══════════════════════════════════════════════════════════════
+// SIGNALS
+// ══════════════════════════════════════════════════════════════
+barOK = not confirmOnClose or barstate.isconfirmed
+
+buySignal  = buySweep  and bull and bullConfirm and sessionOK and barOK
+sellSignal = sellSweep and bear and bearConfirm and sessionOK and barOK
+
+// ══════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════
+var bool  inTrade  = false
+var int   dir      = 0
+var int   entryBar = -1
+var float entry    = na
+var float sl       = na
+var float tp1      = na
+var float tp2      = na
+var float tp3      = na
+
+var box slBox  = na
+var box tp1Box = na
+var box tp2Box = na
+var box tp3Box = na
+
+f_clear() =>
+    box.delete(slBox)
+    box.delete(tp1Box)
+    box.delete(tp2Box)
+    box.delete(tp3Box)
+
+// ══════════════════════════════════════════════════════════════
+// EXIT DETECTION  —  runs BEFORE entries, skips the entry bar.
+// Ambiguous bars (SL and TP both touched) resolve as SL: pessimistic.
+// ══════════════════════════════════════════════════════════════
+exitPrice = 0.0
+exitWin   = false
+didExit   = false
+
+if inTrade and bar_index > entryBar
+    if dir == 1
+        if low <= sl
+            didExit := true
+            exitPrice := sl
+            exitWin := false
+        else if high >= tp3
+            didExit := true
+            exitPrice := tp3
+            exitWin := true
+    else if dir == -1
+        if high >= sl
+            didExit := true
+            exitPrice := sl
+            exitWin := false
+        else if low <= tp3
+            didExit := true
+            exitPrice := tp3
+            exitWin := true
+
+    if didExit
+        inTrade := false
+        dir := 0
+        label.new(bar_index, exitPrice,
+             text  = exitWin ? "TP3" : "SL",
+             style = exitWin ? label.style_label_down : label.style_label_up,
+             color = exitWin ? color.new(color.green, 20) : color.new(color.red, 20),
+             textcolor = color.white, size = size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// BUY EXECUTION
+// ══════════════════════════════════════════════════════════════
+if buySignal and not inTrade
+    f_clear()
+
+    inTrade  := true
+    dir      := 1
+    entryBar := bar_index
+
+    entry := close
+    sl    := entry - atr * slMult
+    tp1   := entry + atr * tp1Mult
+    tp2   := entry + atr * tp2Mult
+    tp3   := entry + atr * tp3Mult
+
+    slBox  := box.new(bar_index, entry, bar_index + boxLen, sl,
+         bgcolor = color.new(color.red, 85),   border_color = color.red)
+    tp1Box := box.new(bar_index, tp1,   bar_index + boxLen, entry,
+         bgcolor = color.new(color.green, 85), border_color = color.green)
+    tp2Box := box.new(bar_index, tp2,   bar_index + boxLen, tp1,
+         bgcolor = color.new(color.green, 75), border_color = color.green)
+    tp3Box := box.new(bar_index, tp3,   bar_index + boxLen, tp2,
+         bgcolor = color.new(color.green, 65), border_color = color.green)
+
+// ══════════════════════════════════════════════════════════════
+// SELL EXECUTION
+// ══════════════════════════════════════════════════════════════
+if sellSignal and not inTrade
+    f_clear()
+
+    inTrade  := true
+    dir      := -1
+    entryBar := bar_index
+
+    entry := close
+    sl    := entry + atr * slMult
+    tp1   := entry - atr * tp1Mult
+    tp2   := entry - atr * tp2Mult
+    tp3   := entry - atr * tp3Mult
+
+    slBox  := box.new(bar_index, sl,    bar_index + boxLen, entry,
+         bgcolor = color.new(color.red, 85),   border_color = color.red)
+    tp1Box := box.new(bar_index, entry, bar_index + boxLen, tp1,
+         bgcolor = color.new(color.green, 85), border_color = color.green)
+    tp2Box := box.new(bar_index, tp1,   bar_index + boxLen, tp2,
+         bgcolor = color.new(color.green, 75), border_color = color.green)
+    tp3Box := box.new(bar_index, tp2,   bar_index + boxLen, tp3,
+         bgcolor = color.new(color.green, 65), border_color = color.green)
+
+// ══════════════════════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════════════════════
+plot(ema200, "EMA 200", color = color.orange)
+plot(ema50,  "EMA 50",  color = color.blue)
+
+plotshape(buySignal,  title = "BUY",  location = location.belowbar,
+     color = color.green, style = shape.labelup,   text = "BUY",  textcolor = color.white)
+plotshape(sellSignal, title = "SELL", location = location.abovebar,
+     color = color.red,   style = shape.labeldown, text = "SELL", textcolor = color.white)
+
+// ══════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════
+alertcondition(buySignal,  "Sniper BUY",  "Institutional Sniper: BUY {{ticker}} @ {{close}}")
+alertcondition(sellSignal, "Sniper SELL", "Institutional Sniper: SELL {{ticker}} @ {{close}}")

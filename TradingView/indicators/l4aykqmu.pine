@@ -1,0 +1,688 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Original Auto AVWAP concept/code: © Electrified (electrifiedtrading)
+// Core and Adaptive AVWAP lifecycle modification
+//@version=6
+indicator("Auto AVWAP - Core and Adaptive Levels", "Auto AVWAP CAL", overlay=true, format=format.price, precision=2, max_polylines_count=100)
+
+WMA = "WMA", EMA = "EMA", SMA = "SMA", VWMA = "VWMA", VAWMA = "VAWMA"
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+
+useHiLow = input.bool(true, "Use High/Low instead of HLC3", group="Anchored VWAP")
+
+maxGenerations = input.int(3, "Maximum Adaptive AVWAPs per direction", minval=1, maxval=10, group="Adaptive AVWAP Creation")
+atrLength = input.int(14, "ATR length", minval=1, group="Adaptive AVWAP Creation")
+creationDistanceATR = input.float(2.0, "Distance required from newest AVWAP (ATR)", minval=0.1, step=0.1, group="Adaptive AVWAP Creation")
+minimumBarsBetween = input.int(24, "Minimum bars between anchors", minval=1, group="Adaptive AVWAP Creation")
+minimumAnchorSpacingATR = input.float(1.0, "Minimum spacing between anchors (ATR)", minval=0.0, step=0.1, group="Adaptive AVWAP Creation")
+confirmationMoveATR = input.float(0.5, "Price reaction required (ATR)", minval=0.0, step=0.1, group="Adaptive AVWAP Creation")
+candidateTimeout = input.int(100, "Candidate timeout (bars)", minval=5, group="Adaptive AVWAP Creation")
+requireProgressive = input.bool(true, "Require progressively higher lows / lower highs", group="Adaptive AVWAP Creation", tooltip="Adaptive support AVWAPs require a higher anchor low. Adaptive resistance AVWAPs require a lower anchor high.")
+
+confirmationMode = input.string("Pivot + Structure break", "Top/bottom confirmation", options=["Reaction only", "Pivot confirmed", "Pivot + Structure break"], group="Top/Bottom Confirmation")
+pivotConfirmationBars = input.int(3, "Bars without a new extreme", minval=1, group="Top/Bottom Confirmation", tooltip="A top must remain unbroken for this many bars. A bottom follows the inverse rule.")
+structureLookback = input.int(5, "Microstructure lookback", minval=2, group="Top/Bottom Confirmation", tooltip="A top is confirmed after closing below the local low captured at the extreme. A bottom requires a close above the captured local high.")
+
+violationBars = input.int(3, "Consecutive bars to invalidate", minval=1, group="Core and Adaptive Invalidation")
+violationSource = input.string("Close", "Violation source", options=["Close", "Open", "High/Low"], group="Core and Adaptive Invalidation")
+confirmedOnly = input.bool(true, "Count only closed bars", group="Core and Adaptive Invalidation")
+
+touchToleranceATR = input.float(0.10, "Touch tolerance (ATR)", minval=0.0, step=0.05, group="AVWAP Interaction Alerts", tooltip="Defines the interaction zone around each AVWAP.")
+rejectionDistanceATR = input.float(0.15, "Minimum rejection close distance (ATR)", minval=0.0, step=0.05, group="AVWAP Interaction Alerts", tooltip="After touching or crossing an AVWAP, price must close this far back on the valid side to qualify as a rejection.")
+minimumFailedBars = input.int(1, "Minimum partial violation bars", minval=1, group="AVWAP Interaction Alerts", tooltip="Minimum consecutive violation bars required before a return to the valid side is classified as a failed violation.")
+interactionAlertsClosedOnly = input.bool(true, "Confirm interactions only on closed bars", group="AVWAP Interaction Alerts")
+
+kMode = input.string(WMA, "K mode", options=[SMA, EMA, WMA, VWMA, VAWMA], group="Stochastic RSI", inline="K")
+stochSource = input.source(hlc3, "Source", group="Stochastic RSI", inline="K")
+smoothK = input.int(4, "K", minval=1, group="Stochastic RSI", inline="Smooth")
+smoothD = input.int(4, "D", minval=1, group="Stochastic RSI", inline="Smooth")
+lengthRSI = input.int(64, "RSI length", minval=1, group="Stochastic RSI", inline="Length")
+lengthStoch = input.int(48, "Stochastic length", minval=1, group="Stochastic RSI", inline="Length")
+lowerBand = input.float(20.0, "Lower band", minval=0.0, maxval=50.0, group="Stochastic RSI", inline="Band")
+upperBand = input.float(80.0, "Upper band", minval=50.0, maxval=100.0, group="Stochastic RSI", inline="Band")
+
+showCandidates = input.bool(false, "Show developing Adaptive candidates", group="Display")
+showMothers = input.bool(true, "Show Core AVWAPs", group="Display")
+
+//------------------------------------------------------------------------------
+// Functions
+//------------------------------------------------------------------------------
+
+vawma(series float source, simple int length) =>
+    float weightedSum = 0.0
+    float weightedVolume = 0.0
+    for m = 1 to length
+        int offset = length - m
+        float weightedVol = volume[offset] * m
+        weightedVolume += weightedVol
+        weightedSum += source[offset] * weightedVol
+    weightedVolume > 0 ? weightedSum / weightedVolume : na
+
+getMA(series float source, simple string mode, simple int length) =>
+    switch mode
+        WMA => ta.wma(source, length)
+        EMA => ta.ema(source, length)
+        VWMA => ta.vwma(source, length)
+        VAWMA => vawma(source, length)
+        => ta.sma(source, length)
+
+firstFreeSlot(array<bool> activeSlots, int enabledSlots) =>
+    int freeSlot = -1
+    for slot = 0 to enabledSlots - 1
+        if freeSlot == -1 and not array.get(activeSlots, slot)
+            freeSlot := slot
+    freeSlot
+
+newestActiveSlot(array<bool> activeSlots, array<int> createdBars, int enabledSlots) =>
+    int newestSlot = -1
+    int newestBar = -1
+    for slot = 0 to enabledSlots - 1
+        if array.get(activeSlots, slot) and array.get(createdBars, slot) > newestBar
+            newestBar := array.get(createdBars, slot)
+            newestSlot := slot
+    newestSlot
+
+slotValue(array<float> sums, array<float> volumes, int slot) =>
+    float slotVolume = array.get(volumes, slot)
+    slotVolume > 0 ? array.get(sums, slot) / slotVolume : na
+
+resistanceSlotColor(int slot) =>
+    switch slot
+        0 => color.new(color.orange, 5)
+        1 => color.new(color.fuchsia, 15)
+        2 => color.new(color.purple, 20)
+        3 => color.new(color.orange, 10)
+        4 => color.new(color.fuchsia, 20)
+        5 => color.new(color.purple, 25)
+        6 => color.new(color.orange, 15)
+        7 => color.new(color.fuchsia, 25)
+        8 => color.new(color.purple, 30)
+        => color.new(color.red, 25)
+
+supportSlotColor(int slot) =>
+    switch slot
+        0 => color.new(color.blue, 5)
+        1 => color.new(color.aqua, 10)
+        2 => color.new(color.teal, 15)
+        3 => color.new(color.blue, 10)
+        4 => color.new(color.aqua, 15)
+        5 => color.new(color.teal, 20)
+        6 => color.new(color.blue, 15)
+        7 => color.new(color.aqua, 20)
+        8 => color.new(color.teal, 25)
+        => color.new(color.navy, 20)
+
+//------------------------------------------------------------------------------
+// Oscillator and common values
+//------------------------------------------------------------------------------
+
+rsiValue = ta.rsi(stochSource, lengthRSI)
+stochValue = ta.stoch(rsiValue, rsiValue, rsiValue, lengthStoch)
+k = getMA(stochValue, kMode, smoothK)
+d = ta.sma(k, smoothD)
+atr = ta.atr(atrLength)
+kCrossUnderD = ta.crossunder(k, d)
+kCrossOverD = ta.crossover(k, d)
+priorLocalLow = ta.lowest(low[1], structureLookback)
+priorLocalHigh = ta.highest(high[1], structureLookback)
+
+vwapHighPrice = useHiLow ? high : hlc3
+vwapLowPrice = useHiLow ? low : hlc3
+barVolume = volume
+canCount = not confirmedOnly or barstate.isconfirmed
+highViolationPrice = violationSource == "Open" ? open : violationSource == "High/Low" ? high : close
+lowViolationPrice = violationSource == "Open" ? open : violationSource == "High/Low" ? low : close
+interactionConfirmed = not interactionAlertsClosedOnly or barstate.isconfirmed
+touchTolerance = touchToleranceATR * atr
+rejectionDistance = rejectionDistanceATR * atr
+
+bool resistanceTouchEvent = false
+bool supportTouchEvent = false
+bool resistanceRejectionEvent = false
+bool supportRejectionEvent = false
+bool resistanceFailedViolationEvent = false
+bool supportFailedViolationEvent = false
+
+//------------------------------------------------------------------------------
+// Core AVWAPs
+//------------------------------------------------------------------------------
+
+var float motherHighSum = 0.0
+var float motherLowSum = 0.0
+var float motherHighVolume = 0.0
+var float motherLowVolume = 0.0
+var float motherHighNextSum = 0.0
+var float motherLowNextSum = 0.0
+var float motherHighNextVolume = 0.0
+var float motherLowNextVolume = 0.0
+var float motherHighNextExtreme = high
+var float motherLowNextExtreme = low
+var float motherHighAnchor = high
+var float motherLowAnchor = low
+var int motherHighCreatedBar = 0
+var int motherLowCreatedBar = 0
+var int motherHighViolationCount = 0
+var int motherLowViolationCount = 0
+var bool motherHighActive = true
+var bool motherLowActive = true
+var bool coreHighTouchLatched = false
+var bool coreLowTouchLatched = false
+var bool motherHighAwaitingConfirmation = false
+var bool motherLowAwaitingConfirmation = false
+var int motherHighNextStart = 0
+var int motherLowNextStart = 0
+var bool motherHighNextTurned = false
+var bool motherLowNextTurned = false
+var bool motherHighNextActive = false
+var bool motherLowNextActive = false
+var float motherHighStructureLevel = na
+var float motherLowStructureLevel = na
+var array<chart.point> motherHighOriginPoints = array.new<chart.point>()
+var array<chart.point> motherLowOriginPoints = array.new<chart.point>()
+
+// A Core candidate belongs to one complete oscillator episode. A resistance
+// candidate can only start in overbought territory; support uses oversold.
+if not motherHighNextActive and d > upperBand
+    motherHighNextActive := true
+    motherHighNextExtreme := high
+    motherHighNextSum := 0.0
+    motherHighNextVolume := 0.0
+    motherHighNextStart := bar_index
+    motherHighNextTurned := false
+    motherHighStructureLevel := priorLocalLow
+    array.clear(motherHighOriginPoints)
+
+if not motherLowNextActive and d < lowerBand
+    motherLowNextActive := true
+    motherLowNextExtreme := low
+    motherLowNextSum := 0.0
+    motherLowNextVolume := 0.0
+    motherLowNextStart := bar_index
+    motherLowNextTurned := false
+    motherLowStructureLevel := priorLocalHigh
+    array.clear(motherLowOriginPoints)
+
+if motherHighActive
+    motherHighSum += vwapHighPrice * barVolume
+    motherHighVolume += barVolume
+if motherLowActive
+    motherLowSum += vwapLowPrice * barVolume
+    motherLowVolume += barVolume
+if motherHighNextActive
+    if high > motherHighNextExtreme
+        motherHighNextExtreme := high
+        motherHighNextSum := 0.0
+        motherHighNextVolume := 0.0
+        motherHighNextStart := bar_index
+        motherHighNextTurned := false
+        motherHighStructureLevel := priorLocalLow
+        array.clear(motherHighOriginPoints)
+    motherHighNextSum += vwapHighPrice * barVolume
+    motherHighNextVolume += barVolume
+    float motherHighDevelopingValue = motherHighNextVolume > 0 ? motherHighNextSum / motherHighNextVolume : na
+    if not na(motherHighDevelopingValue)
+        array.push(motherHighOriginPoints, chart.point.from_index(bar_index, motherHighDevelopingValue))
+    if kCrossUnderD
+        motherHighNextTurned := true
+
+if motherLowNextActive
+    if low < motherLowNextExtreme
+        motherLowNextExtreme := low
+        motherLowNextSum := 0.0
+        motherLowNextVolume := 0.0
+        motherLowNextStart := bar_index
+        motherLowNextTurned := false
+        motherLowStructureLevel := priorLocalHigh
+        array.clear(motherLowOriginPoints)
+    motherLowNextSum += vwapLowPrice * barVolume
+    motherLowNextVolume += barVolume
+    float motherLowDevelopingValue = motherLowNextVolume > 0 ? motherLowNextSum / motherLowNextVolume : na
+    if not na(motherLowDevelopingValue)
+        array.push(motherLowOriginPoints, chart.point.from_index(bar_index, motherLowDevelopingValue))
+    if kCrossOverD
+        motherLowNextTurned := true
+
+motherHighBeforePromotion = motherHighVolume > 0 ? motherHighSum / motherHighVolume : na
+motherLowBeforePromotion = motherLowVolume > 0 ? motherLowSum / motherLowVolume : na
+
+bool motherHighInvalidatedNowEvent = false
+bool motherLowInvalidatedNowEvent = false
+
+bool coreHighInTouchZone = motherHighActive and not na(motherHighBeforePromotion) and high >= motherHighBeforePromotion - touchTolerance and low <= motherHighBeforePromotion + touchTolerance
+bool coreLowInTouchZone = motherLowActive and not na(motherLowBeforePromotion) and high >= motherLowBeforePromotion - touchTolerance and low <= motherLowBeforePromotion + touchTolerance
+
+if interactionConfirmed
+    if coreHighInTouchZone and not coreHighTouchLatched
+        resistanceTouchEvent := true
+    if coreLowInTouchZone and not coreLowTouchLatched
+        supportTouchEvent := true
+    coreHighTouchLatched := coreHighInTouchZone
+    coreLowTouchLatched := coreLowInTouchZone
+
+    if motherHighActive and high >= motherHighBeforePromotion - touchTolerance and close <= motherHighBeforePromotion - rejectionDistance
+        resistanceRejectionEvent := true
+    if motherLowActive and low <= motherLowBeforePromotion + touchTolerance and close >= motherLowBeforePromotion + rejectionDistance
+        supportRejectionEvent := true
+
+if canCount and motherHighActive
+    bool coreHighViolatedNow = highViolationPrice > motherHighBeforePromotion
+    int previousCoreHighViolations = motherHighViolationCount
+    if interactionConfirmed and not coreHighViolatedNow and previousCoreHighViolations >= minimumFailedBars and previousCoreHighViolations < violationBars
+        resistanceFailedViolationEvent := true
+    motherHighViolationCount := coreHighViolatedNow ? previousCoreHighViolations + 1 : 0
+    if motherHighViolationCount >= violationBars
+        motherHighActive := false
+        motherHighAwaitingConfirmation := true
+        motherHighViolationCount := 0
+        motherHighInvalidatedNowEvent := true
+
+if canCount and motherLowActive
+    bool coreLowViolatedNow = lowViolationPrice < motherLowBeforePromotion
+    int previousCoreLowViolations = motherLowViolationCount
+    if interactionConfirmed and not coreLowViolatedNow and previousCoreLowViolations >= minimumFailedBars and previousCoreLowViolations < violationBars
+        supportFailedViolationEvent := true
+    motherLowViolationCount := coreLowViolatedNow ? previousCoreLowViolations + 1 : 0
+    if motherLowViolationCount >= violationBars
+        motherLowActive := false
+        motherLowAwaitingConfirmation := true
+        motherLowViolationCount := 0
+        motherLowInvalidatedNowEvent := true
+
+bool motherHighPivotConfirmed = motherHighNextActive and bar_index - motherHighNextStart >= pivotConfirmationBars
+bool motherLowPivotConfirmed = motherLowNextActive and bar_index - motherLowNextStart >= pivotConfirmationBars
+bool motherHighStructureConfirmed = motherHighNextActive and not na(motherHighStructureLevel) and close < motherHighStructureLevel
+bool motherLowStructureConfirmed = motherLowNextActive and not na(motherLowStructureLevel) and close > motherLowStructureLevel
+bool motherHighReactionConfirmed = motherHighNextActive and motherHighNextTurned and close <= motherHighNextExtreme - confirmationMoveATR * atr
+bool motherLowReactionConfirmed = motherLowNextActive and motherLowNextTurned and close >= motherLowNextExtreme + confirmationMoveATR * atr
+bool motherHighTopConfirmed = motherHighReactionConfirmed and (confirmationMode == "Reaction only" or motherHighPivotConfirmed and (confirmationMode == "Pivot confirmed" or motherHighStructureConfirmed))
+bool motherLowBottomConfirmed = motherLowReactionConfirmed and (confirmationMode == "Reaction only" or motherLowPivotConfirmed and (confirmationMode == "Pivot confirmed" or motherLowStructureConfirmed))
+
+bool motherHighPromotedEvent = motherHighAwaitingConfirmation and motherHighTopConfirmed
+bool motherLowPromotedEvent = motherLowAwaitingConfirmation and motherLowBottomConfirmed
+
+if motherHighPromotedEvent
+    if array.size(motherHighOriginPoints) > 1
+        polyline.new(array.copy(motherHighOriginPoints), curved=false, closed=false, xloc=xloc.bar_index, line_color=color.new(color.red, 35), line_style=line.style_dotted, line_width=3)
+    motherHighSum := motherHighNextSum
+    motherHighVolume := motherHighNextVolume
+    motherHighAnchor := motherHighNextExtreme
+    motherHighCreatedBar := bar_index
+    motherHighViolationCount := 0
+    motherHighActive := true
+    motherHighAwaitingConfirmation := false
+    motherHighNextSum := 0.0
+    motherHighNextVolume := 0.0
+    motherHighNextExtreme := high
+    motherHighNextStart := bar_index
+    motherHighNextTurned := false
+    motherHighNextActive := false
+    motherHighStructureLevel := priorLocalLow
+    array.clear(motherHighOriginPoints)
+
+if motherLowPromotedEvent
+    if array.size(motherLowOriginPoints) > 1
+        polyline.new(array.copy(motherLowOriginPoints), curved=false, closed=false, xloc=xloc.bar_index, line_color=color.new(color.green, 35), line_style=line.style_dotted, line_width=3)
+    motherLowSum := motherLowNextSum
+    motherLowVolume := motherLowNextVolume
+    motherLowAnchor := motherLowNextExtreme
+    motherLowCreatedBar := bar_index
+    motherLowViolationCount := 0
+    motherLowActive := true
+    motherLowAwaitingConfirmation := false
+    motherLowNextSum := 0.0
+    motherLowNextVolume := 0.0
+    motherLowNextExtreme := low
+    motherLowNextStart := bar_index
+    motherLowNextTurned := false
+    motherLowNextActive := false
+    motherLowStructureLevel := priorLocalHigh
+    array.clear(motherLowOriginPoints)
+
+// Stale, unconfirmed Core candidates cannot be promoted much later.
+if motherHighNextActive and bar_index - motherHighNextStart > candidateTimeout
+    motherHighNextActive := false
+    motherHighNextTurned := false
+    motherHighNextSum := 0.0
+    motherHighNextVolume := 0.0
+    array.clear(motherHighOriginPoints)
+
+if motherLowNextActive and bar_index - motherLowNextStart > candidateTimeout
+    motherLowNextActive := false
+    motherLowNextTurned := false
+    motherLowNextSum := 0.0
+    motherLowNextVolume := 0.0
+    array.clear(motherLowOriginPoints)
+
+motherHigh = motherHighActive and motherHighVolume > 0 ? motherHighSum / motherHighVolume : na
+motherLow = motherLowActive and motherLowVolume > 0 ? motherLowSum / motherLowVolume : na
+motherHighNext = motherHighNextActive and motherHighNextVolume > 0 ? motherHighNextSum / motherHighNextVolume : na
+motherLowNext = motherLowNextActive and motherLowNextVolume > 0 ? motherLowNextSum / motherLowNextVolume : na
+
+//------------------------------------------------------------------------------
+// Ten fixed Adaptive AVWAP slots per direction
+//------------------------------------------------------------------------------
+
+var highSums = array.new_float(10, 0.0)
+var highVolumes = array.new_float(10, 0.0)
+var highActive = array.new_bool(10, false)
+var highViolations = array.new_int(10, 0)
+var highCreatedBars = array.new_int(10, -1)
+var highAnchorPrices = array.new_float(10, na)
+var highTouchLatched = array.new_bool(10, false)
+
+var lowSums = array.new_float(10, 0.0)
+var lowVolumes = array.new_float(10, 0.0)
+var lowActive = array.new_bool(10, false)
+var lowViolations = array.new_int(10, 0)
+var lowCreatedBars = array.new_int(10, -1)
+var lowAnchorPrices = array.new_float(10, na)
+var lowTouchLatched = array.new_bool(10, false)
+
+bool highInvalidatedEvent = motherHighInvalidatedNowEvent
+bool lowInvalidatedEvent = motherLowInvalidatedNowEvent
+
+// Update every active generation and invalidate each one independently.
+for slot = 0 to 9
+    if array.get(highActive, slot)
+        array.set(highSums, slot, array.get(highSums, slot) + vwapHighPrice * barVolume)
+        array.set(highVolumes, slot, array.get(highVolumes, slot) + barVolume)
+        float currentHighValue = slotValue(highSums, highVolumes, slot)
+        bool highInTouchZone = high >= currentHighValue - touchTolerance and low <= currentHighValue + touchTolerance
+        if interactionConfirmed
+            if highInTouchZone and not array.get(highTouchLatched, slot)
+                resistanceTouchEvent := true
+            array.set(highTouchLatched, slot, highInTouchZone)
+            if high >= currentHighValue - touchTolerance and close <= currentHighValue - rejectionDistance
+                resistanceRejectionEvent := true
+        if canCount
+            bool highViolatedNow = highViolationPrice > currentHighValue
+            int previousCount = array.get(highViolations, slot)
+            if interactionConfirmed and not highViolatedNow and previousCount >= minimumFailedBars and previousCount < violationBars
+                resistanceFailedViolationEvent := true
+            int count = highViolatedNow ? previousCount + 1 : 0
+            array.set(highViolations, slot, count)
+            if count >= violationBars
+                array.set(highActive, slot, false)
+                array.set(highViolations, slot, 0)
+                array.set(highTouchLatched, slot, false)
+                highInvalidatedEvent := true
+
+    if array.get(lowActive, slot)
+        array.set(lowSums, slot, array.get(lowSums, slot) + vwapLowPrice * barVolume)
+        array.set(lowVolumes, slot, array.get(lowVolumes, slot) + barVolume)
+        float currentLowValue = slotValue(lowSums, lowVolumes, slot)
+        bool lowInTouchZone = high >= currentLowValue - touchTolerance and low <= currentLowValue + touchTolerance
+        if interactionConfirmed
+            if lowInTouchZone and not array.get(lowTouchLatched, slot)
+                supportTouchEvent := true
+            array.set(lowTouchLatched, slot, lowInTouchZone)
+            if low <= currentLowValue + touchTolerance and close >= currentLowValue + rejectionDistance
+                supportRejectionEvent := true
+        if canCount
+            bool lowViolatedNow = lowViolationPrice < currentLowValue
+            int previousCount = array.get(lowViolations, slot)
+            if interactionConfirmed and not lowViolatedNow and previousCount >= minimumFailedBars and previousCount < violationBars
+                supportFailedViolationEvent := true
+            int count = lowViolatedNow ? previousCount + 1 : 0
+            array.set(lowViolations, slot, count)
+            if count >= violationBars
+                array.set(lowActive, slot, false)
+                array.set(lowViolations, slot, 0)
+                array.set(lowTouchLatched, slot, false)
+                lowInvalidatedEvent := true
+
+//------------------------------------------------------------------------------
+// Determine the newest valid reference for each direction
+//------------------------------------------------------------------------------
+
+int newestHighSlot = newestActiveSlot(highActive, highCreatedBars, maxGenerations)
+int newestLowSlot = newestActiveSlot(lowActive, lowCreatedBars, maxGenerations)
+
+float newestHighValue = newestHighSlot >= 0 ? slotValue(highSums, highVolumes, newestHighSlot) : motherHigh
+float newestLowValue = newestLowSlot >= 0 ? slotValue(lowSums, lowVolumes, newestLowSlot) : motherLow
+float newestHighAnchor = newestHighSlot >= 0 ? array.get(highAnchorPrices, newestHighSlot) : motherHighAnchor
+float newestLowAnchor = newestLowSlot >= 0 ? array.get(lowAnchorPrices, newestLowSlot) : motherLowAnchor
+int newestHighBar = newestHighSlot >= 0 ? array.get(highCreatedBars, newestHighSlot) : motherHighCreatedBar
+int newestLowBar = newestLowSlot >= 0 ? array.get(lowCreatedBars, newestLowSlot) : motherLowCreatedBar
+
+int freeHighSlot = firstFreeSlot(highActive, maxGenerations)
+int freeLowSlot = firstFreeSlot(lowActive, maxGenerations)
+
+bool highAbandoned = freeHighSlot >= 0 and not na(atr) and newestHighValue - close >= creationDistanceATR * atr and bar_index - newestHighBar >= minimumBarsBetween
+bool lowAbandoned = freeLowSlot >= 0 and not na(atr) and close - newestLowValue >= creationDistanceATR * atr and bar_index - newestLowBar >= minimumBarsBetween
+
+//------------------------------------------------------------------------------
+// Candidate state: lower high for resistance / higher low for support
+//------------------------------------------------------------------------------
+
+var bool highArmed = false
+var bool lowArmed = false
+var bool highCandidateActive = false
+var bool lowCandidateActive = false
+var bool highCandidateTurned = false
+var bool lowCandidateTurned = false
+var int highCandidateStart = na
+var int lowCandidateStart = na
+var float highCandidateExtreme = na
+var float lowCandidateExtreme = na
+var float highCandidateSum = 0.0
+var float lowCandidateSum = 0.0
+var float highCandidateVolume = 0.0
+var float lowCandidateVolume = 0.0
+var float highCandidateStructureLevel = na
+var float lowCandidateStructureLevel = na
+var array<chart.point> highCandidateOriginPoints = array.new<chart.point>()
+var array<chart.point> lowCandidateOriginPoints = array.new<chart.point>()
+
+// A Core replacement starts a new search context. Existing confirmed
+// Adaptive AVWAPs remain active, but an unfinished candidate from the old Core is discarded.
+if motherHighPromotedEvent
+    highArmed := false
+    highCandidateActive := false
+    highCandidateTurned := false
+if motherLowPromotedEvent
+    lowArmed := false
+    lowCandidateActive := false
+    lowCandidateTurned := false
+
+if highAbandoned
+    highArmed := true
+if lowAbandoned
+    lowArmed := true
+
+// An overbought episode begins a possible new resistance anchor.
+if highArmed and not highCandidateActive and d > upperBand
+    highCandidateActive := true
+    highCandidateTurned := false
+    highCandidateStart := bar_index
+    highCandidateExtreme := high
+    highCandidateSum := 0.0
+    highCandidateVolume := 0.0
+    highCandidateStructureLevel := priorLocalLow
+    array.clear(highCandidateOriginPoints)
+
+// An oversold episode begins a possible new support anchor.
+if lowArmed and not lowCandidateActive and d < lowerBand
+    lowCandidateActive := true
+    lowCandidateTurned := false
+    lowCandidateStart := bar_index
+    lowCandidateExtreme := low
+    lowCandidateSum := 0.0
+    lowCandidateVolume := 0.0
+    lowCandidateStructureLevel := priorLocalHigh
+    array.clear(lowCandidateOriginPoints)
+
+if highCandidateActive
+    if high > highCandidateExtreme
+        highCandidateExtreme := high
+        highCandidateSum := 0.0
+        highCandidateVolume := 0.0
+        highCandidateStart := bar_index
+        highCandidateTurned := false
+        highCandidateStructureLevel := priorLocalLow
+        array.clear(highCandidateOriginPoints)
+    highCandidateSum += vwapHighPrice * barVolume
+    highCandidateVolume += barVolume
+    float highDevelopingValue = highCandidateVolume > 0 ? highCandidateSum / highCandidateVolume : na
+    if not na(highDevelopingValue)
+        array.push(highCandidateOriginPoints, chart.point.from_index(bar_index, highDevelopingValue))
+    if kCrossUnderD
+        highCandidateTurned := true
+
+if lowCandidateActive
+    if low < lowCandidateExtreme
+        lowCandidateExtreme := low
+        lowCandidateSum := 0.0
+        lowCandidateVolume := 0.0
+        lowCandidateStart := bar_index
+        lowCandidateTurned := false
+        lowCandidateStructureLevel := priorLocalHigh
+        array.clear(lowCandidateOriginPoints)
+    lowCandidateSum += vwapLowPrice * barVolume
+    lowCandidateVolume += barVolume
+    float lowDevelopingValue = lowCandidateVolume > 0 ? lowCandidateSum / lowCandidateVolume : na
+    if not na(lowDevelopingValue)
+        array.push(lowCandidateOriginPoints, chart.point.from_index(bar_index, lowDevelopingValue))
+    if kCrossOverD
+        lowCandidateTurned := true
+
+bool highPivotConfirmed = highCandidateActive and bar_index - highCandidateStart >= pivotConfirmationBars
+bool lowPivotConfirmed = lowCandidateActive and bar_index - lowCandidateStart >= pivotConfirmationBars
+bool highStructureConfirmed = highCandidateActive and not na(highCandidateStructureLevel) and close < highCandidateStructureLevel
+bool lowStructureConfirmed = lowCandidateActive and not na(lowCandidateStructureLevel) and close > lowCandidateStructureLevel
+bool highReactionReached = highCandidateActive and highCandidateTurned and close <= highCandidateExtreme - confirmationMoveATR * atr
+bool lowReactionReached = lowCandidateActive and lowCandidateTurned and close >= lowCandidateExtreme + confirmationMoveATR * atr
+bool highReactionConfirmed = highReactionReached and (confirmationMode == "Reaction only" or highPivotConfirmed and (confirmationMode == "Pivot confirmed" or highStructureConfirmed))
+bool lowReactionConfirmed = lowReactionReached and (confirmationMode == "Reaction only" or lowPivotConfirmed and (confirmationMode == "Pivot confirmed" or lowStructureConfirmed))
+
+bool highSpacingValid = highCandidateActive and (not requireProgressive ? math.abs(highCandidateExtreme - newestHighAnchor) >= minimumAnchorSpacingATR * atr : highCandidateExtreme <= newestHighAnchor - minimumAnchorSpacingATR * atr)
+bool lowSpacingValid = lowCandidateActive and (not requireProgressive ? math.abs(lowCandidateExtreme - newestLowAnchor) >= minimumAnchorSpacingATR * atr : lowCandidateExtreme >= newestLowAnchor + minimumAnchorSpacingATR * atr)
+
+bool highCreatedEvent = false
+bool lowCreatedEvent = false
+
+if highReactionConfirmed and highSpacingValid and freeHighSlot >= 0
+    if array.size(highCandidateOriginPoints) > 1
+        polyline.new(array.copy(highCandidateOriginPoints), curved=false, closed=false, xloc=xloc.bar_index, line_color=resistanceSlotColor(freeHighSlot), line_style=line.style_dotted, line_width=2)
+    array.set(highSums, freeHighSlot, highCandidateSum)
+    array.set(highVolumes, freeHighSlot, highCandidateVolume)
+    array.set(highActive, freeHighSlot, true)
+    array.set(highViolations, freeHighSlot, 0)
+    array.set(highTouchLatched, freeHighSlot, false)
+    array.set(highCreatedBars, freeHighSlot, bar_index)
+    array.set(highAnchorPrices, freeHighSlot, highCandidateExtreme)
+    highCandidateActive := false
+    highCandidateTurned := false
+    highArmed := false
+    highCreatedEvent := true
+    array.clear(highCandidateOriginPoints)
+
+if lowReactionConfirmed and lowSpacingValid and freeLowSlot >= 0
+    if array.size(lowCandidateOriginPoints) > 1
+        polyline.new(array.copy(lowCandidateOriginPoints), curved=false, closed=false, xloc=xloc.bar_index, line_color=supportSlotColor(freeLowSlot), line_style=line.style_dotted, line_width=2)
+    array.set(lowSums, freeLowSlot, lowCandidateSum)
+    array.set(lowVolumes, freeLowSlot, lowCandidateVolume)
+    array.set(lowActive, freeLowSlot, true)
+    array.set(lowViolations, freeLowSlot, 0)
+    array.set(lowTouchLatched, freeLowSlot, false)
+    array.set(lowCreatedBars, freeLowSlot, bar_index)
+    array.set(lowAnchorPrices, freeLowSlot, lowCandidateExtreme)
+    lowCandidateActive := false
+    lowCandidateTurned := false
+    lowArmed := false
+    lowCreatedEvent := true
+    array.clear(lowCandidateOriginPoints)
+
+// Discard stale candidates. A new abandonment condition may arm another search.
+if highCandidateActive and bar_index - highCandidateStart > candidateTimeout
+    highCandidateActive := false
+    highCandidateTurned := false
+    highArmed := false
+    array.clear(highCandidateOriginPoints)
+
+if lowCandidateActive and bar_index - lowCandidateStart > candidateTimeout
+    lowCandidateActive := false
+    lowCandidateTurned := false
+    lowArmed := false
+    array.clear(lowCandidateOriginPoints)
+
+// If all enabled slots become occupied, stop waiting for another candidate.
+if firstFreeSlot(highActive, maxGenerations) < 0
+    highArmed := false
+    highCandidateActive := false
+    array.clear(highCandidateOriginPoints)
+if firstFreeSlot(lowActive, maxGenerations) < 0
+    lowArmed := false
+    lowCandidateActive := false
+    array.clear(lowCandidateOriginPoints)
+
+//------------------------------------------------------------------------------
+// Plots
+//------------------------------------------------------------------------------
+
+plot(showMothers ? motherHigh : na, "Core Resistance AVWAP", color.new(color.red, 35), 3, plot.style_circles)
+plot(showMothers ? motherLow : na, "Core Support AVWAP", color.new(color.green, 35), 3, plot.style_circles)
+
+high1 = maxGenerations >= 1 and array.get(highActive, 0) ? slotValue(highSums, highVolumes, 0) : na
+high2 = maxGenerations >= 2 and array.get(highActive, 1) ? slotValue(highSums, highVolumes, 1) : na
+high3 = maxGenerations >= 3 and array.get(highActive, 2) ? slotValue(highSums, highVolumes, 2) : na
+high4 = maxGenerations >= 4 and array.get(highActive, 3) ? slotValue(highSums, highVolumes, 3) : na
+high5 = maxGenerations >= 5 and array.get(highActive, 4) ? slotValue(highSums, highVolumes, 4) : na
+high6 = maxGenerations >= 6 and array.get(highActive, 5) ? slotValue(highSums, highVolumes, 5) : na
+high7 = maxGenerations >= 7 and array.get(highActive, 6) ? slotValue(highSums, highVolumes, 6) : na
+high8 = maxGenerations >= 8 and array.get(highActive, 7) ? slotValue(highSums, highVolumes, 7) : na
+high9 = maxGenerations >= 9 and array.get(highActive, 8) ? slotValue(highSums, highVolumes, 8) : na
+high10 = maxGenerations >= 10 and array.get(highActive, 9) ? slotValue(highSums, highVolumes, 9) : na
+low1 = maxGenerations >= 1 and array.get(lowActive, 0) ? slotValue(lowSums, lowVolumes, 0) : na
+low2 = maxGenerations >= 2 and array.get(lowActive, 1) ? slotValue(lowSums, lowVolumes, 1) : na
+low3 = maxGenerations >= 3 and array.get(lowActive, 2) ? slotValue(lowSums, lowVolumes, 2) : na
+low4 = maxGenerations >= 4 and array.get(lowActive, 3) ? slotValue(lowSums, lowVolumes, 3) : na
+low5 = maxGenerations >= 5 and array.get(lowActive, 4) ? slotValue(lowSums, lowVolumes, 4) : na
+low6 = maxGenerations >= 6 and array.get(lowActive, 5) ? slotValue(lowSums, lowVolumes, 5) : na
+low7 = maxGenerations >= 7 and array.get(lowActive, 6) ? slotValue(lowSums, lowVolumes, 6) : na
+low8 = maxGenerations >= 8 and array.get(lowActive, 7) ? slotValue(lowSums, lowVolumes, 7) : na
+low9 = maxGenerations >= 9 and array.get(lowActive, 8) ? slotValue(lowSums, lowVolumes, 8) : na
+low10 = maxGenerations >= 10 and array.get(lowActive, 9) ? slotValue(lowSums, lowVolumes, 9) : na
+
+plot(high1, "Adaptive Resistance AVWAP 1", resistanceSlotColor(0), 2, plot.style_circles)
+plot(high2, "Adaptive Resistance AVWAP 2", resistanceSlotColor(1), 2, plot.style_circles)
+plot(high3, "Adaptive Resistance AVWAP 3", resistanceSlotColor(2), 2, plot.style_circles)
+plot(high4, "Adaptive Resistance AVWAP 4", resistanceSlotColor(3), 2, plot.style_circles)
+plot(high5, "Adaptive Resistance AVWAP 5", resistanceSlotColor(4), 2, plot.style_circles)
+plot(high6, "Adaptive Resistance AVWAP 6", resistanceSlotColor(5), 2, plot.style_circles)
+plot(high7, "Adaptive Resistance AVWAP 7", resistanceSlotColor(6), 2, plot.style_circles)
+plot(high8, "Adaptive Resistance AVWAP 8", resistanceSlotColor(7), 2, plot.style_circles)
+plot(high9, "Adaptive Resistance AVWAP 9", resistanceSlotColor(8), 2, plot.style_circles)
+plot(high10, "Adaptive Resistance AVWAP 10", resistanceSlotColor(9), 2, plot.style_circles)
+plot(low1, "Adaptive Support AVWAP 1", supportSlotColor(0), 2, plot.style_circles)
+plot(low2, "Adaptive Support AVWAP 2", supportSlotColor(1), 2, plot.style_circles)
+plot(low3, "Adaptive Support AVWAP 3", supportSlotColor(2), 2, plot.style_circles)
+plot(low4, "Adaptive Support AVWAP 4", supportSlotColor(3), 2, plot.style_circles)
+plot(low5, "Adaptive Support AVWAP 5", supportSlotColor(4), 2, plot.style_circles)
+plot(low6, "Adaptive Support AVWAP 6", supportSlotColor(5), 2, plot.style_circles)
+plot(low7, "Adaptive Support AVWAP 7", supportSlotColor(6), 2, plot.style_circles)
+plot(low8, "Adaptive Support AVWAP 8", supportSlotColor(7), 2, plot.style_circles)
+plot(low9, "Adaptive Support AVWAP 9", supportSlotColor(8), 2, plot.style_circles)
+plot(low10, "Adaptive Support AVWAP 10", supportSlotColor(9), 2, plot.style_circles)
+
+highCandidateValue = highCandidateVolume > 0 ? highCandidateSum / highCandidateVolume : na
+lowCandidateValue = lowCandidateVolume > 0 ? lowCandidateSum / lowCandidateVolume : na
+plot(showCandidates and highCandidateActive ? highCandidateValue : na, "Developing Adaptive Resistance Candidate", color.new(color.orange, 70), 1, plot.style_circles)
+plot(showCandidates and lowCandidateActive ? lowCandidateValue : na, "Developing Adaptive Support Candidate", color.new(color.blue, 70), 1, plot.style_circles)
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+
+alertcondition(highCreatedEvent, "New Adaptive resistance AVWAP", "New Adaptive resistance AVWAP created ({{ticker}} {{interval}})")
+alertcondition(lowCreatedEvent, "New Adaptive support AVWAP", "New Adaptive support AVWAP created ({{ticker}} {{interval}})")
+alertcondition(highInvalidatedEvent, "Resistance AVWAP invalidated", "A Core or Adaptive resistance AVWAP was invalidated ({{ticker}} {{interval}})")
+alertcondition(lowInvalidatedEvent, "Support AVWAP invalidated", "A Core or Adaptive support AVWAP was invalidated ({{ticker}} {{interval}})")
+alertcondition(resistanceTouchEvent, "Resistance AVWAP touch", "Price touched a Core or Adaptive resistance AVWAP ({{ticker}} {{interval}})")
+alertcondition(supportTouchEvent, "Support AVWAP touch", "Price touched a Core or Adaptive support AVWAP ({{ticker}} {{interval}})")
+alertcondition(resistanceRejectionEvent, "Resistance AVWAP rejection", "Price rejected a Core or Adaptive resistance AVWAP ({{ticker}} {{interval}})")
+alertcondition(supportRejectionEvent, "Support AVWAP rejection", "Price rejected a Core or Adaptive support AVWAP ({{ticker}} {{interval}})")
+alertcondition(resistanceFailedViolationEvent, "Failed resistance AVWAP violation", "A partial resistance AVWAP violation failed before confirmation ({{ticker}} {{interval}})")
+alertcondition(supportFailedViolationEvent, "Failed support AVWAP violation", "A partial support AVWAP violation failed before confirmation ({{ticker}} {{interval}})")

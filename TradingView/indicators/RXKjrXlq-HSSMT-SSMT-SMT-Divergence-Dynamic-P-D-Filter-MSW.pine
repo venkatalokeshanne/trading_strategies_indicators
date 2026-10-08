@@ -1,0 +1,554 @@
+//@version=6
+indicator('HSSMT SSMT SMT Divergence + Dynamic  P&D Filter [MSW]', overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// --- Inputs ---
+grp_assets = 'Assets Settings'
+sym2 = input.symbol('CME_MINI:ES1!', title = 'Compare Asset 2 (ES)', group = grp_assets)
+name2 = input.string('ES', title = 'Asset 2 Label Name', group = grp_assets)
+
+use_sym3 = input.bool(true, title = 'Enable Asset 3 (YM - Bullish Only)', group = grp_assets)
+sym3 = input.symbol('CBOT_MINI:YM1!', title = 'Compare Asset 3 (YM)', group = grp_assets)
+name3 = input.string('YM', title = 'Asset 3 Label Name', group = grp_assets)
+
+grp_calc = 'SMT Type'
+use_close = input.bool(true, title = 'Enable Close SSMT (Sequential Only)', group = grp_calc)
+use_wicks = input.bool(true, title = 'Enable Wick SMT', group = grp_calc)
+wick_sequential = input.bool(false, title = 'Force Wick SMT to be Sequential (SSMT)', group = grp_calc)
+cycle_lookback = input.int(4, title = 'Wick Cycles Lookback (If Non-Sequential)', minval = 1, maxval = 10, group = grp_calc)
+
+grp_pd = 'Premium / Discount Filter'
+use_pd_filter = input.bool(true, title = 'Enable True Open Filter', group = grp_pd)
+
+grp_style = 'Style Options'
+bull_color = input.color(color.rgb(0, 200, 83), title = 'Asset 2 Bullish Color', group = grp_style)
+ym_bull_color = input.color(color.rgb(255, 152, 0), title = 'Asset 3 Bullish Color', group = grp_style)
+bear_color = input.color(color.rgb(213, 0, 0), title = 'Bearish SMT Color', group = grp_style)
+line_width = input.int(2, title = 'Trend Line Width', minval = 1, maxval = 5, group = grp_style)
+show_labels = input.bool(true, title = 'Show Labels', group = grp_style)
+
+// --- Scale Anchor ---
+plot(close, title = 'Scale Anchor', color = color.new(color.white, 100), display = display.none, editable = false)
+
+// --- Time & Cycle ---
+ny_h = hour(time, 'America/New_York')
+ny_m = minute(time, 'America/New_York')
+ny_y = year(time, 'America/New_York')
+ny_mth = month(time, 'America/New_York')
+ny_d = dayofmonth(time, 'America/New_York')
+ny_dow = dayofweek(time, 'America/New_York')
+
+cycle_day = ny_y * 10000 + ny_mth * 100 + ny_d + (ny_h >= 18 ? 1 : 0)
+shifted_time = time + 21600000
+cycle_week = year(shifted_time, 'America/New_York') * 100 + weekofyear(shifted_time, 'America/New_York')
+
+// --- True Open Calculations (Background) ---
+var float trueDayOpen = na
+var float trueWeekOpen = na
+var float trueSessionOpen = na
+var float trueMonthOpen = na
+
+bool is_ny_0_0 = not na(time) and ny_h == 0 and ny_m == 0
+bool is_ny_18_0 = not na(time) and ny_h == 18 and ny_m == 0
+bool is_90m_open = not na(time) and (ny_h == 3 or ny_h == 9 or ny_h == 15) and ny_m == 23
+bool isSecondWeekSunday = dayofweek == dayofweek.sunday and dayofmonth >= 8 and dayofmonth <= 14
+
+if is_ny_0_0
+    trueDayOpen := open
+    trueDayOpen
+if dayofweek == dayofweek.monday and is_ny_18_0
+    trueWeekOpen := open
+    trueWeekOpen
+if is_90m_open
+    trueSessionOpen := open
+    trueSessionOpen
+if isSecondWeekSunday and is_ny_18_0
+    trueMonthOpen := open
+    trueMonthOpen
+
+// Link active True Open based on chart timeframe
+float active_true_open = na
+if timeframe.isintraday
+    if timeframe.multiplier == 240
+        active_true_open := trueMonthOpen
+        active_true_open
+    else if timeframe.multiplier == 60
+        active_true_open := trueWeekOpen
+        active_true_open
+    else if timeframe.multiplier == 15
+        active_true_open := trueDayOpen
+        active_true_open
+    else if timeframe.multiplier == 5
+        active_true_open := trueSessionOpen
+        active_true_open
+
+// --- Fetch Data ---
+close_b = request.security(sym2, timeframe.period, close)
+high_b = request.security(sym2, timeframe.period, high)
+low_b = request.security(sym2, timeframe.period, low)
+
+close_c = request.security(sym3, timeframe.period, close)
+low_c = request.security(sym3, timeframe.period, low)
+
+// --- Cycle Logic ---
+var int current_cycle = na
+if timeframe.isintraday
+    if timeframe.multiplier == 240
+        current_cycle := cycle_week
+        current_cycle
+    else if timeframe.multiplier == 60
+        current_cycle := cycle_day
+        current_cycle
+    else if timeframe.multiplier == 15
+        current_cycle := cycle_day * 10 + math.floor((ny_h + 6) % 24 / 6)
+        current_cycle
+    else if timeframe.multiplier == 5
+        current_cycle := cycle_day * 100 + math.floor(((ny_h + 6) % 24 * 60 + ny_m) / 90)
+        current_cycle
+
+is_new_cycle = current_cycle != current_cycle[1] and not na(current_cycle[1])
+
+// --- State Variables ---
+var float prev_c_low_A = na
+var int prev_c_low_idx_A = na
+var float prev_c_low_B = na
+var float prev_c_low_C = na
+var float prev_c_high_A = na
+var int prev_c_high_idx_A = na
+var float prev_c_high_B = na
+
+var array<float> past_w_low_A = array.new_float()
+var array<float> past_w_low_B = array.new_float()
+var array<float> past_w_low_C = array.new_float()
+var array<int> past_w_low_idx_A = array.new_int()
+var array<float> past_w_high_A = array.new_float()
+var array<float> past_w_high_B = array.new_float()
+var array<int> past_w_high_idx_A = array.new_int()
+
+var float c_low_A = na
+var int c_low_idx_A = na
+var float c_low_B = na
+var float c_low_C = na
+var float c_high_A = na
+var int c_high_idx_A = na
+var float c_high_B = na
+var float w_low_A = na
+var int w_low_idx_A = na
+var float w_low_B = na
+var float w_low_C = na
+var float w_high_A = na
+var int w_high_idx_A = na
+var float w_high_B = na
+
+// --- Drawing & Invalidation Memory ---
+var line active_c_bull_line = na
+var label active_c_bull_lbl = na
+var line active_c_bear_line = na
+var label active_c_bear_lbl = na
+var line active_w_bull_line = na
+var label active_w_bull_lbl = na
+var line active_w_bear_line = na
+var label active_w_bear_lbl = na
+
+var float act_c_bull_invA = na
+var float act_c_bull_invB = na
+var float act_c_bull_invC = na
+var float act_c_bear_invA = na
+var float act_c_bear_invB = na
+var float act_w_bull_invA = na
+var float act_w_bull_invB = na
+var float act_w_bull_invC = na
+var float act_w_bear_invA = na
+var float act_w_bear_invB = na
+
+// Garbage Collection Arrays
+var array<line> baked_lines = array.new_line()
+var array<label> baked_lbls = array.new_label()
+var array<float> baked_inv_A = array.new_float()
+var array<float> baked_inv_B = array.new_float()
+var array<float> baked_inv_C = array.new_float()
+var array<bool> baked_is_bull = array.new_bool()
+var array<bool> baked_is_close = array.new_bool()
+
+// --- Execution ---
+if timeframe.isintraday and (timeframe.multiplier == 240 or timeframe.multiplier == 60 or timeframe.multiplier == 15 or timeframe.multiplier == 5)
+
+    // --- 1. Cycle Transition ---
+    if is_new_cycle
+        if not na(active_c_bull_line)
+            array.push(baked_lines, active_c_bull_line)
+            array.push(baked_lbls, active_c_bull_lbl)
+            array.push(baked_inv_A, act_c_bull_invA)
+            array.push(baked_inv_B, act_c_bull_invB)
+            array.push(baked_inv_C, act_c_bull_invC)
+            array.push(baked_is_bull, true)
+            array.push(baked_is_close, true)
+
+        if not na(active_c_bear_line)
+            array.push(baked_lines, active_c_bear_line)
+            array.push(baked_lbls, active_c_bear_lbl)
+            array.push(baked_inv_A, act_c_bear_invA)
+            array.push(baked_inv_B, act_c_bear_invB)
+            array.push(baked_inv_C, na)
+            array.push(baked_is_bull, false)
+            array.push(baked_is_close, true)
+
+        if not na(active_w_bull_line)
+            array.push(baked_lines, active_w_bull_line)
+            array.push(baked_lbls, active_w_bull_lbl)
+            array.push(baked_inv_A, act_w_bull_invA)
+            array.push(baked_inv_B, act_w_bull_invB)
+            array.push(baked_inv_C, act_w_bull_invC)
+            array.push(baked_is_bull, true)
+            array.push(baked_is_close, false)
+
+        if not na(active_w_bear_line)
+            array.push(baked_lines, active_w_bear_line)
+            array.push(baked_lbls, active_w_bear_lbl)
+            array.push(baked_inv_A, act_w_bear_invA)
+            array.push(baked_inv_B, act_w_bear_invB)
+            array.push(baked_inv_C, na)
+            array.push(baked_is_bull, false)
+            array.push(baked_is_close, false)
+
+        active_c_bull_line := na
+        active_c_bull_lbl := na
+        active_c_bear_line := na
+        active_c_bear_lbl := na
+        active_w_bull_line := na
+        active_w_bull_lbl := na
+        active_w_bear_line := na
+        active_w_bear_lbl := na
+
+        act_c_bull_invA := na
+        act_c_bull_invB := na
+        act_c_bull_invC := na
+        act_c_bear_invA := na
+        act_c_bear_invB := na
+        act_w_bull_invA := na
+        act_w_bull_invB := na
+        act_w_bull_invC := na
+        act_w_bear_invA := na
+        act_w_bear_invB := na
+
+        // Shift Close
+        prev_c_low_A := c_low_A
+        prev_c_low_idx_A := c_low_idx_A
+        prev_c_low_B := c_low_B
+        prev_c_low_C := c_low_C
+        prev_c_high_A := c_high_A
+        prev_c_high_idx_A := c_high_idx_A
+        prev_c_high_B := c_high_B
+
+        // Shift Wicks & Purge
+        if not na(w_low_A)
+            if array.size(past_w_low_A) > 0
+                for i = array.size(past_w_low_A) - 1 to 0 by 1
+                    if w_low_A <= array.get(past_w_low_A, i) or w_low_B <= array.get(past_w_low_B, i) or use_sym3 and w_low_C <= array.get(past_w_low_C, i)
+                        array.remove(past_w_low_A, i)
+                        array.remove(past_w_low_B, i)
+                        array.remove(past_w_low_C, i)
+                        array.remove(past_w_low_idx_A, i)
+
+            array.unshift(past_w_low_A, w_low_A)
+            array.unshift(past_w_low_B, w_low_B)
+            array.unshift(past_w_low_C, w_low_C)
+            array.unshift(past_w_low_idx_A, w_low_idx_A)
+            if array.size(past_w_low_A) > cycle_lookback
+                array.pop(past_w_low_A)
+                array.pop(past_w_low_B)
+                array.pop(past_w_low_C)
+                array.pop(past_w_low_idx_A)
+
+        if not na(w_high_A)
+            if array.size(past_w_high_A) > 0
+                for i = array.size(past_w_high_A) - 1 to 0 by 1
+                    if w_high_A >= array.get(past_w_high_A, i) or w_high_B >= array.get(past_w_high_B, i)
+                        array.remove(past_w_high_A, i)
+                        array.remove(past_w_high_B, i)
+                        array.remove(past_w_high_idx_A, i)
+
+            array.unshift(past_w_high_A, w_high_A)
+            array.unshift(past_w_high_B, w_high_B)
+            array.unshift(past_w_high_idx_A, w_high_idx_A)
+            if array.size(past_w_high_A) > cycle_lookback
+                array.pop(past_w_high_A)
+                array.pop(past_w_high_B)
+                array.pop(past_w_high_idx_A)
+
+        // Init New Extremes for the new cycle
+        c_low_A := close
+        c_low_idx_A := bar_index
+        c_low_B := close_b
+        c_low_C := close_c
+        c_high_A := close
+        c_high_idx_A := bar_index
+        c_high_B := close_b
+        w_low_A := low
+        w_low_idx_A := bar_index
+        w_low_B := low_b
+        w_low_C := low_c
+        w_high_A := high
+        w_high_idx_A := bar_index
+        w_high_B := high_b
+        w_high_B
+
+    else // --- 2. Update Extremes Intraday (INDEPENDENT TRACKING) ---
+        if close <= c_low_A or na(c_low_A)
+            c_low_A := close
+            c_low_idx_A := bar_index
+            c_low_idx_A
+        if close_b <= c_low_B or na(c_low_B)
+            c_low_B := close_b
+            c_low_B
+        if close_c <= c_low_C or na(c_low_C)
+            c_low_C := close_c
+            c_low_C
+
+        if close >= c_high_A or na(c_high_A)
+            c_high_A := close
+            c_high_idx_A := bar_index
+            c_high_idx_A
+        if close_b >= c_high_B or na(c_high_B)
+            c_high_B := close_b
+            c_high_B
+
+        if low <= w_low_A or na(w_low_A)
+            w_low_A := low
+            w_low_idx_A := bar_index
+            w_low_idx_A
+        if low_b <= w_low_B or na(w_low_B)
+            w_low_B := low_b
+            w_low_B
+        if low_c <= w_low_C or na(w_low_C)
+            w_low_C := low_c
+            w_low_C
+
+        if high >= w_high_A or na(w_high_A)
+            w_high_A := high
+            w_high_idx_A := bar_index
+            w_high_idx_A
+        if high_b >= w_high_B or na(w_high_B)
+            w_high_B := high_b
+            w_high_B
+
+// --- 3. DYNAMIC REAL-TIME SMT EVALUATION ---
+
+    // CLOSE BULLISH (Anchor: Lower Low / Weak Asset - Includes YM)
+    if use_close and not na(prev_c_low_A)
+        bool smt_b1 = c_low_A < prev_c_low_A and c_low_B > prev_c_low_B
+        bool smt_b2 = c_low_A > prev_c_low_A and c_low_B < prev_c_low_B
+        bool smt_c1 = use_sym3 and c_low_A < prev_c_low_A and c_low_C > prev_c_low_C
+        bool smt_c2 = use_sym3 and c_low_A > prev_c_low_A and c_low_C < prev_c_low_C
+
+        bool has_smt_b = smt_b1 or smt_b2
+        bool has_smt_c = smt_c1 or smt_c2
+
+        // P&D FILTER (Both points below True Open -> max of the two is < True Open)
+        bool pd_valid_c_bull = not use_pd_filter or na(active_true_open) or math.max(c_low_A, prev_c_low_A) < active_true_open
+
+        if (has_smt_b or has_smt_c) and pd_valid_c_bull
+            act_c_bull_invA := smt_b1 or smt_c1 ? c_low_A : na
+            act_c_bull_invB := smt_b2 ? c_low_B : na
+            act_c_bull_invC := smt_c2 ? c_low_C : na
+
+            color active_col = has_smt_b ? bull_color : ym_bull_color
+            string lbl_txt = 'Close SSMT [' + (has_smt_b and has_smt_c ? name2 + '+' + name3 : has_smt_c ? name3 : name2) + ']'
+
+            if na(active_c_bull_line)
+                active_c_bull_line := line.new(prev_c_low_idx_A, prev_c_low_A, c_low_idx_A, c_low_A, color = active_col, width = line_width)
+                if show_labels
+                    active_c_bull_lbl := label.new(c_low_idx_A, c_low_A, lbl_txt, style = label.style_label_up, color = color.new(active_col, 100), textcolor = active_col, size = size.small)
+                    active_c_bull_lbl
+            else
+                line.set_xy2(active_c_bull_line, c_low_idx_A, c_low_A)
+                line.set_color(active_c_bull_line, active_col)
+                if show_labels
+                    label.set_xy(active_c_bull_lbl, c_low_idx_A, c_low_A)
+                    label.set_text(active_c_bull_lbl, lbl_txt)
+                    label.set_color(active_c_bull_lbl, color.new(active_col, 100))
+                    label.set_textcolor(active_c_bull_lbl, active_col)
+        else
+            line.delete(active_c_bull_line)
+            label.delete(active_c_bull_lbl)
+            active_c_bull_line := na
+            active_c_bull_lbl := na
+            act_c_bull_invA := na
+            act_c_bull_invB := na
+            act_c_bull_invC := na
+            act_c_bull_invC
+
+    // CLOSE BEARISH (Anchor: Higher High - ES Only)
+    if use_close and not na(prev_c_high_A)
+        bool cond1 = c_high_A > prev_c_high_A and c_high_B < prev_c_high_B
+        bool cond2 = c_high_A < prev_c_high_A and c_high_B > prev_c_high_B
+
+        // P&D FILTER (Both points above True Open -> min of the two is > True Open)
+        bool pd_valid_c_bear = not use_pd_filter or na(active_true_open) or math.min(c_high_A, prev_c_high_A) > active_true_open
+
+        if (cond1 or cond2) and pd_valid_c_bear
+            act_c_bear_invA := cond1 ? c_high_A : na
+            act_c_bear_invB := cond2 ? c_high_B : na
+
+            if na(active_c_bear_line)
+                active_c_bear_line := line.new(prev_c_high_idx_A, prev_c_high_A, c_high_idx_A, c_high_A, color = bear_color, width = line_width)
+                if show_labels
+                    active_c_bear_lbl := label.new(c_high_idx_A, c_high_A, 'Close SSMT [' + name2 + ']', style = label.style_label_down, color = color.new(bear_color, 100), textcolor = bear_color, size = size.small)
+                    active_c_bear_lbl
+            else
+                line.set_xy2(active_c_bear_line, c_high_idx_A, c_high_A)
+                if show_labels
+                    label.set_xy(active_c_bear_lbl, c_high_idx_A, c_high_A)
+        else
+            line.delete(active_c_bear_line)
+            label.delete(active_c_bear_lbl)
+            active_c_bear_line := na
+            active_c_bear_lbl := na
+            act_c_bear_invA := na
+            act_c_bear_invB := na
+            act_c_bear_invB
+
+    // WICK BULLISH (Anchor: Lower Low / Weak Asset - Includes YM)
+    if use_wicks and array.size(past_w_low_A) > 0
+        bool found = false
+        int limit = wick_sequential ? 1 : array.size(past_w_low_A)
+
+        for i = 0 to limit - 1 by 1
+            float p_a = array.get(past_w_low_A, i)
+            float p_b = array.get(past_w_low_B, i)
+            float p_c = array.get(past_w_low_C, i)
+            int p_idx = array.get(past_w_low_idx_A, i)
+
+            bool smt_b1 = w_low_A < p_a and w_low_B > p_b
+            bool smt_b2 = w_low_A > p_a and w_low_B < p_b
+            bool smt_c1 = use_sym3 and w_low_A < p_a and w_low_C > p_c
+            bool smt_c2 = use_sym3 and w_low_A > p_a and w_low_C < p_c
+
+            bool has_smt_b = smt_b1 or smt_b2
+            bool has_smt_c = smt_c1 or smt_c2
+
+            // P&D FILTER (Both points below True Open -> max of the two is < True Open)
+            bool pd_valid_w_bull = not use_pd_filter or na(active_true_open) or math.max(w_low_A, p_a) < active_true_open
+
+            if (has_smt_b or has_smt_c) and pd_valid_w_bull
+                act_w_bull_invA := smt_b1 or smt_c1 ? w_low_A : na
+                act_w_bull_invB := smt_b2 ? w_low_B : na
+                act_w_bull_invC := smt_c2 ? w_low_C : na
+
+                color active_col = has_smt_b ? bull_color : ym_bull_color
+                string lbl_txt = (wick_sequential ? 'Wick SSMT [' : 'Wick SMT [') + (has_smt_b and has_smt_c ? name2 + '+' + name3 : has_smt_c ? name3 : name2) + ']'
+
+                if na(active_w_bull_line)
+                    active_w_bull_line := line.new(p_idx, p_a, w_low_idx_A, w_low_A, color = active_col, width = line_width, style = line.style_dashed)
+                    if show_labels
+                        active_w_bull_lbl := label.new(w_low_idx_A, w_low_A, lbl_txt, style = label.style_label_up, color = color.new(active_col, 100), textcolor = active_col, size = size.small)
+                        active_w_bull_lbl
+                else
+                    line.set_xy1(active_w_bull_line, p_idx, p_a)
+                    line.set_xy2(active_w_bull_line, w_low_idx_A, w_low_A)
+                    line.set_color(active_w_bull_line, active_col)
+                    if show_labels
+                        label.set_xy(active_w_bull_lbl, w_low_idx_A, w_low_A)
+                        label.set_text(active_w_bull_lbl, lbl_txt)
+                        label.set_color(active_w_bull_lbl, color.new(active_col, 100))
+                        label.set_textcolor(active_w_bull_lbl, active_col)
+                found := true
+                break
+
+        if not found
+            line.delete(active_w_bull_line)
+            label.delete(active_w_bull_lbl)
+            active_w_bull_line := na
+            active_w_bull_lbl := na
+            act_w_bull_invA := na
+            act_w_bull_invB := na
+            act_w_bull_invC := na
+            act_w_bull_invC
+
+    // WICK BEARISH (Anchor: Higher High - ES Only)
+    if use_wicks and array.size(past_w_high_A) > 0
+        bool found = false
+        int limit = wick_sequential ? 1 : array.size(past_w_high_A)
+
+        for i = 0 to limit - 1 by 1
+            float p_a = array.get(past_w_high_A, i)
+            float p_b = array.get(past_w_high_B, i)
+            int p_idx = array.get(past_w_high_idx_A, i)
+
+            bool cond1 = w_high_A > p_a and w_high_B < p_b
+            bool cond2 = w_high_A < p_a and w_high_B > p_b
+
+            // P&D FILTER (Both points above True Open -> min of the two is > True Open)
+            bool pd_valid_w_bear = not use_pd_filter or na(active_true_open) or math.min(w_high_A, p_a) > active_true_open
+
+            if (cond1 or cond2) and pd_valid_w_bear
+                act_w_bear_invA := cond1 ? w_high_A : na
+                act_w_bear_invB := cond2 ? w_high_B : na
+
+                if na(active_w_bear_line)
+                    active_w_bear_line := line.new(p_idx, p_a, w_high_idx_A, w_high_A, color = bear_color, width = line_width, style = line.style_dashed)
+                    if show_labels
+                        string lbl_txt = (wick_sequential ? 'Wick SSMT [' : 'Wick SMT [') + name2 + ']'
+                        active_w_bear_lbl := label.new(w_high_idx_A, w_high_A, lbl_txt, style = label.style_label_down, color = color.new(bear_color, 100), textcolor = bear_color, size = size.small)
+                        active_w_bear_lbl
+                else
+                    line.set_xy1(active_w_bear_line, p_idx, p_a)
+                    line.set_xy2(active_w_bear_line, w_high_idx_A, w_high_A)
+                    if show_labels
+                        label.set_xy(active_w_bear_lbl, w_high_idx_A, w_high_A)
+                found := true
+                break
+
+        if not found
+            line.delete(active_w_bear_line)
+            label.delete(active_w_bear_lbl)
+            active_w_bear_line := na
+            active_w_bear_lbl := na
+            act_w_bear_invA := na
+            act_w_bear_invB := na
+            act_w_bear_invB
+
+// --- 4. INVALIDATION ENGINE ---
+if array.size(baked_lines) > 0
+    for i = array.size(baked_lines) - 1 to 0 by 1
+        bool is_broken = false
+        float inv_A = array.get(baked_inv_A, i)
+        float inv_B = array.get(baked_inv_B, i)
+        float inv_C = array.get(baked_inv_C, i)
+        bool is_bull = array.get(baked_is_bull, i)
+        bool is_c = array.get(baked_is_close, i)
+
+        if is_bull
+            float check_A = is_c ? close : low
+            float check_B = is_c ? close_b : low_b
+            float check_C = is_c ? close_c : low_c
+
+            if not na(inv_A) and check_A < inv_A
+                is_broken := true
+                is_broken
+            if not na(inv_B) and check_B < inv_B
+                is_broken := true
+                is_broken
+            if not na(inv_C) and check_C < inv_C
+                is_broken := true
+                is_broken
+        else
+            float check_A = is_c ? close : high
+            float check_B = is_c ? close_b : high_b
+
+            if not na(inv_A) and check_A > inv_A
+                is_broken := true
+                is_broken
+            if not na(inv_B) and check_B > inv_B
+                is_broken := true
+                is_broken
+
+        if is_broken
+            line.delete(array.get(baked_lines, i))
+            label.delete(array.get(baked_lbls, i))
+            array.remove(baked_lines, i)
+            array.remove(baked_lbls, i)
+            array.remove(baked_inv_A, i)
+            array.remove(baked_inv_B, i)
+            array.remove(baked_inv_C, i)
+            array.remove(baked_is_bull, i)
+            array.remove(baked_is_close, i)

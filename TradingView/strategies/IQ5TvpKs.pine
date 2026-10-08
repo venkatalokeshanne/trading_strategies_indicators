@@ -1,0 +1,388 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © lm_h
+//@version=6
+
+// =========================================================================
+// ATTRIBUTION
+// =========================================================================
+//
+// This strategy is a modified version of @ChrisMoody's great interpretation of the VIX Fix by Larry Williams.
+//
+// Original script: https://de.tradingview.com/script/og7JPrRA-CM-Williams-Vix-Fix-Finds-Market-Bottoms/
+// 
+// =========================================================================
+// MOTIVATION AND CHANGES
+// =========================================================================
+//
+// The motivation of the following changes was the goal to have a profitabel strategy of the WVF which also captures strong upward moves.
+// First I built it around the SP500 but then I tried different symbol and ended up with the VIX as my favorite symbol.
+// It may sound weird to use a volatility indicator on the Volatility index but it makes a lot of sense, since it has (more or less) no triangledown
+// and is mean reverting. So the formular for the WVF is perfect as an indicator of these sharp movements.
+//
+// - I changed the formular of the WVF. I changed the calculation of the original wvf (here wvfh) and added the wvfl, 
+//      basically the same but with the intention to capture aggressive bullish behavior, together they are the wvf.
+// - I kept the percentile based ranges and the BB of the WVF but changed the source to the modified WVF
+// - Added a MA of WVF and factorized MAs of wvfh and wvfl as entry/exit conditions
+// - Added MACD for entry confirmation (especially lower or upper timeframe confirmation)
+// - Implemented the indicator into a strategy with basic long and short rules as well as a simple StopLoss rules
+// - Added a Option-simulator (at least that was the idea) and automatic selling when the future contract expires
+// - Added a Buy and Sell stop level function which drastically reduced the loosing long entries on VIX (Turn it off to see how bad it was)
+//
+// - Skript was commented with the help of AI
+//
+// =========================================================================
+// HOW I USED IT
+// =========================================================================
+//
+// The default settings are my favorite for trading the VIX-Future on the 4h-timeframe.
+// I personally think it's powerful on the VIX as a kind of hedging indicator against the market.
+// 
+// If you use it on another symbol you may change some settings, especially the buy and sell stop level.
+// 
+// 
+// =========================================================================
+// DISCLAIMER
+// =========================================================================
+//
+// This script is provided for informational and educational purposes only and does not constitute financial, investment, trading, or tax advice.
+// It does not take into account your personal circumstances, objectives or risk tolerance. 
+// Trading involves substantial risk and can result in the loss of all invested capital. 
+// Use at your own risk. The author accepts no liability for any losses or damages arising from its use.
+// 
+// ============================================================================
+// VIX Fix VIX hedging Strategy 
+// ============================================================================
+
+strategy(title = "VIX Fix VIX Strategy", shorttitle = "VIXFixVIX", 
+overlay = false, pyramiding = 5, 
+calc_on_every_tick = true, default_qty_type = strategy.percent_of_equity, 
+default_qty_value = 10, commission_type = strategy.commission.percent, 
+commission_value = 1, slippage = 1, use_bar_magnifier = true)
+
+// ============================================================================
+// SECTION 1: INPUT PARAMETERS - VIX FIX AND BOLLINGER BANDS
+// ============================================================================
+
+// Lookback Period of WVF
+vfLookback = input.int(22, title="LookBack Period VIX Fix")
+
+// Bollinger Bands
+bbl = input.int(20, title="Bollinger Band Length")
+bblStDev = input.float(2.0, "Bollinger Band Standard Deviation Up", 1, 5, 0.01)
+
+// High/Low Range
+lookback = input.int(50, "Look Back Period Last High/Low")
+ph = input.float(0.99, "Percentile of Last High - 0.90=90%, 0.95=95%, 0.99=99%", 0, 2, 0.01)
+pl = input.float(1.01, "Percentile of Last Low - 1.10=90%, 1.05=95%, 1.01=99%", 0, 2, 0.01)
+
+// Visualization toggles
+showHighLowRange = input.bool(true, title="Show High/Low Range - Based on Percentile and Lookback Period?")
+showStDev = input.bool(true, title="Show Standard Deviation Line?")
+
+// Entry Stop-Level
+// Long
+useBuyStopLevel = input.bool(true, "Use Buy-Level-Stop?", "Above which a buy-signal does not enter a long position.")
+buyStopLevel = input.int(20, "Buy-Stop-Level", tooltip = "If you use another symbol than VIX, please change.", active = useBuyStopLevel)
+// Short
+shorting = input.bool(true, "Shorting?")
+useSellLevel = input.bool(true, "Use Short-Selling-Level?", "Above which a sell-signal triggers a short position.", active = shorting)
+sellLevel = input.int(20, "Short-Selling-Level", tooltip = "If you use another symbol than VIX, please change.", active = useSellLevel and shorting)
+
+// Stop Loss
+useSL = input.bool(false, "Use StopLoss?")
+stoploss = input.float(0.80, "StopLoss level - 0.80 = 20% below entry", 0, 1, 0.01, active = useSL)
+
+// ============================================================================
+// SECTION 2: INPUT PARAMETERS - MOVING AVERAGES (MA)
+// ============================================================================
+
+// Main plotting Moving Average - applied to WVF
+MA = "Moving Average"
+show_ma = input.bool(true, "MA", inline="MA", group = MA, display = display.data_window)
+ma_type = input.string("SMA", "", inline="MA", group = MA, options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"])
+ma_src = input.string("WVF", "", inline="MA", group = MA, options = ["WVF", "Open", "High", "Low", "Close", "HL2", "HLC3", "OHLC4", "HLCC4"], display = display.data_window)
+ma_length = input.int(20, "", inline="MA", group = MA, minval=1)
+ma_color = input.color(#ff0055, "", inline="MA", group = MA, display = display.data_window)
+
+// MA factors
+show_uppersdev_ma = input.bool(true, "Show Upper Factor of MA", inline = "MA", group = MA)
+show_lowersdev_ma = input.bool(true, "Show Lower Factor of MA", inline = "MA", group = MA)
+factor_wvfh_upperBand = input.float(1.1, "Factor Upper MA", 0, 10, 0.01, group = MA)
+factor_wvfl_lowerBand = input.float(3, "Factor Lower MA", 0, 10, 0.01, group = MA)
+
+// ============================================================================
+// SECTION 3: INPUT PARAMETERS - ENTRY MOVING AVERAGE (Entry optimization)
+// ============================================================================
+
+// MA_entry
+MA_entry = "MA_entry"
+use_ma_entry = input.bool(true, "Use MA Entry Optimization?", inline = "MA_entry", group = MA_entry)
+show_ma_entry = input.bool(true, "MA_entry", inline="MA_entry", group = MA_entry, display = display.data_window)
+ma_type_entry = input.string("SMMA (RMA)", "", inline="MA_entry", group = MA_entry, options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"])
+ma_src_entry = input.source(close, "", inline="MA_entry", group = MA_entry, display = display.data_window)
+ma_length_entry = input.int(20, "", inline="MA_entry", group = MA_entry, minval=1)
+ma_color_entry = input.color(color.yellow, "", inline="MA_entry", group = MA_entry, display = display.data_window)
+ma_faktor_entry = input.float(1.00, "MA Factor Entry", 0, 2, 0.01, tooltip = "Factor for entry MA condition", inline = "MA_entry", group = MA_entry)
+
+// ============================================================================
+// SECTION 4: INPUT PARAMETERS - MACD
+// ============================================================================
+
+// MACD
+fast_length = input.int(12, "Fast Length", group = "MACD")
+slow_length = input.int(26, "Slow Length", group = "MACD")
+macd_src = input.source(close, "MACD Source", group = "MACD")
+signal_length = input.int(9, "Signal Smoothing", 1, 50, group = "MACD", display = display.data_window)
+macdtf = input.timeframe("5", "MACD Timeframe", tooltip = "Default: 5-Minute for lower tf reversal confirmation")    // 5-Minute timeframe for some kind of lower tf reversal confirmation
+
+// Sell at future contract expiration
+close_at_expiration = input.bool(false, "Close position at contract expiration?", "Turn on if you use a non rolling future contract")
+
+// Fixed Sell Date: Simulates option expiration date
+use_fixed_selldate = input.bool(true, "Use Fixed Selldate?", "To Simulate Option expiary", active = not close_at_expiration)
+int dte = input.int(180, "Bars till expiration", tooltip = "To simulate a specific option expiration date", active = use_fixed_selldate)
+
+// ============================================================================
+// SECTION 5: INDICATOR CALCULATIONS
+// ============================================================================
+
+// Williams VIX Fix (WVF)
+// wvfh: Positive part (Bullish Volatility) - Distance from High (Downward movement)
+wvfh = ((ta.highest(close, vfLookback) - low) / (ta.highest(close, vfLookback))) * 100
+
+// wvfl: Negative part (Bearish Volatility) - Distance from Low (Upward movement)
+wvfl = ((ta.lowest(close, vfLookback) - high) / (ta.lowest(close, vfLookback))) * 100
+
+// wvf: Total volatility indicator
+wvf = wvfh + wvfl
+
+// MACD
+[macdLine, signalLine, histLine] = request.security(syminfo.tickerid, macdtf, ta.macd(macd_src, fast_length, slow_length, signal_length))
+
+// Bollinger Bands of WVF
+sDev = bblStDev * ta.stdev(wvf, bbl)
+midLine = ta.sma(wvf, bbl)
+lowerBB_wvf = midLine - sDev
+upperBB_wvf = midLine + sDev
+
+// Bollinger Bands for separate wvfh and wvfl
+//sDevp = bblStDev * ta.stdev(wvfh, bbl)
+//sDevn = bblStDev * ta.stdev(wvfl, bbl)
+//upperBand = ta.sma(wvfh, bbl) + sDevp
+//lowerBand = ta.sma(wvfl, bbl) - sDevn
+
+// Range High/Low
+rangeHigh = (ta.highest(wvf, lookback)) * ph
+rangeLow = (ta.lowest(wvf, lookback)) * pl
+
+// ============================================================================
+// SECTION 6: HELPER FUNCTION - MOVING AVERAGE CALCULATION
+// ============================================================================
+
+// Universal MA function: Supports SMA, EMA, SMMA, WMA, VWMA
+ma(source, length, type) =>
+     type == "SMA" ? ta.sma(source, length) :
+     type == "EMA" ? ta.ema(source, length) :
+     type == "SMMA (RMA)" ? ta.rma(source, length) :
+     type == "WMA" ? ta.wma(source, length) :
+     type == "VWMA" ? ta.vwma(source, length) :
+     na
+
+// ============================================================================
+// SECTION 7: MA SOURCE SELECTION
+// ============================================================================
+
+// Select data source for MA: WVF, OHLC, or combinations
+ma_source = ma_src == "WVF" ? wvf : 
+     ma_src == "Open" ? open : 
+     ma_src == "High" ? high : 
+     ma_src == "Low" ? low : 
+     ma_src == "Close" ? close : 
+     ma_src == "HL2" ? hl2 : 
+     ma_src == "HLC3" ? hlc3 : 
+     ma_src == "OHLC4" ? ohlc4 : 
+     ma_src == "HLCC4" ? hlcc4 : 
+     na
+
+// ============================================================================
+// SECTION 8: CALCULATION OF ALL MOVING AVERAGES
+// ============================================================================
+
+// Main MA:
+ma = ma(ma_source, ma_length, ma_type)
+
+// Entry-MA: Price level filter for better entry points
+ma_entry = ma(ma_src_entry, ma_length_entry, ma_type_entry) * ma_faktor_entry
+
+// MA of wvfh and wvfl with factor scaling
+wvfh_ma_upper = ma(wvfh, ma_length, ma_type)
+wvfh_upperBand = wvfh_ma_upper * factor_wvfh_upperBand
+wvfl_ma_lower = ma(wvfl, ma_length, ma_type)
+wvfl_lowerBand = wvfl_ma_lower * factor_wvfl_lowerBand
+
+// ============================================================================
+// SECTION 9: COLOR LOGIC FOR WVF VISUALIZATION
+// ============================================================================
+
+// Color coding of the WVF histogram:
+// - Purple (#8900f9): Extreme High (Overbought/Volatility Peak)
+// - Lime (green): Extreme Low (Oversold/Volatility Bottom)
+// - Gray: Neutral/Normal
+col = (wvf > upperBB_wvf or wvf >= rangeHigh) and wvf > 0 ? #8900f9 : 
+     (wvf < lowerBB_wvf or wvf <= rangeLow) and wvf < 0 ? color.lime : 
+     color.gray
+
+// ============================================================================
+// SECTION 10: MACD-CROSS
+// ============================================================================
+
+// Crossover: MACD crosses signal line upward (Bullish)
+//macd_co = ta.crossover(macdLine, signalLine)
+
+// Crossunder: MACD crosses signal line downward (Bearish)
+//macd_cu = ta.crossunder(macdLine, signalLine)
+
+// ============================================================================
+// SECTION 11: BUY/SELL CONDITIONS (CORE LOGIC)
+// ============================================================================
+
+// Buy condition:
+// - WVF crosses over Upper MA-Band of wvfh AND MACD is negative (not yet recovered)
+// OR
+// - WVF is over Upper MA-Band of wvfh AND WVF color is Purple (extreme volatility)
+buy = ta.crossover(wvf, wvfh_upperBand) and (macdLine < 0) or ((wvf > wvfh_upperBand) and col == #8900f9)
+shortExit = buy
+
+// Sell condition:
+// - WVF crosses under Lower MA-Band of wvfl AND MACD is positive
+// OR
+// - WVF is under Lower MA-Band of wvfl AND WVF color is Lime (extremely oversold)
+sell = ta.crossunder(wvf, wvfl_lowerBand) and (macdLine > 0) or ((wvf < wvfl_lowerBand) and col == color.lime)
+
+// ============================================================================
+// SECTION 12: BUY FILTERS - ADDITIONAL RESTRICTIONS
+// ============================================================================
+
+// Filter 1: Buy-Sell-Stop-Level - Prevents orders above/below specific price levels
+buy := (not useBuyStopLevel) ? buy : 
+     ((close < buyStopLevel) and buy) ? buy : 
+     false
+
+shortsell = (not useSellLevel and not shorting) ? sell : 
+     ((close >= sellLevel) and sell) ? sell :
+     false
+
+// Filter 2: Entry MA - Only buy if price is below Entry-MA
+buy := (not use_ma_entry) ? buy : 
+     ((close < ma_entry) and buy) ? buy : 
+     false
+
+// ============================================================================
+// SECTION 13: POSITION MANAGEMENT - ENTRY
+// ============================================================================
+
+// Counter for unique position IDs
+var int buy_i = 0
+var int sell_i = 0
+
+// Long
+if buy
+    buy_i += 1
+    strategy.entry("Long: " + str.tostring(buy_i), strategy.long, comment = "L")   //: " + str.tostring(j)
+    
+    // Stop-Loss
+    if useSL
+        strategy.exit("LongSL " + str.tostring(buy_i), "Long: " + str.tostring(buy_i), stop = close * stoploss, comment = "StopLoss")
+    
+// Short
+if shortsell
+    sell_i += 1
+    strategy.entry("Short", strategy.short, comment = "S")
+    // Stop-Loss
+    if useSL
+        strategy.exit("Short: " + str.tostring(sell_i), "Short: " + str.tostring(sell_i), stop = close * (2 - stoploss), comment = "Short-StopLoss")                  
+
+// ============================================================================
+// SECTION 14: HELPER FUNCTION - BARS SINCE LAST ENTRY
+// ============================================================================
+
+barsSinceEntry(i) => 
+    strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(i) : na
+
+// ============================================================================
+// SECTION 15: POSITION MANAGEMENT - EXIT
+// ============================================================================
+
+// 1. Close at future contract expiration
+if close_at_expiration and syminfo.expiration_date <= time
+    strategy.close_all("Future contract expiration")
+
+// 2. Fixed closing date (Simulates Option expiration)
+if use_fixed_selldate
+    for j = 0 to strategy.opentrades
+        if (barsSinceEntry(j) >= dte)
+            if strategy.opentrades.entry_comment(j) == "L"
+                strategy.close(strategy.opentrades.entry_id(j), "BTE expiration")   //: " + str.tostring(j)
+
+            else if strategy.opentrades.entry_comment(j) == "S"
+                strategy.close(strategy.opentrades.entry_id(j), "BTE expiration")   //: " + str.tostring(j)
+//            strategy.close_all("Contract expiration")
+
+// 3. Long-Exit
+if sell
+    for k = 0 to buy_i
+        strategy.close("Long: " + str.tostring(k), "TP")
+
+// M3. Short-Exit
+if shortExit and shorting
+    for k = 0 to sell_i
+        strategy.close("Short: " + str.tostring(k), "TP Short")
+
+// ============================================================================
+// SECTION 16: PLOTTING - VISUALIZATION OF INDICATORS
+// ============================================================================
+
+// wvfh and wvfl factorized MA
+plot(show_uppersdev_ma ? wvfh_upperBand : na, color = ma_color, title = "upper_sdev_ma")
+plot(show_lowersdev_ma ? wvfl_lowerBand : na, color = ma_color, title = "lower_sdev_ma")
+
+// Range High/Low Percentile lines
+plot(showHighLowRange and not na(rangeLow) ? rangeLow : na, title="Range Low Percentile", style=plot.style_line, linewidth=1, color=color.orange)
+plot(showHighLowRange and not na(rangeHigh) ? rangeHigh : na, title="Range High Percentile", style=plot.style_line, linewidth=1, color=color.orange)
+
+// Main WVF with color coding
+plot(wvf, title="Williams Vix Fix", style=plot.style_histogram, linewidth = 4, color=col)
+
+// Bollinger Bands of WVF
+plot(showStDev and not na(upperBB_wvf) ? upperBB_wvf : na, title="Upper Band", style=plot.style_line, linewidth = 1, color=color.aqua)
+plot(showStDev and not na(lowerBB_wvf) ? lowerBB_wvf : na, title="Lower Band", style=plot.style_line, linewidth = 1, color=color.aqua)
+
+// Moving Averages
+plot(show_ma ? ma : na, color = ma_color, title="MA")
+plot(show_ma_entry ? ma_entry : na, color = ma_color_entry, title="MA_entry", force_overlay = true)
+
+// Buy-Sell-Stop-Level line chart-force_overlay
+plot(useBuyStopLevel ? buyStopLevel : na, color = color.blue, style = plot.style_line, linestyle = plot.linestyle_dashed, title = "Buy-Stop", force_overlay = true)
+plot(useSellLevel ? sellLevel : na, color = color.red, style = plot.style_line, linestyle = plot.linestyle_dashed, title = "Sell-Level", force_overlay = true)
+
+// ============================================================================
+// SECTION 17: SIGNAL VISUALIZATION
+// ============================================================================
+
+// Buy signal: Green triangle below bar
+plotshape(buy, "BUY", shape.triangleup, location.belowbar, #14f71c, text = "Buy", textcolor = #14f71c, size = size.tiny, force_overlay = true)
+
+// Sell signal: Red triangle above bar
+plotshape(sell, "SELL", shape.triangledown, location.abovebar, #ff0f0f, text = "Sell", textcolor = #ff0f0f, size = size.tiny, force_overlay = true)
+
+
+// ============================================================================
+// SECTION 18: NOTES FOR FUTURE OPTIMIZATIONS
+// ============================================================================
+//TODO: IDEA: Optimization of parameters over the first half of the chart for optimal symbol parameters
+//
+//
+//
+// ============================================================================
+// End of script
+// ============================================================================

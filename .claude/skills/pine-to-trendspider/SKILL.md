@@ -185,11 +185,10 @@ This repository is the source of truth across sessions and Claude accounts.
 3. If you improve a reference file (a [VERIFY] confirmed, a new trap found), commit that
    separately with a message saying what you learnt. A new mistake goes into `LESSONS.md`
    with its check, in a commit starting `Lesson NN:`.
-4. **What is committed:** the skill, tools, `progress/` and **every conversion in
-   `TrendSpider/`** (the user's instruction, 2026-10-08: every indicator and strategy is
-   saved in git and in TrendSpider). Keep the original author's credit and declared licence
-   in each header. The original Pine sources in `TradingView/` are kept locally and are
-   **not** committed while the repository is public (75 % declare no licence). Never commit
+4. **What is committed:** the skill, tools, `progress/`, the original Pine sources in
+   `TradingView/` and **every conversion in `TrendSpider/`** (the owner's instructions,
+   2026-10-08: every indicator and strategy is saved in git and in TrendSpider). Keep the
+   original author's credit and declared licence in each converted header. Never commit
    TrendSpider's engine bundle or market-data fixtures.
 
 ## Final self-audit checklist

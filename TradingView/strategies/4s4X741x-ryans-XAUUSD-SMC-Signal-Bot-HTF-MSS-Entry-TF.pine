@@ -1,0 +1,512 @@
+// =============================================================================
+// XAUUSD SMC/ICT Signal Bot
+// Higher-timeframe Market Structure Shift (MSS) + Order Block + FVG + Liquidity context
+// 1-minute entry trigger (rejection/engulf + volume spike)
+// Sends dynamic entry/SL/TP via alert() -> webhook bridge -> Telegram
+//
+// RUN THIS SCRIPT ON A CHART TIMEFRAME *LOWER* THAN THE "STRUCTURE TIMEFRAME"
+// INPUT BELOW (default structure = 30m, so use e.g. a 10m or 5m chart).
+// request.security() silently breaks this relationship if you put the chart
+// AT OR ABOVE the structure timeframe — it will only capture a fraction of
+// the higher-timeframe bars, corrupting the swing/OB/FVG detection.
+// =============================================================================
+//@version=6
+strategy("XAUUSD SMC Signal Bot (HTF MSS / Entry TF)", overlay=true,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     max_bars_back=500, max_boxes_count=200, max_lines_count=200, max_labels_count=200)
+
+// -----------------------------------------------------------------------------
+// INPUTS
+// -----------------------------------------------------------------------------
+grp_struct = "HTF Structure (MSS / Order Blocks / FVG)"
+
+grp_trend = "HTF Trend Alignment"
+useTrendFilter = input.bool(false, "Only trade with the higher-timeframe trend", group=grp_trend)
+trendTF     = input.timeframe("240", "Trend timeframe (should be well above structure TF)", group=grp_trend)
+trendEmaLen = input.int(50, "Trend EMA length", minval=5, group=grp_trend)
+htfPivotLen   = input.int(3, "HTF swing pivot lookback (each side)", minval=2, maxval=10, group=grp_struct)
+maxSwings     = input.int(30, "Max swing points stored", minval=10, maxval=100, group=grp_struct)
+minFVGpips    = input.float(3.0, "Minimum FVG size (pips)", minval=0.5, group=grp_struct)
+
+grp_liq = "Liquidity"
+eqTolPips     = input.float(2.0, "Equal high/low tolerance (pips)", minval=0.5, group=grp_liq)
+sweepLookback = input.int(20, "Liquidity sweep lookback (HTF bars)", minval=5, group=grp_liq)
+requireLiquiditySweep = input.bool(false, "Require a liquidity sweep before accepting an MSS", group=grp_liq)
+
+grp_key = "Key Levels"
+useDailyLevels = input.bool(true, "Use prior-day High/Low/Mid as key levels", group=grp_key)
+
+grp_entry = "1m Entry Trigger"
+
+grp_cont = "Continuation Entries (no pullback required)"
+useContinuationEntries = input.bool(true, "Also allow continuation entries (strong trend candle, no rejection needed)", group=grp_cont)
+contBodyThreshold  = input.float(0.6, "Minimum candle body (% of range)", minval=0.3, maxval=0.95, group=grp_cont)
+contBreakoutBars   = input.int(5, "Breakout lookback (bars)", minval=2, maxval=20, group=grp_cont)
+contStopBars       = input.int(5, "Structural stop lookback (bars)", minval=2, maxval=20, group=grp_cont)
+useMacdFilter = input.bool(false, "Require MACD momentum agreement", group=grp_entry)
+macdFast   = input.int(12, "MACD fast length", minval=1, group=grp_entry)
+macdSlow   = input.int(26, "MACD slow length", minval=1, group=grp_entry)
+macdSignal = input.int(9, "MACD signal length", minval=1, group=grp_entry)
+volMALen      = input.int(20, "1m volume MA length", minval=5, group=grp_entry)
+volSpikeMult  = input.float(1.5, "1m volume spike multiple (x avg)", minval=1.0, group=grp_entry)
+zoneBufferPips= input.float(3.0, "Zone touch buffer (pips)", minval=0.0, group=grp_entry)
+wickThreshold = input.float(0.4, "Rejection wick threshold (% of candle range)", minval=0.1, maxval=0.9, group=grp_entry)
+useSessionFilter = input.bool(true, "Only trade during active session", group=grp_entry)
+sessionStr    = input.session("0700-2000", "Trading session", group=grp_entry)
+sessionTZ     = input.string("Europe/London", "Session timezone", group=grp_entry)
+
+grp_tg = "Telegram"
+telegramChatId = input.string("", "Telegram chat ID (from @userinfobot or your channel/group)", group=grp_tg)
+
+grp_risk = "Risk / Targets"
+minStopPips = input.float(80, "Minimum stop-loss (pips)", minval=10, group=grp_risk)
+maxStopPips   = input.float(110, "Maximum stop-loss (pips)", minval=10, group=grp_risk)
+tpPipsFixed   = input.float(100, "Fixed take-profit (pips)", minval=10, group=grp_risk)
+pipSize       = input.float(0.1, "Pip size for XAUUSD (0.1 = $0.10 move)", minval=0.001, group=grp_risk)
+
+grp_vis = "Visuals"
+showZones = input.bool(true, "Draw OB / FVG / liquidity zones", group=grp_vis)
+
+// pip -> price helper (gold: 1 pip = $0.10 by this account's convention)
+pips(p) => p * pipSize
+
+// =============================================================================
+// 1) PULL HTF STRUCTURE DATA (raw OHLCV only — do NOT nest ta.pivot* inside security())
+// =============================================================================
+htf = input.timeframe("30", "Structure timeframe (must be HIGHER than your chart timeframe)", group="5m Structure (MSS / Order Blocks / FVG)")
+[hO, hH, hL, hC, hV, hTime] = request.security(syminfo.tickerid, htf,
+     [open, high, low, close, volume, time], lookahead=barmerge.lookahead_off)
+
+// higher-timeframe trend alignment (independent of the structure timeframe)
+trendClose = request.security(syminfo.tickerid, trendTF, close, lookahead=barmerge.lookahead_off)
+trendEma   = request.security(syminfo.tickerid, trendTF, ta.ema(close, trendEmaLen), lookahead=barmerge.lookahead_off)
+trendBullish = not useTrendFilter or trendClose > trendEma
+trendBearish = not useTrendFilter or trendClose < trendEma
+
+// detect a genuinely NEW closed 5m bar (avoid reprocessing the same htf bar
+// across multiple 1m chart bars)
+var int lastHtfTime = na
+isNewHtfBar = na(lastHtfTime) or hTime != lastHtfTime
+if isNewHtfBar
+    lastHtfTime := hTime
+
+// rolling manual history of 5m bars (built ourselves, since security() only
+// ever gives us "the current/most recent" value per array element)
+var array<float> htfO = array.new<float>()
+var array<float> htfH = array.new<float>()
+var array<float> htfL = array.new<float>()
+var array<float> htfC = array.new<float>()
+var array<float> htfV = array.new<float>()
+
+if isNewHtfBar
+    array.push(htfO, hO)
+    array.push(htfH, hH)
+    array.push(htfL, hL)
+    array.push(htfC, hC)
+    array.push(htfV, hV)
+    maxKeep = 300
+    if array.size(htfH) > maxKeep
+        array.shift(htfO)
+        array.shift(htfH)
+        array.shift(htfL)
+        array.shift(htfC)
+        array.shift(htfV)
+
+n5 = array.size(htfH)
+
+// checks the last `sweepLookback` HTF bars (excluding the current one) for a
+// genuine liquidity sweep of `level`: a wick that pierces beyond it, closing
+// back on the other side (a stop-hunt), rather than a clean break straight
+// through. isLowSweep=true checks for a sweep of a swing LOW (wick below,
+// close back above); false checks a swing HIGH (wick above, close back below).
+sweptLevel(level, isLowSweep) =>
+    found = false
+    if not na(level)
+        lookback = math.min(sweepLookback, n5 - 1)
+        for j = 1 to lookback
+            idx = n5 - 1 - j
+            if idx < 0
+                break
+            lo = array.get(htfL, idx)
+            hi = array.get(htfH, idx)
+            cl = array.get(htfC, idx)
+            if isLowSweep and lo < level and cl > level
+                found := true
+            if not isLowSweep and hi > level and cl < level
+                found := true
+    found
+
+// =============================================================================
+// 2) MANUAL 5m PIVOT DETECTION (arrays, not ta.pivothigh/low inside security)
+// =============================================================================
+var array<float> swingHighPx  = array.new<float>()
+var array<int>   swingHighIdx = array.new<int>()
+var array<float> swingLowPx   = array.new<float>()
+var array<int>   swingLowIdx  = array.new<int>()
+
+// bias / MSS state
+var string bias = "none"           // "bull" or "bear" once an MSS has fired
+var float  lastBrokenHighPx = na
+var float  lastBrokenLowPx  = na
+var int    mssBarTime = na
+
+// order block + FVG zone tied to the most recent MSS
+var float obHigh = na
+var float obLow  = na
+var bool  obIsBull = bool(na)
+var float fvgTop = na
+var float fvgBot = na
+var bool  fvgIsBull = bool(na)
+var bool  zoneActive = false   // true once we have a fresh OB/FVG waiting to be tapped
+var bool  zoneTapped = false   // 1m price has touched the zone -> arm entry search
+
+checkIdx = n5 - htfPivotLen - 1   // candidate pivot index (0-based, center of window)
+
+if isNewHtfBar and n5 >= (htfPivotLen * 2 + 1)
+    center = checkIdx
+    candH = array.get(htfH, center)
+    candL = array.get(htfL, center)
+    isPivHigh = true
+    isPivLow  = true
+    for i = 1 to htfPivotLen
+        if array.get(htfH, center - i) > candH or array.get(htfH, center + i) > candH
+            isPivHigh := false
+        if array.get(htfL, center - i) < candL or array.get(htfL, center + i) < candL
+            isPivLow := false
+
+    if isPivHigh
+        array.push(swingHighPx, candH)
+        array.push(swingHighIdx, center)
+        if array.size(swingHighPx) > maxSwings
+            array.shift(swingHighPx)
+            array.shift(swingHighIdx)
+    if isPivLow
+        array.push(swingLowPx, candL)
+        array.push(swingLowIdx, center)
+        if array.size(swingLowPx) > maxSwings
+            array.shift(swingLowPx)
+            array.shift(swingLowIdx)
+
+    // ---- Market Structure Shift (MSS): current 5m close breaks last confirmed
+    //      opposite swing point ----
+    lastSwingHigh = array.size(swingHighPx) > 0 ? array.get(swingHighPx, array.size(swingHighPx) - 1) : na
+    lastSwingLow  = array.size(swingLowPx)  > 0 ? array.get(swingLowPx,  array.size(swingLowPx)  - 1) : na
+    closeNow = array.get(htfC, n5 - 1)
+
+    bullMSS = not na(lastSwingHigh) and closeNow > lastSwingHigh and (not requireLiquiditySweep or sweptLevel(lastSwingLow, true))
+    bearMSS = not na(lastSwingLow)  and closeNow < lastSwingLow  and (not requireLiquiditySweep or sweptLevel(lastSwingHigh, false))
+
+    if bullMSS
+        bias := "bull"
+        lastBrokenHighPx := lastSwingHigh
+        mssBarTime := hTime
+        // Order block = last DOWN-close 5m candle before the break, scanning
+        // back from the bar right before the current one
+        obFound = false
+        for i = 1 to 15
+            idx = n5 - 1 - i
+            if idx < 0
+                break
+            c = array.get(htfC, idx)
+            o = array.get(htfO, idx)
+            if c < o and not obFound
+                obHigh := array.get(htfH, idx)
+                obLow  := array.get(htfL, idx)
+                obIsBull := true
+                obFound := true
+        // FVG in the impulse leg: gap between bar[i-2].high and bar[i].low
+        fvgFound = false
+        for i = 0 to 10
+            idx = n5 - 1 - i
+            if idx < 2
+                break
+            hi2 = array.get(htfH, idx - 2)
+            lo0 = array.get(htfL, idx)
+            if lo0 > hi2 and (lo0 - hi2) >= pips(minFVGpips) and not fvgFound
+                fvgTop := lo0
+                fvgBot := hi2
+                fvgIsBull := true
+                fvgFound := true
+        zoneActive := obFound or fvgFound
+        zoneTapped := false
+        if showZones
+            if not na(obHigh) and not na(obLow)
+                box.new(bar_index, obHigh, bar_index + 30, obLow,
+                     bgcolor=color.new(color.green, 85), border_color=color.new(color.green, 40))
+            if not na(fvgTop) and not na(fvgBot)
+                box.new(bar_index, fvgTop, bar_index + 30, fvgBot,
+                     bgcolor=color.new(color.blue, 88), border_color=color.new(color.blue, 50))
+
+    if bearMSS
+        bias := "bear"
+        lastBrokenLowPx := lastSwingLow
+        mssBarTime := hTime
+        obFound = false
+        for i = 1 to 15
+            idx = n5 - 1 - i
+            if idx < 0
+                break
+            c = array.get(htfC, idx)
+            o = array.get(htfO, idx)
+            if c > o and not obFound
+                obHigh := array.get(htfH, idx)
+                obLow  := array.get(htfL, idx)
+                obIsBull := false
+                obFound := true
+        fvgFound = false
+        for i = 0 to 10
+            idx = n5 - 1 - i
+            if idx < 2
+                break
+            lo2 = array.get(htfL, idx - 2)
+            hi0 = array.get(htfH, idx)
+            if hi0 < lo2 and (lo2 - hi0) >= pips(minFVGpips) and not fvgFound
+                fvgTop := lo2
+                fvgBot := hi0
+                fvgIsBull := false
+                fvgFound := true
+        zoneActive := obFound or fvgFound
+        zoneTapped := false
+        if showZones
+            if not na(obHigh) and not na(obLow)
+                box.new(bar_index, obHigh, bar_index + 30, obLow,
+                     bgcolor=color.new(color.red, 85), border_color=color.new(color.red, 40))
+            if not na(fvgTop) and not na(fvgBot)
+                box.new(bar_index, fvgTop, bar_index + 30, fvgBot,
+                     bgcolor=color.new(color.blue, 88), border_color=color.new(color.blue, 50))
+
+// =============================================================================
+// 3) LIQUIDITY: equal highs/lows pools + sweep detection (on 5m swing data)
+// =============================================================================
+liqHighPx = float(na)
+liqLowPx  = float(na)
+if array.size(swingHighPx) >= 2
+    a = array.get(swingHighPx, array.size(swingHighPx) - 1)
+    b = array.get(swingHighPx, array.size(swingHighPx) - 2)
+    if math.abs(a - b) <= pips(eqTolPips)
+        liqHighPx := math.max(a, b)
+if array.size(swingLowPx) >= 2
+    a2 = array.get(swingLowPx, array.size(swingLowPx) - 1)
+    b2 = array.get(swingLowPx, array.size(swingLowPx) - 2)
+    if math.abs(a2 - b2) <= pips(eqTolPips)
+        liqLowPx := math.min(a2, b2)
+
+// nearest opposing swing point beyond current bias direction = simple TP liquidity target
+targetLiqHigh = array.size(swingHighPx) > 0 ? array.get(swingHighPx, array.size(swingHighPx) - 1) : na
+targetLiqLow  = array.size(swingLowPx)  > 0 ? array.get(swingLowPx,  array.size(swingLowPx)  - 1) : na
+
+// =============================================================================
+// 4) KEY LEVELS: prior day High / Low / Mid via daily security
+// =============================================================================
+[pdH, pdL, pdC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_off)
+pdMid = (pdH + pdL) / 2
+
+// =============================================================================
+// 5) 1-MINUTE ENTRY TRIGGER
+//    Only search for entries once a 5m MSS has produced an active zone AND
+//    price has traded into that zone (retracement) — then look for a 1m
+//    rejection/engulfing candle with a volume spike as the actual trigger.
+// =============================================================================
+volMA = ta.sma(volume, volMALen)
+volSpike = volume > volMA * volSpikeMult
+inSession = not useSessionFilter or not na(time(timeframe.period, sessionStr, sessionTZ))
+
+[macdLine, macdSignalLine, _] = ta.macd(close, macdFast, macdSlow, macdSignal)
+macdBullish = not useMacdFilter or macdLine > macdSignalLine
+macdBearish = not useMacdFilter or macdLine < macdSignalLine
+
+// 1m micro trigger candle: bullish engulf / strong rejection wick + volume spike
+bullEngulf = close > open and close[1] < open[1] and close > open[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close < open[1] and open >= close[1]
+bullRejectWick = (open - low) > (high - low) * wickThreshold and close > open
+bearRejectWick = (high - close) > (high - low) * wickThreshold and close < open
+
+zoneHighPx = na(fvgTop) ? obHigh : na(obHigh) ? fvgTop : math.max(obHigh, fvgTop)
+zoneLowPx  = na(fvgBot) ? obLow  : na(obLow)  ? fvgBot : math.min(obLow, fvgBot)
+
+inZoneLong  = zoneActive and bias == "bull" and not na(zoneLowPx) and low  <= zoneHighPx + pips(zoneBufferPips) and low  >= zoneLowPx - pips(zoneBufferPips)
+inZoneShort = zoneActive and bias == "bear" and not na(zoneHighPx) and high >= zoneLowPx  - pips(zoneBufferPips) and high <= zoneHighPx + pips(zoneBufferPips)
+
+// would an entry ALSO fire on this same bar? (ignoring zoneTapped itself, since
+// that's what we're about to set) — if so, skip the watch alert entirely and
+// let the entry alert cover it, to avoid two alert() calls landing on one bar
+entryAlsoThisBar = barstate.isconfirmed and strategy.position_size == 0 and volSpike and inSession and
+     ((bias == "bull" and (bullEngulf or bullRejectWick) and trendBullish and macdBullish) or
+      (bias == "bear" and (bearEngulf or bearRejectWick) and trendBearish and macdBearish))
+
+zoneTappedPrior = zoneTapped   // value as of the START of this bar, before any update below
+
+if inZoneLong or inZoneShort
+    if not zoneTapped and not entryAlsoThisBar
+        watchSide = bias == "bull" ? "a BUY" : "a SELL"
+        watchText = "XAUUSD - watching for " + watchSide + " | Zone tapped, waiting for entry trigger"
+        alert('{"chat_id":"' + telegramChatId + '","text":"' + watchText + '"}', alert.freq_once_per_bar)
+    zoneTapped := true
+
+grp_safety = "Live Repaint Safety"
+useExtraConfirmBar = input.bool(false, "Wait one extra confirmed bar before entering (safer, slightly delayed entries)", group=grp_safety)
+
+var bool pendingLong  = false
+var bool pendingShort = false
+
+rawLongTrigger  = barstate.isconfirmed and strategy.position_size == 0 and zoneTappedPrior and bias == "bull" and (bullEngulf or bullRejectWick) and volSpike and inSession and trendBullish and macdBullish
+rawShortTrigger = barstate.isconfirmed and strategy.position_size == 0 and zoneTappedPrior and bias == "bear" and (bearEngulf or bearRejectWick) and volSpike and inSession and trendBearish and macdBearish
+
+longTrigger  = useExtraConfirmBar ? (pendingLong  and barstate.isconfirmed and strategy.position_size == 0) : rawLongTrigger
+shortTrigger = useExtraConfirmBar ? (pendingShort and barstate.isconfirmed and strategy.position_size == 0) : rawShortTrigger
+
+if useExtraConfirmBar
+    if longTrigger
+        pendingLong := false
+    else if rawLongTrigger
+        pendingLong := true
+    if shortTrigger
+        pendingShort := false
+    else if rawShortTrigger
+        pendingShort := true
+    // cancel a pending signal if the trend has genuinely reversed in the meantime
+    if bias == "bear"
+        pendingLong := false
+    if bias == "bull"
+        pendingShort := false
+
+// ---- Continuation entries: no pullback/rejection candle needed. Fires on a
+// strong-bodied trend candle breaking above/below recent consolidation, with
+// volume confirming genuine participation — targets straight grinding moves
+// the reversal-only logic above sits out.
+contLongTrigger  = useContinuationEntries and barstate.isconfirmed and strategy.position_size == 0 and bias == "bull" and
+     (close - open) > (high - low) * contBodyThreshold and close > open and
+     close > ta.highest(high[1], contBreakoutBars) and
+     volSpike and inSession and trendBullish and macdBullish
+
+contShortTrigger = useContinuationEntries and barstate.isconfirmed and strategy.position_size == 0 and bias == "bear" and
+     (open - close) > (high - low) * contBodyThreshold and close < open and
+     close < ta.lowest(low[1], contBreakoutBars) and
+     volSpike and inSession and trendBearish and macdBearish
+
+// -----------------------------------------------------------------------------
+// STOP / TARGET CALCULATION — returns DISTANCES (price units), not absolute
+// prices. strategy.entry() fills at the OPEN of the NEXT bar by default, not
+// the signal bar's close — so an absolute stop/limit computed from `close`
+// can end up a different distance from the real fill than intended (this was
+// causing stops to trigger well short of the configured minimum). Using
+// tick-relative loss=/profit= in strategy.exit() anchors correctly to
+// whatever price the entry actually fills at.
+// -----------------------------------------------------------------------------
+calcStopDistLong(entry) =>
+    structStop = na(zoneLowPx) ? entry - pips(minStopPips) : zoneLowPx - pips(5)
+    dist = entry - structStop
+    math.max(pips(minStopPips), math.min(pips(maxStopPips), dist))
+
+calcStopDistShort(entry) =>
+    structStop = na(zoneHighPx) ? entry + pips(minStopPips) : zoneHighPx + pips(5)
+    dist = structStop - entry
+    math.max(pips(minStopPips), math.min(pips(maxStopPips), dist))
+
+calcStopDistContLong(entry) =>
+    structStop = ta.lowest(low, contStopBars) - pips(5)
+    dist = entry - structStop
+    math.max(pips(minStopPips), math.min(pips(maxStopPips), dist))
+
+calcStopDistContShort(entry) =>
+    structStop = ta.highest(high, contStopBars) + pips(5)
+    dist = structStop - entry
+    math.max(pips(minStopPips), math.min(pips(maxStopPips), dist))
+
+// =============================================================================
+// 6) FIRE SIGNALS
+// =============================================================================
+if longTrigger or contLongTrigger
+    entryEst = close   // estimate only — real fill is next bar's open
+    isCont = not longTrigger and contLongTrigger
+    stopDist = isCont ? calcStopDistContLong(entryEst) : calcStopDistLong(entryEst)
+    tpDist   = pips(tpPipsFixed)
+    rr = tpDist / stopDist
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", loss=stopDist / syminfo.mintick, profit=tpDist / syminfo.mintick)
+    tgText = "XAUUSD BUY" + (isCont ? " (Continuation)" : "") + " | Entry ~" + str.tostring(entryEst, "#.##") +
+         " | SL " + str.tostring(stopDist / pipSize, "#.#") + "p" +
+         " | TP " + str.tostring(tpDist / pipSize, "#.#") + "p" +
+         " | RR " + str.tostring(rr, "#.##")
+    alert('{"chat_id":"' + telegramChatId + '","text":"' + tgText + '"}', alert.freq_once_per_bar)
+    zoneActive := false
+    zoneTapped := false
+
+if shortTrigger or contShortTrigger
+    entryEst = close
+    isCont = not shortTrigger and contShortTrigger
+    stopDist = isCont ? calcStopDistContShort(entryEst) : calcStopDistShort(entryEst)
+    tpDist   = pips(tpPipsFixed)
+    rr = tpDist / stopDist
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", loss=stopDist / syminfo.mintick, profit=tpDist / syminfo.mintick)
+    tgText = "XAUUSD SELL" + (isCont ? " (Continuation)" : "") + " | Entry ~" + str.tostring(entryEst, "#.##") +
+         " | SL " + str.tostring(stopDist / pipSize, "#.#") + "p" +
+         " | TP " + str.tostring(tpDist / pipSize, "#.#") + "p" +
+         " | RR " + str.tostring(rr, "#.##")
+    alert('{"chat_id":"' + telegramChatId + '","text":"' + tgText + '"}', alert.freq_once_per_bar)
+    zoneActive := false
+    zoneTapped := false
+
+// =============================================================================
+// 7) VISUALS (bias marker plots)
+// =============================================================================
+plot(bias == "bull" ? low - pips(2) : na, title="Bull bias marker", style=plot.style_circles, color=color.green)
+plot(bias == "bear" ? high + pips(2) : na, title="Bear bias marker", style=plot.style_circles, color=color.red)
+
+// alertcondition placeholders (for TradingView's alert-creation UI — the real
+// dynamic message comes from the alert() calls above)
+alertcondition(longTrigger, title="SMC Long Signal", message="XAUUSD long signal - check alert() payload for live entry/SL/TP")
+alertcondition(shortTrigger, title="SMC Short Signal", message="XAUUSD short signal - check alert() payload for live entry/SL/TP")
+
+// =============================================================================
+// 8) FIXED-LOT $ P&L DIAGNOSTICS (0.05 lots) — informational, no behavior change.
+//    Computed directly from each closed trade's entry/exit price (NOT the
+//    Strategy Tester's default equity-% stats, which are misleading when the
+//    script's own position sizing doesn't match your real 0.05 lot size).
+//    Updated INCREMENTALLY every bar as trades close (rather than recomputed
+//    in one big loop only on the last bar) — the last-bar-loop pattern
+//    proved unreliable before, so this avoids it entirely.
+//    View these in the Data Window (not a table — unreliable in this setup).
+// =============================================================================
+grp_diag = "Fixed-Lot $ P&L Diagnostics"
+lotSize = input.float(0.05, "Lot size for $ P&L diagnostic", minval=0.01, group=grp_diag)
+diagStart = input.time(timestamp("2023-01-01 00:00"), "Diagnostic window start", group=grp_diag)
+diagEnd   = input.time(timestamp("2026-12-31 23:59"), "Diagnostic window end", group=grp_diag)
+pipValuePerLotUSD = 10.0
+
+var float fixedLotTotalPnL = 0.0
+var float fixedLotPeakPnL  = 0.0
+var float fixedLotMaxDD    = 0.0
+var int   curConsecLosses  = 0
+var int   maxConsecLosses  = 0
+var int   prevClosedCount  = 0
+
+if strategy.closedtrades > prevClosedCount
+    for i = prevClosedCount to strategy.closedtrades - 1
+        entryTime = strategy.closedtrades.entry_time(i)
+        if entryTime >= diagStart and entryTime <= diagEnd
+            entryP = strategy.closedtrades.entry_price(i)
+            exitP  = strategy.closedtrades.exit_price(i)
+            isLong = strategy.closedtrades.size(i) > 0
+            priceDiff = isLong ? (exitP - entryP) : (entryP - exitP)
+            tradePips = priceDiff / pipSize
+            tradeUSD = tradePips * pipValuePerLotUSD * lotSize
+            fixedLotTotalPnL += tradeUSD
+            if fixedLotTotalPnL > fixedLotPeakPnL
+                fixedLotPeakPnL := fixedLotTotalPnL
+            ddNow = fixedLotPeakPnL - fixedLotTotalPnL
+            if ddNow > fixedLotMaxDD
+                fixedLotMaxDD := ddNow
+            if tradeUSD < 0
+                curConsecLosses += 1
+                if curConsecLosses > maxConsecLosses
+                    maxConsecLosses := curConsecLosses
+            else
+                curConsecLosses := 0
+    prevClosedCount := strategy.closedtrades
+
+plot(fixedLotTotalPnL, title="Fixed-lot ($, 0.05 lots) Total P&L",     display=display.data_window)
+plot(fixedLotMaxDD,    title="Fixed-lot ($, 0.05 lots) Max Drawdown",  display=display.data_window)
+plot(maxConsecLosses,  title="Max consecutive losing trades",         display=display.data_window)
+

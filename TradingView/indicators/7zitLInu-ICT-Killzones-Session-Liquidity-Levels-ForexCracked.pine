@@ -1,0 +1,405 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © ForexCracked
+
+//@version=6
+indicator("ICT Killzones + Session Liquidity Levels [ForexCracked]", shorttitle = "KZLIQ[FXC]", overlay = true, max_boxes_count = 500, max_labels_count = 500)
+
+// =====================================================================
+// ICT Killzones + Session Liquidity Levels
+// ---------------------------------------------------------------------
+// Sessions are the anchor, not the product. What the script measures:
+//
+// 1) DEPTH-CALIBRATED ZONES. A completed session's high/low is drawn as
+//    a BAND, not a line. Its thickness is the MEDIAN OVERSHOOT (in ATR
+//    units) recorded from the last 40 times a level of that same session
+//    and side was actually taken on this symbol. The far edge is thus a
+//    measured price rather than a taste-based buffer. Under 8 samples it
+//    falls back to a floor and the label says "n<8".
+//
+// 2) SESSION-HANDOFF TALLIES. Rolling counts of whether the following
+//    session traded through this level. An Asia level shows what London
+//    and then New York did with it; a London level shows what New York
+//    did. New York is last in the day, so its levels carry no tally.
+//    A session-TRANSITION statistic, printed as "LDN swept 34/60
+//    sessions" on the level itself.
+//
+// 3) FORWARD MEDIAN-RANGE ENVELOPE. The session that has not opened yet
+//    is drawn in untraded space, sized by its own median range, with
+//    both edge prices, so distance-to-level can be judged honestly.
+//
+// 4) DELETE-ON-SWEEP. A level is removed the instant it is taken, so
+//    everything visible is still-live liquidity.
+//
+// Zero request.security calls: symbol- and timeframe-agnostic by
+// construction. All state is bounded (arrays capped, objects capped).
+// =====================================================================
+
+// ---------------- INPUTS ----------------
+gS = "Sessions"
+tz       = input.string("GMT", "Timezone", options = ["GMT", "Europe/London", "America/New_York", "Asia/Tokyo", "Asia/Singapore", "Australia/Sydney", "Asia/Kolkata"], group = gS)
+asiaSpec = input.session("0000-0800", "Asia",     group = gS)
+lonSpec  = input.session("0800-1600", "London",   group = gS)
+nySpec   = input.session("1300-2100", "New York", group = gS)
+showBox  = input.bool(true, "Session boxes", group = gS)
+keepDays = input.int(3, "Days of session boxes", minval = 1, maxval = 10, group = gS, tooltip = "Kept deliberately low. More days means a busier chart, and the liquidity zones are the point.")
+
+gK = "Killzones"
+useKZ1  = input.bool(true, "Killzone 1", inline = "k1", group = gK)
+kz1     = input.session("0700-1000", "", inline = "k1", group = gK)
+useKZ2  = input.bool(true, "Killzone 2", inline = "k2", group = gK)
+kz2     = input.session("1200-1500", "", inline = "k2", group = gK)
+
+gM = "Measurement"
+statN   = input.int(60, "Statistics window (sessions)", minval = 10, maxval = 120, group = gM, tooltip = "The cap on how many completed sessions the tallies and median ranges are counted over. On very low timeframes the chart holds fewer sessions than this, so the real n is smaller. Every label prints its own n.")
+minZone = input.float(0.35, "Minimum zone height (x ATR)", minval = 0.1, step = 0.05, group = gM, tooltip = "A floor so a measured zone never becomes too thin to see. Raise it on small screens.")
+maxSide = input.int(4, "Untapped levels per side", minval = 1, maxval = 8, group = gM)
+skipWknd= input.bool(true, "Skip weekend sessions in statistics", group = gM, tooltip = "On 24/7 symbols, weekend sessions are much quieter and would drag the medians down. Their levels still draw; only the statistics ignore them.")
+
+gV = "Style"
+colAbove = input.color(#e84e89, "Liquidity above price", group = gV)
+colBelow = input.color(#2dd4bf, "Liquidity below price", group = gV)
+colSess  = input.color(#1a2c4c, "Session box", group = gV)
+showFwd  = input.bool(true, "Forward envelope", group = gV)
+showTbl  = input.bool(true, "Dashboard", group = gV)
+tblPosIn = input.string("Top Right", "Dashboard position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = gV)
+tblPos   = tblPosIn == "Top Left" ? position.top_left : tblPosIn == "Bottom Right" ? position.bottom_right : tblPosIn == "Bottom Left" ? position.bottom_left : position.top_right
+
+// ---------------- GUARD ----------------
+tfOk = timeframe.isintraday and timeframe.in_seconds() <= 14400
+var label warnLbl = na
+if barstate.islast and not tfOk
+    label.delete(warnLbl)
+    warnLbl := label.new(bar_index, close, "KZLIQ: use an intraday timeframe (4H or faster)", style = label.style_label_left, color = color.new(#1a2c4c, 10), textcolor = color.white, size = size.normal)
+
+atr = ta.atr(14)
+
+// ---------------- SESSION CLOCKS (simple-string args, so no loops here) ----------------
+inAsia = tfOk and not na(time(timeframe.period, asiaSpec, tz))
+inLon  = tfOk and not na(time(timeframe.period, lonSpec,  tz))
+inNY   = tfOk and not na(time(timeframe.period, nySpec,   tz))
+inKZ1  = tfOk and useKZ1 and not na(time(timeframe.period, kz1, tz))
+inKZ2  = tfOk and useKZ2 and not na(time(timeframe.period, kz2, tz))
+
+bgcolor(inKZ1 ? color.new(colAbove, 94) : na, title = "Killzone 1")
+bgcolor(inKZ2 ? color.new(colBelow, 94) : na, title = "Killzone 2")
+
+// ---------------- STATE: 3 sessions, index 0 Asia / 1 London / 2 NY ----------------
+var array<float> runHi   = array.new<float>(3, na)
+var array<float> runLo   = array.new<float>(3, na)
+var array<int>   runStart= array.new<int>(3, 0)
+var array<int>   lastStart = array.new<int>(3, 0)
+var array<int>   lastDur   = array.new<int>(3, 0)
+// today's completed extremes, for the handoff tests
+var array<float> dayHi = array.new<float>(3, na)
+var array<float> dayLo = array.new<float>(3, na)
+
+// median range per session, in ATR units, for the forward envelope
+var array<float> rngAsia = array.new<float>()
+var array<float> rngLon  = array.new<float>()
+var array<float> rngNY   = array.new<float>()
+// overshoot depth per session x side (0 hi / 1 lo), in ATR units
+var array<float> dAsiaHi = array.new<float>(), var array<float> dAsiaLo = array.new<float>()
+var array<float> dLonHi  = array.new<float>(), var array<float> dLonLo  = array.new<float>()
+var array<float> dNYHi   = array.new<float>(), var array<float> dNYLo   = array.new<float>()
+// handoff tallies (1/0 bits)
+var array<int> hLonAsiaHi = array.new<int>(), var array<int> hLonAsiaLo = array.new<int>()
+var array<int> hNYAsiaHi  = array.new<int>(), var array<int> hNYAsiaLo  = array.new<int>()
+var array<int> hNYLonHi   = array.new<int>(), var array<int> hNYLonLo   = array.new<int>()
+
+rngArr(int s) => s == 0 ? rngAsia : s == 1 ? rngLon : rngNY
+depArr(int s, bool isHi) => s == 0 ? (isHi ? dAsiaHi : dAsiaLo) : s == 1 ? (isHi ? dLonHi : dLonLo) : (isHi ? dNYHi : dNYLo)
+sName(int s) => s == 0 ? "ASIA" : s == 1 ? "LDN" : "NY"
+
+pushCap(array<float> a, float v, int cap) =>
+    array.push(a, v)
+    if array.size(a) > cap
+        array.shift(a)
+pushCapI(array<int> a, int v, int cap) =>
+    array.push(a, v)
+    if array.size(a) > cap
+        array.shift(a)
+
+// 5-digit / 3-digit forex feeds quote a pip as 10 ticks; everything else
+// (4-digit forex, indices, crypto, metals) is reported in price units.
+isFx    = syminfo.type == "forex" and syminfo.mintick <= 0.00001
+pipSize = syminfo.mintick * (isFx ? 10 : 1)
+unit    = isFx ? "p" : ""
+toPips(float d) => math.round(d / pipSize, isFx ? 1 : 2)
+
+// ---------------- LIVE LIQUIDITY ZONES (parallel arrays) ----------------
+var array<box>   zBox  = array.new<box>()
+var array<label> zLbl  = array.new<label>()
+var array<float> zPx   = array.new<float>()
+var array<bool>  zIsHi = array.new<bool>()
+var array<int>   zSess = array.new<int>()
+var array<int>   zBorn = array.new<int>()
+
+zRemove(int i) =>
+    box.delete(array.get(zBox, i))
+    label.delete(array.get(zLbl, i))
+    array.remove(zBox, i),  array.remove(zLbl, i),  array.remove(zPx, i)
+    array.remove(zIsHi, i), array.remove(zSess, i), array.remove(zBorn, i)
+
+// Tally text: what the FOLLOWING sessions have historically done with a level
+// like this one. Asia levels are followed by both London and New York, London
+// levels by New York, and New York is last in the day so it carries no tally.
+tallySeg(array<int> a, string who) =>
+    n = array.size(a)
+    n >= 5 ? " · " + who + " swept " + str.tostring(array.sum(a)) + "/" + str.tostring(n) + " sessions" : " · " + who + " n<5"
+
+tallyTxt(int s, bool isHi) =>
+    out = ""
+    if s == 0
+        out := tallySeg(isHi ? hLonAsiaHi : hLonAsiaLo, "LDN") + tallySeg(isHi ? hNYAsiaHi : hNYAsiaLo, "NY")
+    else if s == 1
+        out := tallySeg(isHi ? hNYLonHi : hNYLonLo, "NY")
+    else
+        out := " · last session of the day"
+    out
+
+// ---------------- SESSION BOXES ----------------
+var array<box>   sBox = array.new<box>()
+var array<label> sLbl = array.new<label>()
+
+// ---------------- FINALIZE A SESSION ----------------
+finalize(int s, float hi, float lo, int startT, int endT) =>
+    if not na(hi) and not na(lo) and not na(atr) and atr > 0 and startT > 0
+        dw = dayofweek(time, tz)
+        statOk = not skipWknd or (dw != dayofweek.saturday and dw != dayofweek.sunday)
+        // range stat
+        if statOk
+            pushCap(rngArr(s), (hi - lo) / atr, statN)
+        // handoff tests against earlier sessions completed today
+        if s == 1 and statOk
+            if not na(array.get(dayHi, 0))
+                pushCapI(hLonAsiaHi, hi > array.get(dayHi, 0) ? 1 : 0, statN)
+                pushCapI(hLonAsiaLo, lo < array.get(dayLo, 0) ? 1 : 0, statN)
+        if s == 2 and statOk
+            if not na(array.get(dayHi, 0))
+                pushCapI(hNYAsiaHi, hi > array.get(dayHi, 0) ? 1 : 0, statN)
+                pushCapI(hNYAsiaLo, lo < array.get(dayLo, 0) ? 1 : 0, statN)
+            if not na(array.get(dayHi, 1))
+                pushCapI(hNYLonHi, hi > array.get(dayHi, 1) ? 1 : 0, statN)
+                pushCapI(hNYLonLo, lo < array.get(dayLo, 1) ? 1 : 0, statN)
+        array.set(dayHi, s, hi)
+        array.set(dayLo, s, lo)
+        array.set(lastStart, s, startT)
+        array.set(lastDur, s, math.max(endT - startT, 1))
+        // session box
+        if showBox
+            b = box.new(startT, hi, endT, lo, xloc = xloc.bar_time, bgcolor = color.new(colSess, 90), border_color = color.new(colSess, 25), border_width = 1)
+            l = label.new(int(math.avg(startT, endT)), hi, sName(s) + " " + str.tostring(toPips(hi - lo)) + unit, xloc = xloc.bar_time, style = label.style_label_down, color = color.new(colSess, 20), textcolor = color.white, size = size.tiny)
+            array.push(sBox, b), array.push(sLbl, l)
+            while array.size(sBox) > keepDays * 3
+                box.delete(array.shift(sBox))
+                label.delete(array.shift(sLbl))
+        // two liquidity zones, drawn with measured depth
+        for k = 0 to 1
+            isHi = k == 0
+            px   = isHi ? hi : lo
+            dArr = depArr(s, isHi)
+            hAtr = array.size(dArr) >= 8 ? math.max(array.median(dArr), minZone) : minZone
+            h    = hAtr * atr
+            top  = isHi ? px + h : px
+            bot  = isHi ? px : px - h
+            base = px > close ? colAbove : colBelow
+            bx = box.new(endT, top, endT + array.get(lastDur, s), bot, xloc = xloc.bar_time, bgcolor = color.new(base, 65), border_color = color.new(base, 10), border_width = 1)
+            // right-anchored styles: the anchor sits at the projection's right
+            // edge, so the text flows LEFT over the empty projection space and
+            // can never run off-screen into the price scale
+            lb = label.new(endT, isHi ? top : bot, "", xloc = xloc.bar_time, style = isHi ? label.style_label_lower_right : label.style_label_upper_right, color = color.new(#1a2c4c, 20), textcolor = color.new(base, 0), size = size.tiny)
+            array.push(zBox, bx), array.push(zLbl, lb), array.push(zPx, px)
+            array.push(zIsHi, isHi), array.push(zSess, s), array.push(zBorn, bar_index)
+
+// rising / falling edges. A na accumulator (first bar of the chart, or the
+// first bar after a data gap) is treated as a fresh session start so a
+// half-tracked session can never poison the statistics.
+if inAsia and (not inAsia[1] or na(array.get(runHi, 0)))
+    array.set(runHi, 0, high), array.set(runLo, 0, low), array.set(runStart, 0, time)
+else if inAsia
+    array.set(runHi, 0, math.max(array.get(runHi, 0), high)), array.set(runLo, 0, math.min(array.get(runLo, 0), low))
+if not inAsia and inAsia[1]
+    finalize(0, array.get(runHi, 0), array.get(runLo, 0), array.get(runStart, 0), time_close[1])
+    array.set(runHi, 0, na), array.set(runLo, 0, na)
+
+if inLon and (not inLon[1] or na(array.get(runHi, 1)))
+    array.set(runHi, 1, high), array.set(runLo, 1, low), array.set(runStart, 1, time)
+else if inLon
+    array.set(runHi, 1, math.max(array.get(runHi, 1), high)), array.set(runLo, 1, math.min(array.get(runLo, 1), low))
+if not inLon and inLon[1]
+    finalize(1, array.get(runHi, 1), array.get(runLo, 1), array.get(runStart, 1), time_close[1])
+    array.set(runHi, 1, na), array.set(runLo, 1, na)
+
+if inNY and (not inNY[1] or na(array.get(runHi, 2)))
+    array.set(runHi, 2, high), array.set(runLo, 2, low), array.set(runStart, 2, time)
+else if inNY
+    array.set(runHi, 2, math.max(array.get(runHi, 2), high)), array.set(runLo, 2, math.min(array.get(runLo, 2), low))
+if not inNY and inNY[1]
+    finalize(2, array.get(runHi, 2), array.get(runLo, 2), array.get(runStart, 2), time_close[1])
+    array.set(runHi, 2, na), array.set(runLo, 2, na)
+
+// new day resets the handoff reference extremes
+if dayofweek != dayofweek[1]
+    array.set(dayHi, 0, na), array.set(dayLo, 0, na)
+    array.set(dayHi, 1, na), array.set(dayLo, 1, na)
+    array.set(dayHi, 2, na), array.set(dayLo, 2, na)
+
+// ---------------- SWEEP DETECTION: record the overshoot, then delete ----------------
+sweptNow = false
+nearNow  = false
+if array.size(zPx) > 0 and not na(atr) and atr > 0
+    i = array.size(zPx) - 1
+    while i >= 0
+        px   = array.get(zPx, i)
+        isHi = array.get(zIsHi, i)
+        s    = array.get(zSess, i)
+        if isHi ? high > px : low < px
+            over = isHi ? (high - px) / atr : (px - low) / atr
+            pushCap(depArr(s, isHi), math.max(over, 0.0), 40)
+            zRemove(i)
+            sweptNow := true
+        else
+            if math.abs(px - close) / atr <= 0.25
+                nearNow := true
+        i := i - 1
+
+// cap untapped levels per side: drop the oldest
+capSide(bool wantHi) =>
+    cnt = 0
+    if array.size(zPx) > 0
+        for i = 0 to array.size(zPx) - 1
+            if (array.get(zPx, i) > close) == wantHi
+                cnt := cnt + 1
+    while cnt > maxSide
+        worst = -1
+        oldest = 1e15
+        for i = 0 to array.size(zPx) - 1
+            if (array.get(zPx, i) > close) == wantHi and array.get(zBorn, i) < oldest
+                oldest := array.get(zBorn, i)
+                worst := i
+        if worst >= 0
+            zRemove(worst)
+        cnt := cnt - 1
+capSide(true)
+capSide(false)
+
+// ---------------- REDRAW LIVE ZONES ON THE LAST BAR ----------------
+if barstate.islast and array.size(zPx) > 0 and not na(atr) and atr > 0
+    projEnd = time + math.max(array.get(lastDur, 1), 3600000)
+    for i = 0 to array.size(zPx) - 1
+        px   = array.get(zPx, i)
+        isHi = array.get(zIsHi, i)
+        s    = array.get(zSess, i)
+        base = px > close ? colAbove : colBelow
+        dArr = depArr(s, isHi)
+        n    = array.size(dArr)
+        hAtr = n >= 8 ? math.max(array.median(dArr), minZone) : minZone
+        h    = hAtr * atr
+        b    = array.get(zBox, i)
+        box.set_top(b, isHi ? px + h : px)
+        box.set_bottom(b, isHi ? px : px - h)
+        box.set_right(b, projEnd)
+        box.set_bgcolor(b, color.new(base, 65))
+        box.set_border_color(b, color.new(base, 10))
+        l = array.get(zLbl, i)
+        label.set_xy(l, projEnd, isHi ? px + h : px - h)
+        label.set_text(l, sName(s) + (isHi ? " HI " : " LO ") + str.tostring(px, format.mintick)
+              + " · " + str.tostring(math.abs(toPips(px - close))) + unit + " " + (px > close ? "above" : "below")
+              + (n >= 8 ? " · depth " + str.tostring(hAtr, "#.00") + " ATR" : " · depth n<8")
+              + tallyTxt(s, isHi))
+        label.set_textcolor(l, color.new(base, 0))
+
+// ---------------- FORWARD ENVELOPE ----------------
+// The next occurrence of each session is derived from the CLOCK, not from
+// history: build today's start time via timestamp() in the selected tz (so
+// the tz database resolves DST), and walk forward day by day until it is in
+// the future. Deriving it from lastStart + 24h breaks after weekends,
+// holidays and data gaps, and drifts an hour on DST switch days.
+sessSpecOf(int s) => s == 0 ? asiaSpec : s == 1 ? lonSpec : nySpec
+
+nextStart(int s) =>
+    spec = sessSpecOf(s)
+    hh = int(str.tonumber(str.substring(spec, 0, 2)))
+    mm = int(str.tonumber(str.substring(spec, 2, 4)))
+    out = -1
+    if not na(hh) and not na(mm)
+        d = 0
+        found = false
+        while d <= 7 and not found
+            ref = time + d * 86400000
+            cand = timestamp(tz, year(ref, tz), month(ref, tz), dayofmonth(ref, tz), hh, mm)
+            if cand > time
+                out := cand
+                found := true
+            d := d + 1
+    out
+
+var box fwdBox = na
+var label fwdLbl = na
+if barstate.islast and showFwd and not na(atr) and atr > 0
+    box.delete(fwdBox), label.delete(fwdLbl)
+    nxt = -1
+    nxtStart = 0
+    for s = 0 to 2
+        if array.get(lastDur, s) > 0 and array.size(rngArr(s)) >= 5
+            cand = nextStart(s)
+            if cand > 0 and (nxt < 0 or cand < nxtStart)
+                nxt := s
+                nxtStart := cand
+    if nxt >= 0
+        medR = array.median(rngArr(nxt)) * atr
+        top  = close + medR / 2.0
+        bot  = close - medR / 2.0
+        fwdBox := box.new(nxtStart, top, nxtStart + array.get(lastDur, nxt), bot, xloc = xloc.bar_time, bgcolor = color.new(colSess, 95), border_color = color.new(color.gray, 30), border_width = 1, border_style = line.style_dashed)
+        fwdLbl := label.new(nxtStart, top, sName(nxt) + " median range " + str.tostring(toPips(medR)) + unit + " (n" + str.tostring(array.size(rngArr(nxt))) + ")", xloc = xloc.bar_time, style = label.style_label_down, color = color.new(colSess, 20), textcolor = color.new(color.gray, 0), size = size.tiny)
+
+// ---------------- DASHBOARD ----------------
+if showTbl and barstate.islast and tfOk
+    var table t = table.new(tblPos, 2, 5, bgcolor = #1a2c4c, frame_color = color.new(color.gray, 55), frame_width = 1, border_color = color.new(#2a3d63, 25), border_width = 1)
+    lbl = #9fb0c4
+    liveS = inNY ? "New York" : inLon ? "London" : inAsia ? "Asia" : "closed"
+    table.cell(t, 0, 0, " KILLZONES + LIQUIDITY ", text_color = color.white, bgcolor = #1f3a63, text_size = size.small)
+    table.cell(t, 1, 0, inKZ1 or inKZ2 ? "in killzone" : "", text_color = #ffd166, bgcolor = #1f3a63, text_size = size.tiny)
+    table.cell(t, 0, 1, "Live session", text_color = lbl, text_size = size.tiny)
+    table.cell(t, 1, 1, liveS, text_color = color.white, text_size = size.tiny)
+    nAbove = 0
+    nBelow = 0
+    nearI  = -1
+    nearD  = 1e15
+    if array.size(zPx) > 0
+        for i = 0 to array.size(zPx) - 1
+            px = array.get(zPx, i)
+            if px > close
+                nAbove := nAbove + 1
+            else
+                nBelow := nBelow + 1
+            d = math.abs(px - close)
+            if d < nearD
+                nearD := d
+                nearI := i
+    table.cell(t, 0, 2, "Untapped", text_color = lbl, text_size = size.tiny)
+    table.cell(t, 1, 2, str.tostring(nAbove) + " above · " + str.tostring(nBelow) + " below", text_color = color.white, text_size = size.tiny)
+    table.cell(t, 0, 3, "Nearest", text_color = lbl, text_size = size.tiny)
+    if nearI >= 0
+        px = array.get(zPx, nearI)
+        table.cell(t, 1, 3, sName(array.get(zSess, nearI)) + (array.get(zIsHi, nearI) ? " HI " : " LO ") + str.tostring(px, format.mintick) + " · " + str.tostring(math.abs(toPips(px - close))) + unit, text_color = px > close ? colAbove : colBelow, text_size = size.tiny)
+    else
+        table.cell(t, 1, 3, "none", text_color = lbl, text_size = size.tiny)
+    tdy = ""
+    for s = 0 to 2
+        if not na(array.get(dayHi, s)) and array.size(rngArr(s)) >= 5 and not na(atr) and atr > 0
+            r = (array.get(dayHi, s) - array.get(dayLo, s)) / atr
+            m = array.median(rngArr(s))
+            if m > 0
+                tdy := tdy + (tdy == "" ? "" : " · ") + sName(s) + " " + str.tostring(math.round(r / m, 1)) + "x"
+    table.cell(t, 0, 4, "Today vs median", text_color = lbl, text_size = size.tiny)
+    table.cell(t, 1, 4, tdy == "" ? "warming up" : tdy, text_color = color.white, text_size = size.tiny)
+
+// ---------------- ALERTS ----------------
+alertcondition(inAsia and not inAsia[1], "Asia session open", "Asia session opened on {{ticker}}")
+alertcondition(inLon and not inLon[1], "London session open", "London session opened on {{ticker}}")
+alertcondition(inNY and not inNY[1], "New York session open", "New York session opened on {{ticker}}")
+alertcondition((inKZ1 and not inKZ1[1]) or (inKZ2 and not inKZ2[1]), "Killzone open", "A killzone window opened on {{ticker}} {{interval}}")
+alertcondition(sweptNow, "Session liquidity swept", "An untapped session high or low was swept on {{ticker}} {{interval}}")
+alertcondition(nearNow, "Approaching session liquidity", "Price is within 0.25 ATR of an untapped session level on {{ticker}} {{interval}}")

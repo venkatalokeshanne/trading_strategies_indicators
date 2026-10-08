@@ -1,0 +1,342 @@
+//@version=6
+strategy("NQ ICT Semi-Auto Strategy v1",
+     overlay = true,
+     initial_capital = 100000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.0,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 2)
+
+//---------------------------------------------------------
+// Inputs
+//---------------------------------------------------------
+groupBias   = "Bias / Confirmation"
+groupSess   = "Sessions"
+groupStruct = "Structure"
+groupDisp   = "Displacement / MSS / FVG"
+groupRisk   = "Risk / Trade Management"
+groupVis    = "Visuals"
+
+manualBias = input.string("Mixed", "Manual Bias", options = ["Bullish", "Bearish", "Mixed", "Neutral"], group = groupBias)
+confirmSymbol = input.symbol("CME_MINI:ES1!", "SP500 Confirmation Symbol", group = groupBias)
+confirmMode = input.string("Balanced", "Confirmation Mode", options = ["Strict", "Balanced", "Loose"], group = groupBias)
+spEmaLen = input.int(20, "SP500 EMA Length", minval = 1, group = groupBias)
+smtLookback = input.int(20, "SMT Lookback", minval = 3, group = groupBias)
+
+sessionTZ = input.string("America/New_York", "Session Timezone", group = groupSess)
+nyOpenSession = input.session("0930-1130", "NY Open", group = groupSess)
+nyPmSession = input.session("1330-1530", "NY PM", group = groupSess)
+enablePmSession = input.bool(false, "Enable NY PM", group = groupSess)
+blockMonday = input.bool(false, "Block Monday", group = groupSess)
+
+pivotLen = input.int(3, "Pivot Length", minval = 1, group = groupStruct)
+midBandPct = input.float(0.10, "Midpoint No-Trade Band %", minval = 0.0, maxval = 0.45, step = 0.01, group = groupStruct)
+setupLookback = input.int(6, "Bars Allowed Between Sweep/Disp/MSS", minval = 1, group = groupStruct)
+
+atrLen = input.int(14, "ATR Length", minval = 1, group = groupDisp)
+dispATRMult = input.float(1.2, "Displacement ATR Multiplier", minval = 0.1, step = 0.1, group = groupDisp)
+minBodyRatio = input.float(0.60, "Min Body / Range Ratio", minval = 0.1, maxval = 1.0, step = 0.05, group = groupDisp)
+closeNearPct = input.float(0.25, "Close Near Edge %", minval = 0.05, maxval = 0.5, step = 0.05, group = groupDisp)
+minFvgTicks = input.int(8, "Minimum FVG Size (ticks)", minval = 1, group = groupDisp)
+
+maxTradesPerDay = input.int(2, "Max Trades Per Day", minval = 1, group = groupRisk)
+maxStopPoints = input.float(80.0, "Max Stop Distance (points)", minval = 0.25, step = 0.25, group = groupRisk)
+stopBufferTicks = input.int(4, "Stop Buffer (ticks)", minval = 0, group = groupRisk)
+targetRR = input.float(2.0, "Final Target R", minval = 0.5, step = 0.25, group = groupRisk)
+breakEvenRR = input.float(1.5, "Break-Even Trigger R", minval = 0.5, step = 0.25, group = groupRisk)
+
+showPD = input.bool(true, "Plot PDH / PDL / Mid", group = groupVis)
+showFVG = input.bool(true, "Plot Active FVG", group = groupVis)
+showSignals = input.bool(true, "Plot Signals", group = groupVis)
+
+//---------------------------------------------------------
+// Session logic
+//---------------------------------------------------------
+inNyOpen = not na(time(timeframe.period, nyOpenSession, sessionTZ))
+inNyPm   = not na(time(timeframe.period, nyPmSession, sessionTZ))
+isMonday = dayofweek == dayofweek.monday
+
+allowedSession = inNyOpen or (enablePmSession and inNyPm)
+allowedDay = not (blockMonday and isMonday)
+sessionOK = allowedSession and allowedDay
+
+//---------------------------------------------------------
+// Daily levels (previous day high/low)
+//---------------------------------------------------------
+pdh = request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_off, barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid, "D", low[1], barmerge.gaps_off, barmerge.lookahead_off)
+mid = (pdh + pdl) / 2.0
+dayRange = math.abs(pdh - pdl)
+midBand = dayRange * midBandPct
+
+inPremium = close > mid + midBand
+inDiscount = close < mid - midBand
+inMidNoTrade = math.abs(close - mid) <= midBand
+
+//---------------------------------------------------------
+// Swing structure
+//---------------------------------------------------------
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+sweepHighRef = na(lastSwingHigh) ? pdh : math.max(pdh, lastSwingHigh)
+sweepLowRef  = na(lastSwingLow)  ? pdl : math.min(pdl, lastSwingLow)
+
+//---------------------------------------------------------
+// Liquidity sweep
+//---------------------------------------------------------
+buffer = syminfo.mintick * stopBufferTicks
+
+bearSweep = high > sweepHighRef and close < sweepHighRef
+bullSweep = low < sweepLowRef and close > sweepLowRef
+
+//---------------------------------------------------------
+// Displacement
+//---------------------------------------------------------
+atr = ta.atr(atrLen)
+barRange = high - low
+bodySize = math.abs(close - open)
+bodyRatio = barRange > 0 ? bodySize / barRange : 0.0
+
+bearDisp = barRange > atr * dispATRMult and bodyRatio >= minBodyRatio and close <= low + (barRange * closeNearPct)
+bullDisp = barRange > atr * dispATRMult and bodyRatio >= minBodyRatio and close >= high - (barRange * closeNearPct)
+
+//---------------------------------------------------------
+// MSS approximation
+//---------------------------------------------------------
+bearMss = not na(lastSwingLow) and close < lastSwingLow
+bullMss = not na(lastSwingHigh) and close > lastSwingHigh
+
+recentBearSweep = ta.barssince(bearSweep) >= 0 and ta.barssince(bearSweep) <= setupLookback
+recentBullSweep = ta.barssince(bullSweep) >= 0 and ta.barssince(bullSweep) <= setupLookback
+recentBearDisp  = ta.barssince(bearDisp) >= 0 and ta.barssince(bearDisp) <= setupLookback
+recentBullDisp  = ta.barssince(bullDisp) >= 0 and ta.barssince(bullDisp) <= setupLookback
+recentBearMss   = ta.barssince(bearMss) >= 0 and ta.barssince(bearMss) <= setupLookback
+recentBullMss   = ta.barssince(bullMss) >= 0 and ta.barssince(bullMss) <= setupLookback
+
+//---------------------------------------------------------
+// FVG detection
+//---------------------------------------------------------
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+
+bullFvgTop = low
+bullFvgBot = high[2]
+bearFvgTop = low[2]
+bearFvgBot = high
+
+minFvgSize = syminfo.mintick * minFvgTicks
+validBullFvg = bullFvg and (bullFvgTop - bullFvgBot >= minFvgSize)
+validBearFvg = bearFvg and (bearFvgTop - bearFvgBot >= minFvgSize)
+
+//---------------------------------------------------------
+// SP500 confirmation
+//---------------------------------------------------------
+spClose = request.security(confirmSymbol, timeframe.period, close, barmerge.gaps_off, barmerge.lookahead_off)
+spHigh  = request.security(confirmSymbol, timeframe.period, high,  barmerge.gaps_off, barmerge.lookahead_off)
+spLow   = request.security(confirmSymbol, timeframe.period, low,   barmerge.gaps_off, barmerge.lookahead_off)
+spEma   = ta.ema(spClose, spEmaLen)
+
+spWeak = spClose < spEma
+spStrong = spClose > spEma
+
+nqHigherHigh = high > ta.highest(high[1], smtLookback)
+nqLowerLow   = low < ta.lowest(low[1], smtLookback)
+spFailsHH    = spHigh <= ta.highest(spHigh[1], smtLookback)
+spFailsLL    = spLow >= ta.lowest(spLow[1], smtLookback)
+
+bearSmt = nqHigherHigh and spFailsHH
+bullSmt = nqLowerLow and spFailsLL
+
+confirmBear = switch confirmMode
+    "Strict"   => spWeak
+    "Balanced" => spWeak or bearSmt
+    => not spStrong
+
+confirmBull = switch confirmMode
+    "Strict"   => spStrong
+    "Balanced" => spStrong or bullSmt
+    => not spWeak
+
+//---------------------------------------------------------
+// Manual bias filter
+//---------------------------------------------------------
+allowShortBias = manualBias == "Bearish" or manualBias == "Mixed"
+allowLongBias  = manualBias == "Bullish" or manualBias == "Mixed"
+
+//---------------------------------------------------------
+// Setup state
+//---------------------------------------------------------
+var float activeBearFvgTop = na
+var float activeBearFvgBot = na
+var float activeBullFvgTop = na
+var float activeBullFvgBot = na
+var float pendingShortStop = na
+var float pendingLongStop = na
+var int   bearSetupBar = na
+var int   bullSetupBar = na
+
+newBearSetup = sessionOK and allowShortBias and inPremium and not inMidNoTrade and recentBearSweep and recentBearDisp and recentBearMss and validBearFvg and confirmBear
+newBullSetup = sessionOK and allowLongBias  and inDiscount and not inMidNoTrade and recentBullSweep and recentBullDisp and recentBullMss and validBullFvg and confirmBull
+
+if newBearSetup
+    activeBearFvgTop := bearFvgTop
+    activeBearFvgBot := bearFvgBot
+    pendingShortStop := math.max(high, sweepHighRef) + buffer
+    bearSetupBar := bar_index
+
+if newBullSetup
+    activeBullFvgTop := bullFvgTop
+    activeBullFvgBot := bullFvgBot
+    pendingLongStop := math.min(low, sweepLowRef) - buffer
+    bullSetupBar := bar_index
+
+expireBars = setupLookback * 2
+
+if not na(bearSetupBar) and bar_index - bearSetupBar > expireBars
+    activeBearFvgTop := na
+    activeBearFvgBot := na
+    pendingShortStop := na
+    bearSetupBar := na
+
+if not na(bullSetupBar) and bar_index - bullSetupBar > expireBars
+    activeBullFvgTop := na
+    activeBullFvgBot := na
+    pendingLongStop := na
+    bullSetupBar := na
+
+//---------------------------------------------------------
+// Entry logic
+//---------------------------------------------------------
+retraceIntoBearFvg = not na(activeBearFvgTop) and high >= activeBearFvgBot and low <= activeBearFvgTop
+retraceIntoBullFvg = not na(activeBullFvgTop) and high >= activeBullFvgBot and low <= activeBullFvgTop
+
+stopShortDist = not na(pendingShortStop) ? pendingShortStop - close : na
+stopLongDist  = not na(pendingLongStop)  ? close - pendingLongStop : na
+
+validShortStop = not na(stopShortDist) and stopShortDist > syminfo.mintick and stopShortDist <= maxStopPoints
+validLongStop  = not na(stopLongDist)  and stopLongDist > syminfo.mintick and stopLongDist <= maxStopPoints
+
+//---------------------------------------------------------
+// Trade counter per day
+//---------------------------------------------------------
+newDay = ta.change(time("D")) != 0
+var int tradesToday = 0
+
+if newDay
+    tradesToday := 0
+
+openedNewTrade = strategy.position_size != 0 and strategy.position_size[1] == 0
+if openedNewTrade
+    tradesToday += 1
+
+canTradeMore = tradesToday < maxTradesPerDay
+flat = strategy.position_size == 0
+
+enterShort = flat and canTradeMore and sessionOK and retraceIntoBearFvg and validShortStop and allowShortBias and confirmBear
+enterLong  = flat and canTradeMore and sessionOK and retraceIntoBullFvg and validLongStop and allowLongBias and confirmBull
+
+if enterShort
+    strategy.entry("Short", strategy.short)
+    activeBearFvgTop := na
+    activeBearFvgBot := na
+    bearSetupBar := na
+
+if enterLong
+    strategy.entry("Long", strategy.long)
+    activeBullFvgTop := na
+    activeBullFvgBot := na
+    bullSetupBar := na
+
+//---------------------------------------------------------
+// Trade management
+//---------------------------------------------------------
+var float liveLongStop = na
+var float liveLongTp   = na
+var float liveLongRisk = na
+
+var float liveShortStop = na
+var float liveShortTp   = na
+var float liveShortRisk = na
+
+newLongPos = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShortPos = strategy.position_size < 0 and strategy.position_size[1] >= 0
+flatNow = strategy.position_size == 0
+
+if newLongPos
+    liveLongStop := pendingLongStop
+    liveLongRisk := strategy.position_avg_price - liveLongStop
+    liveLongTp := strategy.position_avg_price + (liveLongRisk * targetRR)
+    pendingLongStop := na
+
+if newShortPos
+    liveShortStop := pendingShortStop
+    liveShortRisk := liveShortStop - strategy.position_avg_price
+    liveShortTp := strategy.position_avg_price - (liveShortRisk * targetRR)
+    pendingShortStop := na
+
+if strategy.position_size > 0
+    beLongTrigger = strategy.position_avg_price + (liveLongRisk * breakEvenRR)
+    if high >= beLongTrigger
+        liveLongStop := math.max(liveLongStop, strategy.position_avg_price)
+    strategy.exit("Long Exit", "Long", stop = liveLongStop, limit = liveLongTp)
+
+if strategy.position_size < 0
+    beShortTrigger = strategy.position_avg_price - (liveShortRisk * breakEvenRR)
+    if low <= beShortTrigger
+        liveShortStop := math.min(liveShortStop, strategy.position_avg_price)
+    strategy.exit("Short Exit", "Short", stop = liveShortStop, limit = liveShortTp)
+
+if flatNow
+    liveLongStop := na
+    liveLongTp := na
+    liveLongRisk := na
+    liveShortStop := na
+    liveShortTp := na
+    liveShortRisk := na
+
+//---------------------------------------------------------
+// Visuals
+//---------------------------------------------------------
+p1 = plot(showPD ? pdh : na, "PDH", color = color.red, linewidth = 1, style = plot.style_linebr)
+p2 = plot(showPD ? pdl : na, "PDL", color = color.aqua, linewidth = 1, style = plot.style_linebr)
+p3 = plot(showPD ? mid : na, "Midpoint", color = color.yellow, linewidth = 1, style = plot.style_linebr)
+
+bgcolor(inPremium ? color.new(color.red, 92) : na)
+bgcolor(inDiscount ? color.new(color.green, 92) : na)
+bgcolor(inMidNoTrade ? color.new(color.orange, 88) : na)
+
+plot(showFVG ? activeBearFvgTop : na, "Active Bear FVG Top", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(showFVG ? activeBearFvgBot : na, "Active Bear FVG Bottom", color = color.new(color.red, 0), style = plot.style_linebr)
+plot(showFVG ? activeBullFvgTop : na, "Active Bull FVG Top", color = color.new(color.green, 0), style = plot.style_linebr)
+plot(showFVG ? activeBullFvgBot : na, "Active Bull FVG Bottom", color = color.new(color.green, 0), style = plot.style_linebr)
+
+plotshape(showSignals and bearSweep, title = "Bear Sweep", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "SWP")
+plotshape(showSignals and bullSweep, title = "Bull Sweep", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny, text = "SWP")
+plotshape(showSignals and bearMss, title = "Bear MSS", style = shape.circle, location = location.abovebar, color = color.maroon, size = size.tiny, text = "MSS")
+plotshape(showSignals and bullMss, title = "Bull MSS", style = shape.circle, location = location.belowbar, color = color.lime, size = size.tiny, text = "MSS")
+plotshape(showSignals and enterShort, title = "Short Entry", style = shape.labeldown, location = location.abovebar, color = color.red, text = "SHORT")
+plotshape(showSignals and enterLong, title = "Long Entry", style = shape.labelup, location = location.belowbar, color = color.green, text = "LONG")
+
+//---------------------------------------------------------
+// Alerts
+//---------------------------------------------------------
+alertcondition(bearSweep, "Bearish Sweep", "Bearish liquidity sweep detected")
+alertcondition(bullSweep, "Bullish Sweep", "Bullish liquidity sweep detected")
+alertcondition(bearMss, "Bearish MSS", "Bearish MSS detected")
+alertcondition(bullMss, "Bullish MSS", "Bullish MSS detected")
+alertcondition(newBearSetup, "Bearish Setup Ready", "Bearish ICT setup chain completed")
+alertcondition(newBullSetup, "Bullish Setup Ready", "Bullish ICT setup chain completed")
+alertcondition(enterShort, "Short Entry", "Short entry triggered")
+alertcondition(enterLong, "Long Entry", "Long entry triggered")

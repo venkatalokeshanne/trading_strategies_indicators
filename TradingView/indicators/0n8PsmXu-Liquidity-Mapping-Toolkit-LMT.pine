@@ -1,0 +1,320 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  LIQUIDITY MAPPING TOOLKIT (LMT) — Original build, LMS-style feature set
+//  Liquidity levels • Supply/Demand zones • Key session levels • Risk sizing
+//  Designed for NQ/ES futures, works on any symbol. Dark-theme neon defaults.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Liquidity Mapping Toolkit [LMT]", overlay = true,
+     max_lines_count = 500, max_boxes_count = 300, max_labels_count = 300)
+
+// ─────────────────────────── INPUTS ───────────────────────────
+grpGen   = "⚙️ General"
+cleanMode = input.bool(false, "Clean Mode (hide labels)", group = grpGen)
+tzNY      = "America/New_York"
+
+grpLiq   = "💧 Liquidity Levels"
+showLiq   = input.bool(true,  "Show Liquidity Levels", group = grpLiq)
+pivLen    = input.int(10, "Pivot Strength", minval = 2, group = grpLiq)
+maxLevels = input.int(12, "Max Active Levels (per side)", minval = 2, maxval = 40, group = grpLiq)
+eqTolATR  = input.float(0.15, "Equal H/L Tolerance (×ATR)", step = 0.05, group = grpLiq)
+showSwept = input.bool(true,  "Keep Swept Levels (dashed)", group = grpLiq)
+bslColor  = input.color(color.new(#00E5FF, 0), "Buy-Side Liquidity", group = grpLiq)
+sslColor  = input.color(color.new(#FF3D71, 0), "Sell-Side Liquidity", group = grpLiq)
+eqColor   = input.color(color.new(#FFD54F, 0), "Equal Highs/Lows", group = grpLiq)
+
+grpZone  = "🟦 Supply & Demand Zones"
+showZones  = input.bool(true, "Show Zones", group = grpZone)
+impulseMult= input.float(1.6, "Impulse Body (×ATR)", step = 0.1, group = grpZone)
+maxZones   = input.int(6, "Max Active Zones (per side)", minval = 1, maxval = 20, group = grpZone)
+supColor   = input.color(color.new(#FF3D71, 82), "Supply Fill", group = grpZone)
+demColor   = input.color(color.new(#00E676, 82), "Demand Fill", group = grpZone)
+
+grpKey   = "📌 Key Levels (NY-anchored)"
+showPD    = input.bool(true, "Prev Day High/Low (RTH)", group = grpKey)
+showPM    = input.bool(true, "Pre-Market High/Low", group = grpKey)
+showOpen  = input.bool(true, "RTH Open (9:30)", group = grpKey)
+pdColor   = input.color(color.new(#B388FF, 0), "PDH/PDL Color", group = grpKey)
+pmColor   = input.color(color.new(#4FC3F7, 0), "PMH/PML Color", group = grpKey)
+opColor   = input.color(color.new(#FFFFFF, 0), "Open Color", group = grpKey)
+
+grpRisk  = "🎯 Risk Manager"
+showRisk  = input.bool(true, "Show Risk Panel", group = grpRisk)
+acctSize  = input.float(50000, "Account Size ($)", minval = 100, group = grpRisk)
+riskPct   = input.float(1.0, "Risk Per Trade (%)", minval = 0.05, step = 0.25, group = grpRisk)
+stopMode  = input.string("ATR", "Stop Mode", options = ["ATR", "Manual (pts)"], group = grpRisk)
+stopATR   = input.float(1.5, "ATR Stop Multiple", step = 0.25, group = grpRisk)
+stopPts   = input.float(25.0, "Manual Stop (points)", step = 0.25, group = grpRisk)
+tblPos    = input.string("Top Right", "Panel Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpRisk)
+
+// ─────────────────────────── CORE SERIES ───────────────────────────
+atr = ta.atr(14)
+
+// ─────────────────────────── LIQUIDITY LEVELS ───────────────────────────
+// Pivot highs = buy-side liquidity (stops above), pivot lows = sell-side.
+// Equal highs/lows (within tolerance) upgrade to EQH/EQL — stronger pools.
+
+type LiqLevel
+    line  ln
+    float price
+    bool  isHigh
+    bool  swept
+    bool  isEQ
+    label lb
+    color col
+
+var array<LiqLevel> liqHi = array.new<LiqLevel>()
+var array<LiqLevel> liqLo = array.new<LiqLevel>()
+
+f_addLevel(array<LiqLevel> arr, float price, bool isHigh, int srcBar) =>
+    // Equal-level check against most recent unswept level on same side
+    bool isEQ = false
+    if arr.size() > 0
+        LiqLevel last = arr.get(arr.size() - 1)
+        if not last.swept and math.abs(last.price - price) <= eqTolATR * atr
+            isEQ := true
+            last.isEQ := true
+            last.col := eqColor
+            line.set_color(last.ln, eqColor)
+            line.set_width(last.ln, 2)
+            if not na(last.lb)
+                label.set_text(last.lb, isHigh ? "EQH" : "EQL")
+                label.set_textcolor(last.lb, eqColor)
+    color c = isEQ ? eqColor : (isHigh ? bslColor : sslColor)
+    line ln = line.new(srcBar, price, bar_index, price, extend = extend.right,
+         color = c, width = isEQ ? 2 : 1, style = line.style_solid)
+    label lb = na
+    if not cleanMode
+        string txt = isEQ ? (isHigh ? "EQH" : "EQL") : (isHigh ? "BSL" : "SSL")
+        lb := label.new(bar_index, price, txt, style = isHigh ? label.style_label_down : label.style_label_up,
+             color = color.new(color.black, 100), textcolor = c, size = size.tiny)
+    arr.push(LiqLevel.new(ln, price, isHigh, false, isEQ, lb, c))
+    // Trim oldest
+    if arr.size() > maxLevels
+        LiqLevel old = arr.shift()
+        line.delete(old.ln)
+        if not na(old.lb)
+            label.delete(old.lb)
+
+f_sweep(array<LiqLevel> arr) =>
+    bool sweptAny = false
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            LiqLevel lv = arr.get(i)
+            if not lv.swept
+                bool hit = lv.isHigh ? high > lv.price : low < lv.price
+                if hit
+                    lv.swept := true
+                    sweptAny := true
+                    if showSwept
+                        line.set_style(lv.ln, line.style_dashed)
+                        line.set_extend(lv.ln, extend.none)
+                        line.set_x2(lv.ln, bar_index)
+                        line.set_color(lv.ln, color.new(lv.col, 60))
+                        if not na(lv.lb)
+                            label.set_text(lv.lb, label.get_text(lv.lb) + " ✕")
+                    else
+                        line.delete(lv.ln)
+                        if not na(lv.lb)
+                            label.delete(lv.lb)
+                        arr.remove(i)
+    sweptAny
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+if showLiq
+    if not na(ph)
+        f_addLevel(liqHi, ph, true, bar_index - pivLen)
+    if not na(pl)
+        f_addLevel(liqLo, pl, false, bar_index - pivLen)
+
+bool bslSweptNow = showLiq ? f_sweep(liqHi) : false
+bool sslSweptNow = showLiq ? f_sweep(liqLo) : false
+
+// ─────────────────────────── SUPPLY / DEMAND ZONES ───────────────────────────
+// Impulse candle (body ≥ mult×ATR) marks the base candle before it as a zone.
+// Zones extend right until price CLOSES through them (mitigated → deleted).
+
+type Zone
+    box  bx
+    bool isSupply
+    float top
+    float bot
+
+var array<Zone> zones = array.new<Zone>()
+
+body    = math.abs(close - open)
+bullImp = close > open and body >= impulseMult * atr
+bearImp = close < open and body >= impulseMult * atr
+
+f_addZone(bool isSupply) =>
+    float zTop = math.max(high[1], math.max(open[1], close[1]))
+    float zBot = math.min(low[1],  math.min(open[1], close[1]))
+    // Base candle = candle before the impulse
+    zTop := isSupply ? high[1] : math.max(open[1], close[1])
+    zBot := isSupply ? math.min(open[1], close[1]) : low[1]
+    box bx = box.new(bar_index - 1, zTop, bar_index, zBot, extend = extend.right,
+         bgcolor = isSupply ? supColor : demColor,
+         border_color = isSupply ? color.new(#FF3D71, 40) : color.new(#00E676, 40),
+         border_width = 1,
+         text = cleanMode ? "" : (isSupply ? "SUPPLY" : "DEMAND"),
+         text_color = isSupply ? color.new(#FF3D71, 20) : color.new(#00E676, 20),
+         text_size = size.tiny, text_halign = text.align_right)
+    zones.push(Zone.new(bx, isSupply, zTop, zBot))
+    // Enforce per-side cap
+    int cnt = 0
+    if zones.size() > 0
+        for i = zones.size() - 1 to 0
+            Zone z = zones.get(i)
+            if z.isSupply == isSupply
+                cnt += 1
+                if cnt > maxZones
+                    box.delete(z.bx)
+                    zones.remove(i)
+
+if showZones
+    if bearImp
+        f_addZone(true)
+    if bullImp
+        f_addZone(false)
+    // Mitigation: close through the far edge kills the zone
+    if zones.size() > 0
+        for i = zones.size() - 1 to 0
+            Zone z = zones.get(i)
+            bool dead = z.isSupply ? close > z.top : close < z.bot
+            if dead
+                box.delete(z.bx)
+                zones.remove(i)
+
+// ─────────────────────────── KEY LEVELS (PDH/PDL, PMH/PML, OPEN) ───────────────────────────
+inRTH = not na(time(timeframe.period, "0930-1600", tzNY))
+inPM  = not na(time(timeframe.period, "1800-0930", tzNY))
+newRTH = inRTH and not inRTH[1]
+
+var float curHi = na
+var float curLo = na
+var float pdh = na
+var float pdl = na
+var float pmh = na
+var float pml = na
+var float rthOpen = na
+var line lnPDH = na
+var line lnPDL = na
+var line lnPMH = na
+var line lnPML = na
+var line lnOpen = na
+var label lbPDH = na
+var label lbPDL = na
+var label lbPMH = na
+var label lbPML = na
+var label lbOpen = na
+
+f_keyLine(line ln, label lb, float price, color c, string txt, string lstyle) =>
+    line l2 = ln
+    label b2 = lb
+    if na(l2)
+        l2 := line.new(bar_index, price, bar_index + 1, price, extend = extend.right, color = c,
+             style = lstyle == "dot" ? line.style_dotted : line.style_solid, width = 1)
+        if not cleanMode
+            b2 := label.new(bar_index, price, txt, style = label.style_label_left,
+                 color = color.new(color.black, 100), textcolor = c, size = size.tiny)
+    else
+        line.set_xy1(l2, bar_index, price)
+        line.set_xy2(l2, bar_index + 1, price)
+        if not na(b2)
+            label.set_xy(b2, bar_index, price)
+    [l2, b2]
+
+if newRTH
+    pdh := curHi
+    pdl := curLo
+    curHi := high
+    curLo := low
+    rthOpen := open
+if inRTH
+    curHi := math.max(nz(curHi, high), high)
+    curLo := math.min(nz(curLo, low), low)
+
+if inPM and not inPM[1]
+    pmh := high
+    pml := low
+if inPM
+    pmh := math.max(nz(pmh, high), high)
+    pml := math.min(nz(pml, low), low)
+
+if showPD and not na(pdh)
+    [a1, a2] = f_keyLine(lnPDH, lbPDH, pdh, pdColor, "PDH", "solid")
+    lnPDH := a1
+    lbPDH := a2
+    [b1, b2] = f_keyLine(lnPDL, lbPDL, pdl, pdColor, "PDL", "solid")
+    lnPDL := b1
+    lbPDL := b2
+if showPM and not na(pmh)
+    [c1, c2] = f_keyLine(lnPMH, lbPMH, pmh, pmColor, "PMH", "dot")
+    lnPMH := c1
+    lbPMH := c2
+    [d1, d2] = f_keyLine(lnPML, lbPML, pml, pmColor, "PML", "dot")
+    lnPML := d1
+    lbPML := d2
+if showOpen and not na(rthOpen)
+    [e1, e2] = f_keyLine(lnOpen, lbOpen, rthOpen, opColor, "OPEN", "dot")
+    lnOpen := e1
+    lbOpen := e2
+
+// ─────────────────────────── RISK MANAGER PANEL ───────────────────────────
+var table tbl = na
+
+f_pos() =>
+    switch tblPos
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        => position.bottom_left
+
+// Global-scope helper — Pine does not allow function declarations inside local blocks
+f_cell(table t, int r, string k, string v, color vc) =>
+    table.cell(t, 0, r, k, text_color = color.new(#8B949E, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_color = vc, text_size = size.small, text_halign = text.align_right)
+
+if showRisk and barstate.islast
+    if na(tbl)
+        tbl := table.new(f_pos(), 2, 8, bgcolor = color.new(#0D1117, 10),
+             border_color = color.new(#30363D, 0), border_width = 1)
+    float tickVal   = syminfo.mintick * syminfo.pointvalue / syminfo.mintick // $ per point
+    float ptValue   = syminfo.pointvalue
+    float stopDist  = stopMode == "ATR" ? stopATR * atr : stopPts
+    float riskDol   = acctSize * riskPct / 100
+    float riskPerCt = stopDist * ptValue
+    int   contracts = riskPerCt > 0 ? math.max(0, math.floor(riskDol / riskPerCt)) : 0
+    float tgt1R     = stopDist
+    // Nearest unswept liquidity above/below
+    float nearAbove = na
+    float nearBelow = na
+    if liqHi.size() > 0
+        for i = 0 to liqHi.size() - 1
+            LiqLevel lv = liqHi.get(i)
+            if not lv.swept and lv.price > close
+                nearAbove := na(nearAbove) ? lv.price : math.min(nearAbove, lv.price)
+    if liqLo.size() > 0
+        for i = 0 to liqLo.size() - 1
+            LiqLevel lv = liqLo.get(i)
+            if not lv.swept and lv.price < close
+                nearBelow := na(nearBelow) ? lv.price : math.max(nearBelow, lv.price)
+
+    color hd = color.new(#00E5FF, 0)
+    color tx = color.white
+
+    table.cell(tbl, 0, 0, "⚡ LMT RISK", text_color = hd, text_size = size.small)
+    table.cell(tbl, 1, 0, syminfo.ticker, text_color = hd, text_size = size.small)
+    f_cell(tbl, 1, "Risk $", "$" + str.tostring(riskDol, "#,###"), tx)
+    f_cell(tbl, 2, "Stop", str.tostring(stopDist, format.mintick) + " pts", tx)
+    f_cell(tbl, 3, "Contracts", str.tostring(contracts), contracts > 0 ? color.new(#00E676, 0) : color.new(#FF3D71, 0))
+    f_cell(tbl, 4, "$/Contract", "$" + str.tostring(riskPerCt, "#,###"), tx)
+    f_cell(tbl, 5, "2R Target", str.tostring(2 * tgt1R, format.mintick) + " pts", color.new(#00E676, 0))
+    f_cell(tbl, 6, "Liq Above", na(nearAbove) ? "—" : str.tostring(nearAbove, format.mintick), bslColor)
+    f_cell(tbl, 7, "Liq Below", na(nearBelow) ? "—" : str.tostring(nearBelow, format.mintick), sslColor)
+
+// ─────────────────────────── ALERTS ───────────────────────────
+alertcondition(bslSweptNow, "BSL Sweep", "Buy-side liquidity swept")
+alertcondition(sslSweptNow, "SSL Sweep", "Sell-side liquidity swept")

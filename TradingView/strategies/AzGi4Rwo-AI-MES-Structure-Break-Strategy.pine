@@ -1,0 +1,242 @@
+//@version=6
+strategy('AI MES Structure Break Strategy', overlay = true, default_qty_type = strategy.fixed, default_qty_value = 1, commission_type = strategy.commission.cash_per_contract, commission_value = 0.62, calc_on_every_tick = false)
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+htfTF = input.timeframe('15', 'HTF Timeframe', group = 'Higher Timeframe')
+htfEMALen = input.int(21, 'HTF EMA Length', group = 'Higher Timeframe')
+
+pivotLen = input.int(3, 'Pivot Lookback (bars each side)', group = 'Structure', minval = 2, maxval = 10)
+
+rsiLen = input.int(14, 'RSI Length', group = 'Momentum')
+rsiMid = input.float(50, 'RSI Midline', group = 'Momentum')
+
+volLen = input.int(20, 'Volume MA Length', group = 'Volume')
+volMult = input.float(1.3, 'Volume Multiplier', group = 'Volume', step = 0.1)
+
+riskRatio = input.float(1.5, 'Reward:Risk Ratio', group = 'Risk', step = 0.1)
+stopBuffer = input.float(1.0, 'Stop Buffer (points beyond pivot)', group = 'Risk', step = 0.25)
+maxTrades = input.int(2, 'Max Trades Per Session Window', group = 'Risk', minval = 1, maxval = 5)
+
+useSess1 = input.bool(true, 'Use Morning Session', group = 'Sessions')
+sess1Start = input.int(9, 'Morning Start Hour (ET)', group = 'Sessions', minval = 0, maxval = 23)
+sess1End = input.int(11, 'Morning End Hour (ET)', group = 'Sessions', minval = 0, maxval = 23)
+sess1Min = input.int(30, 'Morning Start Minute', group = 'Sessions', minval = 0, maxval = 59)
+sess1EndMin = input.int(30, 'Morning End Minute', group = 'Sessions', minval = 0, maxval = 59)
+
+useSess2 = input.bool(true, 'Use Afternoon Session', group = 'Sessions')
+sess2Start = input.int(13, 'Afternoon Start Hour (ET)', group = 'Sessions', minval = 0, maxval = 23)
+sess2End = input.int(15, 'Afternoon End Hour (ET)', group = 'Sessions', minval = 0, maxval = 23)
+sess2Min = input.int(30, 'Afternoon Start Minute', group = 'Sessions', minval = 0, maxval = 59)
+sess2EndMin = input.int(30, 'Afternoon End Minute', group = 'Sessions', minval = 0, maxval = 59)
+
+// ══════════════════════════════════════════════════════
+// SESSION LOGIC
+// ══════════════════════════════════════════════════════
+
+etHour = hour(time, 'America/New_York')
+etMin = minute(time, 'America/New_York')
+etTime = etHour * 100 + etMin
+
+sess1StartT = sess1Start * 100 + sess1Min
+sess1EndT = sess1End * 100 + sess1EndMin
+sess2StartT = sess2Start * 100 + sess2Min
+sess2EndT = sess2End * 100 + sess2EndMin
+
+inMorning = useSess1 and etTime >= sess1StartT and etTime < sess1EndT
+inAfternoon = useSess2 and etTime >= sess2StartT and etTime < sess2EndT
+inSession = inMorning or inAfternoon
+
+prevMorning = useSess1 and (etTime[1] < sess1StartT or etTime[1] >= sess1EndT) and inMorning
+prevAfternoon = useSess2 and (etTime[1] < sess2StartT or etTime[1] >= sess2EndT) and inAfternoon
+newWindow = prevMorning or prevAfternoon
+
+var int windowTrades = 0
+if newWindow
+    windowTrades := 0
+
+underTradeLimit = windowTrades < maxTrades
+
+// ══════════════════════════════════════════════════════
+// HIGHER TIMEFRAME BIAS
+// ══════════════════════════════════════════════════════
+
+htfEMA = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEMALen), lookahead = barmerge.lookahead_off)
+bullBias = close > htfEMA
+bearBias = close < htfEMA
+
+// ══════════════════════════════════════════════════════
+// PIVOT STRUCTURE
+// ══════════════════════════════════════════════════════
+
+pivHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivLow = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastPivHigh = na
+var float lastPivLow = na
+var int lastPivHighBar = na
+var int lastPivLowBar = na
+
+if not na(pivHigh)
+    lastPivHigh := pivHigh
+    lastPivHighBar := bar_index - pivotLen
+
+if not na(pivLow)
+    lastPivLow := pivLow
+    lastPivLowBar := bar_index - pivotLen
+
+breakHigh = not na(lastPivHigh) and close > lastPivHigh and close[1] <= lastPivHigh
+breakLow = not na(lastPivLow) and close < lastPivLow and close[1] >= lastPivLow
+
+// ══════════════════════════════════════════════════════
+// MOMENTUM & VOLUME
+// ══════════════════════════════════════════════════════
+
+rsi = ta.rsi(close, rsiLen)
+avgVol = ta.sma(volume, volLen)
+highVol = volume > avgVol * volMult
+
+rsiLong = rsi > rsiMid
+rsiShort = rsi < rsiMid
+
+// ══════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// ══════════════════════════════════════════════════════
+
+longCondition = breakHigh and bullBias and rsiLong and highVol and inSession and underTradeLimit and strategy.position_size == 0
+shortCondition = breakLow and bearBias and rsiShort and highVol and inSession and underTradeLimit and strategy.position_size == 0
+
+// ══════════════════════════════════════════════════════
+// DYNAMIC STOP & TARGET
+// ══════════════════════════════════════════════════════
+
+longStop = lastPivLow - stopBuffer
+shortStop = lastPivHigh + stopBuffer
+longRisk = close - longStop
+shortRisk = shortStop - close
+longTarget = close + longRisk * riskRatio
+shortTarget = close - shortRisk * riskRatio
+
+// ══════════════════════════════════════════════════════
+// ENTRIES
+// ══════════════════════════════════════════════════════
+
+var float entryStop = na
+var float entryTarget = na
+
+if strategy.position_size == 0
+    entryStop := na
+    entryTarget := na
+
+if longCondition
+    entryStop := longStop
+    entryTarget := longTarget
+    strategy.entry('Long', strategy.long)
+    windowTrades := windowTrades + 1
+    alert('🟢 MES LONG SIGNAL\n' +
+         'Pivot broken: ' + str.tostring(math.round(lastPivHigh, 2)) + '\n' +
+         'Entry: '        + str.tostring(math.round(close, 2))       + '\n' +
+         'Stop: '         + str.tostring(math.round(longStop, 2))    + '\n' +
+         'Target: '       + str.tostring(math.round(longTarget, 2))  + '\n' +
+         'Risk (pts): '   + str.tostring(math.round(longRisk, 2))    + '\n' +
+         'Session: '      + (inMorning ? 'Morning' : 'Afternoon')    + '\n' +
+         'RSI: '          + str.tostring(math.round(rsi, 1))         + '\n' +
+         'HTF Bias: BULL', alert.freq_once_per_bar)
+
+if shortCondition
+    entryStop := shortStop
+    entryTarget := shortTarget
+    strategy.entry('Short', strategy.short)
+    windowTrades := windowTrades + 1
+    alert('🔴 MES SHORT SIGNAL\n' +
+         'Pivot broken: ' + str.tostring(math.round(lastPivLow, 2))  + '\n' +
+         'Entry: '        + str.tostring(math.round(close, 2))       + '\n' +
+         'Stop: '         + str.tostring(math.round(shortStop, 2))   + '\n' +
+         'Target: '       + str.tostring(math.round(shortTarget, 2)) + '\n' +
+         'Risk (pts): '   + str.tostring(math.round(shortRisk, 2))   + '\n' +
+         'Session: '      + (inMorning ? 'Morning' : 'Afternoon')    + '\n' +
+         'RSI: '          + str.tostring(math.round(rsi, 1))         + '\n' +
+         'HTF Bias: BEAR', alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// EXITS
+// ══════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    strategy.exit('Long Exit', 'Long', stop = entryStop, limit = entryTarget)
+    if low <= entryStop
+        alert('🛑 MES LONG STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,      2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop,  2)), alert.freq_once_per_bar)
+    if high >= entryTarget
+        alert('✅ MES LONG TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+if strategy.position_size < 0
+    strategy.exit('Short Exit', 'Short', stop = entryStop, limit = entryTarget)
+    if high >= entryStop
+        alert('🛑 MES SHORT STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,      2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop,  2)), alert.freq_once_per_bar)
+    if low <= entryTarget
+        alert('✅ MES SHORT TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+sessionEnd = not inSession and inSession[1]
+if sessionEnd
+    strategy.close_all(comment = 'Session End')
+    alert('🔔 MES SESSION END — All positions closed. Price: ' +
+         str.tostring(math.round(close, 2)), alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════
+
+plot(htfEMA, '15m EMA (21)', color = color.new(color.yellow, 20), linewidth = 2)
+plot(ta.vwap(hlc3), 'VWAP', color = color.new(color.purple, 20), linewidth = 1)
+plot(lastPivHigh, 'Last Pivot High', color = color.new(color.red, 50), style = plot.style_circles, linewidth = 1)
+plot(lastPivLow, 'Last Pivot Low', color = color.new(color.green, 50), style = plot.style_circles, linewidth = 1)
+
+plotshape(longCondition, style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.normal, title = 'Long Entry')
+plotshape(shortCondition, style = shape.triangledown, location = location.abovebar, color = color.red, size = size.normal, title = 'Short Entry')
+
+isLong = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+plot(isLong  ? entryStop   : na, 'Long Stop',    color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isLong  ? entryTarget : na, 'Long Target',  color = color.lime, style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryStop   : na, 'Short Stop',   color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryTarget : na, 'Short Target', color = color.lime, style = plot.style_linebr, linewidth = 1)
+
+bgcolor(inMorning   ? color.new(color.blue,   93) : na, title = 'Morning Session')
+bgcolor(inAfternoon ? color.new(color.purple,  93) : na, title = 'Afternoon Session')
+bgcolor(na(lastPivHigh) or na(lastPivLow) ? color.new(color.yellow, 92) : na, title = 'No Pivot Warning')
+
+// ══════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════
+
+var table info = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 78), border_width = 1)
+if barstate.isrealtime or barstate.islastconfirmedhistory
+    table.cell(info, 0, 0, 'HTF EMA',    text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 0, str.tostring(math.round(htfEMA, 2)),     text_color = color.yellow, text_size = size.small)
+    table.cell(info, 0, 1, 'Bias',       text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 1, bullBias ? 'BULL ▲' : 'BEAR ▼',         text_color = bullBias ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 2, 'Pivot High', text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 2, na(lastPivHigh) ? '–' : str.tostring(math.round(lastPivHigh, 2)), text_color = color.red,  text_size = size.small)
+    table.cell(info, 0, 3, 'Pivot Low',  text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 3, na(lastPivLow) ? '–' : str.tostring(math.round(lastPivLow, 2)),   text_color = color.lime, text_size = size.small)
+    table.cell(info, 0, 4, 'RSI',        text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 4, str.tostring(math.round(rsi, 1)) + (rsiLong ? ' ▲' : ' ▼'),       text_color = rsiLong ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 5, 'Volume',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 5, highVol ? 'HIGH ✓' : 'normal',           text_color = highVol ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 6, 'Session',    text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 6, inMorning ? 'Morning' : inAfternoon ? 'Afternoon' : 'Closed',      text_color = inSession ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 7, 'Trades',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 7, str.tostring(windowTrades) + '/' + str.tostring(maxTrades),        text_color = underTradeLimit ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 8, 'Position',   text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 8, isLong ? 'LONG ▲' : isShort ? 'SHORT ▼' : 'FLAT',                 text_color = isLong ? color.lime : isShort ? color.red : color.gray, text_size = size.small)

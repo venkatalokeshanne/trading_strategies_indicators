@@ -1,0 +1,600 @@
+//@version=6
+// =============================================================================
+// APSIS SESSIONS -- session ranges and the levels the suite keys off
+// =============================================================================
+// Rewritten from scratch. The previous version created a box on a session's
+// first bar and then mutated one edge of it for the rest of the session, so
+// every box depended on its birth anchor surviving each recalculation. When
+// that anchor drifted the boxes slid around as the chart moved.
+//
+// A box is created ONCE per session and, while that session is live, has all
+// four edges rewritten from stored state each bar. It is never deleted by the
+// next session -- an earlier attempt called box.delete() on the session-start
+// bar, which destroyed YESTERDAY'S box because the handle still pointed at it.
+// Only three boxes then existed on the whole chart, and they appeared to jump
+// as TradingView re-ran the script over a different data window while scrolling.
+// Finished boxes are retired only by the history limit.
+//
+// Everything here is a fact rather than an interpretation: a prior day high is
+// a price that printed. Nothing in this script asks to be believed.
+// =============================================================================
+
+// Budget note. Worst case is daysBack=20 with Detail=Everything and carry scope
+// All sessions: 420 lines and 360 labels. These MUST exceed that. If TradingView
+// hits its own cap it deletes the oldest drawings itself, outside our arrays --
+// the arrays then still believe those lines exist and never delete the labels
+// paired with them, which is precisely the orphaned-label bug this file already
+// had once. Raise these before raising daysBack's maxval.
+indicator("Apsis Sessions", "SESSIONS", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ── inputs ───────────────────────────────────────────────────────────────────
+gG = "General"
+tz       = input.string("America/New_York", "Timezone", group = gG,
+     options = ["America/New_York", "America/Chicago", "Europe/London", "UTC"])
+daysBack = input.int(1, "Days of history", minval = 1, maxval = 20, group = gG,
+     tooltip = "Every extra day is roughly forty more drawing objects. Yesterday's opening " +
+               "range is not a level anyone trades; its high and low are, and those survive " +
+               "as PDH/PDL. Raise this only if you actually work multi-day.")
+
+gSess = "Sessions"
+showAsia   = input.bool(true, "Asia",     group = gSess)
+showLondon = input.bool(true, "London",   group = gSess)
+showNY     = input.bool(true, "New York", group = gSess)
+sessAsia   = input.session("1800-0300", "Asia hours",     group = gSess)
+sessLondon = input.session("0300-0800", "London hours",   group = gSess)
+sessNY     = input.session("0930-1600", "New York hours", group = gSess)
+sessON     = input.session("1800-0930", "Overnight",      group = gSess)
+
+gLev = "Levels"
+showPD  = input.bool(true, "Prior day high / low", group = gLev)
+showON  = input.bool(true, "Overnight high / low", group = gLev)
+showIB  = input.bool(true, "Initial balance (60m)", group = gLev)
+showOR  = input.bool(true, "Opening range", group = gLev)
+orMins  = input.int(15, "Opening range minutes", minval = 5, maxval = 60, step = 5, group = gLev)
+showExt = input.bool(true, "IB extension", group = gLev,
+     tooltip = "The initial balance projected by a multiple of its own range. 0.5 is the " +
+               "target the Apsis IBext engine uses.")
+extMult = input.float(0.5, "Extension multiple", minval = 0.25, step = 0.25, group = gLev)
+
+gSty = "Presentation"
+density = input.string("Balanced", "Detail", group = gSty,
+     options = ["Minimal", "Balanced", "Everything", "Custom"],
+     tooltip = "Minimal    — session boxes, their carried highs and lows, prior day. " +
+               "Balanced   — adds midlines, overnight and the initial balance. " +
+               "Everything — adds opening range, IB extension and corridor tags. " +
+               "Custom     — the individual switches below take over. " +
+               "Everything draws about forty objects per day of history, which is why it " +
+               "is not the default: a level you cannot pick out of a stack is not a level.")
+showTag   = input.bool(true, "Label sessions with their range", group = gSty,
+     tooltip = "Prints the session name and how many points it covered inside the box. " +
+               "The range is the single most useful number about a session and almost no " +
+               "free indicator shows it.")
+showMid   = input.bool(true, "Session midline", group = gSty,
+     tooltip = "The 50% of each session range. Price returning to it is the most common " +
+               "reference point traders actually use the range for.")
+carryHL   = input.bool(true, "Carry session high / low forward", group = gSty,
+     tooltip = "A session's extremes stay relevant after it closes -- the Asia high is a " +
+               "level through London and New York. The box ends; the levels continue.")
+carryBars = input.int(240, "Carry for (bars)", minval = 10, maxval = 1000, group = gSty,
+     tooltip = "Bars, not minutes. On a 1m chart 120 bars is only two hours, which barely " +
+               "clears the next session -- raise it there. 240 covers four hours.")
+showCloud = input.bool(true, "Fill the carried range (cloud)", group = gSty,
+     tooltip = "Shades the corridor between a closed session's high and low as it is " +
+               "projected forward, so you can see at a glance whether price is still " +
+               "inside the range that session built.")
+cloudFade = input.int(86, "Cloud density", minval = 70, maxval = 99, group = gSty,
+     tooltip = "Lower is denser. At 94 the cloud is invisible next to a session box at " +
+               "85 -- it has to be in the same range as the boxes to read at all. Raise " +
+               "it if three overlapping corridors get muddy.")
+lblGap = input.float(0.15, "Label spacing (ATR)", minval = 0.0, step = 0.05, group = gSty,
+     tooltip = "Levels closer together than this share one label instead of stacking. " +
+               "The LINE is always drawn -- only the text is suppressed, so nothing is " +
+               "lost. Set to 0 to label every level. Measured in ATR so it scales with " +
+               "the instrument and with volatility.")
+carryScope = input.string("Latest session only", "Carry which sessions", group = gSty,
+     options = ["Latest session only", "All sessions"],
+     tooltip = "Three carried corridors, each hundreds of bars wide and filled, is more " +
+               "translucent colour than chart. The corridor that matters is the one from " +
+               "the session that JUST closed -- once London has closed, Asia's range is a " +
+               "level, not a corridor, and PDH/ONH already carry the levels you need.")
+cloudEdge = input.bool(true, "Outline the carried range", group = gSty,
+     tooltip = "Brightens the high and low of the carried corridor so its boundaries stay " +
+               "legible once the fill is dense enough to see.")
+closedMode = input.string("Fade", "Closed session box", group = gSty,
+     options = ["Fade", "Outline only", "Keep", "Hide"],
+     tooltip = "What happens to a session box once the session ends. Fade      — drops it " +
+               "well back so the live session is the only solid block on the chart. " +
+               "Outline only — keeps the border, drops the fill entirely. " +
+               "Keep         — the old behaviour, all boxes equally solid. " +
+               "Hide         — box disappears at the close, leaving only the carried " +
+               "high and low. Anything but Keep is what stops three stacked boxes from " +
+               "reading as clutter, because a closed range IS just its two extremes.")
+closedFade = input.int(96, "Closed box density", minval = 88, maxval = 100, group = gSty,
+     tooltip = "Only applies to Fade. Higher is fainter. Live sessions stay at their " +
+               "theme density regardless.")
+showPanel = input.bool(true, "Session panel", group = gSty)
+
+// The preset wins unless you pick Custom. Reading the raw inputs anywhere below
+// this point is a bug -- use the e* values.
+isCustom = density == "Custom"
+eMid     = isCustom ? showMid : density != "Minimal"
+ePD      = isCustom ? showPD  : true
+eON      = isCustom ? showON  : density != "Minimal"
+eIB      = isCustom ? showIB  : density != "Minimal"
+eOR      = isCustom ? showOR  : density == "Everything"
+eExt     = isCustom ? showExt : density == "Everything"
+eBoxTag  = isCustom ? showTag : true
+eCarTag  = isCustom ? showTag : density != "Minimal"
+
+gCol = "Colours"
+theme = input.string("Apsis", "Theme", group = gCol,
+     options = ["Apsis", "Aurora", "Muted", "Custom"],
+     tooltip = "Apsis  — indigo / cyan / mint, matching the rest of the suite.  " +
+               "Aurora   — deeper, more saturated; reads best on a black background.  " +
+               "Muted    — low-chroma slate for people who want the levels and not the " +
+               "light show.  Custom uses the colours below.")
+colAsia   = input.color(color.new(#8b7cf0, 88), "Asia",     group = gCol)
+colLondon = input.color(color.new(#4ec9ff, 88), "London",   group = gCol)
+colNY     = input.color(color.new(#7ef7d0, 90), "New York", group = gCol)
+colHigh   = input.color(color.new(#ff4d7d, 0),  "Highs",    group = gCol)
+colLow    = input.color(color.new(#4ec9ff, 0),  "Lows",     group = gCol)
+colIB     = input.color(color.new(#ffb454, 0),  "Initial balance", group = gCol)
+
+// Sessions are weighted deliberately: New York carries the most colour because
+// it is where the volume is, Asia the least. A palette that shouts equally at
+// all three tells you nothing about which one matters.
+cA = theme == "Apsis" ? #8b7cf0 : theme == "Aurora" ? #a06bff : theme == "Muted" ? #6b7a99 : colAsia
+cL = theme == "Apsis" ? #4ec9ff : theme == "Aurora" ? #17d5ff : theme == "Muted" ? #7c93ab : colLondon
+cN = theme == "Apsis" ? #7ef7d0 : theme == "Aurora" ? #35ffc0 : theme == "Muted" ? #93a7a0 : colNY
+fadeA = theme == "Muted" ? 93 : 88
+fadeL = theme == "Muted" ? 92 : 87
+fadeN = theme == "Muted" ? 91 : 85
+
+// ── session flags ────────────────────────────────────────────────────────────
+inA  = showAsia   and not na(time(timeframe.period, sessAsia,   tz))
+inL  = showLondon and not na(time(timeframe.period, sessLondon, tz))
+inN  = showNY     and not na(time(timeframe.period, sessNY,     tz))
+inON = not na(time(timeframe.period, sessON, tz))
+
+// Global and unconditional -- ta.* inside an if block silently desynchronises.
+atrRef  = ta.atr(14)
+
+barMins = timeframe.in_seconds(timeframe.period) / 60
+// A bar longer than an hour straddles two sessions and time() then reports both
+// as active. The boxes would not be coarse, they would be wrong.
+tfOk = barMins <= 60
+
+// ── per-session state ────────────────────────────────────────────────────────
+var int   aStart = na
+var float aHi = na
+var float aLo = na
+var box   aBox = na
+
+var int   lStart = na
+var float lHi = na
+var float lLo = na
+var box   lBox = na
+
+var int   nStart = na
+var float nHi = na
+var float nLo = na
+var box   nBox = na
+
+var float onHi = na
+var float onLo = na
+var float pdHi = na
+var float pdLo = na
+var float ibHi = na
+var float ibLo = na
+var float orHi = na
+var float orLo = na
+var int   nBar = 0
+// A session that was ALREADY RUNNING on the first bar TradingView loaded was
+// never observed from its open. Measuring an initial balance from that bar gives
+// "the first 60 minutes of whatever happened to load", which is why the lines
+// looked random and why they MOVED when you scrolled: scrolling changes the
+// first loaded bar, so it changes the anchor. A session only counts once we have
+// seen the market outside it. These flags are updated at the BOTTOM of the
+// script, so on a session-start bar they still describe the bars before it.
+var bool sawOutA  = false
+var bool sawOutL  = false
+var bool sawOutN  = false
+var bool sawOutON = false
+
+var box[]   boxes = array.new<box>()
+// TWO separate line pools. They previously shared one array with DIFFERENT trim
+// limits, so whichever function ran last cut the array back to its own limit and
+// deleted the other's lines -- and deleting a line also destroys any linefill
+// attached to it, which is why the clouds vanished.
+var line[]     sessLines = array.new<line>()   // midlines + carried extremes
+var line[]     lvlLines  = array.new<line>()   // PDH / ONH / IB / OR levels
+// THE RULE THIS FILE KEEPS BREAKING: paired objects must be trimmed together.
+// One shared label pool at daysBack*30 kept five days of labels while the line
+// pools kept one and two -- so days three to five were labels with no line, left
+// floating in space. Each pool below is sized to exactly daysBack days of its
+// own producer, and labels are never allowed to outlive their lines.
+var line[]     carLines  = array.new<line>()    // carried corridor edges, 2 per session
+var label[]    carLabs   = array.new<label>()   // corridor tags, 2 per session
+var label[]    lvlLabs   = array.new<label>()   // level tags, 1 per level line
+var linefill[] fills     = array.new<linefill>()
+
+f_pts(float v) =>
+    str.tostring(math.round_to_mintick(v))
+
+// Name the box WHILE the session runs, with a live range that ticks up as it
+// widens. Previously the text was only written at the close, so the session you
+// are actually in -- the one you most want identified -- was the only unlabelled
+// box on the chart. The close still rewrites it with the final number.
+f_tag(box b, float hi, float lo, color c, string nm) =>
+    if eBoxTag and not na(b) and not na(hi) and not na(lo)
+        box.set_text(b, nm + "   " + f_pts(hi - lo))
+        box.set_text_color(b, color.new(c, 12))
+        box.set_text_size(b, size.tiny)
+        box.set_text_halign(b, text.align_center)
+        box.set_text_valign(b, text.align_top)
+
+// ── Asia ─────────────────────────────────────────────────────────────────────
+if inA and tfOk
+    if not inA[1] and sawOutA
+        // New session: a NEW box. The previous one is left exactly where it is.
+        aStart := bar_index
+        aHi := high
+        aLo := low
+        aBox := box.new(bar_index, high, bar_index, low,
+             border_color = color.new(cA, 45), bgcolor = color.new(cA, fadeA))
+        array.push(boxes, aBox)
+        while array.size(boxes) > daysBack * 3
+            box.delete(array.shift(boxes))
+    else
+        aHi := math.max(nz(aHi, high), high)
+        aLo := math.min(nz(aLo, low), low)
+    // All four edges rewritten from stored state, so the anchor cannot drift.
+    if not na(aBox)
+        f_tag(aBox, aHi, aLo, cA, "ASIA")
+        box.set_lefttop(aBox, nz(aStart, bar_index), nz(aHi, high))
+        box.set_rightbottom(aBox, bar_index, nz(aLo, low))
+
+// ── London ───────────────────────────────────────────────────────────────────
+if inL and tfOk
+    if not inL[1] and sawOutL
+        // New session: a NEW box. The previous one is left exactly where it is.
+        lStart := bar_index
+        lHi := high
+        lLo := low
+        lBox := box.new(bar_index, high, bar_index, low,
+             border_color = color.new(cL, 45), bgcolor = color.new(cL, fadeL))
+        array.push(boxes, lBox)
+        while array.size(boxes) > daysBack * 3
+            box.delete(array.shift(boxes))
+    else
+        lHi := math.max(nz(lHi, high), high)
+        lLo := math.min(nz(lLo, low), low)
+    // All four edges rewritten from stored state, so the anchor cannot drift.
+    if not na(lBox)
+        f_tag(lBox, lHi, lLo, cL, "LONDON")
+        box.set_lefttop(lBox, nz(lStart, bar_index), nz(lHi, high))
+        box.set_rightbottom(lBox, bar_index, nz(lLo, low))
+
+// ── New York ─────────────────────────────────────────────────────────────────
+if inN and tfOk
+    if not inN[1] and sawOutN
+        // New session: a NEW box. The previous one is left exactly where it is.
+        nStart := bar_index
+        nHi := high
+        nLo := low
+        nBar := 0
+        nBox := box.new(bar_index, high, bar_index, low,
+             border_color = color.new(cN, 45), bgcolor = color.new(cN, fadeN))
+        array.push(boxes, nBox)
+        while array.size(boxes) > daysBack * 3
+            box.delete(array.shift(boxes))
+    else
+        nHi := math.max(nz(nHi, high), high)
+        nLo := math.min(nz(nLo, low), low)
+        nBar += 1
+    // All four edges rewritten from stored state, so the anchor cannot drift.
+    if not na(nBox)
+        f_tag(nBox, nHi, nLo, cN, "NEW YORK")
+        box.set_lefttop(nBox, nz(nStart, bar_index), nz(nHi, high))
+        box.set_rightbottom(nBox, bar_index, nz(nLo, low))
+
+// ── session close: label, midline, carried extremes ─────────────────────────
+// Everything below is drawn ONCE, when the session has closed and every value
+// is final. Nothing is mutated afterwards, so none of it can move.
+f_finish(box b, int x0, float hi, float lo, color c, string nm) =>
+    if not na(b) and not na(x0) and not na(hi) and not na(lo)
+        // A closed session's box has done its job. The range it built is now
+        // carried by two lines; the block of colour underneath adds nothing and
+        // three of them stacked is what makes the chart read as clutter. Dropping
+        // it back also leaves the LIVE session as the only solid shape, which is
+        // free information -- you can see which session you are in without
+        // reading a clock.
+        if closedMode == "Fade"
+            box.set_bgcolor(b, color.new(c, closedFade))
+            box.set_border_color(b, color.new(c, 72))
+        else if closedMode == "Outline only"
+            box.set_bgcolor(b, color.new(c, 100))
+            box.set_border_color(b, color.new(c, 50))
+        else if closedMode == "Hide"
+            box.set_bgcolor(b, color.new(c, 100))
+            box.set_border_color(b, color.new(c, 100))
+        if closedMode == "Hide"
+            // The live tag already wrote a name here. Clear it, or it floats
+            // over the chart with no box under it.
+            box.set_text(b, "")
+        else if eBoxTag
+            // Final range, and dimmer than the live tag -- the session you are
+            // in should be the one that reads first.
+            box.set_text(b, nm + "   " + f_pts(hi - lo))
+            box.set_text_color(b, color.new(c, 38))
+        if eMid
+            mid = (hi + lo) / 2
+            array.push(sessLines, line.new(x0, mid, bar_index, mid,
+                 color = color.new(c, 45), width = 1, style = line.style_dashed))
+        if carryHL
+            // With the fill carrying the visual weight, a width-2 edge at 10%
+            // is shouting. Thin and dim it when the cloud is on.
+            edgeT = not cloudEdge ? 45 : showCloud ? 32 : 10
+            edgeW = cloudEdge and not showCloud ? 2 : 1
+            // How many corridors survive. One session's worth, or daysBack days'.
+            keepL = carryScope == "All sessions" ? daysBack * 6 : 2
+            keepF = carryScope == "All sessions" ? daysBack * 3 : 1
+            // Dashed on purpose: a solid edge here is indistinguishable from a
+            // session box border, which is what made the two blend together.
+            hl = line.new(bar_index, hi, bar_index + carryBars, hi,
+                 color = color.new(c, edgeT), width = edgeW, style = line.style_dashed)
+            ll = line.new(bar_index, lo, bar_index + carryBars, lo,
+                 color = color.new(c, edgeT), width = edgeW, style = line.style_dashed)
+            array.push(carLines, hl)
+            array.push(carLines, ll)
+            // Name the corridor. Without a label it is the same hue as the box
+            // it sits against and reads as one shape -- you cannot tell where
+            // the session stopped and its carried range began.
+            if eCarTag
+                array.push(carLabs, label.new(bar_index + carryBars, hi, nm + " H",
+                     style = label.style_label_left, color = color.new(color.black, 100),
+                     textcolor = color.new(c, 15), size = size.tiny))
+                array.push(carLabs, label.new(bar_index + carryBars, lo, nm + " L",
+                     style = label.style_label_left, color = color.new(color.black, 100),
+                     textcolor = color.new(c, 15), size = size.tiny))
+                // Trimmed on the SAME budget as carLines so a tag cannot outlive
+                // the corridor it names.
+                while array.size(carLabs) > keepL
+                    label.delete(array.shift(carLabs))
+            // The corridor between a closed session's extremes, projected
+            // forward. Two bare lines say where the range was; filling between
+            // them says price is still inside it, which is the thing you
+            // actually want to know at a glance.
+            if showCloud
+                array.push(fills, linefill.new(hl, ll, color.new(c, cloudFade)))
+                while array.size(fills) > keepF
+                    linefill.delete(array.shift(fills))
+            // Corridor edges last: deleting a line destroys any linefill built on
+            // it, so the fill trim above must already have released the old ones.
+            while array.size(carLines) > keepL
+                line.delete(array.shift(carLines))
+        // Midlines only now -- one per session close, three sessions a day.
+        while array.size(sessLines) > daysBack * 3
+            line.delete(array.shift(sessLines))
+
+if not inA and inA[1]
+    f_finish(aBox, aStart, aHi, aLo, cA, "ASIA")
+if not inL and inL[1]
+    f_finish(lBox, lStart, lHi, lLo, cL, "LONDON")
+if not inN and inN[1]
+    f_finish(nBox, nStart, nHi, nLo, cN, "NEW YORK")
+
+// ── overnight, initial balance, opening range ───────────────────────────────
+if inON
+    if not inON[1] and sawOutON
+        onHi := high
+        onLo := low
+    else if not na(onHi)
+        onHi := math.max(onHi, high)
+        onLo := math.min(onLo, low)
+
+inIB = inN and nBar * barMins < 60
+inOR = inN and nBar * barMins < orMins
+
+if inIB
+    ibHi := nBar == 0 ? high : math.max(nz(ibHi, high), high)
+    ibLo := nBar == 0 ? low  : math.min(nz(ibLo, low), low)
+if inOR
+    orHi := nBar == 0 ? high : math.max(nz(orHi, high), high)
+    orLo := nBar == 0 ? low  : math.min(nz(orLo, low), low)
+
+// ── levels ───────────────────────────────────────────────────────────────────
+// Drawn ONCE, at the session close, when every endpoint is already known, and
+// never touched afterwards -- so a historical level cannot move. Nothing is
+// extended to the right edge either: ten infinite lines a day turns a week of
+// history into noise.
+var float[] drawnPx = array.new<float>()
+// The current session's level drawings, so they can be extended to the live
+// edge each bar. Cleared at the open; the handles stay in lvlLines/lvlLabs for
+// retirement, these are only a view onto today's.
+var line[]  curL = array.new<line>()
+var label[] curB = array.new<label>()
+
+f_lvl(float p, color c, string txt, bool solid, int x1) =>
+    if not na(p) and not na(nStart)
+        array.push(lvlLines, line.new(nStart, p, x1, p, color = c,
+             width = solid ? 2 : 1,
+             style = solid ? line.style_solid : line.style_dotted))
+        // ONH, PDH and IBH routinely land within a couple of points of each
+        // other. Three labels in that band is unreadable and the reader loses
+        // all three. Draw every LINE, but only the first label in a cluster --
+        // the price is on the axis either way.
+        tol = nz(atrRef, 0) * lblGap
+        nD  = array.size(drawnPx)
+        crowded = false
+        if nD > 0 and tol > 0
+            for i = 0 to nD - 1
+                if math.abs(p - array.get(drawnPx, i)) < tol
+                    crowded := true
+        array.push(drawnPx, p)
+        lb = label.new(x1, p, crowded ? "" : txt,
+             style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = c, size = size.tiny)
+        array.push(lvlLabs, lb)
+        array.push(curL, array.get(lvlLines, array.size(lvlLines) - 1))
+        array.push(curB, lb)
+        // Strictly 1:1 with lvlLines, so shift them in lockstep and a label can
+        // never survive the line it belongs to.
+        //
+        // LOAD-BEARING: this cap (12 per day) must stay ABOVE the most levels a
+        // single session can draw (10: PDH, PDL, ONH, ONL, IBH, IBL, IB+, IB-,
+        // ORH, ORL). The trim removes from the FRONT, so today's lines are the
+        // last to go -- but only while one session cannot exceed the cap on its
+        // own. If it could, the extension loop below would be setting x2 on a
+        // deleted handle. Raise this before adding another level type.
+        while array.size(lvlLines) > daysBack * 12
+            line.delete(array.shift(lvlLines))
+            label.delete(array.shift(lvlLabs))
+
+// Sweep state has to be REMEMBERED. Reading high/low on the last bar answers
+// "did the most recent bar sweep it", which is not the question -- a prior day
+// high taken at 10:00 is swept for the rest of the day.
+var bool swpPDH = false
+var bool swpPDL = false
+var bool swpONH = false
+var bool swpONL = false
+
+if not na(pdHi) and high > pdHi
+    swpPDH := true
+if not na(pdLo) and low  < pdLo
+    swpPDL := true
+if not na(onHi) and not inON and high > onHi
+    swpONH := true
+if not na(onLo) and not inON and low  < onLo
+    swpONL := true
+
+sessEnd = not inN and inN[1]
+nyOpen  = inN and not inN[1] and sawOutN
+
+// LEVELS ARE DRAWN THE MOMENT THEIR VALUE IS FINAL, not at the session close.
+// Previously every level -- prior day, overnight, initial balance, opening
+// range -- was drawn inside `if sessEnd`, so nothing appeared until 16:00 and
+// the lines were laid backwards across a session that had already finished.
+// That is exactly backwards: a prior day high is for trading TODAY against, and
+// an initial balance is for the six and a half hours that follow it.
+//
+// Nothing here is back-dated. Each value is already final when it is drawn:
+// prior day and overnight are settled before the bell, the initial balance at
+// 60 minutes, the opening range at its own length. The lines then extend to the
+// live edge -- their PRICE never moves, only their right end.
+minsIn = nBar * barMins
+
+if nyOpen
+    // Crowding is judged within one session.
+    array.clear(drawnPx)
+    array.clear(curL)
+    array.clear(curB)
+    if ePD
+        f_lvl(pdHi, colHigh, "PDH", false, bar_index)
+        f_lvl(pdLo, colLow,  "PDL", false, bar_index)
+    if eON
+        f_lvl(onHi, colHigh, "ONH", false, bar_index)
+        f_lvl(onLo, colLow,  "ONL", false, bar_index)
+
+// The initial balance is final exactly 60 minutes in. Fire on the bar that
+// crosses the boundary, once.
+if inN and eIB and barMins <= 30 and minsIn >= 60 and minsIn - barMins < 60
+    f_lvl(ibHi, colIB, "IBH", true, bar_index)
+    f_lvl(ibLo, colIB, "IBL", true, bar_index)
+    if eExt and not na(ibHi) and not na(ibLo)
+        rng = ibHi - ibLo
+        f_lvl(ibHi + rng * extMult, colIB, "IB+", false, bar_index)
+        f_lvl(ibLo - rng * extMult, colIB, "IB-", false, bar_index)
+
+if inN and eOR and barMins <= orMins / 2 and minsIn >= orMins and minsIn - barMins < orMins
+    f_lvl(orHi, colHigh, "ORH", true, bar_index)
+    f_lvl(orLo, colLow,  "ORL", true, bar_index)
+
+// Carry today's levels to the live edge. Only the right end moves.
+if inN and array.size(curL) > 0
+    for i = 0 to array.size(curL) - 1
+        line.set_x2(array.get(curL, i), bar_index + 1)
+        label.set_x(array.get(curB, i), bar_index + 1)
+
+// Roll the prior day forward only NOW, after this close has been drawn. Today's
+// RTH range becomes tomorrow's PDH/PDL, which is the only thing "prior day" can
+// honestly mean. Guarded so a partial session at the left edge of loaded data
+// cannot poison it.
+if sessEnd and not na(nStart)
+    pdHi := nHi
+    pdLo := nLo
+    swpPDH := false
+    swpPDL := false
+
+// The overnight range is final the moment the window closes; that is when its
+// sweep state starts over.
+if not inON and inON[1]
+    swpONH := false
+    swpONL := false
+
+// ── observed-outside flags ──────────────────────────────────────────────────
+// Deliberately last. Read at the top of the next bar, they answer "did we see
+// the market outside this session before it opened?" -- false only for a
+// session already in progress on the first loaded bar.
+if not inA
+    sawOutA := true
+if not inL
+    sawOutL := true
+if not inN
+    sawOutN := true
+if not inON
+    sawOutON := true
+
+// ── timeframe notice ─────────────────────────────────────────────────────────
+var label warn = na
+if barstate.islast and not tfOk
+    label.delete(warn)
+    warn := label.new(bar_index, high,
+         "Apsis Sessions needs a 1H chart or finer", style = label.style_label_down,
+         color = color.new(colIB, 78), textcolor = colIB, size = size.small)
+
+// ── session panel ───────────────────────────────────────────────────────────
+// Today's ranges and which reference levels are still intact. "Intact" is the
+// useful state: an unswept prior-day high is somewhere price has not yet been,
+// and that is what a session trader is actually watching for.
+f_state(bool swept, float lvl) =>
+    na(lvl) ? "—" : swept ? "swept" : "intact"
+
+var table pnl = table.new(position.top_right, 2, 7, border_width = 0,
+     frame_width = 1, frame_color = color.new(#2a3a4d, 40))
+
+f_prow(int r, string k, string v, color c) =>
+    plate = color.new(#0b1018, 12)
+    table.cell(pnl, 0, r, k, text_color = color.new(#7c93ab, 0), text_size = size.tiny,
+         bgcolor = plate, text_halign = text.align_left)
+    table.cell(pnl, 1, r, v, text_color = c, text_size = size.tiny,
+         bgcolor = plate, text_halign = text.align_right)
+
+if showPanel and barstate.islast and tfOk
+    live = inN ? "NEW YORK" : inL ? "LONDON" : inA ? "ASIA" : "CLOSED"
+    cGrey = color.new(#7c93ab, 0)
+    lcol = inN ? color.new(cN, 10) : inL ? color.new(cL, 10) : inA ? color.new(cA, 10) : cGrey
+    table.cell(pnl, 0, 0, "SESSION", text_color = color.new(#7c93ab, 0),
+         text_size = size.tiny, bgcolor = color.new(#131c28, 8), text_halign = text.align_left)
+    table.cell(pnl, 1, 0, live, text_color = lcol, text_size = size.tiny,
+         bgcolor = color.new(#131c28, 8), text_halign = text.align_right)
+    f_prow(1, "Asia range",   na(aHi) or na(aLo) ? "—" : f_pts(aHi - aLo), color.new(cA, 10))
+    f_prow(2, "London range", na(lHi) or na(lLo) ? "—" : f_pts(lHi - lLo), color.new(cL, 10))
+    f_prow(3, "NY range",     na(nHi) or na(nLo) ? "—" : f_pts(nHi - nLo), color.new(cN, 10))
+    f_prow(4, "Prior day H", f_state(swpPDH, pdHi), swpPDH ? cGrey : colHigh)
+    f_prow(5, "Prior day L", f_state(swpPDL, pdLo), swpPDL ? cGrey : colLow)
+    f_prow(6, "Overnight H/L", f_state(swpONH, onHi) + " / " + f_state(swpONL, onLo),
+         swpONH and swpONL ? cGrey : color.new(#e8f3ff, 20))
+
+// ── sweep alerts ─────────────────────────────────────────────────────────────
+// Fires on the TRANSITION only -- the bar the level actually goes.
+swPDH = ePD and swpPDH and not swpPDH[1]
+swPDL = ePD and swpPDL and not swpPDL[1]
+swONH = eON and swpONH and not swpONH[1]
+swONL = eON and swpONL and not swpONL[1]
+
+alertcondition(swPDH, "Prior day high swept", "Apsis Sessions: prior day high swept")
+alertcondition(swPDL, "Prior day low swept",  "Apsis Sessions: prior day low swept")
+alertcondition(swONH, "Overnight high swept", "Apsis Sessions: overnight high swept")
+alertcondition(swONL, "Overnight low swept",  "Apsis Sessions: overnight low swept")

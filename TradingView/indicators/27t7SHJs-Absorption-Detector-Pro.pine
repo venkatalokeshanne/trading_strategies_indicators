@@ -1,0 +1,209 @@
+//@version=6
+indicator("Absorption Detector Pro ", overlay=true, max_labels_count=500)
+
+// ═══════════════════════════════════════
+// CORE ABSORPTION SETTINGS
+// ═══════════════════════════════════════
+grpCore = "Core Absorption"
+lookback             = input.int(20, "Lookback for Volume/Range Averages", group=grpCore)
+minVolRatio          = input.float(1.3, "Minimum Volume Ratio (sanity floor)", step=0.1, group=grpCore)
+absorptionScoreFloor = input.float(1.2, "Minimum Absorption Score (sanity floor)", step=0.1, group=grpCore)
+closeThreshold       = input.float(0.70, "Close-in-range threshold (0.5-1.0)", step=0.05, minval=0.5, maxval=1.0, group=grpCore, tooltip="How close to the candle's extreme the close must be. Higher = stronger rejection required.")
+
+// ═══════════════════════════════════════
+// SIGNAL QUALITY (the main levers for fewer/better signals)
+// ═══════════════════════════════════════
+grpQual = "Signal Quality"
+rankLen           = input.int(100, "Percentile Rank Window (bars)", group=grpQual, tooltip="Absorption score is ranked against the last N bars. Self-adjusts to each symbol/timeframe.")
+qualityPercentile = input.float(90, "Minimum Score Percentile", minval=50, maxval=99, step=1, group=grpQual, tooltip="Only the top X% of absorption scores over the ranking window qualify. Raise for fewer signals.")
+requireClimax     = input.bool(true, "Require PVSRA Climax Volume", group=grpQual)
+requireSweep      = input.bool(true, "Require Liquidity Sweep of Recent High/Low", group=grpQual)
+sweepLookback     = input.int(20, "Sweep Lookback Bars", group=grpQual)
+useTrendFilter    = input.bool(true, "Require Prior Trend Direction", group=grpQual)
+trendLen          = input.int(20, "Trend MA Length", group=grpQual)
+minBarsBetween    = input.int(10, "Cooldown Between Signals (bars)", group=grpQual, tooltip="Suppresses clustered/repeat signals.")
+
+// ═══════════════════════════════════════
+// PVSRA (candle context)
+// ═══════════════════════════════════════
+grpPvsra = "PVSRA Candles"
+pvsraLen        = input.int(10, "PVSRA Lookback (bars)", group=grpPvsra)
+climaxMult      = input.float(2.0, "Climax Volume Multiplier", step=0.1, group=grpPvsra)
+aboveAvgMult    = input.float(1.5, "Above-Avg Volume Multiplier", step=0.1, group=grpPvsra)
+showPvsraColors = input.bool(true, "Paint Candles with PVSRA Colors", group=grpPvsra)
+
+climaxBullColor   = input.color(color.lime, "Climax Bull", group=grpPvsra)
+climaxBearColor   = input.color(color.red, "Climax Bear", group=grpPvsra)
+aboveAvgBullColor = input.color(color.blue, "Above-Avg Bull", group=grpPvsra)
+aboveAvgBearColor = input.color(color.fuchsia, "Above-Avg Bear", group=grpPvsra)
+normalBullColor   = input.color(color.silver, "Normal Bull", group=grpPvsra)
+normalBearColor   = input.color(color.gray, "Normal Bear", group=grpPvsra)
+
+// ═══════════════════════════════════════
+// ORDER FLOW DELTA CONFIRMATION (optional)
+// ═══════════════════════════════════════
+grpDelta = "Order Flow Confirmation (optional)"
+useDelta = input.bool(false, "Confirm with Intrabar Buy/Sell Delta", group=grpDelta)
+deltaTF  = input.timeframe("1", "Lower Timeframe for Delta", group=grpDelta)
+
+// ═══════════════════════════════════════
+// VISUALS
+// ═══════════════════════════════════════
+grpVis = "Visuals"
+showLabels      = input.bool(true, "Show Absorption Labels", group=grpVis)
+showBgHighlight = input.bool(true, "Highlight Absorption Bars (background)", group=grpVis)
+showTable       = input.bool(true, "Show Diagnostics Table", group=grpVis)
+absorbBullColor = input.color(color.yellow, "Bullish Absorption Marker", group=grpVis)
+absorbBearColor = input.color(color.orange, "Bearish Absorption Marker", group=grpVis)
+
+// ═══════════════════════════════════════
+// PVSRA CLASSIFICATION
+// ═══════════════════════════════════════
+candleRange = high - low
+va          = volume * candleRange
+
+avgVolPrev    = ta.sma(volume[1], pvsraLen)
+highestVaPrev = ta.highest(va[1], pvsraLen)
+
+isClimax   = volume >= avgVolPrev * climaxMult or va >= highestVaPrev
+isAboveAvg = not isClimax and volume >= avgVolPrev * aboveAvgMult
+bullCandle = close >= open
+
+pvsraColor = isClimax ? (bullCandle ? climaxBullColor : climaxBearColor) :
+             isAboveAvg ? (bullCandle ? aboveAvgBullColor : aboveAvgBearColor) :
+             (bullCandle ? normalBullColor : normalBearColor)
+
+barcolor(showPvsraColors ? pvsraColor : na)
+
+// ═══════════════════════════════════════
+// ABSORPTION SCORE (effort vs. result) + PERCENTILE RANK
+// ═══════════════════════════════════════
+volAvg   = ta.sma(volume, lookback)
+rangeAvg = ta.sma(candleRange, lookback)
+
+volRatio      = volAvg == 0 ? 0.0 : volume / volAvg
+rangeRatioRaw = rangeAvg == 0 ? 1.0 : candleRange / rangeAvg
+rangeRatio    = math.max(rangeRatioRaw, 0.05)
+
+absorptionScore = volRatio / rangeRatio
+scorePercentile = ta.percentrank(absorptionScore, rankLen)
+
+closePosition = candleRange == 0 ? 0.5 : (close - low) / candleRange
+
+// ═══════════════════════════════════════
+// QUALITY GATES
+// ═══════════════════════════════════════
+isElevatedVolume  = volume >= volAvg * minVolRatio
+isAboveFloorScore = absorptionScore >= absorptionScoreFloor
+isHighPercentile  = scorePercentile >= qualityPercentile
+climaxOk          = not requireClimax or isClimax
+
+coreAbsorption = isElevatedVolume and isAboveFloorScore and isHighPercentile and climaxOk
+
+// liquidity sweep: bar pokes beyond the recent range before (per closePosition) rejecting
+recentHighExclCur = ta.highest(high, sweepLookback)[1]
+recentLowExclCur  = ta.lowest(low, sweepLookback)[1]
+sweptHigh = high > recentHighExclCur
+sweptLow  = low < recentLowExclCur
+sweepOkBull = not requireSweep or sweptLow
+sweepOkBear = not requireSweep or sweptHigh
+
+// trend context: must go against the immediately preceding move
+trendMA     = ta.sma(close, trendLen)
+downtrend   = close < trendMA
+uptrend     = close > trendMA
+trendOkBull = not useTrendFilter or downtrend
+trendOkBear = not useTrendFilter or uptrend
+
+// ═══════════════════════════════════════
+// ORDER FLOW DELTA (optional)
+// ═══════════════════════════════════════
+float delta = na
+
+if useDelta
+    ltfOpens  = request.security_lower_tf(syminfo.tickerid, deltaTF, open)
+    ltfCloses = request.security_lower_tf(syminfo.tickerid, deltaTF, close)
+    ltfVols   = request.security_lower_tf(syminfo.tickerid, deltaTF, volume)
+    upVol = 0.0
+    downVol = 0.0
+    for i = 0 to array.size(ltfCloses) - 1
+        c = array.get(ltfCloses, i)
+        o = array.get(ltfOpens, i)
+        v = array.get(ltfVols, i)
+        if c > o
+            upVol += v
+        else if c < o
+            downVol += v
+        else
+            upVol += v / 2
+            downVol += v / 2
+    delta := upVol - downVol
+
+deltaConfirmsBull = not useDelta or (not na(delta) and delta < 0)
+deltaConfirmsBear = not useDelta or (not na(delta) and delta > 0)
+
+// ═══════════════════════════════════════
+// COOLDOWN (prevents clustering)
+// ═══════════════════════════════════════
+var int lastSignalBar = na
+canSignal = na(lastSignalBar) or (bar_index - lastSignalBar) >= minBarsBetween
+
+// ═══════════════════════════════════════
+// FINAL SIGNALS
+// ═══════════════════════════════════════
+bullishAbsorption = coreAbsorption and closePosition >= closeThreshold and trendOkBull and sweepOkBull and deltaConfirmsBull and canSignal
+bearishAbsorption = coreAbsorption and closePosition <= (1 - closeThreshold) and trendOkBear and sweepOkBear and deltaConfirmsBear and canSignal
+
+if bullishAbsorption or bearishAbsorption
+    lastSignalBar := bar_index
+
+// ═══════════════════════════════════════
+// VISUALS: MARKERS
+// ═══════════════════════════════════════
+plotshape(bullishAbsorption, title="Bullish Absorption", location=location.belowbar,
+     style=shape.triangleup, color=absorbBullColor, size=size.small)
+plotshape(bearishAbsorption, title="Bearish Absorption", location=location.abovebar,
+     style=shape.triangledown, color=absorbBearColor, size=size.small)
+
+if showLabels and bullishAbsorption
+    label.new(bar_index, low, "ABS " + str.tostring(absorptionScore, "#.#") + "x  P" + str.tostring(scorePercentile, "#"),
+         style=label.style_label_up, color=absorbBullColor, textcolor=color.black, size=size.tiny)
+if showLabels and bearishAbsorption
+    label.new(bar_index, high, "ABS " + str.tostring(absorptionScore, "#.#") + "x  P" + str.tostring(scorePercentile, "#"),
+         style=label.style_label_down, color=absorbBearColor, textcolor=color.black, size=size.tiny)
+
+bgcolor(showBgHighlight and bullishAbsorption ? color.new(absorbBullColor, 80) :
+        showBgHighlight and bearishAbsorption ? color.new(absorbBearColor, 80) : na)
+
+// ═══════════════════════════════════════
+// DIAGNOSTICS TABLE
+// ═══════════════════════════════════════
+sweptText = sweptHigh and sweptLow ? "both" : sweptHigh ? "high" : sweptLow ? "low" : "no"
+trendText = useTrendFilter ? (downtrend ? "downtrend" : uptrend ? "uptrend" : "flat") : "off"
+
+var table infoTable = table.new(position.top_right, 2, 9, border_width=1)
+if showTable and barstate.islast
+    table.cell(infoTable, 0, 0, "Metric", bgcolor=color.new(color.gray, 20), text_color=color.white)
+    table.cell(infoTable, 1, 0, "Value", bgcolor=color.new(color.gray, 20), text_color=color.white)
+    table.cell(infoTable, 0, 1, "Volume Ratio")
+    table.cell(infoTable, 1, 1, str.tostring(volRatio, "#.##") + "x")
+    table.cell(infoTable, 0, 2, "Range Ratio")
+    table.cell(infoTable, 1, 2, str.tostring(rangeRatio, "#.##") + "x")
+    table.cell(infoTable, 0, 3, "Absorption Score")
+    table.cell(infoTable, 1, 3, str.tostring(absorptionScore, "#.##"))
+    table.cell(infoTable, 0, 4, "Score Percentile")
+    table.cell(infoTable, 1, 4, str.tostring(scorePercentile, "#") + "  (need " + str.tostring(qualityPercentile, "#") + ")")
+    table.cell(infoTable, 0, 5, "PVSRA Climax")
+    table.cell(infoTable, 1, 5, isClimax ? "yes" : "no")
+    table.cell(infoTable, 0, 6, "Swept High/Low")
+    table.cell(infoTable, 1, 6, sweptText)
+    table.cell(infoTable, 0, 7, "Trend Context")
+    table.cell(infoTable, 1, 7, trendText)
+    table.cell(infoTable, 0, 8, "Bars Since Signal")
+    table.cell(infoTable, 1, 8, na(lastSignalBar) ? "n/a" : str.tostring(bar_index - lastSignalBar))
+
+// ═══════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════
+alertcondition(bullishAbsorption, "Bullish Absorption", "Quality bullish absorption: swept lows, climax volume, compressed range, strong close.")
+alertcondition(bearishAbsorption, "Bearish Absorption", "Quality bearish absorption: swept highs, climax volume, compressed range, strong close.")

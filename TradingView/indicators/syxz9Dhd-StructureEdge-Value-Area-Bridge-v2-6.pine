@@ -1,0 +1,1045 @@
+//@version=6
+indicator("StructureEdge Value Area Bridge v2.6", overlay=true, max_bars_back=5000, max_lines_count=20, max_labels_count=20)
+
+// ============================================================================
+// STRUCTUREEDGE VALUE AREA BRIDGE v2.6
+// ============================================================================
+//
+// CANONICAL PROFILE
+//
+// Source resolution: 1-minute
+// Session:           Existing TradingView regular-session logic
+// Target rows:       200
+// Value Area:        70%
+//
+// Previous Day:
+// Completed session -> calculate -> lock VAH / POC / VAL.
+//
+// Previous Week:
+// All qualifying 1-minute bars for completed trading week -> one combined
+// weekly profile -> calculate -> lock VAH / POC / VAL.
+//
+// FUTURES FIX v2.5:
+//
+// Calendar/trading-week logic is based on `time_tradingday`, not the
+// calendar date on which an overnight futures bar physically opens.
+//
+// Example:
+//
+// Thursday evening NQ bars that belong to Friday's trading session
+// are treated as FRIDAY.
+//
+// Sunday evening NQ bars that belong to Monday's trading session
+// are treated as MONDAY and as the new trading week.
+//
+// This fixes Previous Week rollover on futures without changing the
+// underlying profile/session collection behavior.
+//
+// CALCULATION IS ALWAYS BASED ON 1-MINUTE DATA.
+//
+// DELIVERY FIX v2.6:
+// - Newly finalized previous-day / previous-week profiles send immediately.
+// - Locked profiles are also re-delivered every four hours by default.
+// - A heartbeat confirms receiver freshness; it never recalculates or changes
+//   a completed profile.
+//
+// VISUALS:
+// - Horizontal lines only
+// - No vertical lines
+// - No label boxes / markers
+// - Plain text positioned above each horizontal line
+// - Text aligned to the right
+//
+// ============================================================================
+
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+receiverToken = input.string("PASTE_TOKEN_HERE", "StructureEdge receiver token")
+
+rows = input.int(200, "Profile rows", minval=50, maxval=400)
+
+heartbeatMinutes = input.int(240, "Receiver heartbeat (minutes)", minval=60, maxval=1440)
+
+showDayLevels = input.bool(true, "Show Previous Day VAH / POC / VAL")
+showWeekLevels = input.bool(true, "Show Previous Week VAH / POC / VAL")
+
+labelBarsRight = input.int(3, "Text position from current bar", minval=1, maxval=20)
+
+textOffsetAtrPercent = input.float(
+     2.0,
+     "Text height above line (% ATR)",
+     minval=0.0,
+     maxval=10.0,
+     step=0.5
+)
+
+dailyVaColor = input.color(color.white, "Previous Day VAH / VAL Color")
+dailyPocColor = input.color(color.orange, "Previous Day POC Color")
+
+weeklyVaColor = input.color(color.aqua, "Previous Week VAH / VAL Color")
+weeklyPocColor = input.color(color.red, "Previous Week POC Color")
+
+dayLineWidth = input.int(1, "Previous Day Line Width", minval=1, maxval=4)
+weekLineWidth = input.int(2, "Previous Week Line Width", minval=1, maxval=4)
+
+VA_PERCENT = 0.70
+
+
+// ============================================================================
+// TEXT OFFSET
+// ============================================================================
+
+float currentAtr = nz(ta.atr(14), syminfo.mintick * 6.0)
+
+float labelYOffset = math.max(
+     syminfo.mintick * 6.0,
+     currentAtr * (textOffsetAtrPercent / 100.0)
+)
+
+
+// ============================================================================
+// PROFILE STORAGE
+// ============================================================================
+
+var array<float> dayHighs = array.new_float()
+var array<float> dayLows = array.new_float()
+var array<float> dayVolumes = array.new_float()
+
+var array<float> weekHighs = array.new_float()
+var array<float> weekLows = array.new_float()
+var array<float> weekVolumes = array.new_float()
+
+
+// ============================================================================
+// SESSION STATE
+// ============================================================================
+
+var int dayStart = na
+var int dayEnd = na
+
+var int weekStart = na
+var int weekEnd = na
+
+// v2.5:
+// This is now YYYYWW based on the TRADING DAY, not the physical opening date.
+var int activeWeekKey = na
+
+// Also derived from time_tradingday for overnight futures.
+var int currentDayOfWeek = na
+
+var bool dayStartedAtOpen = false
+var bool dayFinalized = false
+var bool weekFinalized = false
+
+
+// ============================================================================
+// LOCKED PREVIOUS DAY PROFILE
+// ============================================================================
+
+var float pdVah = na
+var float pdPoc = na
+var float pdVal = na
+
+var int pdStart = na
+var int pdEnd = na
+
+
+// ============================================================================
+// LOCKED PREVIOUS WEEK PROFILE
+// ============================================================================
+
+var float pwVah = na
+var float pwPoc = na
+var float pwVal = na
+
+var int pwStart = na
+var int pwEnd = na
+
+
+// ============================================================================
+// DRAWING OBJECTS
+// ============================================================================
+
+// Previous Day
+
+var line pdVahLine = na
+var line pdPocLine = na
+var line pdValLine = na
+
+var label pdVahLabel = na
+var label pdPocLabel = na
+var label pdValLabel = na
+
+
+// Previous Week
+
+var line pwVahLine = na
+var line pwPocLine = na
+var line pwValLine = na
+
+var label pwVahLabel = na
+var label pwPocLabel = na
+var label pwValLabel = na
+
+
+// ============================================================================
+// PROFILE CALCULATION
+// ============================================================================
+
+f_profile(array<float> highs, array<float> lows, array<float> volumes, int requestedRows) =>
+
+    float profileLow = array.min(lows)
+    float profileHigh = array.max(highs)
+
+    float vah = na
+    float poc = na
+    float val = na
+
+    if profileHigh <= profileLow
+
+        vah := profileHigh
+        poc := profileHigh
+        val := profileLow
+
+    else
+
+        // --------------------------------------------------------------------
+        // PROFILE RANGE
+        // --------------------------------------------------------------------
+
+        float profileRange = profileHigh - profileLow
+
+        int totalTicks = int(math.round(profileRange / syminfo.mintick))
+
+        if totalTicks < 1
+            totalTicks := 1
+
+
+        // --------------------------------------------------------------------
+        // DETERMINE TICK-ALIGNED ROW HEIGHT
+        // --------------------------------------------------------------------
+
+        float idealTicksPerRow = float(totalTicks) / float(requestedRows)
+
+        int lowerTicksPerRow = int(math.floor(idealTicksPerRow))
+        int upperTicksPerRow = int(math.ceil(idealTicksPerRow))
+
+        if lowerTicksPerRow < 1
+            lowerTicksPerRow := 1
+
+        if upperTicksPerRow < 1
+            upperTicksPerRow := 1
+
+        int rowsUsingLower = int(math.ceil(float(totalTicks) / float(lowerTicksPerRow)))
+        int rowsUsingUpper = int(math.ceil(float(totalTicks) / float(upperTicksPerRow)))
+
+        int lowerDifference = math.abs(rowsUsingLower - requestedRows)
+        int upperDifference = math.abs(rowsUsingUpper - requestedRows)
+
+        int ticksPerRow = lowerDifference <= upperDifference ? lowerTicksPerRow : upperTicksPerRow
+
+        float step = float(ticksPerRow) * syminfo.mintick
+
+        int count = int(math.ceil(profileRange / step))
+
+        if count < 1
+            count := 1
+
+        array<float> bins = array.new_float(count, 0.0)
+
+
+        // --------------------------------------------------------------------
+        // DISTRIBUTE EACH 1-MINUTE BAR'S VOLUME THROUGH ITS PRICE RANGE
+        // --------------------------------------------------------------------
+
+        int barCount = array.size(highs)
+
+        if barCount > 0
+
+            for i = 0 to barCount - 1
+
+                float barHigh = array.get(highs, i)
+                float barLow = array.get(lows, i)
+                float barVolume = array.get(volumes, i)
+
+                float barRange = barHigh - barLow
+
+                int firstBin = int(math.floor((barLow - profileLow) / step))
+                int lastBin = int(math.floor((barHigh - profileLow) / step))
+
+                if firstBin < 0
+                    firstBin := 0
+
+                if firstBin > count - 1
+                    firstBin := count - 1
+
+                if lastBin < 0
+                    lastBin := 0
+
+                if lastBin > count - 1
+                    lastBin := count - 1
+
+
+                // ------------------------------------------------------------
+                // ZERO-RANGE BAR
+                // ------------------------------------------------------------
+
+                if barRange <= 0
+
+                    float existingVolume = array.get(bins, firstBin)
+
+                    array.set(
+                         bins,
+                         firstBin,
+                         existingVolume + barVolume
+                    )
+
+
+                // ------------------------------------------------------------
+                // NORMAL BAR
+                // ------------------------------------------------------------
+
+                else
+
+                    for b = firstBin to lastBin
+
+                        float binLow = profileLow + float(b) * step
+                        float binHigh = math.min(profileHigh, binLow + step)
+
+                        float overlapTop = math.min(barHigh, binHigh)
+                        float overlapBottom = math.max(barLow, binLow)
+
+                        float overlap = overlapTop - overlapBottom
+
+                        if overlap > 0
+
+                            float allocatedVolume = barVolume * overlap / barRange
+                            float existingVolume = array.get(bins, b)
+
+                            array.set(
+                                 bins,
+                                 b,
+                                 existingVolume + allocatedVolume
+                            )
+
+
+        // --------------------------------------------------------------------
+        // POINT OF CONTROL
+        // --------------------------------------------------------------------
+
+        float maxVolume = array.max(bins)
+
+        int pocIndex = array.indexof(bins, maxVolume)
+
+        float pocRowLow = profileLow + float(pocIndex) * step
+        float pocRowHigh = math.min(profileHigh, pocRowLow + step)
+
+        float rawPoc = (pocRowLow + pocRowHigh) / 2.0
+
+        poc := math.round(rawPoc / syminfo.mintick) * syminfo.mintick
+
+
+        // --------------------------------------------------------------------
+        // 70% VALUE AREA
+        // --------------------------------------------------------------------
+
+        float totalProfileVolume = array.sum(bins)
+        float targetVolume = totalProfileVolume * VA_PERCENT
+
+        float includedVolume = array.get(bins, pocIndex)
+
+        int lowerIndex = pocIndex
+        int upperIndex = pocIndex
+
+        float targetTolerance = math.max(1.0, targetVolume) * 0.0000000001
+
+
+        while includedVolume < targetVolume - targetTolerance and (lowerIndex > 0 or upperIndex < count - 1)
+
+            int aboveIndex = upperIndex < count - 1 ? upperIndex + 1 : -1
+            int belowIndex = lowerIndex > 0 ? lowerIndex - 1 : -1
+
+            bool chooseAbove = false
+
+
+            if belowIndex == -1
+
+                chooseAbove := true
+
+
+            else if aboveIndex == -1
+
+                chooseAbove := false
+
+
+            else
+
+                float aboveVolume = array.get(bins, aboveIndex)
+                float belowVolume = array.get(bins, belowIndex)
+
+                float maxCandidateVolume = math.max(
+                     math.abs(aboveVolume),
+                     math.abs(belowVolume)
+                )
+
+                float comparisonTolerance = math.max(
+                     1.0,
+                     maxCandidateVolume
+                ) * 0.000000000001
+
+
+                if aboveVolume > belowVolume + comparisonTolerance
+
+                    chooseAbove := true
+
+
+                else if belowVolume > aboveVolume + comparisonTolerance
+
+                    chooseAbove := false
+
+
+                else
+
+                    int aboveDistance = aboveIndex - pocIndex
+                    int belowDistance = pocIndex - belowIndex
+
+                    chooseAbove := aboveDistance <= belowDistance
+
+
+            float candidateVolume = chooseAbove ? array.get(bins, aboveIndex) : array.get(bins, belowIndex)
+
+
+            if includedVolume + candidateVolume <= targetVolume + targetTolerance
+
+                if chooseAbove
+                    upperIndex := aboveIndex
+                else
+                    lowerIndex := belowIndex
+
+                includedVolume += candidateVolume
+
+
+            else
+
+                break
+
+
+        // --------------------------------------------------------------------
+        // FINAL VALUE AREA BOUNDARIES
+        // --------------------------------------------------------------------
+
+        float upperRowLow = profileLow + float(upperIndex) * step
+        float upperRowHigh = math.min(profileHigh, upperRowLow + step)
+
+        float lowerRowLow = profileLow + float(lowerIndex) * step
+
+        vah := math.round(upperRowHigh / syminfo.mintick) * syminfo.mintick
+        val := math.round(lowerRowLow / syminfo.mintick) * syminfo.mintick
+
+
+    [vah, poc, val]
+
+
+// ============================================================================
+// TIMEFRAME VALIDATION
+// ============================================================================
+
+if barstate.isfirst and timeframe.in_seconds() < 60
+    runtime.error("StructureEdge Value Area Bridge requires a chart timeframe of 1 minute or greater.")
+
+
+// ============================================================================
+// CANONICAL 1-MINUTE SOURCE DATA
+// ============================================================================
+//
+// v2.5 IMPORTANT:
+//
+// `time_tradingday` replaces ordinary `dayofweek` / `weekofyear` as the
+// calendar anchor.
+//
+// It gives us the primary TRADING DATE even when a futures session begins
+// on the prior physical calendar day.
+//
+// Keep tuple assignment on one line for Pine parser compatibility.
+//
+// ============================================================================
+
+[srcTimes, srcTimeCloses, srcTradingDays, srcHighs, srcLows, srcVolumes, srcIsMarket, srcFirstRegular, srcLastRegular] = request.security_lower_tf(syminfo.tickerid, "1", [time, time_close, time_tradingday, high, low, volume, session.ismarket, session.isfirstbar_regular, session.islastbar_regular])
+
+
+// ============================================================================
+// EVENT FLAGS
+// ============================================================================
+
+bool dayLevelChanged = false
+bool weekLevelChanged = false
+bool sendBridgeAlert = false
+
+
+// ============================================================================
+// PROCESS 1-MINUTE DATA
+// ============================================================================
+
+if barstate.isconfirmed
+
+    int sourceCount = array.size(srcTimes)
+
+    if sourceCount > 0
+
+        for i = 0 to sourceCount - 1
+
+            int srcTime = array.get(srcTimes, i)
+            int srcTimeClose = array.get(srcTimeCloses, i)
+            int srcTradingDay = array.get(srcTradingDays, i)
+
+            float srcHigh = array.get(srcHighs, i)
+            float srcLow = array.get(srcLows, i)
+            float srcVolume = array.get(srcVolumes, i)
+
+            bool srcMarket = array.get(srcIsMarket, i)
+            bool srcFirst = array.get(srcFirstRegular, i)
+            bool srcLast = array.get(srcLastRegular, i)
+
+
+            // =================================================================
+            // TRADING-DAY CALENDAR
+            // =================================================================
+            //
+            // `time_tradingday` is always anchored at 00:00 UTC for the
+            // trading day represented by the bar.
+            //
+            // For example:
+            //
+            // Thursday evening -> Friday trading day -> FRIDAY
+            // Sunday evening   -> Monday trading day -> MONDAY
+            //
+            // =================================================================
+
+            int srcDow = dayofweek(srcTradingDay, "UTC")
+            int srcTradingYear = year(srcTradingDay, "UTC")
+            int srcTradingWeek = weekofyear(srcTradingDay, "UTC")
+
+            // YYYYWW key protects rollover across calendar years.
+            int srcWeekKey = srcTradingYear * 100 + srcTradingWeek
+
+
+            // =================================================================
+            // INITIALIZE WEEK KEY
+            // =================================================================
+
+            if na(activeWeekKey)
+                activeWeekKey := srcWeekKey
+
+
+            // =================================================================
+            // NEW TRADING WEEK
+            // =================================================================
+
+            bool newTradingWeek = srcWeekKey != activeWeekKey
+
+
+            if newTradingWeek
+
+                // -------------------------------------------------------------
+                // HOLIDAY / MISSING-FRIDAY FALLBACK
+                // -------------------------------------------------------------
+                //
+                // Normally Friday's trading session already finalizes the
+                // weekly profile.
+                //
+                // If it did not, the first bar belonging to the next trading
+                // week finalizes whatever weekly data remains.
+                //
+                // On futures, Sunday evening belongs to Monday's trading day,
+                // so this fallback now works immediately at the Sunday reopen.
+                // -------------------------------------------------------------
+
+                if not weekFinalized and array.size(weekHighs) > 0
+
+                    [fallbackPwVah, fallbackPwPoc, fallbackPwVal] = f_profile(weekHighs, weekLows, weekVolumes, rows)
+
+                    pwVah := fallbackPwVah
+                    pwPoc := fallbackPwPoc
+                    pwVal := fallbackPwVal
+
+                    pwStart := weekStart
+                    pwEnd := weekEnd
+
+                    weekLevelChanged := true
+                    sendBridgeAlert := true
+
+
+                // Start storage for the new trading week.
+
+                array.clear(weekHighs)
+                array.clear(weekLows)
+                array.clear(weekVolumes)
+
+                weekStart := na
+                weekEnd := na
+
+                activeWeekKey := srcWeekKey
+                weekFinalized := false
+
+
+            // =================================================================
+            // FIRST REGULAR SESSION BAR
+            // =================================================================
+
+            if srcFirst
+
+                // -------------------------------------------------------------
+                // DAILY FALLBACK
+                // -------------------------------------------------------------
+
+                if array.size(dayHighs) > 0 and dayStartedAtOpen and not dayFinalized
+
+                    [fallbackPdVah, fallbackPdPoc, fallbackPdVal] = f_profile(dayHighs, dayLows, dayVolumes, rows)
+
+                    pdVah := fallbackPdVah
+                    pdPoc := fallbackPdPoc
+                    pdVal := fallbackPdVal
+
+                    pdStart := dayStart
+                    pdEnd := dayEnd
+
+                    dayLevelChanged := true
+                    sendBridgeAlert := true
+
+
+                // -------------------------------------------------------------
+                // RESET DAY
+                // -------------------------------------------------------------
+
+                array.clear(dayHighs)
+                array.clear(dayLows)
+                array.clear(dayVolumes)
+
+                dayStart := srcTime
+                dayEnd := na
+
+                dayStartedAtOpen := true
+                dayFinalized := false
+
+
+                // -------------------------------------------------------------
+                // CRITICAL FUTURES FIX
+                // -------------------------------------------------------------
+                //
+                // This is now based on the trading day, not the physical
+                // calendar day the session opened.
+                //
+                // Thursday-evening start of Friday NQ session => FRIDAY.
+                // -------------------------------------------------------------
+
+                currentDayOfWeek := srcDow
+
+
+                // -------------------------------------------------------------
+                // INITIALIZE WEEK START
+                // -------------------------------------------------------------
+
+                if array.size(weekHighs) == 0
+                    weekStart := srcTime
+
+
+            // =================================================================
+            // COLLECT SESSION DATA
+            // ============================================================================
+
+            if srcMarket
+
+                array.push(dayHighs, srcHigh)
+                array.push(dayLows, srcLow)
+                array.push(dayVolumes, srcVolume)
+
+                dayEnd := srcTimeClose
+
+
+                array.push(weekHighs, srcHigh)
+                array.push(weekLows, srcLow)
+                array.push(weekVolumes, srcVolume)
+
+                weekEnd := srcTimeClose
+
+
+            // =================================================================
+            // REGULAR SESSION CLOSE
+            // ============================================================================
+
+            if srcLast and dayStartedAtOpen and not dayFinalized and array.size(dayHighs) > 0
+
+                [nextPdVah, nextPdPoc, nextPdVal] = f_profile(dayHighs, dayLows, dayVolumes, rows)
+
+                pdVah := nextPdVah
+                pdPoc := nextPdPoc
+                pdVal := nextPdVal
+
+                pdStart := dayStart
+                pdEnd := dayEnd
+
+                dayFinalized := true
+
+                dayLevelChanged := true
+                sendBridgeAlert := true
+
+
+                // =============================================================
+                // FRIDAY TRADING-DAY CLOSE -> FINALIZE WEEK
+                // =============================================================
+                //
+                // v2.4:
+                // A futures session beginning Thursday evening could appear
+                // to be Thursday because ordinary `dayofweek` was based on the
+                // bar's opening timestamp.
+                //
+                // v2.5:
+                // currentDayOfWeek came from time_tradingday, so the same
+                // session is correctly identified as FRIDAY.
+                //
+                // =============================================================
+
+                if currentDayOfWeek == dayofweek.friday and array.size(weekHighs) > 0
+
+                    [nextPwVah, nextPwPoc, nextPwVal] = f_profile(weekHighs, weekLows, weekVolumes, rows)
+
+                    pwVah := nextPwVah
+                    pwPoc := nextPwPoc
+                    pwVal := nextPwVal
+
+                    pwStart := weekStart
+                    pwEnd := weekEnd
+
+                    weekFinalized := true
+
+                    weekLevelChanged := true
+                    sendBridgeAlert := true
+
+
+// ============================================================================
+// DRAW PREVIOUS DAY LEVELS
+// ============================================================================
+
+if dayLevelChanged
+
+    if not na(pdVahLine)
+        line.delete(pdVahLine)
+
+    if not na(pdPocLine)
+        line.delete(pdPocLine)
+
+    if not na(pdValLine)
+        line.delete(pdValLine)
+
+
+    if not na(pdVahLabel)
+        label.delete(pdVahLabel)
+
+    if not na(pdPocLabel)
+        label.delete(pdPocLabel)
+
+    if not na(pdValLabel)
+        label.delete(pdValLabel)
+
+
+    if showDayLevels
+
+        // Horizontal Lines
+
+        pdVahLine := line.new(
+             bar_index,
+             pdVah,
+             bar_index + 1,
+             pdVah,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=dailyVaColor,
+             style=line.style_solid,
+             width=dayLineWidth
+        )
+
+        pdPocLine := line.new(
+             bar_index,
+             pdPoc,
+             bar_index + 1,
+             pdPoc,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=dailyPocColor,
+             style=line.style_solid,
+             width=dayLineWidth
+        )
+
+        pdValLine := line.new(
+             bar_index,
+             pdVal,
+             bar_index + 1,
+             pdVal,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=dailyVaColor,
+             style=line.style_solid,
+             width=dayLineWidth
+        )
+
+
+        // --------------------------------------------------------------------
+        // PLAIN TEXT ONLY
+        // --------------------------------------------------------------------
+
+        pdVahLabel := label.new(
+             bar_index + labelBarsRight,
+             pdVah + labelYOffset,
+             "Previous Day VAH  " + str.tostring(pdVah, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=dailyVaColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+        pdPocLabel := label.new(
+             bar_index + labelBarsRight,
+             pdPoc + labelYOffset,
+             "Previous Day POC  " + str.tostring(pdPoc, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=dailyPocColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+        pdValLabel := label.new(
+             bar_index + labelBarsRight,
+             pdVal + labelYOffset,
+             "Previous Day VAL  " + str.tostring(pdVal, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=dailyVaColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+
+// ============================================================================
+// DRAW PREVIOUS WEEK LEVELS
+// ============================================================================
+
+if weekLevelChanged
+
+    if not na(pwVahLine)
+        line.delete(pwVahLine)
+
+    if not na(pwPocLine)
+        line.delete(pwPocLine)
+
+    if not na(pwValLine)
+        line.delete(pwValLine)
+
+
+    if not na(pwVahLabel)
+        label.delete(pwVahLabel)
+
+    if not na(pwPocLabel)
+        label.delete(pwPocLabel)
+
+    if not na(pwValLabel)
+        label.delete(pwValLabel)
+
+
+    if showWeekLevels
+
+        // Horizontal Lines
+
+        pwVahLine := line.new(
+             bar_index,
+             pwVah,
+             bar_index + 1,
+             pwVah,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=weeklyVaColor,
+             style=line.style_solid,
+             width=weekLineWidth
+        )
+
+        pwPocLine := line.new(
+             bar_index,
+             pwPoc,
+             bar_index + 1,
+             pwPoc,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=weeklyPocColor,
+             style=line.style_solid,
+             width=weekLineWidth
+        )
+
+        pwValLine := line.new(
+             bar_index,
+             pwVal,
+             bar_index + 1,
+             pwVal,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             color=weeklyVaColor,
+             style=line.style_solid,
+             width=weekLineWidth
+        )
+
+
+        // --------------------------------------------------------------------
+        // PLAIN TEXT ONLY
+        // --------------------------------------------------------------------
+
+        pwVahLabel := label.new(
+             bar_index + labelBarsRight,
+             pwVah + labelYOffset,
+             "Previous Week VAH  " + str.tostring(pwVah, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=weeklyVaColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+        pwPocLabel := label.new(
+             bar_index + labelBarsRight,
+             pwPoc + labelYOffset,
+             "Previous Week POC  " + str.tostring(pwPoc, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=weeklyPocColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+        pwValLabel := label.new(
+             bar_index + labelBarsRight,
+             pwVal + labelYOffset,
+             "Previous Week VAL  " + str.tostring(pwVal, format.mintick),
+             xloc=xloc.bar_index,
+             yloc=yloc.price,
+             style=label.style_none,
+             textcolor=weeklyVaColor,
+             size=size.small,
+             textalign=text.align_right
+        )
+
+
+// ============================================================================
+// KEEP TEXT ALIGNED TO RIGHT OF CURRENT PRICE ACTION
+// ============================================================================
+
+if barstate.islast
+
+    int labelX = bar_index + labelBarsRight
+
+
+    // ------------------------------------------------------------------------
+    // PREVIOUS DAY
+    // ------------------------------------------------------------------------
+
+    if showDayLevels
+
+        if not na(pdVahLabel)
+            label.set_x(pdVahLabel, labelX)
+            label.set_y(pdVahLabel, pdVah + labelYOffset)
+
+        if not na(pdPocLabel)
+            label.set_x(pdPocLabel, labelX)
+            label.set_y(pdPocLabel, pdPoc + labelYOffset)
+
+        if not na(pdValLabel)
+            label.set_x(pdValLabel, labelX)
+            label.set_y(pdValLabel, pdVal + labelYOffset)
+
+
+    // ------------------------------------------------------------------------
+    // PREVIOUS WEEK
+    // ------------------------------------------------------------------------
+
+    if showWeekLevels
+
+        if not na(pwVahLabel)
+            label.set_x(pwVahLabel, labelX)
+            label.set_y(pwVahLabel, pwVah + labelYOffset)
+
+        if not na(pwPocLabel)
+            label.set_x(pwPocLabel, labelX)
+            label.set_y(pwPocLabel, pwPoc + labelYOffset)
+
+        if not na(pwValLabel)
+            label.set_x(pwValLabel, labelX)
+            label.set_y(pwValLabel, pwVal + labelYOffset)
+
+
+// ============================================================================
+// STRUCTUREEDGE WEBHOOK
+// ============================================================================
+
+bool haveDayProfile = not na(pdVah) and not na(pdPoc) and not na(pdVal)
+
+bool haveWeekProfile = not na(pwVah) and not na(pwPoc) and not na(pwVal)
+
+bool tokenConfigured = receiverToken != "" and receiverToken != "PASTE_TOKEN_HERE"
+
+// A time-bucket transition is stable across symbols and works during extended
+// futures/equity sessions. TradingView alerts execute only on live bars, so the
+// historical bucket transitions do not create a delivery backlog.
+int heartbeatBucket = int(time_close / (heartbeatMinutes * 60 * 1000))
+bool heartbeatDue = barstate.isconfirmed and not na(heartbeatBucket[1]) and heartbeatBucket != heartbeatBucket[1]
+bool shouldDeliver = sendBridgeAlert or heartbeatDue
+string deliveryReason = sendBridgeAlert ? "PROFILE_UPDATE" : "HEARTBEAT"
+
+if shouldDeliver and haveDayProfile and haveWeekProfile and tokenConfigured
+
+    string payload = "{"
+
+    payload := payload + '"version":2,'
+    payload := payload + '"bridge_release":"2.6",'
+    payload := payload + '"delivery_reason":"' + deliveryReason + '",'
+    payload := payload + '"heartbeat_minutes":' + str.tostring(heartbeatMinutes) + ","
+    payload := payload + '"profile_current":true,'
+    payload := payload + '"token":"' + receiverToken + '",'
+    payload := payload + '"symbol":"' + syminfo.prefix + ":" + syminfo.ticker + '",'
+    payload := payload + '"session_type":"RTH",'
+    payload := payload + '"source_timeframe":"1m",'
+    payload := payload + '"profile_rows":' + str.tostring(rows) + ","
+    payload := payload + '"value_area_percent":70,'
+    payload := payload + '"trading_day_aware":true,'
+    payload := payload + '"calculated_at":' + str.tostring(int(timenow / 1000)) + ","
+
+
+    // Previous Day
+
+    payload := payload + '"previous_day":{'
+    payload := payload + '"start":' + str.tostring(int(pdStart / 1000)) + ","
+    payload := payload + '"end":' + str.tostring(int(pdEnd / 1000)) + ","
+    payload := payload + '"vah":' + str.tostring(pdVah, format.mintick) + ","
+    payload := payload + '"poc":' + str.tostring(pdPoc, format.mintick) + ","
+    payload := payload + '"val":' + str.tostring(pdVal, format.mintick)
+    payload := payload + "},"
+
+
+    // Previous Week
+
+    payload := payload + '"previous_week":{'
+    payload := payload + '"start":' + str.tostring(int(pwStart / 1000)) + ","
+    payload := payload + '"end":' + str.tostring(int(pwEnd / 1000)) + ","
+    payload := payload + '"vah":' + str.tostring(pwVah, format.mintick) + ","
+    payload := payload + '"poc":' + str.tostring(pwPoc, format.mintick) + ","
+    payload := payload + '"val":' + str.tostring(pwVal, format.mintick)
+    payload := payload + "}"
+
+    payload := payload + "}"
+
+    alert(payload, alert.freq_once_per_bar_close)

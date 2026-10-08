@@ -1,0 +1,370 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator(
+     "Equalhigh — Gyaku Watch Neon Cycle",
+     shorttitle = "GW Neon Cycle",
+     overlay = false,
+     max_labels_count = 200
+)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EQUALHIGH — GYAKU WATCH NEON CYCLE
+// Japanese price-volume cycle (逆ウォッチ曲線), adapted for TradingView.
+//
+// Classical geometry:
+//   X axis = smoothed volume     Y axis = smoothed price
+//   1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 is the expected counter-clockwise cycle.
+//
+// Pine Script cannot use volume as a native chart X-axis. This adaptation
+// classifies the price/volume vector into eight phases and renders its state,
+// transitions and rotation as a neon phase engine.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+string GROUP_ENGINE  = "1. Gyaku engine"
+string GROUP_FILTERS = "2. Signal filters"
+string GROUP_VISUALS = "3. Neon interface"
+
+priceSource = input.source(close, "Price source", group = GROUP_ENGINE)
+priceLength = input.int(25, "Price smoothing", minval = 2, maxval = 200, group = GROUP_ENGINE)
+volumeLength = input.int(25, "Volume smoothing", minval = 2, maxval = 200, group = GROUP_ENGINE)
+smoothing = input.string("EMA", "Smoothing method", options = ["EMA", "SMA", "RMA"], group = GROUP_ENGINE)
+vectorLookback = input.int(3, "Vector lookback", minval = 1, maxval = 20, group = GROUP_ENGINE,
+     tooltip = "Number of bars used to measure the direction of smoothed price and volume.")
+adaptiveLength = input.int(80, "Adaptive noise window", minval = 20, maxval = 300, group = GROUP_ENGINE)
+deadZone = input.float(0.25, "Adaptive dead zone × σ", minval = 0.00, maxval = 2.00, step = 0.05, group = GROUP_ENGINE,
+     tooltip = "Higher values create steadier phases. Lower values react faster.")
+minPriceSlope = input.float(0.08, "Minimum price vector (%)", minval = 0.00, maxval = 5.00, step = 0.01, group = GROUP_ENGINE)
+minVolumeSlope = input.float(0.80, "Minimum volume vector (%)", minval = 0.00, maxval = 20.00, step = 0.10, group = GROUP_ENGINE)
+
+useTrendFilter = input.bool(true, "Confirm signals with trend EMA", group = GROUP_FILTERS)
+trendLength = input.int(50, "Trend EMA length", minval = 5, maxval = 300, group = GROUP_FILTERS)
+useAtrGate = input.bool(true, "Use ATR anti-noise gate", group = GROUP_FILTERS)
+atrLength = input.int(14, "ATR length", minval = 2, maxval = 100, group = GROUP_FILTERS)
+minAtrMove = input.float(0.20, "Minimum vector move × ATR", minval = 0.00, maxval = 3.00, step = 0.05, group = GROUP_FILTERS)
+rotationThreshold = input.float(0.08, "Rotation detection threshold", minval = 0.00, maxval = 5.00, step = 0.01, group = GROUP_FILTERS)
+
+showDashboard = input.bool(true, "Show neon dashboard", group = GROUP_VISUALS)
+showWheel = input.bool(true, "Show eight-phase wheel", group = GROUP_VISUALS)
+showVectors = input.bool(true, "Show normalized price/volume vectors", group = GROUP_VISUALS)
+showEnergy = input.bool(true, "Show energy columns", group = GROUP_VISUALS)
+showChartSignals = input.bool(true, "Show signals on price chart", group = GROUP_VISUALS)
+colorPriceBars = input.bool(false, "Color price bars by phase", group = GROUP_VISUALS)
+showPaneGlow = input.bool(true, "Neon phase glow", group = GROUP_VISUALS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. NEON PALETTE
+// ─────────────────────────────────────────────────────────────────────────────
+
+color VOID       = color.rgb(3, 6, 18)
+color PANEL      = color.rgb(7, 12, 31)
+color GRID       = color.rgb(32, 46, 78)
+color WHITE      = color.rgb(232, 244, 255)
+color MUTED      = color.rgb(126, 148, 181)
+color CYAN       = color.rgb(0, 245, 255)
+color AQUA       = color.rgb(0, 255, 174)
+color LIME       = color.rgb(151, 255, 0)
+color GOLD       = color.rgb(255, 218, 0)
+color ORANGE     = color.rgb(255, 118, 0)
+color PINK       = color.rgb(255, 31, 132)
+color MAGENTA    = color.rgb(206, 46, 255)
+color VIOLET     = color.rgb(115, 72, 255)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_ma(float source, int length, string method) =>
+    switch method
+        "SMA" => ta.sma(source, length)
+        "RMA" => ta.rma(source, length)
+        => ta.ema(source, length)
+
+f_clamp(float value, float floor, float ceiling) =>
+    math.max(floor, math.min(ceiling, value))
+
+f_phaseColor(int p) =>
+    switch p
+        1 => CYAN
+        2 => AQUA
+        3 => LIME
+        4 => GOLD
+        5 => ORANGE
+        6 => PINK
+        7 => MAGENTA
+        8 => VIOLET
+        => MUTED
+
+f_phaseName(int p) =>
+    switch p
+        1 => "ACCUMULATION"
+        2 => "IGNITION"
+        3 => "EXPANSION"
+        4 => "DISTRIBUTION"
+        5 => "APEX"
+        6 => "BREAKDOWN"
+        7 => "DESCENT"
+        8 => "CAPITULATION"
+        => "CALIBRATING"
+
+f_phaseAction(int p) =>
+    switch p
+        1 => "WATCH FOR LAUNCH"
+        2 => "BULLISH CONFIRMATION"
+        3 => "RIDE / BUY PULLBACKS"
+        4 => "PROTECT PROFITS"
+        5 => "REVERSAL RISK"
+        6 => "BEARISH CONFIRMATION"
+        7 => "AVOID / SELL RALLIES"
+        8 => "WATCH FOR A BASE"
+        => "WAIT FOR DATA"
+
+f_vectorArrow(float value, float band) =>
+    value > band ? "▲" : value < -band ? "▼" : "◆"
+
+f_wheelCell(table id, int column, int row, int cellPhase, int activePhase) =>
+    color cellColor = f_phaseColor(cellPhase)
+    bool active = cellPhase == activePhase
+    string cellText = active ? "◈ " + str.tostring(cellPhase) : str.tostring(cellPhase)
+    table.cell(
+         id, column, row, cellText,
+         text_color = active ? VOID : cellColor,
+         bgcolor = active ? cellColor : color.new(cellColor, 88),
+         text_size = active ? size.small : size.tiny,
+         text_halign = text.align_center,
+         text_valign = text.align_center
+    )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. PRICE–VOLUME VECTOR ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+float cleanVolume = nz(volume, 0.0)
+float priceMA = f_ma(priceSource, priceLength, smoothing)
+float volumeMA = f_ma(cleanVolume, volumeLength, smoothing)
+
+float priceBase = priceMA[vectorLookback]
+float volumeBase = volumeMA[vectorLookback]
+float priceVector = not na(priceBase) and priceBase != 0.0 ? 100.0 * (priceMA / priceBase - 1.0) : na
+float volumeVector = not na(volumeBase) and volumeBase != 0.0 ? 100.0 * (volumeMA / volumeBase - 1.0) : na
+
+float priceSigma = ta.stdev(priceVector, adaptiveLength)
+float volumeSigma = ta.stdev(volumeVector, adaptiveLength)
+float priceBand = math.max(minPriceSlope, nz(priceSigma, 0.0) * deadZone)
+float volumeBand = math.max(minVolumeSlope, nz(volumeSigma, 0.0) * deadZone)
+
+bool hasVolume = not na(ta.sma(cleanVolume, volumeLength)) and ta.sma(cleanVolume, volumeLength) > 0.0
+bool ready = hasVolume and not na(priceVector) and not na(volumeVector) and not na(priceSigma) and not na(volumeSigma)
+
+bool priceUp = ready and priceVector > priceBand
+bool priceDown = ready and priceVector < -priceBand
+bool priceFlat = ready and not priceUp and not priceDown
+bool volumeUp = ready and volumeVector > volumeBand
+bool volumeDown = ready and volumeVector < -volumeBand
+bool volumeFlat = ready and not volumeUp and not volumeDown
+
+var int phase = na
+int priorPhase = nz(phase[1], 1)
+int rawPhase = priorPhase
+
+if ready
+    if priceFlat
+        rawPhase := volumeUp ? 1 : volumeDown ? 5 : priorPhase
+    else if priceUp
+        rawPhase := volumeUp ? 2 : volumeDown ? 4 : 3
+    else if priceDown
+        rawPhase := volumeUp ? 8 : volumeDown ? 6 : 7
+    phase := rawPhase
+else
+    phase := na
+
+color phaseColor = f_phaseColor(phase)
+bool phaseChanged = ready and not na(phase[1]) and phase != phase[1]
+
+var int phaseAge = 0
+phaseAge := ready ? (phaseChanged ? 1 : phaseAge + 1) : 0
+
+// Normalized coordinates of the underlying Gyaku vector.
+float priceNorm = ready ? f_clamp(priceVector / math.max(priceBand, 0.000001), -4.0, 4.0) : na
+float volumeNorm = ready ? f_clamp(volumeVector / math.max(volumeBand, 0.000001), -4.0, 4.0) : na
+float energy = ready ? math.min(100.0, 20.0 * math.sqrt(priceNorm * priceNorm + volumeNorm * volumeNorm)) : na
+float confidence = ready ? math.min(100.0, energy * 0.75 + math.min(phaseAge, 10) * 2.5) : na
+
+// Positive cross-product = counter-clockwise rotation in price/volume space.
+float rotation = ready and not na(priceNorm[1]) and not na(volumeNorm[1]) ? volumeNorm[1] * priceNorm - priceNorm[1] * volumeNorm : na
+string rotationState = not ready ? "CALIBRATING" : rotation > rotationThreshold ? "COUNTER-CLOCKWISE ↺" : rotation < -rotationThreshold ? "CLOCKWISE ↻" : "VECTOR STABLE"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. SIGNAL LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+
+float trendEMA = ta.ema(close, trendLength)
+float atrValue = ta.atr(atrLength)
+float vectorDistance = math.abs(priceMA - priceBase)
+bool atrPassed = not useAtrGate or (not na(vectorDistance) and vectorDistance >= atrValue * minAtrMove)
+bool bullTrendPassed = not useTrendFilter or close > trendEMA
+bool bearTrendPassed = not useTrendFilter or close < trendEMA
+
+bool accumulationSetup = ready and phase == 1 and phase[1] == 8
+bool bullIgnitionRaw = ready and phase == 2 and (phase[1] == 1 or phase[1] == 8)
+bool distributionWarning = ready and phase == 4 and (phase[1] == 2 or phase[1] == 3)
+bool bearIgnitionRaw = ready and phase == 6 and (phase[1] == 4 or phase[1] == 5)
+
+bool bullSignal = bullIgnitionRaw and bullTrendPassed and atrPassed
+bool bearSignal = bearIgnitionRaw and bearTrendPassed and atrPassed
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. NEON PHASE DISPLAY
+// ─────────────────────────────────────────────────────────────────────────────
+
+bgcolor(showPaneGlow and ready ? color.new(phaseColor, 94) : VOID, title = "Neon phase glow")
+
+hline(8, "8 · Capitulation", color = color.new(VIOLET, 76), linestyle = hline.style_dotted)
+hline(7, "7 · Descent", color = color.new(MAGENTA, 82), linestyle = hline.style_dotted)
+hline(6, "6 · Breakdown", color = color.new(PINK, 76), linestyle = hline.style_dotted)
+hline(5, "5 · Apex", color = color.new(ORANGE, 82), linestyle = hline.style_dotted)
+hline(4, "4 · Distribution", color = color.new(GOLD, 78), linestyle = hline.style_dotted)
+hline(3, "3 · Expansion", color = color.new(LIME, 82), linestyle = hline.style_dotted)
+hline(2, "2 · Ignition", color = color.new(AQUA, 76), linestyle = hline.style_dotted)
+hline(1, "1 · Accumulation", color = color.new(CYAN, 78), linestyle = hline.style_dotted)
+hline(0, "Energy floor", color = color.new(GRID, 35))
+
+float phaseTop = ready ? phase + 0.34 : na
+float phaseBottom = ready ? phase - 0.34 : na
+phaseTopPlot = plot(phaseTop, "Phase aura top", color = color.new(phaseColor, 100), editable = false)
+phaseBottomPlot = plot(phaseBottom, "Phase aura bottom", color = color.new(phaseColor, 100), editable = false)
+fill(phaseTopPlot, phaseBottomPlot, color = showPaneGlow ? color.new(phaseColor, 82) : na, title = "Phase aura")
+
+plot(ready ? phase : na, "Phase glow", color = color.new(phaseColor, 72), linewidth = 4, style = plot.style_stepline)
+plot(ready ? phase : na, "Gyaku phase", color = phaseColor, linewidth = 2, style = plot.style_stepline)
+plotshape(phaseChanged ? phase : na, title = "Phase transition", style = shape.diamond, location = location.absolute,
+     color = WHITE, size = size.tiny)
+
+// Map both normalized vectors into the 1–8 pane without changing their signs.
+float priceVectorDisplay = ready ? 4.5 + f_clamp(priceNorm / 4.0, -1.0, 1.0) * 2.7 : na
+float volumeVectorDisplay = ready ? 4.5 + f_clamp(volumeNorm / 4.0, -1.0, 1.0) * 2.7 : na
+plot(showVectors ? priceVectorDisplay : na, "Price vector", color = color.new(CYAN, 18), linewidth = 1)
+plot(showVectors ? volumeVectorDisplay : na, "Volume vector", color = color.new(MAGENTA, 18), linewidth = 1)
+
+float energyDisplay = ready ? energy / 100.0 * 0.78 : na
+plot(showEnergy ? energyDisplay : na, "Vector energy", color = color.new(phaseColor, 34), style = plot.style_columns, histbase = 0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. PRICE-CHART SIGNALS
+// ─────────────────────────────────────────────────────────────────────────────
+
+plotshape(showChartSignals and accumulationSetup, title = "Accumulation setup glow", style = shape.circle,
+     location = location.belowbar, color = color.new(CYAN, 62), size = size.small, force_overlay = true)
+plotshape(showChartSignals and accumulationSetup, title = "Accumulation setup", style = shape.diamond,
+     location = location.belowbar, color = CYAN, text = "GW1", textcolor = VOID, size = size.tiny, force_overlay = true)
+
+plotshape(showChartSignals and bullSignal, title = "Bullish ignition glow", style = shape.circle,
+     location = location.belowbar, color = color.new(AQUA, 58), size = size.large, force_overlay = true)
+plotshape(showChartSignals and bullSignal, title = "Bullish ignition", style = shape.triangleup,
+     location = location.belowbar, color = AQUA, text = "GW+", textcolor = VOID, size = size.small, force_overlay = true)
+
+plotshape(showChartSignals and distributionWarning, title = "Distribution warning glow", style = shape.circle,
+     location = location.abovebar, color = color.new(GOLD, 62), size = size.small, force_overlay = true)
+plotshape(showChartSignals and distributionWarning, title = "Distribution warning", style = shape.diamond,
+     location = location.abovebar, color = GOLD, text = "GW4", textcolor = VOID, size = size.tiny, force_overlay = true)
+
+plotshape(showChartSignals and bearSignal, title = "Bearish ignition glow", style = shape.circle,
+     location = location.abovebar, color = color.new(PINK, 58), size = size.large, force_overlay = true)
+plotshape(showChartSignals and bearSignal, title = "Bearish ignition", style = shape.triangledown,
+     location = location.abovebar, color = PINK, text = "GW−", textcolor = WHITE, size = size.small, force_overlay = true)
+
+barcolor(colorPriceBars and ready ? color.new(phaseColor, 4) : na, title = "Gyaku phase bar color")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. FUTURISTIC INTERFACE
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Dashboard and cycle wheel share one table. TradingView does not reserve space
+// between two tables anchored on the same side of a short pane, which can make
+// top-right and bottom-right tables overlap. A single 5 × 9 interface remains
+// stable at every pane height.
+var table interface = table.new(
+     position.top_right, 5, 9,
+     bgcolor = color.new(PANEL, 4),
+     frame_color = color.new(CYAN, 35),
+     frame_width = 1,
+     border_color = color.new(GRID, 30),
+     border_width = 1
+)
+
+if barstate.islast
+    table.clear(interface, 0, 0, 4, 8)
+
+    if showDashboard
+        string statusText = ready ? "◉ ONLINE" : hasVolume ? "◌ CALIBRATING" : "× NO VOLUME"
+        color statusColor = ready ? AQUA : hasVolume ? GOLD : PINK
+
+        table.cell(interface, 0, 0, "EQUALHIGH //", text_color = CYAN, bgcolor = VOID, text_size = size.small)
+        table.cell(interface, 1, 0, "GYAKU CORE", text_color = WHITE, bgcolor = VOID, text_size = size.small)
+
+        table.cell(interface, 0, 1, "SYSTEM", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 1, statusText, text_color = statusColor, bgcolor = color.new(statusColor, 88), text_size = size.tiny)
+
+        table.cell(interface, 0, 2, "PHASE", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 2, ready ? str.tostring(phase) + " · " + f_phaseName(phase) : "—", text_color = ready ? phaseColor : MUTED,
+             bgcolor = ready ? color.new(phaseColor, 88) : PANEL, text_size = size.small)
+
+        table.cell(interface, 0, 3, "PRICE VECTOR", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 3, ready ? f_vectorArrow(priceVector, priceBand) + " " + str.tostring(priceVector, "#.##") + "%" : "—",
+             text_color = CYAN, bgcolor = PANEL, text_size = size.tiny)
+
+        table.cell(interface, 0, 4, "VOLUME VECTOR", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 4, ready ? f_vectorArrow(volumeVector, volumeBand) + " " + str.tostring(volumeVector, "#.##") + "%" : "—",
+             text_color = MAGENTA, bgcolor = PANEL, text_size = size.tiny)
+
+        table.cell(interface, 0, 5, "ENERGY / TRUST", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 5, ready ? str.tostring(energy, "#.0") + " / " + str.tostring(confidence, "#.0") : "—",
+             text_color = ready ? phaseColor : MUTED, bgcolor = PANEL, text_size = size.tiny)
+
+        table.cell(interface, 0, 6, "ROTATION", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 6, rotationState, text_color = rotation > rotationThreshold ? AQUA : rotation < -rotationThreshold ? PINK : MUTED,
+             bgcolor = PANEL, text_size = size.tiny)
+
+        table.cell(interface, 0, 7, "PHASE AGE", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 7, ready ? str.tostring(phaseAge) + " BARS" : "—", text_color = WHITE, bgcolor = PANEL, text_size = size.tiny)
+
+        table.cell(interface, 0, 8, "TACTICAL READ", text_color = MUTED, bgcolor = PANEL, text_size = size.tiny)
+        table.cell(interface, 1, 8, f_phaseAction(phase), text_color = ready ? phaseColor : MUTED,
+             bgcolor = ready ? color.new(phaseColor, 90) : PANEL, text_size = size.tiny)
+
+    // Compact 3 × 3 compass: volume increases right, price increases upward.
+    if showWheel
+        table.cell(interface, 2, 0, "P↑", text_color = CYAN, bgcolor = VOID, text_size = size.tiny)
+        table.cell(interface, 3, 0, "CYCLE", text_color = WHITE, bgcolor = VOID, text_size = size.small)
+        table.cell(interface, 4, 0, "V→", text_color = MAGENTA, bgcolor = VOID, text_size = size.tiny)
+
+        f_wheelCell(interface, 2, 2, 4, phase)
+        f_wheelCell(interface, 3, 2, 3, phase)
+        f_wheelCell(interface, 4, 2, 2, phase)
+        f_wheelCell(interface, 2, 4, 5, phase)
+        f_wheelCell(interface, 4, 4, 1, phase)
+        f_wheelCell(interface, 2, 6, 6, phase)
+        f_wheelCell(interface, 3, 6, 7, phase)
+        f_wheelCell(interface, 4, 6, 8, phase)
+
+        table.cell(interface, 3, 4, "↺\nGYAKU", text_color = WHITE, bgcolor = color.new(phaseColor, 76),
+             text_size = size.tiny, text_halign = text.align_center, text_valign = text.align_center)
+
+        table.cell(interface, 2, 8, "PRICE", text_color = color.new(CYAN, 20), bgcolor = VOID, text_size = size.tiny)
+        table.cell(interface, 3, 8, "↺", text_color = phaseColor, bgcolor = VOID, text_size = size.small)
+        table.cell(interface, 4, 8, "VOLUME", text_color = color.new(MAGENTA, 20), bgcolor = VOID, text_size = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(accumulationSetup, "GW Phase 1 — Accumulation", "Gyaku Watch entered Phase 1 after capitulation: accumulation setup.")
+alertcondition(bullSignal, "GW Phase 2 — Bullish ignition", "Gyaku Watch confirmed a filtered Phase 2 bullish ignition.")
+alertcondition(distributionWarning, "GW Phase 4 — Distribution", "Gyaku Watch entered Phase 4: bullish price with contracting volume.")
+alertcondition(bearSignal, "GW Phase 6 — Bearish ignition", "Gyaku Watch confirmed a filtered Phase 6 bearish ignition.")
+alertcondition(phaseChanged, "GW phase transition", "Gyaku Watch changed phase. Check the Neon Core dashboard.")

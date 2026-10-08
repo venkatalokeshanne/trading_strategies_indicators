@@ -1,0 +1,471 @@
+//@version=6
+strategy("Vortex Reversal Engine [forexobroker]",
+     shorttitle="VRE",
+     overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     initial_capital=10000,
+     currency=currency.USD,
+     commission_type=strategy.commission.cash_per_order,
+     commission_value=0,
+     slippage=1,
+     max_labels_count=500,
+     max_lines_count=500,
+     max_boxes_count=200)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Vortex Reversal Engine [forexobroker]
+// Mean-reversion at Bollinger Band extremes. Price touches outer band,
+// RSI confirms stretch, bullish/bearish candle triggers entry back to mean.
+// Asymmetric TP/SL for high win rate.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ INPUTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+grpStrat = "Strategy"
+bbLen      = input.int(20, "BB Length", minval=5, maxval=50, group=grpStrat)
+bbMult     = input.float(2.0, "BB Multiplier", minval=1.0, maxval=4.0, step=0.1, group=grpStrat)
+rsiLen     = input.int(14, "RSI Length", minval=2, maxval=50, group=grpStrat)
+rsiOB      = input.int(70, "RSI Overbought", minval=55, maxval=90, group=grpStrat)
+rsiOS      = input.int(30, "RSI Oversold", minval=10, maxval=45, group=grpStrat)
+adxLen     = input.int(14, "ADX Length", minval=5, maxval=50, group=grpStrat)
+adxMax     = input.float(30.0, "ADX Max (Range Filter)", minval=15, maxval=50, step=1, group=grpStrat, tooltip="Only trade when ADX is BELOW this — confirms ranging market where mean-reversion works")
+touchLookback = input.int(5, "Band Touch Lookback", minval=1, maxval=15, group=grpStrat, tooltip="How many bars back to check for BB touch")
+useVolFilter = input.bool(false, "Volume Filter", group=grpStrat)
+volMult    = input.float(1.0, "Volume Filter ×", minval=0.5, maxval=3.0, step=0.1, group=grpStrat)
+
+grpRisk = "Risk Management"
+atrLen     = input.int(14, "ATR Length", minval=5, maxval=50, group=grpRisk)
+tpATRMult  = input.float(1.0, "TP ATR Mult", minval=0.5, maxval=5.0, step=0.1, group=grpRisk, tooltip="Take profit = ATR × this (closer = higher win rate)")
+slATRMult  = input.float(3.5, "SL ATR Mult", minval=1.0, maxval=6.0, step=0.1, group=grpRisk, tooltip="Stop loss = ATR × this (wider = less likely hit at extremes)")
+usePartial = input.bool(false, "Partial Exit Mode", group=grpRisk, tooltip="ON: 50% at TP1, trail rest to TP2.")
+tp2ATRMult = input.float(3.0, "TP2 ATR Mult (partial)", minval=1.0, maxval=8.0, step=0.1, group=grpRisk)
+useTrail   = input.bool(true, "Trailing Stop (partial)", group=grpRisk)
+trailATR   = input.float(1.5, "Trail ATR Mult", minval=0.5, maxval=4.0, step=0.1, group=grpRisk)
+
+grpFilter = "Filters"
+cooldownBars   = input.int(5, "Signal Cooldown (bars)", minval=1, maxval=50, group=grpFilter)
+filterSession  = input.bool(false, "Session Filter", group=grpFilter)
+sessionChoice  = input.string("London+NY", "Session", options=["Asia", "London", "New York", "London+NY"], group=grpFilter)
+
+grpDisplay = "Display"
+showDashboard  = input.bool(true, "Show Dashboard", group=grpDisplay)
+showBB         = input.bool(true, "Show Bollinger Bands", group=grpDisplay)
+showGlow       = input.bool(true, "Show Signal Glow", group=grpDisplay)
+showTPSL       = input.bool(true, "Show SL/TP Zones", group=grpDisplay)
+showBarColor   = input.bool(true, "Color Bars", group=grpDisplay)
+tablePosition  = input.string("top_right", "Table Position", options=["top_left","top_center","top_right","bottom_left","bottom_center","bottom_right"], group=grpDisplay)
+textSizeInput  = input.string("small", "Text Size", options=["tiny","small","normal"], group=grpDisplay)
+
+grpCol = "Colors"
+neonBull    = input.color(#00E676, "Neon Bull", group=grpCol)
+neonBear    = input.color(#FF1744, "Neon Bear", group=grpCol)
+tpColor     = input.color(#00B0FF, "TP", group=grpCol)
+tp2Color    = input.color(#FFD740, "TP2", group=grpCol)
+slColor     = input.color(#FF4081, "Stop Loss", group=grpCol)
+bbColor     = input.color(#E040FB, "BB Bands", group=grpCol)
+neutralCol  = input.color(#787B86, "Neutral", group=grpCol)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ THEME + HELPERS                                                         │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+bool isDark = color.r(chart.bg_color) < 128
+headerBg   = isDark ? #2A2E39 : #E8E8E8
+headerText = isDark ? #D1D4DC : #333333
+cellBg     = isDark ? #1E222D : #F5F5F5
+borderCol  = isDark ? #363A45 : #D0D0D0
+titleBg    = #4A148C
+titleText  = color.white
+
+getTablePos() =>
+    switch tablePosition
+        "top_left"      => position.top_left
+        "top_center"    => position.top_center
+        "top_right"     => position.top_right
+        "bottom_left"   => position.bottom_left
+        "bottom_center" => position.bottom_center
+        => position.bottom_right
+
+getTextSize() =>
+    switch textSizeInput
+        "tiny"   => size.tiny
+        "small"  => size.small
+        => size.normal
+
+pipSize = syminfo.mintick * (str.contains(syminfo.ticker, "JPY") ? 100 : 10)
+
+// Session
+utcHour    = hour(time, "UTC")
+inAsia     = utcHour >= 0 and utcHour < 8
+inLondon   = utcHour >= 8 and utcHour < 16
+inNY       = utcHour >= 13 and utcHour < 22
+sessionOK  = not filterSession or (sessionChoice == "Asia" and inAsia) or (sessionChoice == "London" and inLondon) or (sessionChoice == "New York" and inNY) or (sessionChoice == "London+NY" and (inLondon or inNY))
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ CORE CALCULATIONS                                                       │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// Bollinger Bands
+bbBasis = ta.sma(close, bbLen)
+bbDev   = ta.stdev(close, bbLen) * bbMult
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = (bbUpper - bbLower) / bbBasis * 100
+
+// RSI
+rsiVal = ta.rsi(close, rsiLen)
+
+// ATR + Volume
+atrVal = ta.atr(atrLen)
+volSMA = ta.sma(volume, 20)
+volOK  = not useVolFilter or volume > volSMA * volMult
+
+// ADX — anti-trend filter (mean reversion works best in RANGING markets)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+isRanging = adxVal < adxMax
+
+// ── BB BAND TOUCH (recent, not just current bar) ──
+// Check if price touched the outer band within the last N bars
+touchedLower = nz(ta.barssince(low <= bbLower), 999) <= touchLookback
+touchedUpper = nz(ta.barssince(high >= bbUpper), 999) <= touchLookback
+
+// ── RSI EXTREME (recently stretched) ──
+// RSI was in oversold/overbought zone recently
+rsiWasOS = nz(ta.barssince(rsiVal < rsiOS), 999) <= touchLookback
+rsiWasOB = nz(ta.barssince(rsiVal > rsiOB), 999) <= touchLookback
+
+// Current RSI position — must be recovering (not still falling/rising)
+rsiRecoveringBull = rsiVal > rsiVal[1] and rsiVal < 55
+rsiRecoveringBear = rsiVal < rsiVal[1] and rsiVal > 45
+
+// ── REVERSAL CANDLE ──
+// Simple but effective: close vs open + close position in bar
+bullCandle = close > open and close > (high + low) / 2
+bearCandle = close < open and close < (high + low) / 2
+
+// ── PRICE RECOVERING FROM EXTREME ──
+// For longs: price was at/below lower BB recently, now closing back above it, still below basis (room to revert)
+bullRecovery = close > bbLower and close < bbBasis and touchedLower
+// For shorts: price was at/above upper BB recently, now closing back below it, still above basis (room to revert)
+bearRecovery = close < bbUpper and close > bbBasis and touchedUpper
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ SIGNAL DETECTION                                                        │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var int lastLongBar  = -999
+var int lastShortBar = -999
+noPosition = strategy.position_size == 0
+
+// Bullish: NO active position + ranging market + touched lower BB recently + RSI was oversold + RSI recovering + bullish candle + price below basis
+longSig = noPosition and isRanging and bullRecovery and rsiWasOS and rsiRecoveringBull and bullCandle and volOK and sessionOK and barstate.isconfirmed and (bar_index - lastLongBar) >= cooldownBars and (bar_index - lastShortBar) >= cooldownBars
+
+// Bearish: NO active position + ranging market + touched upper BB recently + RSI was overbought + RSI declining + bearish candle + price above basis
+shortSig = noPosition and isRanging and bearRecovery and rsiWasOB and rsiRecoveringBear and bearCandle and volOK and sessionOK and barstate.isconfirmed and (bar_index - lastShortBar) >= cooldownBars and (bar_index - lastLongBar) >= cooldownBars
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ STRATEGY EXECUTION                                                      │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var float activeSL    = na
+var float activeTP    = na
+var float activeTP2   = na
+var float activeEntry = na
+var bool  activeLong  = false
+var bool  hasPosition = false
+
+if longSig
+    lastLongBar := bar_index
+    float entryP = close
+    float tpDist = atrVal * tpATRMult
+    float slDist = atrVal * slATRMult
+    float slP    = entryP - slDist
+    float tpP    = entryP + tpDist
+    float tp2P   = entryP + atrVal * tp2ATRMult
+
+    strategy.entry("Long", strategy.long)
+    if usePartial
+        strategy.exit("LX1", "Long", qty_percent=50, limit=tpP, stop=slP)
+        if useTrail
+            strategy.exit("LX2", "Long", limit=tp2P, stop=slP, trail_points=math.round(atrVal * trailATR / syminfo.mintick), trail_offset=math.round(atrVal * trailATR / syminfo.mintick))
+        else
+            strategy.exit("LX2", "Long", limit=tp2P, stop=slP)
+    else
+        strategy.exit("LX", "Long", limit=tpP, stop=slP)
+
+    activeSL    := slP
+    activeTP    := tpP
+    activeTP2   := usePartial ? tp2P : tpP
+    activeEntry := entryP
+    activeLong  := true
+    hasPosition := true
+
+if shortSig
+    lastShortBar := bar_index
+    float entryP = close
+    float tpDist = atrVal * tpATRMult
+    float slDist = atrVal * slATRMult
+    float slP    = entryP + slDist
+    float tpP    = entryP - tpDist
+    float tp2P   = entryP - atrVal * tp2ATRMult
+
+    strategy.entry("Short", strategy.short)
+    if usePartial
+        strategy.exit("SX1", "Short", qty_percent=50, limit=tpP, stop=slP)
+        if useTrail
+            strategy.exit("SX2", "Short", limit=tp2P, stop=slP, trail_points=math.round(atrVal * trailATR / syminfo.mintick), trail_offset=math.round(atrVal * trailATR / syminfo.mintick))
+        else
+            strategy.exit("SX2", "Short", limit=tp2P, stop=slP)
+    else
+        strategy.exit("SX", "Short", limit=tpP, stop=slP)
+
+    activeSL    := slP
+    activeTP    := tpP
+    activeTP2   := usePartial ? tp2P : tpP
+    activeEntry := entryP
+    activeLong  := false
+    hasPosition := true
+
+if strategy.position_size == 0
+    hasPosition := false
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ FANCY VISUALS                                                           │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+// === Bollinger Bands with Neon Glow ===
+upperPlot = plot(showBB ? bbUpper : na, "BB Upper", color=color.new(bbColor, 30), linewidth=2)
+basisPlot = plot(showBB ? bbBasis : na, "BB Basis", color=color.new(neutralCol, 50), linewidth=1, style=plot.style_circles)
+lowerPlot = plot(showBB ? bbLower : na, "BB Lower", color=color.new(bbColor, 30), linewidth=2)
+
+// BB fill: shows which half of BB price is in
+bbFillUpper = close > bbBasis ? color.new(neonBear, 88) : color.new(neutralCol, 95)
+bbFillLower = close < bbBasis ? color.new(neonBull, 88) : color.new(neutralCol, 95)
+fill(upperPlot, basisPlot, color=showBB ? bbFillUpper : na, title="BB Upper Fill")
+fill(basisPlot, lowerPlot, color=showBB ? bbFillLower : na, title="BB Lower Fill")
+
+// === Signal Glow ===
+plotshape(longSig and showGlow, "Long Glow", shape.circle, location.belowbar, color.new(neonBull, 80), size=size.huge)
+plotshape(shortSig and showGlow, "Short Glow", shape.circle, location.abovebar, color.new(neonBear, 80), size=size.huge)
+
+// === Primary Signals ===
+plotshape(longSig, "BUY", shape.triangleup, location.belowbar, neonBull, size=size.normal, text="BUY", textcolor=neonBull)
+plotshape(shortSig, "SELL", shape.triangledown, location.abovebar, neonBear, size=size.normal, text="SELL", textcolor=neonBear)
+
+// === Confirmation Dots ===
+plotshape(longSig, "Bull Dot", shape.circle, location.belowbar, color.new(#00E5FF, 0), size=size.tiny)
+plotshape(shortSig, "Bear Dot", shape.circle, location.abovebar, color.new(#FF6D00, 0), size=size.tiny)
+
+// === SL/TP Zone Boxes ===
+if longSig and showTPSL
+    box.new(bar_index, activeEntry, bar_index + 20, activeSL, border_color=color.new(slColor, 30), bgcolor=color.new(slColor, 90), border_width=1, border_style=line.style_dashed)
+    box.new(bar_index, activeEntry, bar_index + 20, activeTP, border_color=color.new(tpColor, 30), bgcolor=color.new(tpColor, 92), border_width=1, border_style=line.style_dotted)
+    line.new(bar_index, activeSL, bar_index + 25, activeSL, color=slColor, style=line.style_dashed, width=2)
+    line.new(bar_index, activeTP, bar_index + 25, activeTP, color=tpColor, style=line.style_dotted, width=2)
+    line.new(bar_index, activeEntry, bar_index + 25, activeEntry, color=neonBull, style=line.style_solid, width=1)
+    label.new(bar_index + 26, activeSL, "SL " + str.tostring(math.abs(activeEntry - activeSL) / pipSize, "#.#") + "p", color=color.new(slColor, 50), textcolor=slColor, style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + 26, activeTP, "TP " + str.tostring(math.abs(activeTP - activeEntry) / pipSize, "#.#") + "p", color=color.new(tpColor, 50), textcolor=tpColor, style=label.style_label_left, size=size.tiny)
+    if usePartial
+        box.new(bar_index, activeTP, bar_index + 20, activeTP2, border_color=color.new(tp2Color, 30), bgcolor=color.new(tp2Color, 92), border_width=1, border_style=line.style_dotted)
+        line.new(bar_index, activeTP2, bar_index + 25, activeTP2, color=tp2Color, style=line.style_dotted, width=2)
+        label.new(bar_index + 26, activeTP2, "TP2 " + str.tostring(math.abs(activeTP2 - activeEntry) / pipSize, "#.#") + "p", color=color.new(tp2Color, 50), textcolor=tp2Color, style=label.style_label_left, size=size.tiny)
+
+if shortSig and showTPSL
+    box.new(bar_index, activeSL, bar_index + 20, activeEntry, border_color=color.new(slColor, 30), bgcolor=color.new(slColor, 90), border_width=1, border_style=line.style_dashed)
+    box.new(bar_index, activeEntry, bar_index + 20, activeTP, border_color=color.new(tpColor, 30), bgcolor=color.new(tpColor, 92), border_width=1, border_style=line.style_dotted)
+    line.new(bar_index, activeSL, bar_index + 25, activeSL, color=slColor, style=line.style_dashed, width=2)
+    line.new(bar_index, activeTP, bar_index + 25, activeTP, color=tpColor, style=line.style_dotted, width=2)
+    line.new(bar_index, activeEntry, bar_index + 25, activeEntry, color=neonBear, style=line.style_solid, width=1)
+    label.new(bar_index + 26, activeSL, "SL " + str.tostring(math.abs(activeSL - activeEntry) / pipSize, "#.#") + "p", color=color.new(slColor, 50), textcolor=slColor, style=label.style_label_left, size=size.tiny)
+    label.new(bar_index + 26, activeTP, "TP " + str.tostring(math.abs(activeEntry - activeTP) / pipSize, "#.#") + "p", color=color.new(tpColor, 50), textcolor=tpColor, style=label.style_label_left, size=size.tiny)
+    if usePartial
+        box.new(bar_index, activeTP, bar_index + 20, activeTP2, border_color=color.new(tp2Color, 30), bgcolor=color.new(tp2Color, 92), border_width=1, border_style=line.style_dotted)
+        line.new(bar_index, activeTP2, bar_index + 25, activeTP2, color=tp2Color, style=line.style_dotted, width=2)
+        label.new(bar_index + 26, activeTP2, "TP2 " + str.tostring(math.abs(activeEntry - activeTP2) / pipSize, "#.#") + "p", color=color.new(tp2Color, 50), textcolor=tp2Color, style=label.style_label_left, size=size.tiny)
+
+// === Bar Coloring ===
+posBarCol = strategy.position_size > 0 ? neonBull : strategy.position_size < 0 ? neonBear : na
+extremeCol = touchedLower and rsiWasOS ? color.new(neonBull, 60) : touchedUpper and rsiWasOB ? color.new(neonBear, 60) : na
+barcolor(showBarColor ? (not na(posBarCol) ? posBarCol : extremeCol) : na, title="Bar Color")
+
+// === Position Background ===
+bgcolor(strategy.position_size > 0 ? color.new(neonBull, 95) : strategy.position_size < 0 ? color.new(neonBear, 95) : na, title="Position BG")
+
+// === Reversal Zone Background ===
+bgcolor(touchedLower and rsiWasOS and strategy.position_size == 0 ? color.new(neonBull, 93) : touchedUpper and rsiWasOB and strategy.position_size == 0 ? color.new(neonBear, 93) : na, title="Reversal Zone BG")
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ PERFORMANCE TRACKING                                                    │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+var int   totalTrades  = 0
+var int   winCount     = 0
+var int   lossCount    = 0
+var float totalPips    = 0.0
+var float grossWin     = 0.0
+var float grossLoss    = 0.0
+var float maxWinPips   = 0.0
+var float maxLossPips  = 0.0
+var int   maxWStreak   = 0
+var int   maxLStreak   = 0
+var int   curStreak    = 0
+
+newTrade = strategy.closedtrades != nz(strategy.closedtrades[1])
+
+if newTrade and barstate.isconfirmed
+    totalTrades += 1
+    int lastIdx = strategy.closedtrades - 1
+    float entryP = strategy.closedtrades.entry_price(lastIdx)
+    float exitP  = strategy.closedtrades.exit_price(lastIdx)
+    bool  isLong = strategy.closedtrades.size(lastIdx) > 0
+    float pips   = isLong ? (exitP - entryP) / pipSize : (entryP - exitP) / pipSize
+    totalPips += pips
+
+    if pips > 0
+        winCount  += 1
+        grossWin  += pips
+        maxWinPips := math.max(maxWinPips, pips)
+        curStreak  := curStreak > 0 ? curStreak + 1 : 1
+        maxWStreak := math.max(maxWStreak, curStreak)
+    else
+        lossCount  += 1
+        grossLoss  += math.abs(pips)
+        maxLossPips := math.max(maxLossPips, math.abs(pips))
+        curStreak   := curStreak < 0 ? curStreak - 1 : -1
+        maxLStreak  := math.max(maxLStreak, math.abs(curStreak))
+
+winRate      = totalTrades > 0 ? winCount * 100.0 / totalTrades : 0.0
+profitFactor = grossLoss > 0 ? grossWin / grossLoss : grossWin > 0 ? 999.0 : 0.0
+expectancy   = totalTrades > 0 ? totalPips / totalTrades : 0.0
+avgWin       = winCount > 0 ? grossWin / winCount : 0.0
+avgLoss      = lossCount > 0 ? grossLoss / lossCount : 0.0
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DATA WINDOW                                                             │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+plot(totalPips,          "Total Pips",    display=display.data_window)
+plot(winRate,            "Win Rate %",    display=display.data_window)
+plot(profitFactor,       "Profit Factor", display=display.data_window)
+plot(expectancy,         "Expectancy",    display=display.data_window)
+plot(totalTrades * 1.0,  "Trades",        display=display.data_window)
+plot(strategy.netprofit, "Net Profit",    display=display.data_window)
+plot(rsiVal,             "RSI",           display=display.data_window)
+plot(adxVal,             "ADX",           display=display.data_window)
+plot(bbWidth,            "BB Width %",    display=display.data_window)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ DASHBOARD                                                               │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+if showDashboard and barstate.islast
+    var table dash = table.new(getTablePos(), 4, 15, border_width=1, border_color=borderCol, frame_width=2, frame_color=borderCol)
+    tSz = getTextSize()
+    int row = 0
+
+    // Title
+    table.cell(dash, 0, row, "🌀 VORTEX", text_color=color.new(#E040FB, 0), bgcolor=titleBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "REVERSAL", text_color=color.new(#00E5FF, 0), bgcolor=titleBg, text_size=tSz)
+    table.cell(dash, 2, row, "ENGINE", text_color=color.new(#FFD740, 0), bgcolor=titleBg, text_size=tSz)
+    table.cell(dash, 3, row, "forexobroker", text_color=titleText, bgcolor=titleBg, text_size=tSz)
+    row += 1
+
+    // Market State
+    bbState = bbWidth < 3 ? "SQUEEZE" : bbWidth < 6 ? "NORMAL" : "WIDE"
+    bbStateCol = bbWidth < 3 ? color.new(#FFD740, 0) : bbWidth < 6 ? neutralCol : color.new(#E040FB, 0)
+    adxState = isRanging ? "RANGE" : "TREND"
+    adxCol = isRanging ? neonBull : neonBear
+    rsiState = rsiVal > rsiOB ? "OVERBOUGHT" : rsiVal < rsiOS ? "OVERSOLD" : "NEUTRAL"
+    rsiCol = rsiVal > rsiOB ? neonBear : rsiVal < rsiOS ? neonBull : neutralCol
+    table.cell(dash, 0, row, "BB:" + bbState, text_color=bbStateCol, bgcolor=color.new(bbStateCol, 30), text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "ADX:" + str.tostring(adxVal, "#") + " " + adxState, text_color=adxCol, bgcolor=color.new(bbStateCol, 30), text_size=tSz)
+    table.cell(dash, 2, row, "RSI:" + str.tostring(rsiVal, "#"), text_color=rsiCol, bgcolor=color.new(bbStateCol, 30), text_size=tSz)
+    table.cell(dash, 3, row, rsiState, text_color=rsiCol, bgcolor=color.new(bbStateCol, 30), text_size=tSz)
+    row += 1
+
+    // Performance header
+    table.cell(dash, 0, row, "PERFORMANCE", text_color=titleText, bgcolor=color.new(#00B0FF, 30), text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "", bgcolor=color.new(#00B0FF, 30), text_size=tSz)
+    table.cell(dash, 2, row, "", bgcolor=color.new(#00B0FF, 30), text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=color.new(#00B0FF, 30), text_size=tSz)
+    row += 1
+
+    table.cell(dash, 0, row, "Trades", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, str.tostring(totalTrades), text_color=headerText, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "W:" + str.tostring(winCount), text_color=neonBull, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "L:" + str.tostring(lossCount), text_color=neonBear, bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    wrCol = winRate >= 75 ? neonBull : winRate >= 60 ? color.new(#FFD740, 0) : winRate >= 50 ? neutralCol : neonBear
+    table.cell(dash, 0, row, "Win Rate", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, str.tostring(winRate, "#.#") + "%", text_color=wrCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, winRate >= 80 ? "ELITE" : winRate >= 70 ? "STRONG" : winRate >= 60 ? "GOOD" : "LOW", text_color=wrCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    pfCol = profitFactor >= 2.0 ? neonBull : profitFactor >= 1.5 ? color.new(#FFD740, 0) : profitFactor >= 1.0 ? neutralCol : neonBear
+    table.cell(dash, 0, row, "Profit Factor", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, str.tostring(profitFactor, "#.##"), text_color=pfCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, profitFactor >= 2.0 ? "STRONG" : profitFactor >= 1.5 ? "GOOD" : profitFactor >= 1.0 ? "WEAK" : "NEG", text_color=pfCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    pipCol = totalPips >= 0 ? neonBull : neonBear
+    table.cell(dash, 0, row, "Total Pips", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, (totalPips >= 0 ? "+" : "") + str.tostring(totalPips, "#.#"), text_color=pipCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "Avg:" + str.tostring(expectancy, "#.#"), text_color=expectancy >= 0 ? neonBull : neonBear, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    npCol = strategy.netprofit >= 0 ? neonBull : neonBear
+    table.cell(dash, 0, row, "Net Profit", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "$" + str.tostring(strategy.netprofit, "#.##"), text_color=npCol, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "", bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    table.cell(dash, 0, row, "Avg W/L", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, str.tostring(avgWin, "#.#") + "p", text_color=neonBull, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, str.tostring(avgLoss, "#.#") + "p", text_color=neonBear, bgcolor=cellBg, text_size=tSz)
+    rrRatio = avgLoss > 0 ? avgWin / avgLoss : 0.0
+    table.cell(dash, 3, row, "R:" + str.tostring(rrRatio, "#.##"), text_color=rrRatio >= 0.5 ? neonBull : neutralCol, bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    table.cell(dash, 0, row, "Best/Worst", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "+" + str.tostring(maxWinPips, "#.#") + "p", text_color=neonBull, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "-" + str.tostring(maxLossPips, "#.#") + "p", text_color=neonBear, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    table.cell(dash, 0, row, "Streaks", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "W:" + str.tostring(maxWStreak), text_color=neonBull, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "L:" + str.tostring(maxLStreak), text_color=neonBear, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    table.cell(dash, 0, row, "Max DD", text_color=headerText, bgcolor=headerBg, text_size=tSz, text_halign=text.align_left)
+    table.cell(dash, 1, row, "$" + str.tostring(strategy.max_drawdown, "#.##"), text_color=neonBear, bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 2, row, "", bgcolor=cellBg, text_size=tSz)
+    table.cell(dash, 3, row, "", bgcolor=cellBg, text_size=tSz)
+    row += 1
+
+    // Active position
+    if hasPosition
+        table.cell(dash, 0, row, "ACTIVE", text_color=titleText, bgcolor=color.new(activeLong ? neonBull : neonBear, 20), text_size=tSz, text_halign=text.align_left)
+        table.cell(dash, 1, row, activeLong ? "LONG" : "SHORT", text_color=activeLong ? neonBull : neonBear, bgcolor=color.new(activeLong ? neonBull : neonBear, 20), text_size=tSz)
+        float curPips = activeLong ? (close - activeEntry) / pipSize : (activeEntry - close) / pipSize
+        table.cell(dash, 2, row, (curPips >= 0 ? "+" : "") + str.tostring(curPips, "#.#") + "p", text_color=curPips >= 0 ? neonBull : neonBear, bgcolor=color.new(activeLong ? neonBull : neonBear, 20), text_size=tSz)
+        table.cell(dash, 3, row, "", bgcolor=color.new(activeLong ? neonBull : neonBear, 20), text_size=tSz)
+
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ALERTS                                                                  │
+// └──────────────────────────────────────────────────────────────────────────┘
+
+alertcondition(longSig,  "Bullish Reversal",  "VRE: BUY - reversal at lower BB extreme")
+alertcondition(shortSig, "Bearish Reversal", "VRE: SELL - reversal at upper BB extreme")
+alertcondition(longSig or shortSig, "Any Reversal", "VRE: Reversal signal detected")
+alertcondition(touchedLower and rsiWasOS, "Oversold Zone", "VRE: Price at lower BB + RSI oversold")
+alertcondition(touchedUpper and rsiWasOB, "Overbought Zone", "VRE: Price at upper BB + RSI overbought")

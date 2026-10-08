@@ -1,0 +1,526 @@
+//shitholed April 2026
+//Update v38: Integrated Full 21-Row Performance Dashboard & frozen end-date metrics.
+//@version=6
+strategy("0 Anchored VWAP Strategy - Full Suite v38", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, commission_type=strategy.commission.percent, commission_value=0.01, calc_on_every_tick=true, process_orders_on_close=true)
+
+// --- Colors & Constants ---
+kcolor = #0094FF
+dcolor = #FF6A00
+
+WMA = "WMA", EMA = "EMA", SMA = "SMA", VWMA = "VWMA", VAWMA = "VAWMA"
+
+///////////////////////////////////////////////////
+// Inputs
+
+// Backtest Period
+groupDate   = "Backtest Period"
+startYear   = input.int(1970, "Start Year", group=groupDate)
+startMonth  = input.int(1, "Start Month", minval=1, maxval=12, group=groupDate)
+startDay    = input.int(1, "Start Day", minval=1, maxval=31, group=groupDate)
+
+endYear     = input.int(2030, "End Year", group=groupDate)
+endMonth    = input.int(12, "End Month", minval=1, maxval=12, group=groupDate)
+endDay      = input.int(31, "End Day", minval=1, maxval=31, group=groupDate)
+
+// VWAP & RSI/Stoch Settings
+useHiLow      = input.bool(false, "Use High/Low instead of HLC3", group="Anchored VWAP")
+useOpen       = input.bool(false, "Use Open instead of Close for Alerts", group="Anchored VWAP") 
+
+k_mode        = input.string(EMA, "K Mode", group="Stochastic RSI", options=[SMA, EMA, WMA, VWMA, VAWMA]) 
+src           = input.source(hlc3, "Source", group="Stochastic RSI")
+smoothK       = input.int(3, "K Smoothing", group="Stochastic RSI", minval=1) 
+smoothD       = input.int(2, "D Smoothing", group="Stochastic RSI", minval=1) 
+
+lengthRSI     = input.int(64, "RSI Length", group="Lengths", minval=1)
+lengthStoch   = input.int(47, "Stochastic Length", group="Lengths", minval=1)
+
+lowerBand     = input.int(20, "Lower Band", group="Band", maxval=50)
+upperBand     = input.int(80, "Upper Band", group="Band", minval=50)
+
+lowerReversal = input.int(20, "Lower Reversal", group="Reversal")
+upperReversal = input.int(80, "Upper Reversal", group="Reversal")
+
+// --- Advanced Filters & Exits ---
+groupAdv = "Advanced Filters & Exits"
+
+useTrendFilter = input.bool(false, "Enable Trend Filter", group=groupAdv)
+trendType      = input.string("EMA", "Trend MA Type", options=["SMA", "EMA"], group=groupAdv)
+trendLength    = input.int(250, "Trend MA Length", step=5, group=groupAdv)
+trendTF        = input.timeframe("", "Trend Timeframe (empty = Chart, '1D' = always Daily)", group=groupAdv)
+
+useVolConfirm  = input.bool(false, "Volume Confirmation", group=groupAdv, tooltip="Breakout must occur with above-average volume.")
+volLength      = input.int(20, "Volume SMA Length", group=groupAdv)
+volMult        = input.float(1.5, "Volume Multiplier (e.g., 1.5 for +50%)", step=0.1, group=groupAdv)
+
+useShorts      = input.bool(false, "Allow Short Trades", group=groupAdv)
+
+useATRStop     = input.bool(false, "Enable ATR Stop-Loss", group=groupAdv)
+atrLength      = input.int(14, "ATR Length", group=groupAdv)
+atrMult        = input.float(2.0, "ATR Multiplier", step=0.1, group=groupAdv)
+
+usePartialTP   = input.bool(false, "Enable Partial Take Profit", group=groupAdv)
+tpPercent      = input.float(5.0, "Take Profit Target in %", step=0.5, group=groupAdv)
+tpQtyPercent   = input.int(50, "What % of position to sell there?", minval=1, maxval=100, group=groupAdv)
+
+// Cooldowns & Holding Times
+useCooldown       = input.bool(true, "Enable Cooldown After Sale", group=groupAdv, tooltip="Pauses new entries for X bars after any trade is closed.")
+cooldownBars      = input.int(8, "Cooldown in Bars", minval=1, group=groupAdv)
+
+useMinHold        = input.bool(false, "Enable Minimum Hold Time", group=groupAdv, tooltip="Prevents regular VWAP exits for X bars after opening a position (Stop-Losses remain active!).")
+minHoldBars       = input.int(1, "Minimum Hold in Bars", minval=1, group=groupAdv)
+
+// Performance Visualization & UI
+showPanel     = input.bool(true, title='Show Statistical Panel', group="Performance Visualization")
+dashPosInput  = input.string("Bottom Right", title="Dashboard Position", options=["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], group="Performance Visualization")
+showRelPerf   = input.bool(false, "Show Strategy Equity Curve (Yellow) on Chart", group="Performance Visualization", tooltip="Shows the simulated price curve of the strategy on the main chart. Starts exactly at the start price of the backtest period to allow direct comparisons.")
+
+///////////////////////////////////////////////////
+// Time Filter
+startDate   = timestamp(startYear, startMonth, startDay, 0, 0)
+endDate     = timestamp(endYear, endMonth, endDay, 23, 59)
+inDateRange = time >= startDate and time <= endDate
+
+///////////////////////////////////////////////////
+// Functions
+
+vawma(series float src, simple int len) =>
+    float sum = 0.0
+    float vol = 0.0
+    for m = 1 to len 
+        int i = len - m
+        float v = volume[i] * m
+        vol += v
+        sum += src[i] * v
+    sum / vol
+
+getMA(series float series, simple string mode, simple int len) =>
+    mode == WMA   ? ta.wma(series, len) :
+      mode == EMA ? ta.ema(series, len) :
+      mode == VWMA ? ta.vwma(series, len) :
+      mode == VAWMA ? vawma(series, len) :
+      ta.sma(series, len)
+
+///////////////////////////////////////////////////
+// Calculations
+
+rsi1  = ta.rsi(src, lengthRSI)
+stoch = ta.stoch(rsi1, rsi1, rsi1, lengthStoch)
+k     = getMA(stoch, k_mode, smoothK)
+d     = ta.sma(k, smoothD)
+
+var float hi = high
+var float lo = low
+var float phi = high
+var float plo = low
+var int state = 0
+
+var float hiAVWAP_s = 0.0
+var float loAVWAP_s = 0.0
+var float hiAVWAP_v = 0.0
+var float loAVWAP_v = 0.0
+var float hiAVWAP_s_next = 0.0
+var float loAVWAP_s_next = 0.0
+var float hiAVWAP_v_next = 0.0
+var float loAVWAP_v_next = 0.0
+
+if (d < lowerBand or high > phi)
+    phi := high
+    hiAVWAP_s_next := 0.0
+    hiAVWAP_v_next := 0.0
+if (d > upperBand or low < plo)
+    plo := low
+    loAVWAP_s_next := 0.0
+    loAVWAP_v_next := 0.0
+
+if (high > hi)
+    hi := high
+    hiAVWAP_s := 0.0
+    hiAVWAP_v := 0.0    
+if (low < lo)
+    lo := low
+    loAVWAP_s := 0.0
+    loAVWAP_v := 0.0
+
+float vwapHi = useHiLow ? high : hlc3
+float vwapLo = useHiLow ? low : hlc3
+    
+hiAVWAP_s += vwapHi * volume
+loAVWAP_s += vwapLo * volume
+hiAVWAP_v += volume
+loAVWAP_v += volume
+hiAVWAP_s_next += vwapHi * volume
+loAVWAP_s_next += vwapLo * volume
+hiAVWAP_v_next += volume
+loAVWAP_v_next += volume
+
+if (state != -1 and d < lowerBand)
+    state := -1
+else if (state != +1 and d > upperBand)
+    state := +1
+
+if (hi > phi and state == +1 and k < d and k < lowerReversal)
+    hi := phi
+    hiAVWAP_s := hiAVWAP_s_next
+    hiAVWAP_v := hiAVWAP_v_next
+if (lo < plo and state == -1 and k > d and k > upperReversal)
+    lo := plo
+    loAVWAP_s := loAVWAP_s_next
+    loAVWAP_v := loAVWAP_v_next
+    
+float hiAVWAP = hiAVWAP_s / hiAVWAP_v
+float loAVWAP = loAVWAP_s / loAVWAP_v
+float hiAVWAP_next = hiAVWAP_s_next / hiAVWAP_v_next
+float loAVWAP_next = loAVWAP_s_next / loAVWAP_v_next
+    
+// Plot VWAP Lines
+plot(hiAVWAP_next, "High Next", color.new(color.red, 75), 1, style=plot.style_circles)
+plot(loAVWAP_next, "Low Next", color.new(color.green, 75), 1, style=plot.style_circles)
+plot(hiAVWAP, "High VWAP", color.new(color.red, 50), 2, style=plot.style_circles)
+plot(loAVWAP, "Low VWAP", color.new(color.green, 50), 2, style=plot.style_circles)
+
+float alertValue = useOpen ? open : close
+float resistance = alertValue - hiAVWAP
+float support    = alertValue - loAVWAP
+
+
+///////////////////////////////////////////////////
+// Advanced Indicators for Strategy Logic
+
+// Trend Filter (MTF capable)
+getTrendMA() =>
+    trendType == "EMA" ? ta.ema(close, trendLength) : ta.sma(close, trendLength)
+
+string currentTF = trendTF == "" ? timeframe.period : trendTF
+float trendMA = request.security(syminfo.tickerid, currentTF, getTrendMA())
+
+bool isTrendUp = useTrendFilter ? close > trendMA : true
+bool isTrendDn = useTrendFilter ? close < trendMA : true
+
+// Volume Filter
+bool isVolConfirm = useVolConfirm ? volume > (ta.sma(volume, volLength) * volMult) : true
+
+// ATR Stop
+float atr = ta.atr(atrLength)
+var float longStopPrice = 0.0
+var float shortStopPrice = 0.0
+
+// --- Cooldown Trackers ---
+// Exit Tracker
+var int lastExitBar = 0
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    lastExitBar := bar_index
+
+// Entry Tracker (for Minimum Hold Time)
+var int lastEntryBar = 0
+bool isNewEntry = (strategy.position_size != 0 and nz(strategy.position_size[1]) == 0) or (strategy.position_size > 0 and nz(strategy.position_size[1]) < 0) or (strategy.position_size < 0 and nz(strategy.position_size[1]) > 0)
+if isNewEntry
+    lastEntryBar := bar_index
+
+bool isCooldownActive = useCooldown and (lastExitBar > 0) and (bar_index - lastExitBar < cooldownBars)
+
+bool goLong  = resistance > 0 and inDateRange and isTrendUp and isVolConfirm and not isCooldownActive
+bool goShort = support < 0 and inDateRange and isTrendDn and isVolConfirm and useShorts and not isCooldownActive
+
+///////////////////////////////////////////////////
+// Strategy Logic & Exits
+
+// 1. Entries & Stop-Loss Calculation on Entry
+if goLong and strategy.position_size <= 0
+    longStopPrice := close - (atr * atrMult)
+    strategy.entry("Long", strategy.long, comment="Breakout Up")
+
+if goShort and strategy.position_size >= 0
+    shortStopPrice := close + (atr * atrMult)
+    strategy.entry("Short", strategy.short, comment="Breakout Dn")
+
+// 2. Normal VWAP Exits (Protected by Minimum Hold Time)
+bool canRegularExit = not useMinHold or (bar_index - lastEntryBar >= minHoldBars)
+
+if support < 0 and strategy.position_size > 0 and canRegularExit
+    strategy.close("Long", comment="VWAP Exit Long")
+
+if resistance > 0 and strategy.position_size < 0 and canRegularExit
+    strategy.close("Short", comment="VWAP Exit Short")
+
+// 3. Advanced Stop-Loss & Take-Profit Logic
+if strategy.position_size > 0
+    float tp_limit = strategy.position_avg_price * (1 + (tpPercent / 100))
+    
+    if usePartialTP and useATRStop
+        strategy.exit("TP/Stop L", "Long", qty_percent=tpQtyPercent, limit=tp_limit, stop=longStopPrice)
+        strategy.exit("Stop Only L", "Long", stop=longStopPrice) 
+    else if usePartialTP
+        strategy.exit("TP L", "Long", qty_percent=tpQtyPercent, limit=tp_limit)
+    else if useATRStop
+        strategy.exit("Stop L", "Long", stop=longStopPrice)
+
+if strategy.position_size < 0
+    float tp_limit_short = strategy.position_avg_price * (1 - (tpPercent / 100))
+    
+    if usePartialTP and useATRStop
+        strategy.exit("TP/Stop S", "Short", qty_percent=tpQtyPercent, limit=tp_limit_short, stop=shortStopPrice)
+        strategy.exit("Stop Only S", "Short", stop=shortStopPrice)
+    else if usePartialTP
+        strategy.exit("TP S", "Short", qty_percent=tpQtyPercent, limit=tp_limit_short)
+    else if useATRStop
+        strategy.exit("Stop S", "Short", stop=shortStopPrice)
+
+// Flatten position at the end of backtest to freeze strategy equity
+if (not inDateRange and inDateRange[1])
+    strategy.close_all(comment="End of Backtest")
+
+///////////////////////////////////////////////////
+// Metrics & Performance Calculation
+
+var float startPrice = na
+var int startTime = na
+var int actualEndTime = na
+var bool testStarted = false
+
+// Freeze variables for End of Backtest B&H logic
+var float active_close = na
+if inDateRange
+    active_close := close
+
+float final_close = not na(active_close) ? active_close : close
+
+// Exposure & Sharpe/Sortino Trackers
+var int totalBars = 0
+var int barsInTrade = 0
+var int ret_bars = 0
+var float sum_strat_ret = 0.0
+var float sum_strat_ret2 = 0.0
+var float sum_bh_ret = 0.0
+var float sum_bh_ret2 = 0.0
+var float sum_strat_neg_ret2 = 0.0
+var float sum_bh_neg_ret2 = 0.0
+
+// Check if VWAP has valid values
+bool isValidData = not na(hiAVWAP) and hiAVWAP_v > 0
+
+if inDateRange and isValidData 
+    if not testStarted
+        startPrice := close
+        startTime := time
+        testStarted := true
+    else
+        // Bar-by-Bar Returns for Risk Metrics
+        float strat_bar_ret = strategy.equity[1] > 0 ? (strategy.equity - strategy.equity[1]) / strategy.equity[1] : 0
+        float bh_bar_ret = close[1] > 0 ? (close - close[1]) / close[1] : 0
+        
+        sum_strat_ret += strat_bar_ret
+        sum_strat_ret2 += strat_bar_ret * strat_bar_ret
+        if strat_bar_ret < 0
+            sum_strat_neg_ret2 += strat_bar_ret * strat_bar_ret
+        
+        sum_bh_ret += bh_bar_ret
+        sum_bh_ret2 += bh_bar_ret * bh_bar_ret
+        if bh_bar_ret < 0
+            sum_bh_neg_ret2 += bh_bar_ret * bh_bar_ret
+        
+        ret_bars += 1
+
+    actualEndTime := time // Track the actual last time inside the backtest range
+    totalBars += 1
+    if strategy.position_size != 0
+        barsInTrade += 1
+
+float currentYears = testStarted ? (actualEndTime - startTime) / (1000 * 60 * 60 * 24 * 365.25) : 0
+
+// Time in Market
+float timeInMarketPerc = totalBars > 0 ? (barsInTrade * 100.0 / totalBars) : 0
+float timeFraction = timeInMarketPerc / 100.0
+float exposureYears = currentYears * timeFraction
+
+// Capital Deployed Tracker
+var float sum_cap_exposure = 0.0
+var float max_cap_exposure = 0.0
+float ptVal2 = (not na(syminfo.pointvalue) and syminfo.pointvalue > 0) ? syminfo.pointvalue : 1.0
+float currentInvestedCapital = math.abs(strategy.position_size) * final_close * ptVal2
+float currentCapPerc = strategy.equity > 0 ? (currentInvestedCapital / strategy.equity) * 100 : 0
+
+if inDateRange and testStarted
+    sum_cap_exposure += currentCapPerc
+    max_cap_exposure := math.max(max_cap_exposure, currentCapPerc)
+
+float avgCapExposurePerc = totalBars > 0 ? (sum_cap_exposure / totalBars) : 0
+
+// Buy & Hold (using frozen final_close)
+float bh_ret  = testStarted ? (final_close - startPrice) / startPrice * 100 : 0
+float bh_cagr = currentYears > 0 ? (math.pow(final_close / startPrice, 1 / currentYears) - 1) * 100 : 0
+
+// Buy & Hold Drawdown
+var float maxBHClose = 0.0
+var float bh_max_dd = 0.0
+var int bh_max_dd_time = na
+if inDateRange and testStarted
+    maxBHClose := math.max(maxBHClose, close)
+    float currentBHDD = maxBHClose > 0 ? ((close - maxBHClose) / maxBHClose * 100) : 0
+    if currentBHDD < bh_max_dd
+        bh_max_dd := currentBHDD
+        bh_max_dd_time := time
+
+// Strategy Standard Metrics
+float strat_ret  = (strategy.equity - strategy.initial_capital) / strategy.initial_capital * 100
+float strat_cagr = currentYears > 0 and strategy.equity > 0 ? (math.pow(strategy.equity / strategy.initial_capital, 1 / currentYears) - 1) * 100 : 0
+var float strat_max = strategy.initial_capital
+strat_max := math.max(strat_max, strategy.equity)
+float strat_dd = strat_max > 0 ? (strategy.equity - strat_max) / strat_max * 100 : 0
+var float strat_max_dd = 0.0
+var int strat_max_dd_time = na
+if (strat_dd < strat_max_dd)
+    strat_max_dd := strat_dd
+    strat_max_dd_time := time
+
+// Relative Equity (using final_close)
+float relativeEquity = testStarted ? (strategy.equity / strategy.initial_capital) / (final_close / startPrice) * 100 : 100
+
+// Normalize strategy return to the start price for the overlay chart
+float scaledEquity = testStarted ? startPrice * (strategy.equity / strategy.initial_capital) : na
+plot(showRelPerf ? scaledEquity : na, "Strategy Equity Curve", color=color.new(color.yellow, 0), linewidth=2)
+
+// Risk Metrics (Sharpe & Sortino)
+float strat_mu  = ret_bars > 0 ? sum_strat_ret / ret_bars : 0
+float strat_var = ret_bars > 0 ? (sum_strat_ret2 / ret_bars) - (strat_mu * strat_mu) : 0
+float strat_std = strat_var > 0 ? math.sqrt(strat_var) : 0
+
+float bh_mu  = ret_bars > 0 ? sum_bh_ret / ret_bars : 0
+float bh_var = ret_bars > 0 ? (sum_bh_ret2 / ret_bars) - (bh_mu * bh_mu) : 0
+float bh_std = bh_var > 0 ? math.sqrt(bh_var) : 0
+
+float bars_per_year = currentYears > 0 ? ret_bars / currentYears : 0
+float annual_factor = math.sqrt(bars_per_year)
+
+float strat_ann_vol = strat_std * annual_factor
+float bh_ann_vol    = bh_std * annual_factor
+
+float strat_sharpe = strat_ann_vol > 0 ? (strat_cagr / 100) / strat_ann_vol : na
+float bh_sharpe    = bh_ann_vol > 0 ? (bh_cagr / 100) / bh_ann_vol : na
+
+float strat_downside_var = ret_bars > 0 ? (sum_strat_neg_ret2 / ret_bars) : 0
+float strat_downside_std = math.sqrt(strat_downside_var)
+float strat_ann_downside_vol = strat_downside_std * annual_factor
+float strat_sortino = strat_ann_downside_vol > 0 ? (strat_cagr / 100) / strat_ann_downside_vol : na
+
+float bh_downside_var = ret_bars > 0 ? (sum_bh_neg_ret2 / ret_bars) : 0
+float bh_downside_std = math.sqrt(bh_downside_var)
+float bh_ann_downside_vol = bh_downside_std * annual_factor
+float bh_sortino = bh_ann_downside_vol > 0 ? (bh_cagr / 100) / bh_ann_downside_vol : na
+
+// Calmar Ratios
+float bh_calmar        = bh_max_dd < 0 ? bh_cagr / math.abs(bh_max_dd) : 0
+float strat_calmar     = strat_max_dd < 0 ? strat_cagr / math.abs(strat_max_dd) : 0
+float strat_exp_cagr   = exposureYears > 0 and strategy.equity > 0 ? (math.pow(strategy.equity / strategy.initial_capital, 1 / exposureYears) - 1) * 100 : 0
+float strat_adj_calmar = strat_max_dd < 0 ? strat_exp_cagr / math.abs(strat_max_dd) : 0
+float bh_adj_calmar    = bh_calmar // B&H is always 100% exposed
+
+// Win / Loss Metrics
+float strat_pf = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+float strat_win_rate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+float strat_avg_win = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+float strat_avg_loss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
+float strat_wl_ratio = strat_avg_loss > 0 ? strat_avg_win / strat_avg_loss : na
+
+// Market Cap
+float tso = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", "FQ", ignore_invalid_symbol=true)
+float marketCapBillion = (tso * final_close) / 1000000000
+
+
+///////////////////////////////////////////////////
+// Dashboard Table (Pro Full Suite Layout)
+
+var string dashPos = switch dashPosInput
+    "Top Right" => position.top_right
+    "Middle Right" => position.middle_right
+    "Bottom Right" => position.bottom_right
+    "Top Left" => position.top_left
+    "Middle Left" => position.middle_left
+    => position.bottom_left
+
+var table perfTable = table.new(dashPos, 3, 21, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.new(color.gray, 50))
+
+if showPanel and barstate.islastconfirmedhistory
+    table.cell(perfTable, 0, 0, "Asset / Ticker", text_color=color.white, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 1, 0, syminfo.ticker, text_color=color.yellow, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 2, 0, syminfo.currency, text_color=color.gray, bgcolor=color.new(color.blue, 80), text_size=size.small)
+
+    table.cell(perfTable, 0, 1, "Market Cap (Bln.)", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)
+    table.cell(perfTable, 1, 1, na(marketCapBillion) ? "n/a" : str.tostring(marketCapBillion, "#.##"), text_color=color.yellow, bgcolor=color.new(color.blue, 70), text_size=size.small)
+    table.cell(perfTable, 2, 1, syminfo.currency, text_color=color.gray, bgcolor=color.new(color.blue, 70), text_size=size.small)
+
+    table.cell(perfTable, 0, 2, "Chart Timeframe", text_color=color.white, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 1, 2, timeframe.period, text_color=color.yellow, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 2, 2, "-", text_color=color.gray, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    
+    table.cell(perfTable, 0, 3, "Test Period", text_color=color.white, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 1, 3, na(startTime) ? "-" : str.format("{0,date,yyyy-MM-dd}", startTime), text_color=color.yellow, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(perfTable, 2, 3, na(actualEndTime) ? "-" : str.format("{0,date,yyyy-MM-dd}", actualEndTime), text_color=color.yellow, bgcolor=color.new(color.blue, 80), text_size=size.small)
+
+    table.cell(perfTable, 0, 4, "Metric", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(perfTable, 1, 4, "Buy & Hold", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    table.cell(perfTable, 2, 4, "Strategy", text_color=color.white, bgcolor=color.new(color.gray, 80), text_size=size.small)
+    
+    table.cell(perfTable, 0, 5, "Total Return", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 5, str.tostring(bh_ret, "#.##") + "%", text_color=bh_ret >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 5, str.tostring(strat_ret, "#.##") + "%", text_color=strat_ret >= 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(perfTable, 0, 6, "CAGR (p.a.)", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 6, str.tostring(bh_cagr, "#.##") + "%", text_color=bh_cagr >= 0 ? color.green : color.red, text_size=size.small)
+    table.cell(perfTable, 2, 6, str.tostring(strat_cagr, "#.##") + "%", text_color=strat_cagr >= 0 ? color.green : color.red, text_size=size.small)
+    
+    table.cell(perfTable, 0, 7, "Max Drawdown", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 7, str.tostring(bh_max_dd, "#.##") + "%", text_color=color.red, text_size=size.small)
+    table.cell(perfTable, 2, 7, str.tostring(strat_max_dd, "#.##") + "%", text_color=color.red, text_size=size.small)
+    
+    table.cell(perfTable, 0, 8, "Date Max DD", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 8, na(bh_max_dd_time) ? "-" : str.format("{0,date,yyyy-MM-dd}", bh_max_dd_time), text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 2, 8, na(strat_max_dd_time) ? "-" : str.format("{0,date,yyyy-MM-dd}", strat_max_dd_time), text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 9, "Rel. Performance", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 9, "100.00%", text_color=color.gray, text_size=size.small)
+    table.cell(perfTable, 2, 9, str.tostring(relativeEquity, "#.##") + "%", text_color=relativeEquity >= 100 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 10, "Trades", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 10, "1", text_color=color.gray, text_size=size.small) 
+    table.cell(perfTable, 2, 10, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    
+    table.cell(perfTable, 0, 11, "Time in Market", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 11, "100.00%", text_color=color.gray, text_size=size.small) 
+    table.cell(perfTable, 2, 11, str.tostring(timeInMarketPerc, "#.##") + "%", text_color=color.white, text_size=size.small)
+
+    table.cell(perfTable, 0, 12, "Avg. Cap. Deployed", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 12, "100.00%", text_color=color.gray, text_size=size.small) 
+    table.cell(perfTable, 2, 12, str.tostring(avgCapExposurePerc, "#.##") + "%", text_color=color.yellow, text_size=size.small)
+
+    table.cell(perfTable, 0, 13, "Max. Cap. Deployed", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 13, "100.00%", text_color=color.gray, text_size=size.small) 
+    table.cell(perfTable, 2, 13, str.tostring(max_cap_exposure, "#.##") + "%", text_color=color.orange, text_size=size.small)
+
+    table.cell(perfTable, 0, 14, "Calmar Ratio", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 14, str.tostring(bh_calmar, "#.##"), text_color=bh_calmar >= 1 ? color.green : (bh_calmar > 0 ? color.white : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 14, str.tostring(strat_calmar, "#.##"), text_color=strat_calmar >= 1 ? color.green : (strat_calmar > 0 ? color.white : color.red), text_size=size.small)
+    
+    table.cell(perfTable, 0, 15, "Adj. Calmar (Time)", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 15, str.tostring(bh_adj_calmar, "#.##"), text_color=bh_adj_calmar >= 1 ? color.green : (bh_adj_calmar > 0 ? color.white : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 15, str.tostring(strat_adj_calmar, "#.##"), text_color=strat_adj_calmar >= 1 ? color.green : (strat_adj_calmar > 0 ? color.white : color.red), text_size=size.small)
+
+    table.cell(perfTable, 0, 16, "Sharpe Ratio", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 16, na(bh_sharpe) ? "n/a" : str.tostring(bh_sharpe, "#.##"), text_color=bh_sharpe >= 1 ? color.green : (bh_sharpe > 0 ? color.white : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 16, na(strat_sharpe) ? "n/a" : str.tostring(strat_sharpe, "#.##"), text_color=strat_sharpe >= 1 ? color.green : (strat_sharpe > 0 ? color.white : color.red), text_size=size.small)
+
+    table.cell(perfTable, 0, 17, "Profit Factor", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 17, "-", text_color=color.gray, text_size=size.small)
+    table.cell(perfTable, 2, 17, na(strat_pf) ? "n/a" : str.tostring(strat_pf, "#.##"), text_color=strat_pf >= 1 ? color.green : color.red, text_size=size.small)
+
+    table.cell(perfTable, 0, 18, "Win Rate", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 18, "-", text_color=color.gray, text_size=size.small)
+    table.cell(perfTable, 2, 18, str.tostring(strat_win_rate, "#.##") + "%", text_color=strat_win_rate >= 50 ? color.green : (strat_win_rate > 0 ? color.white : color.red), text_size=size.small)
+
+    table.cell(perfTable, 0, 19, "Avg W/L Ratio", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 19, "-", text_color=color.gray, text_size=size.small)
+    table.cell(perfTable, 2, 19, na(strat_wl_ratio) ? "n/a" : str.tostring(strat_wl_ratio, "#.##"), text_color=strat_wl_ratio >= 1 ? color.green : color.red, text_size=size.small)
+
+    // New Row for Sortino Ratio
+    table.cell(perfTable, 0, 20, "Sortino Ratio", text_color=color.white, text_size=size.small)
+    table.cell(perfTable, 1, 20, na(bh_sortino) ? "n/a" : str.tostring(bh_sortino, "#.##"), text_color=bh_sortino >= 1 ? color.green : (bh_sortino > 0 ? color.white : color.red), text_size=size.small)
+    table.cell(perfTable, 2, 20, na(strat_sortino) ? "n/a" : str.tostring(strat_sortino, "#.##"), text_color=strat_sortino >= 1 ? color.green : (strat_sortino > 0 ? color.white : color.red), text_size=size.small)

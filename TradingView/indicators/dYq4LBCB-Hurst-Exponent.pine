@@ -1,0 +1,140 @@
+//@version=6
+indicator("Hurst Exponent — Multi-Scale R/S (Screener)", shorttitle="Hurst (R/S)", overlay=false, precision=3, max_bars_back=2000)
+
+// ============================================================================
+// Multi-scale Rescaled Range (R/S) Hurst exponent estimator, v6, screener-ready.
+//
+// Method:
+//   1. Build N return observations ending at the current bar.
+//   2. For a ladder of log-spaced window sizes n (minScale ... N/2), split the
+//      N-bar sample into floor(N/n) non-overlapping chunks of length n, compute
+//      R/S for each chunk, and average them -> RS(n).
+//   3. Fit log(RS(n)) = log(c) + H * log(n) by ordinary least squares across
+//      ALL scales simultaneously. The slope is H.
+//
+// Screener notes:
+//   - Every plot() below becomes a filterable column when this script is added
+//     to a Pine Screener list ("Add script to screener" in the screener panel).
+//   - The screener evaluates the script's last bar per symbol, so keep N and
+//     recalcEvery reasonable if you're scanning a large watchlist.
+//   - "Regime" is a simple numeric code (1 / 0 / -1) so you can filter with a
+//     plain equality condition instead of a float threshold.
+// ============================================================================
+
+// ------------------------------- Inputs ------------------------------------
+N           = input.int(256, "Lookback Window (return samples)", minval=32, step=32,
+             tooltip="How many past returns are used to estimate H each time it recalculates.")
+minScale    = input.int(8,   "Minimum Sub-window Size (n)", minval=4)
+numScales   = input.int(10,  "Number of Scales", minval=4, maxval=24,
+             tooltip="More scales = more robust regression, more CPU per calculation.")
+smoothLen   = input.int(4,   "H Smoothing Length (SMA)", minval=1)
+topBand     = input.float(0.60, "Upper Band (Trending)", step=0.05, maxval=1.0)
+lowBand     = input.float(0.40, "Lower Band (Mean-Reverting)", step=0.05, maxval=1.0)
+recalcEvery = input.int(1,   "Recalculate Every X Bars", minval=1,
+             tooltip="Set >1 on long charts / large screener lists to cut CPU load.")
+
+// -------------------------- Build the scale ladder --------------------------
+maxScale = math.max(minScale * 2, int(N / 2))
+
+var int[] scales = array.new_int(0)
+if barstate.isfirst
+    logMin = math.log(minScale)
+    logMax = math.log(maxScale)
+    for i = 0 to numScales - 1
+        frac  = numScales == 1 ? 0.0 : i / (numScales - 1.0)
+        sRaw  = math.round(math.exp(logMin + frac * (logMax - logMin)))
+        sInt  = int(math.max(minScale, math.min(maxScale, sRaw)))
+        if array.size(scales) == 0 or array.get(scales, array.size(scales) - 1) != sInt
+            array.push(scales, sInt)
+
+// --------------------------- R/S at a given scale ---------------------------
+f_rs_at_scale(array<float> retArr, int n) =>
+    nChunks = int(math.floor(N / n))
+    sumRS = 0.0
+    validChunks = 0
+    for c = 0 to nChunks - 1
+        chunkSum = 0.0
+        for k = 0 to n - 1
+            chunkSum += array.get(retArr, c * n + k)
+        mean = chunkSum / n
+
+        cum   = 0.0
+        cmin  = 0.0
+        cmax  = 0.0
+        sqSum = 0.0
+        for k = 0 to n - 1
+            dev = array.get(retArr, c * n + k) - mean
+            cum += dev
+            cmin := math.min(cmin, cum)
+            cmax := math.max(cmax, cum)
+            sqSum += dev * dev
+        sd = math.sqrt(sqSum / n)
+        if sd > 0
+            sumRS += (cmax - cmin) / sd
+            validChunks += 1
+
+    validChunks > 0 ? sumRS / validChunks : na
+
+// ------------------------------ Main calculation -----------------------------
+var float H = na
+var array<float> retArr = array.new_float(N)
+
+doCalc = bar_index >= N and (bar_index % recalcEvery == 0)
+
+if doCalc
+    for i = 0 to N - 1
+        array.set(retArr, i, (close[i] - close[i + 1]) / close[i + 1])
+
+    var array<float> xs = array.new_float(0)
+    var array<float> ys = array.new_float(0)
+    array.clear(xs)
+    array.clear(ys)
+
+    for i = 0 to array.size(scales) - 1
+        n  = array.get(scales, i)
+        rs = f_rs_at_scale(retArr, n)
+        if not na(rs) and rs > 0
+            array.push(xs, math.log(n))
+            array.push(ys, math.log(rs))
+
+    m = array.size(xs)
+    if m >= 2
+        sumX  = array.sum(xs)
+        sumY  = array.sum(ys)
+        sumXY = 0.0
+        sumXX = 0.0
+        for i = 0 to m - 1
+            x = array.get(xs, i)
+            y = array.get(ys, i)
+            sumXY += x * y
+            sumXX += x * x
+        denom = m * sumXX - sumX * sumX
+        H := denom != 0 ? (m * sumXY - sumX * sumY) / denom : H
+
+// -------------------------------- Smoothing ----------------------------------
+Hsmooth = ta.sma(H, smoothLen)
+
+isTrending     = Hsmooth >= topBand
+isMeanReverting = Hsmooth <= lowBand
+regime = isTrending ? 1 : isMeanReverting ? -1 : 0
+
+// ---------------------------------- Plots -------------------------------------
+// Chart display
+plot(H, title="H (Raw)", color=color.new(color.gray, 60))
+hLine   = plot(Hsmooth, title="H (Smoothed)", color=color.orange, linewidth=2)
+
+hline(0.5, "Random Walk (0.5)", color=color.gray)
+topLine = plot(topBand, title="Trending Threshold", color=color.red)
+lowLine = plot(lowBand, title="Mean-Reversion Threshold", color=color.green)
+
+fill(topLine, hLine, color = isTrending ? color.new(color.red, 70)   : na)
+fill(lowLine, hLine, color = isMeanReverting ? color.new(color.green, 70) : na)
+
+// Screener columns — filter on these once the script is added to a screener list.
+plot(regime, title="Regime (1=Trend, -1=MeanRevert, 0=Neutral)", display=display.data_window)
+plot(isTrending ? 1 : 0, title="Is Trending (1/0)", display=display.data_window)
+plot(isMeanReverting ? 1 : 0, title="Is Mean-Reverting (1/0)", display=display.data_window)
+
+// Optional alerts if you also want to use this in an alert-based scan
+alertcondition(isTrending, title="Hurst: Entered Trending Regime", message="H crossed above {{plot('H (Smoothed)')}}")
+alertcondition(isMeanReverting, title="Hurst: Entered Mean-Reverting Regime", message="H dropped below {{plot('H (Smoothed)')}}")

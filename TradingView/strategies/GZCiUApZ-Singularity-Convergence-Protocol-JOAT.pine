@@ -1,0 +1,650 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+
+strategy("Singularity Convergence Protocol [JOAT]", shorttitle="SCP [JOAT]", overlay=true,
+     initial_capital=100000, default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100, commission_type=strategy.commission.percent,
+     commission_value=0.1, slippage=2, pyramiding=0,
+     max_boxes_count=200, max_lines_count=200, max_labels_count=150)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Risk Management
+riskPercent = input.float(2.0, "Risk Per Trade %", minval=0.5, maxval=5.0, group="Risk")
+stopLossATR = input.float(2.0, "Stop Loss (ATR)", minval=1.0, maxval=4.0, group="Risk")
+takeProfitRR = input.float(2.0, "Take Profit (R:R)", minval=1.0, maxval=5.0, group="Risk")
+useTrailing = input.bool(true, "Use Trailing Stop", group="Risk")
+trailingATR = input.float(3.0, "Trailing ATR", minval=2.0, maxval=5.0, group="Risk")
+
+// Strategy Settings
+minSignals = input.int(2, "Minimum Signals", minval=1, maxval=4, group="Strategy")
+useConfluence = input.bool(true, "Use Confluence Scoring", group="Strategy")
+showVisuals = input.bool(true, "Show Visual Features", group="Strategy")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 1. IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// VFI
+typical = hlc3
+vfiInter = math.log(typical) - math.log(typical[1])
+vfiVinter = ta.stdev(vfiInter, 30)
+vfiCutoff = 0.2 * vfiVinter * close
+vave = ta.sma(volume, 14)[1]
+vmax = vave * 2.5
+vc = volume < vmax ? volume : vmax
+mf = typical - typical[1]
+vcp = mf > vfiCutoff ? vc : (mf < -vfiCutoff ? -vc : 0)
+vfiSum = ta.sma(vcp, 14) * 14
+vfiFinal = (vfiSum / vave) * 4.0
+
+// Laguerre RSI
+lagGamma = 0.4
+var float L0 = 0.0, var float L1 = 0.0, var float L2 = 0.0, var float L3 = 0.0
+L0 := (1.0 - lagGamma) * close + lagGamma * nz(L0[1])
+L1 := -lagGamma * L0 + nz(L0[1]) + lagGamma * nz(L1[1])
+L2 := -lagGamma * L1 + nz(L1[1]) + lagGamma * nz(L2[1])
+L3 := -lagGamma * L2 + nz(L2[1]) + lagGamma * nz(L3[1])
+lagCU = math.max(math.max(L0 - L1, 0) + math.max(L1 - L2, 0) + math.max(L2 - L3, 0), 0.0001)
+lagCD = math.max(math.max(L1 - L0, 0) + math.max(L2 - L1, 0) + math.max(L3 - L2, 0), 0.0001)
+lagRSI = (lagCU / (lagCU + lagCD) - 0.5) * 100
+
+// Fisher Transform
+composite = (vfiFinal + lagRSI) / 2
+fisherInput = 0.1 * (composite / 1.5)
+fisherValue = (math.exp(2 * fisherInput) - 1) / (math.exp(2 * fisherInput) + 1)
+fisherSmooth = ta.ema(fisherValue, 7)
+
+// TSI
+tsiPC = close - close[1]
+tsiDouble = ta.ema(ta.ema(tsiPC, 25), 13)
+tsiDoubleABS = ta.ema(ta.ema(math.abs(tsiPC), 25), 13)
+tsiValue = 100 * (tsiDouble / tsiDoubleABS)
+
+// MFI
+typicalPrice = hlc3
+rawMoneyFlow = typicalPrice * volume
+posFlow = typicalPrice > typicalPrice[1] ? rawMoneyFlow : 0
+negFlow = typicalPrice < typicalPrice[1] ? rawMoneyFlow : 0
+moneyRatio = math.sum(posFlow, 14) / math.sum(negFlow, 14)
+mfi = 100 - (100 / (1 + moneyRatio))
+
+// OBV
+obvRaw = ta.cum(math.sign(close - close[1]) * volume)
+obvNorm = (obvRaw - ta.lowest(obvRaw, 100)) / (ta.highest(obvRaw, 100) - ta.lowest(obvRaw, 100)) * 100 - 50
+
+// A/D Line
+adLine = ta.cum(((close - low) - (high - close)) / (high - low) * volume)
+adSmooth = ta.ema(adLine, 14)
+adNorm = (adSmooth - ta.lowest(adSmooth, 100)) / (ta.highest(adSmooth, 100) - ta.lowest(adSmooth, 100)) * 100 - 50
+
+// Williams %R
+williamsR = ta.wpr(14)
+
+// CMF
+mfvCalc = ((close - low) - (high - close)) / (high - low) * volume
+cmf = ta.sma(mfvCalc, 20) / ta.sma(volume, 20)
+
+// Momentum Core
+momentumCore = (vfiFinal * 0.20) + (lagRSI * 0.20) + (fisherSmooth * 20 * 0.15) + 
+     (tsiValue / 2 * 0.15) + ((mfi - 50) / 2 * 0.10) + (obvNorm * 0.10) + (adNorm * 0.05) + (cmf * 50 * 0.05)
+momentumSmooth = ta.ema(momentumCore, 7)
+
+momentumBull = momentumSmooth > 0 and momentumSmooth > momentumSmooth[1]
+momentumBear = momentumSmooth < 0 and momentumSmooth < momentumSmooth[1]
+momentumScore = momentumBull ? 1.0 : momentumBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 2. 
+// ═══════════════════════════════════════════════════════════════════════════════
+
+swingLength = 10
+ph = ta.pivothigh(high, swingLength, swingLength)
+pl = ta.pivotlow(low, swingLength, swingLength)
+
+// Order Blocks
+var float bullOBTop = na, var float bullOBBottom = na, var bool bullOBActive = false
+if not na(pl) and close > high[swingLength]
+    bullOBBottom := low[swingLength + 1]
+    bullOBTop := high[swingLength + 1]
+    bullOBActive := true
+if bullOBActive and close < bullOBBottom
+    bullOBActive := false
+
+var float bearOBTop = na, var float bearOBBottom = na, var bool bearOBActive = false
+if not na(ph) and close < low[swingLength]
+    bearOBTop := high[swingLength + 1]
+    bearOBBottom := low[swingLength + 1]
+    bearOBActive := true
+if bearOBActive and close > bearOBTop
+    bearOBActive := false
+
+// FVG
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+
+// Premium/Discount Zones
+highestHigh = ta.highest(high, 50)
+lowestLow = ta.lowest(low, 50)
+equilibrium = (highestHigh + lowestLow) / 2
+inPremium = close > equilibrium
+inDiscount = close < equilibrium
+
+// Market Structure
+var float lastHH = na, var float lastLL = na, var int marketStructure = 0
+if not na(ph)
+    if na(lastHH) or ph > lastHH
+        lastHH := ph
+        if marketStructure != 1
+            marketStructure := 1
+    else
+        marketStructure := -1
+if not na(pl)
+    if na(lastLL) or pl < lastLL
+        lastLL := pl
+        if marketStructure != -1
+            marketStructure := -1
+    else
+        marketStructure := 1
+
+structureBull = (bullOBActive or bullFVG) and marketStructure == 1 and inDiscount
+structureBear = (bearOBActive or bearFVG) and marketStructure == -1 and inPremium
+structureScore = structureBull ? 1.0 : structureBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 3.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+momentum = ta.mom(close, 21)
+almaBase = ta.alma(close, 9, 0.85, 6)
+almaAdjusted = almaBase - (almaBase - momentum)
+
+ma1 = ta.ema(momentum, 9)
+ma2 = ta.ema(momentum, 21)
+ma3 = ta.ema(momentum, 55)
+ma4 = ta.ema(momentum, 100)
+ma5 = ta.ema(momentum, 200)
+
+basis1 = math.avg(ma1, ma2)
+basis2 = math.avg(ma2, ma3)
+basis3 = math.avg(ma3, ma4)
+basis4 = math.avg(ma4, ma5)
+basis5 = math.avg(ma5, ma1)
+
+basisAvg = math.avg(basis1, momentum)
+basisAvgAll = math.avg(basis1, basis2, basis3, basis4, basis5)
+
+origin = ta.sma(basisAvgAll, 25)
+deviation = 6.0 * ta.stdev(basisAvgAll, 25)
+topBand = origin + deviation
+bottomBand = origin - deviation
+
+highMean = ta.highest(basisAvg, 415)
+lowMean = ta.lowest(basisAvg, 415)
+centerMean = math.avg(highMean, lowMean)
+
+growin(basis) => momentum > basis
+fallin(basis) => momentum <= basis and momentum <= almaAdjusted
+
+allBullish = growin(basis1) and growin(basis2) and growin(basis3) and growin(basis4) and growin(basis5)
+allBearish = fallin(basis1) and fallin(basis2) and fallin(basis3) and fallin(basis4) and fallin(basis5)
+
+extremeBull = basis1 > topBand and almaAdjusted > topBand and almaAdjusted > almaAdjusted[3]
+extremeBear = basis1 < bottomBand and almaAdjusted < bottomBand and almaAdjusted < almaAdjusted[3]
+
+spread = basis1 - basis5
+
+// Extract ta.rising/falling to global scope
+basis1Rising = ta.rising(basis1, 2)
+basis1Falling = ta.falling(basis1, 2)
+
+waveBull = basis1 > basis2 and basis1Rising and spread > 5
+waveBear = basis1 < basis2 and basis1Falling and spread < -5
+waveScore = waveBull or allBullish ? 1.0 : waveBear or allBearish ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY TRACKING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+liqPH = ta.pivothigh(high, 10, 10)
+liqPL = ta.pivotlow(low, 10, 10)
+
+var float buyLiq = na, var float sellLiq = na
+if not na(liqPH)
+    buyLiq := liqPH
+if not na(liqPL)
+    sellLiq := liqPL
+
+buyLiqSwept = not na(buyLiq) and high > buyLiq
+sellLiqSwept = not na(sellLiq) and low < sellLiq
+
+avgVolume = ta.sma(volume, 45)
+volSurge = volume > avgVolume * 2.25
+
+liquidityBull = sellLiqSwept and volSurge
+liquidityBear = buyLiqSwept and volSurge
+liquidityScore = liquidityBull ? 1.0 : liquidityBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TREND DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+hullLength = 20
+hullWMA1 = ta.wma(close, math.floor(hullLength / 2))
+hullWMA2 = ta.wma(close, hullLength)
+hullMA = ta.wma(2 * hullWMA1 - hullWMA2, math.round(math.sqrt(hullLength)))
+
+atr = ta.atr(10)
+src = (high + low) / 2
+upperBand = src + 3.0 * atr
+lowerBand = src - 3.0 * atr
+
+var int direction = 0
+direction := close > upperBand ? -1 : close < lowerBand ? 1 : nz(direction[1], 1)
+superTrend = direction == -1 ? lowerBand : upperBand
+
+[diPlus, diMinus, adx] = ta.dmi(14, 14)
+
+ema1 = ta.ema(close, 9)
+ema2 = ta.ema(close, 21)
+ema3 = ta.ema(close, 50)
+
+bullishAlignment = ema1 > ema2 and ema2 > ema3
+bearishAlignment = ema1 < ema2 and ema2 < ema3
+
+// Extract ta.rising/falling to global scope
+hullRising = ta.rising(hullMA, 3)
+hullFalling = ta.falling(hullMA, 3)
+
+trendBull = hullRising and direction == -1 and adx > 20 and bullishAlignment
+trendBear = hullFalling and direction == 1 and adx > 20 and bearishAlignment
+trendScore = trendBull ? 1.0 : trendBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DIVERGENCE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+rsiValue = ta.rsi(close, 14)
+[macdLine, signalLine, _] = ta.macd(close, 12, 26, 9)
+
+tsiPC2 = close - close[1]
+tsiDouble2 = ta.ema(ta.ema(tsiPC2, 25), 13)
+tsiDoubleABS2 = ta.ema(ta.ema(math.abs(tsiPC2), 25), 13)
+tsiValue2 = 100 * (tsiDouble2 / tsiDoubleABS2)
+
+stochValue = ta.stoch(close, high, low, 14)
+stochSmooth = ta.sma(stochValue, 3)
+
+compositeOsc = (rsiValue - 50) + macdLine + tsiValue2 + (stochSmooth - 50)
+
+rsiPH = ta.pivothigh(rsiValue, 5, 5)
+rsiPL = ta.pivotlow(rsiValue, 5, 5)
+
+// Extract ta.valuewhen to global scope
+prevPL = ta.valuewhen(not na(pl), pl, 1)
+prevRSIPL = ta.valuewhen(not na(rsiPL), rsiPL, 1)
+prevPH = ta.valuewhen(not na(ph), ph, 1)
+prevRSIPH = ta.valuewhen(not na(rsiPH), rsiPH, 1)
+
+var bool bullDiv = false, var bool bearDiv = false, var int confluenceScore = 0
+
+if not na(pl) and not na(rsiPL)
+    if pl < prevPL and rsiPL > prevRSIPL
+        bullDiv := true
+        confluenceScore := 0
+        if rsiPL > prevRSIPL
+            confluenceScore += 1
+        if macdLine > macdLine[5]
+            confluenceScore += 1
+        if tsiValue2 > tsiValue2[5]
+            confluenceScore += 1
+        if stochSmooth > stochSmooth[5]
+            confluenceScore += 1
+    else
+        bullDiv := false
+
+if not na(ph) and not na(rsiPH)
+    if ph > prevPH and rsiPH < prevRSIPH
+        bearDiv := true
+        confluenceScore := 0
+        if rsiPH < prevRSIPH
+            confluenceScore += 1
+        if macdLine < macdLine[5]
+            confluenceScore += 1
+        if tsiValue2 < tsiValue2[5]
+            confluenceScore += 1
+        if stochSmooth < stochSmooth[5]
+            confluenceScore += 1
+    else
+        bearDiv := false
+
+divergenceBull = bullDiv and confluenceScore >= 2 and compositeOsc < -20
+divergenceBear = bearDiv and confluenceScore >= 2 and compositeOsc > 20
+divergenceScore = divergenceBull ? 1.0 : divergenceBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLATILITY ANALYSIS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrRaw = ta.atr(14)
+atrSmoothed = ta.ema(atrRaw, 7)
+atrHigh = ta.highest(atrSmoothed, 100)
+atrLow = ta.lowest(atrSmoothed, 100)
+atrPercentile = ((atrSmoothed - atrLow) / (atrHigh - atrLow)) * 100
+
+[bbMiddle, bbUpper, bbLower] = ta.bb(close, 20, 2.0)
+bbWidth = ((bbUpper - bbLower) / bbMiddle) * 100
+bbWidthHigh = ta.highest(bbWidth, 100)
+bbWidthLow = ta.lowest(bbWidth, 100)
+bbWidthPercentile = ((bbWidth - bbWidthLow) / (bbWidthHigh - bbWidthLow)) * 100
+
+kcBasis = ta.ema(close, 20)
+kcRange = ta.atr(20) * 1.5
+kcUpper = kcBasis + kcRange
+kcLower = kcBasis - kcRange
+
+squeezeOn = bbLower > kcLower and bbUpper < kcUpper
+squeezeOff = not squeezeOn
+squeezeBreakout = squeezeOn[1] and squeezeOff
+
+returns = math.log(close / close[1])
+hvStdDev = ta.stdev(returns, 20)
+hv = hvStdDev * math.sqrt(252) * 100
+hvHigh = ta.highest(hv, 100)
+hvLow = ta.lowest(hv, 100)
+hvPercentile = ((hv - hvLow) / (hvHigh - hvLow)) * 100
+
+volIndex = (atrPercentile + bbWidthPercentile + hvPercentile) / 3
+
+volatilityBull = squeezeBreakout and close > close[1] and volIndex < 40
+volatilityBear = squeezeBreakout and close < close[1] and volIndex < 40
+volatilityScore = volatilityBull ? 1.0 : volatilityBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSTITUTIONAL FLOW
+// ═══════════════════════════════════════════════════════════════════════════════
+
+mfvCalc2 = ((close - low) - (high - close)) / (high - low) * volume
+cmf2 = ta.sma(mfvCalc2, 20) / ta.sma(volume, 20)
+
+typPrice = hlc3
+rawMF = typPrice * volume
+posFlow2 = typPrice > typPrice[1] ? rawMF : 0
+negFlow2 = typPrice < typPrice[1] ? rawMF : 0
+moneyRatio2 = math.sum(posFlow2, 14) / math.sum(negFlow2, 14)
+mfi2 = 100 - (100 / (1 + moneyRatio2))
+
+obvRaw2 = ta.cum(math.sign(close - close[1]) * volume)
+obvNorm2 = (obvRaw2 - ta.lowest(obvRaw2, 100)) / (ta.highest(obvRaw2, 100) - ta.lowest(obvRaw2, 100)) * 100
+
+adLine2 = ta.cum(((close - low) - (high - close)) / (high - low) * volume)
+adSmooth2 = ta.ema(adLine2, 14)
+adNorm2 = (adSmooth2 - ta.lowest(adSmooth2, 100)) / (ta.highest(adSmooth2, 100) - ta.lowest(adSmooth2, 100)) * 100
+
+flowIndex = (cmf2 * 50 + (mfi2 - 50) + (obvNorm2 - 50) + (adNorm2 - 50)) / 4
+
+var int phase = 0
+if flowIndex > 30 and cmf2 > 0.1 and mfi2 > 50
+    phase := 2
+else if flowIndex > 10 and cmf2 > 0
+    phase := 1
+else if flowIndex < -30 and cmf2 < -0.1 and mfi2 < 50
+    phase := -2
+else if flowIndex < -10 and cmf2 < 0
+    phase := -1
+else
+    phase := 0
+
+institutionalBull = phase >= 1 and flowIndex > 10 and cmf2 > 0 and mfi2 > 50
+institutionalBear = phase <= -1 and flowIndex < -10 and cmf2 < 0 and mfi2 < 50
+institutionalScore = institutionalBull ? 1.0 : institutionalBear ? -1.0 : 0.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL AGGREGATION WITH CONFLUENCE SCORING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Count binary signals
+bullSignals = 0
+bearSignals = 0
+
+if momentumBull
+    bullSignals += 1
+if momentumBear
+    bearSignals += 1
+if structureBull
+    bullSignals += 1
+if structureBear
+    bearSignals += 1
+if waveBull
+    bullSignals += 1
+if waveBear
+    bearSignals += 1
+if liquidityBull
+    bullSignals += 1
+if liquidityBear
+    bearSignals += 1
+if trendBull
+    bullSignals += 1
+if trendBear
+    bearSignals += 1
+if divergenceBull
+    bullSignals += 1
+if divergenceBear
+    bearSignals += 1
+if volatilityBull
+    bullSignals += 1
+if volatilityBear
+    bearSignals += 1
+if institutionalBull
+    bullSignals += 1
+if institutionalBear
+    bearSignals += 1
+
+// Confluence Score (weighted sum of all systems)
+confluenceTotal = momentumScore + structureScore + waveScore + liquidityScore + trendScore + divergenceScore + volatilityScore + institutionalScore
+
+// Bonus signals for strong conditions
+bonusBull = 0
+bonusBear = 0
+
+if extremeBull
+    bonusBull += 1
+if extremeBear
+    bonusBear += 1
+if allBullish
+    bonusBull += 1
+if allBearish
+    bonusBear += 1
+if confluenceScore == 4
+    bonusBull += 1
+if confluenceScore == 4
+    bonusBear += 1
+if volSurge and flowIndex > 20
+    bonusBull += 1
+if volSurge and flowIndex < -20
+    bonusBear += 1
+
+totalBullScore = bullSignals + bonusBull + (confluenceTotal > 0 ? confluenceTotal : 0)
+totalBearScore = bearSignals + bonusBear + (confluenceTotal < 0 ? math.abs(confluenceTotal) : 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY CONDITIONS - MORE AGGRESSIVE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+longSignal = useConfluence ? 
+     (totalBullScore >= minSignals and totalBullScore > totalBearScore) : 
+     (bullSignals >= minSignals and bullSignals > bearSignals)
+
+shortSignal = useConfluence ? 
+     (totalBearScore >= minSignals and totalBearScore > totalBullScore) : 
+     (bearSignals >= minSignals and bearSignals > bullSignals)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+longStop = close - (atr * stopLossATR)
+longTarget = close + (atr * stopLossATR * takeProfitRR)
+shortStop = close + (atr * stopLossATR)
+shortTarget = close - (atr * stopLossATR * takeProfitRR)
+
+if longSignal
+    strategy.entry("LONG", strategy.long, comment="L[" + str.tostring(bullSignals) + "]")
+    strategy.exit("Exit Long", "LONG", stop=longStop, limit=longTarget)
+
+if shortSignal
+    strategy.entry("SHORT", strategy.short, comment="S[" + str.tostring(bearSignals) + "]")
+    strategy.exit("Exit Short", "SHORT", stop=shortStop, limit=shortTarget)
+
+if useTrailing and strategy.position_size > 0
+    trailStop = close - (atr * trailingATR)
+    strategy.exit("Trail Long", "LONG", stop=trailStop)
+
+if useTrailing and strategy.position_size < 0
+    trailStop = close + (atr * trailingATR)
+    strategy.exit("Trail Short", "SHORT", stop=trailStop)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INSANE VISUAL FEATURES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Hull MA - MUST be in global scope
+hullColor = hullRising ? #00FF88 : hullFalling ? #FF0055 : #00B8D4
+plot(showVisuals ? hullMA : na, "Hull MA", hullColor, 3)
+
+// SuperTrend - MUST be in global scope
+stColor = direction == -1 ? color.new(#00E5FF, 40) : color.new(#FF0055, 40)
+plot(showVisuals ? superTrend : na, "SuperTrend", stColor, 2)
+
+// EMAs - MUST be in global scope
+plot(showVisuals ? ema1 : na, "EMA 9", color.new(#00FF88, 70), 1)
+plot(showVisuals ? ema2 : na, "EMA 21", color.new(#00E5FF, 70), 1)
+plot(showVisuals ? ema3 : na, "EMA 50", color.new(#FFC107, 70), 1)
+
+// Backgrounds - MUST be in global scope
+regimeBG = showVisuals ? (extremeBull ? color.new(#FF0055, 97) : 
+     extremeBear ? color.new(#00FF88, 97) : 
+     squeezeOn ? color.new(#9C27B0, 97) : na) : na
+bgcolor(regimeBG)
+
+entryBG = showVisuals ? (longSignal ? color.new(#00FF88, 95) : shortSignal ? color.new(#FF0055, 95) : na) : na
+bgcolor(entryBG)
+
+// Drawing objects - can be in conditional
+if showVisuals and barstate.islast
+    // Order Blocks
+    if bullOBActive
+        box.new(bar_index - 20, bullOBTop, bar_index + 10, bullOBBottom,
+             bgcolor=color.new(#00E676, 85), border_color=color.new(#00E676, 0), border_width=2)
+    
+    if bearOBActive
+        box.new(bar_index - 20, bearOBTop, bar_index + 10, bearOBBottom,
+             bgcolor=color.new(#FF1744, 85), border_color=color.new(#FF1744, 0), border_width=2)
+    
+    // FVG Zones
+    if bullFVG
+        box.new(bar_index[2], low, bar_index + 10, high[2],
+             bgcolor=color.new(#00BCD4, 90), border_color=color.new(#00BCD4, 30), 
+             border_width=2, border_style=line.style_dashed)
+    
+    if bearFVG
+        box.new(bar_index[2], low[2], bar_index + 10, high,
+             bgcolor=color.new(#FF6F00, 90), border_color=color.new(#FF6F00, 30), 
+             border_width=2, border_style=line.style_dashed)
+    
+    // Liquidity Levels
+    if not na(buyLiq)
+        line.new(bar_index - 20, buyLiq, bar_index + 20, buyLiq,
+             color=buyLiqSwept ? color.new(#76FF03, 70) : color.new(#76FF03, 0), 
+             width=2, style=buyLiqSwept ? line.style_dotted : line.style_solid)
+    
+    if not na(sellLiq)
+        line.new(bar_index - 20, sellLiq, bar_index + 20, sellLiq,
+             color=sellLiqSwept ? color.new(#F50057, 70) : color.new(#F50057, 0), 
+             width=2, style=sellLiqSwept ? line.style_dotted : line.style_solid)
+    
+    // Equilibrium Line
+    line.new(bar_index - 50, equilibrium, bar_index, equilibrium,
+         color=color.new(#FFC107, 70), width=2, style=line.style_solid)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLEAN DASHBOARD - ESSENTIAL METRICS ONLY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.bottom_right, 3, 9,
+     bgcolor=#0a0e1a, border_width=2, frame_color=#00E5FF, border_color=#00E5FF)
+
+if barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "SINGULARITY", text_color=#00E5FF, text_size=size.normal,
+         bgcolor=#1a1d2e, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "CONVERGENCE", text_color=#FF0055, text_size=size.normal,
+         bgcolor=#1a1d2e, text_halign=text.align_center)
+    table.cell(dash, 2, 0, "PROTOCOL", text_color=#00FF88, text_size=size.normal,
+         bgcolor=#1a1d2e, text_halign=text.align_center)
+    
+    // Confluence Scores
+    table.cell(dash, 0, 1, "Bull Score", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(totalBullScore, format.mintick),
+         text_color=#00FF88, text_size=size.small, 
+         bgcolor=totalBullScore >= minSignals ? color.new(#00FF88, 85) : na)
+    table.cell(dash, 2, 1, str.tostring(bullSignals) + "/8",
+         text_color=#00FF88, text_size=size.small)
+    
+    table.cell(dash, 0, 2, "Bear Score", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(totalBearScore, format.mintick),
+         text_color=#FF0055, text_size=size.small, 
+         bgcolor=totalBearScore >= minSignals ? color.new(#FF0055, 85) : na)
+    table.cell(dash, 2, 2, str.tostring(bearSignals) + "/8",
+         text_color=#FF0055, text_size=size.small)
+    
+    // Vol Index
+    table.cell(dash, 0, 3, "Vol Index", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(math.round(volIndex, 1)),
+         text_color=volIndex > 70 ? #FF0055 : volIndex < 30 ? #00BCD4 : #FFC107, text_size=size.small)
+    table.cell(dash, 2, 3, volIndex > 70 ? "HIGH" : volIndex < 30 ? "LOW" : "NORMAL",
+         text_color=volIndex > 70 ? #FF0055 : volIndex < 30 ? #00BCD4 : #FFC107, text_size=size.small)
+    
+    // Spread
+    table.cell(dash, 0, 4, "Spread", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(math.round(spread, 1)),
+         text_color=spread > 10 ? #00FF88 : spread < -10 ? #FF0055 : #757575, text_size=size.small)
+    table.cell(dash, 2, 4, spread > 20 ? "EXTREME+" : spread < -20 ? "EXTREME-" : "—",
+         text_color=spread > 20 ? #00FF88 : spread < -20 ? #FF0055 : #757575, text_size=size.small)
+    
+    // Flow Index
+    table.cell(dash, 0, 5, "Flow Index", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(math.round(flowIndex, 1)),
+         text_color=flowIndex > 0 ? #00FF88 : #FF0055, text_size=size.small)
+    table.cell(dash, 2, 5, flowIndex > 30 ? "STRONG+" : flowIndex < -30 ? "STRONG-" : "WEAK",
+         text_color=flowIndex > 30 ? #00FF88 : flowIndex < -30 ? #FF0055 : #757575, text_size=size.small)
+    
+    // Price Zone
+    table.cell(dash, 0, 6, "Price Zone", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 6, inPremium ? "PREMIUM" : "DISCOUNT",
+         text_color=inPremium ? #FF6F00 : #00BCD4, text_size=size.small)
+    table.cell(dash, 2, 6, str.tostring(math.round(((close - equilibrium) / equilibrium) * 100, 2)) + "%",
+         text_color=inPremium ? #FF6F00 : #00BCD4, text_size=size.small)
+    
+    // Win Rate
+    winRate = strategy.wintrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    table.cell(dash, 0, 7, "Win Rate", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 7, str.tostring(math.round(winRate, 1)) + "%",
+         text_color=winRate > 50 ? #00FF88 : #FF0055, text_size=size.small)
+    table.cell(dash, 2, 7, str.tostring(strategy.closedtrades) + " trades",
+         text_color=#00E5FF, text_size=size.small)
+    
+    // Position & Signal
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posColor = strategy.position_size > 0 ? #00FF88 : strategy.position_size < 0 ? #FF0055 : #808080
+    posBg = strategy.position_size != 0 ? color.new(posColor, 85) : na
+    table.cell(dash, 0, 8, "Position", text_color=#00E5FF, text_size=size.small)
+    table.cell(dash, 1, 8, posText, text_color=posColor, text_size=size.small, bgcolor=posBg)
+    
+    signalText = longSignal ? "LONG SIGNAL" : shortSignal ? "SHORT SIGNAL" : "NO SIGNAL"
+    signalColor = longSignal ? #00FF88 : shortSignal ? #FF0055 : #757575
+    signalBg = longSignal or shortSignal ? color.new(signalColor, 85) : na
+    table.cell(dash, 2, 8, signalText, text_color=signalColor, text_size=size.small, bgcolor=signalBg)

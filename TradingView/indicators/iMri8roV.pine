@@ -1,0 +1,655 @@
+// This Pine Script(R) code is subject to the terms of the Mozilla Public License 2.0:
+// https://mozilla.org/MPL/2.0/
+//@version=6
+indicator(
+     "Atlas IMA",
+     shorttitle = "Atlas IMA",
+     overlay = true,
+     max_bars_back = 5000
+)
+
+//=============================================================================
+// Atlas IMA
+// Adaptive composite moving average for trend, regime and volatility context.
+// It combines EMA, HMA, WMA and RMA memories across four horizons, then adapts
+// the final response to volatility and directional efficiency. It does not use
+// order-flow or proprietary institutional data, and it is not a trading system.
+//=============================================================================
+
+
+//=============================================================================
+// 1. PERFIL Y ORIGEN
+//=============================================================================
+groupProfile = "1. Perfil y origen"
+
+profileMode = input.string(
+     "Auto",
+     "Perfil de activo",
+     options = ["Auto", "Nasdaq 100", "Oro", "Petroleo", "Forex", "Crypto", "Manual"],
+     group = groupProfile
+)
+
+src = input.source(close, "Precio origen", group = groupProfile)
+
+useMtf = input.bool(false, "Usar origen MTF SAFE", group = groupProfile)
+originTf = input.timeframe("60", "Timeframe origen MTF", group = groupProfile)
+useConfirmedMtf = input.bool(true, "MTF con vela cerrada / confirmado", group = groupProfile)
+
+showOriginPanel = input.bool(true, "Mostrar panel", group = groupProfile)
+
+panelPos = input.string(
+     "Arriba derecha",
+     "Posicion panel",
+     options = ["Arriba derecha", "Arriba izquierda", "Abajo derecha", "Abajo izquierda"],
+     group = groupProfile
+)
+
+
+//=============================================================================
+// 2. MEMORIAS ADAPTATIVAS
+//=============================================================================
+groupMemory = "2. Memorias adaptativas"
+
+manualMomentumLen = input.int(20, "Manual momentum", minval = 2, maxval = 300, group = groupMemory)
+manualTrendLen = input.int(50, "Manual tendencia", minval = 5, maxval = 500, group = groupMemory)
+manualRegimeLen = input.int(100, "Manual regimen", minval = 10, maxval = 800, group = groupMemory)
+manualStructureLen = input.int(200, "Manual estructura", minval = 20, maxval = 1000, group = groupMemory)
+
+
+//=============================================================================
+// 3. PONDERACION Y LAG
+//=============================================================================
+groupWeight = "3. Ponderacion y lag"
+
+lagMode = input.string(
+     "Adaptativo",
+     "Motor de lag",
+     options = ["Conservador", "Adaptativo", "Rapido"],
+     group = groupWeight
+)
+
+manualEmaWeight = input.float(0.35, "Manual peso EMA", minval = 0.0, maxval = 1.0, step = 0.05, group = groupWeight)
+manualHmaWeight = input.float(0.35, "Manual peso HMA", minval = 0.0, maxval = 1.0, step = 0.05, group = groupWeight)
+manualWmaWeight = input.float(0.20, "Manual peso WMA", minval = 0.0, maxval = 1.0, step = 0.05, group = groupWeight)
+manualSmmaWeight = input.float(0.10, "Manual peso SMMA", minval = 0.0, maxval = 1.0, step = 0.05, group = groupWeight)
+
+imaSmoothing = input.float(
+     2.00,
+     "Suavizado adicional IMA",
+     minval = 1.00,
+     maxval = 5.00,
+     step = 0.25,
+     tooltip = "Un valor mayor hace que la IMA reaccione mas lentamente y evita que quede demasiado pegada al precio.",
+     group = groupWeight
+)
+
+
+//=============================================================================
+// 4. REGIMEN Y VOLATILIDAD
+//=============================================================================
+groupRegime = "4. Regimen y volatilidad"
+
+atrLen = input.int(14, "ATR", minval = 1, group = groupRegime)
+volMemory = input.int(80, "Memoria ATR", minval = 10, maxval = 500, group = groupRegime)
+effLen = input.int(34, "Eficiencia tendencia", minval = 5, maxval = 200, group = groupRegime)
+
+manualCompression = input.float(0.82, "Manual compresion ATR", minval = 0.20, maxval = 1.20, step = 0.01, group = groupRegime)
+manualExpansion = input.float(1.15, "Manual expansion ATR", minval = 0.60, maxval = 3.00, step = 0.01, group = groupRegime)
+manualTrendEff = input.float(0.26, "Manual eficiencia tendencia", minval = 0.05, maxval = 0.80, step = 0.01, group = groupRegime)
+
+strongSpreadAtr = input.float(
+     0.35,
+     "Separacion ATR minima para bias fuerte",
+     minval = 0.05,
+     maxval = 3.00,
+     step = 0.05,
+     group = groupRegime
+)
+
+
+//=============================================================================
+// 5. CONFLUENCIA Y ZONA DE DECISION
+//=============================================================================
+groupConfluence = "5. Confluencia y decision"
+
+showConfluence = input.bool(false, "Mostrar zona de confluencia", group = groupConfluence)
+
+manualConfluenceAtr = input.float(
+     0.60,
+     "Manual rango maximo confluencia x ATR",
+     minval = 0.10,
+     maxval = 3.00,
+     step = 0.05,
+     tooltip = "Separacion maxima entre las memorias, medida en ATR, para considerar que existe confluencia.",
+     group = groupConfluence
+)
+
+confluenceTransp = input.int(
+     88,
+     "Transparencia confluencia",
+     minval = 70,
+     maxval = 98,
+     group = groupConfluence
+)
+
+showDecisionZone = input.bool(
+     true,
+     "Mostrar Zona IMA de decision",
+     group = groupConfluence
+)
+
+decisionAtr = input.float(
+     0.22,
+     "Ancho Zona IMA x ATR",
+     minval = 0.05,
+     maxval = 2.00,
+     step = 0.05,
+     group = groupConfluence
+)
+
+decisionOnlyCompression = input.bool(
+     true,
+     "Zona decision solo en compresion / pre-cambio",
+     group = groupConfluence
+)
+
+decisionTransp = input.int(
+     86,
+     "Transparencia Zona IMA",
+     minval = 70,
+     maxval = 98,
+     group = groupConfluence
+)
+
+
+//=============================================================================
+// 6. VISUAL
+//=============================================================================
+groupVisual = "6. Visual"
+
+visualPreset = input.string(
+     "Limpio",
+     "Preset visual",
+     options = ["Completo", "Limpio", "Solo principal"],
+     group = groupVisual
+)
+
+showSignals = input.bool(false, "Mostrar senales de bias", group = groupVisual)
+showPhaseSignals = input.bool(false, "Mostrar senales de fase", group = groupVisual)
+showBiasBackground = input.bool(false, "Fondo suave por bias", group = groupVisual)
+confirmSignalsOnClose = input.bool(true, "Confirmar senales y alertas al cierre", group = groupVisual)
+
+mainWidth = input.int(3, "Grosor principal", minval = 1, maxval = 5, group = groupVisual)
+memoryWidth = input.int(1, "Grosor memorias", minval = 1, maxval = 4, group = groupVisual)
+
+bullColor = input.color(color.rgb(0, 205, 125), "Color alcista", group = groupVisual)
+bearColor = input.color(color.rgb(230, 45, 65), "Color bajista", group = groupVisual)
+neutralColor = input.color(color.rgb(150, 150, 150), "Color neutral", group = groupVisual)
+confluenceColor = input.color(color.rgb(255, 190, 40), "Color confluencia", group = groupVisual)
+decisionColor = input.color(color.rgb(80, 160, 255), "Color Zona IMA decision", group = groupVisual)
+
+
+//=============================================================================
+// 7. FUNCIONES GENERALES
+//=============================================================================
+f_panelPos(_opt) =>
+    _opt == "Arriba izquierda" ? position.top_left :
+     _opt == "Abajo derecha" ? position.bottom_right :
+     _opt == "Abajo izquierda" ? position.bottom_left :
+     position.top_right
+
+f_profileAuto() =>
+    _ticker = str.upper(syminfo.ticker)
+    _tickerId = str.upper(syminfo.tickerid)
+    _raw = _ticker + " " + _tickerId
+
+    _isNas = str.contains(_raw, "NAS") or str.contains(_raw, "US100") or str.contains(_raw, "NDX") or str.contains(_raw, "NASDAQ")
+    _isGold = str.contains(_raw, "XAU") or str.contains(_raw, "GOLD") or str.contains(_raw, "ORO")
+    _isOil = str.contains(_raw, "USOIL") or str.contains(_raw, "UKOIL") or str.contains(_raw, "WTI") or str.contains(_raw, "BRENT") or str.contains(_raw, "OIL")
+    _isForex = syminfo.type == "forex" or str.contains(_raw, "FOREX")
+    _isCrypto = syminfo.type == "crypto" or str.contains(_raw, "BTC") or str.contains(_raw, "ETH") or str.contains(_raw, "CRYPTO")
+
+    _isNas ? "Nasdaq 100" :
+     _isGold ? "Oro" :
+     _isOil ? "Petroleo" :
+     _isForex ? "Forex" :
+     _isCrypto ? "Crypto" :
+     "Manual"
+
+resolvedProfile = profileMode == "Auto" ? f_profileAuto() : profileMode
+
+f_profileInt(_nas, _gold, _oil, _forex, _crypto, _manual) =>
+    resolvedProfile == "Nasdaq 100" ? _nas :
+     resolvedProfile == "Oro" ? _gold :
+     resolvedProfile == "Petroleo" ? _oil :
+     resolvedProfile == "Forex" ? _forex :
+     resolvedProfile == "Crypto" ? _crypto :
+     _manual
+
+f_profileFloat(_nas, _gold, _oil, _forex, _crypto, _manual) =>
+    resolvedProfile == "Nasdaq 100" ? _nas :
+     resolvedProfile == "Oro" ? _gold :
+     resolvedProfile == "Petroleo" ? _oil :
+     resolvedProfile == "Forex" ? _forex :
+     resolvedProfile == "Crypto" ? _crypto :
+     _manual
+
+lenMomentum = f_profileInt(21, 20, 18, 21, 24, manualMomentumLen)
+lenTrend = f_profileInt(55, 50, 45, 50, 60, manualTrendLen)
+lenRegime = f_profileInt(100, 100, 90, 100, 120, manualRegimeLen)
+lenStructure = f_profileInt(200, 200, 180, 200, 240, manualStructureLen)
+
+profileCompression = f_profileFloat(0.86, 0.82, 0.78, 0.88, 0.80, manualCompression)
+profileExpansion = f_profileFloat(1.18, 1.15, 1.22, 1.10, 1.25, manualExpansion)
+profileTrendEff = f_profileFloat(0.28, 0.25, 0.30, 0.22, 0.28, manualTrendEff)
+profileConfluenceAtr = f_profileFloat(0.65, 0.60, 0.75, 0.55, 0.65, manualConfluenceAtr)
+
+profileEmaWeight = resolvedProfile == "Manual" ? manualEmaWeight : resolvedProfile == "Forex" ? 0.40 : resolvedProfile == "Crypto" ? 0.30 : 0.35
+profileHmaWeight = resolvedProfile == "Manual" ? manualHmaWeight : resolvedProfile == "Petroleo" ? 0.40 : resolvedProfile == "Nasdaq 100" ? 0.38 : resolvedProfile == "Crypto" ? 0.38 : 0.32
+profileWmaWeight = resolvedProfile == "Manual" ? manualWmaWeight : resolvedProfile == "Crypto" ? 0.20 : 0.18
+profileSmmaWeight = resolvedProfile == "Manual" ? manualSmmaWeight : resolvedProfile == "Forex" ? 0.18 : 0.12
+
+f_hma(_src, _length) =>
+    _half = math.max(1, int(_length / 2))
+    _sqrt = math.max(1, int(math.sqrt(_length)))
+    ta.wma(2.0 * ta.wma(_src, _half) - ta.wma(_src, _length), _sqrt)
+
+f_hybrid(_src, _length) =>
+    _ema = ta.ema(_src, _length)
+    _hma = f_hma(_src, _length)
+    _wma = ta.wma(_src, _length)
+    _smma = ta.rma(_src, _length)
+
+    _sumW = math.max(profileEmaWeight + profileHmaWeight + profileWmaWeight + profileSmmaWeight, 0.01)
+
+    (_ema * profileEmaWeight + _hma * profileHmaWeight + _wma * profileWmaWeight + _smma * profileSmmaWeight) / _sumW
+
+f_biasText(_state) =>
+    _state == 2 ? "ALCISTA FUERTE" :
+     _state == 1 ? "ALCISTA" :
+     _state == -2 ? "BAJISTA FUERTE" :
+     _state == -1 ? "BAJISTA" :
+     "NEUTRAL"
+
+f_regimeText(_state) =>
+    _state == 1 ? "TREND" :
+     _state == -1 ? "RANGE" :
+     "TRANSICION"
+
+f_phaseText(_phase) =>
+    _phase == 2 ? "AGOTAMIENTO" :
+     _phase == 1 ? "EXPANSION" :
+     _phase == -1 ? "PRE-CAMBIO" :
+     _phase == -2 ? "COMPRESION" :
+     "TRANSICION"
+
+f_phaseColor(_phase) =>
+    _phase == 2 ? color.new(confluenceColor, 0) :
+     _phase == 1 ? color.new(bullColor, 10) :
+     _phase == -1 ? color.new(decisionColor, 5) :
+     _phase == -2 ? color.new(neutralColor, 10) :
+     color.new(color.black, 50)
+
+
+//=============================================================================
+// 8. MOTOR ADAPTATIVO
+//=============================================================================
+// `_confirmed` desplaza los resultados dentro del contexto solicitado.
+// En MTF se combina con lookahead_on para obtener la ultima vela HTF cerrada
+// sin introducir informacion futura.
+f_atlasCore(_confirmed) =>
+    _fast = f_hybrid(src, lenMomentum)
+    _mid = f_hybrid(src, lenTrend)
+    _long = f_hybrid(src, lenRegime)
+    _struct = f_hybrid(src, lenStructure)
+
+    _atr = ta.atr(atrLen)
+    _safeAtr = math.max(nz(_atr, syminfo.mintick), syminfo.mintick)
+
+    _atrBase = ta.sma(_atr, volMemory)
+    _safeAtrBase = math.max(nz(_atrBase, _safeAtr), syminfo.mintick)
+    _atrRatio = _safeAtr / _safeAtrBase
+
+    _path = math.sum(math.abs(ta.change(src)), effLen)
+    _direct = math.abs(src - nz(src[effLen], src))
+    _efficiency = _path > 0.0 ? _direct / _path : 0.0
+
+    _isCompression = _atrRatio < profileCompression
+    _isExpansion = _atrRatio > profileExpansion
+    _isTrend = _efficiency >= profileTrendEff and not _isCompression
+
+    _regimeState = _isTrend ? 1 : _isCompression or _efficiency < profileTrendEff * 0.70 ? -1 : 0
+
+    _lagFast = lagMode == "Rapido" ? 0.55 : lagMode == "Conservador" ? 0.20 : 0.35
+    _lagStable = lagMode == "Rapido" ? 0.15 : lagMode == "Conservador" ? 0.45 : 0.30
+
+    _targetTrend = _mid * (1.0 - _lagFast) + _fast * _lagFast
+    _targetRange = _mid * (1.0 - _lagStable) + _long * _lagStable
+    _target = _regimeState == 1 ? _targetTrend : _regimeState == -1 ? _targetRange : (_targetTrend + _targetRange) * 0.5
+
+    _alphaBase = lagMode == "Rapido" ? 0.42 : lagMode == "Conservador" ? 0.18 : 0.28
+    _alphaVol = _isExpansion ? _alphaBase * 1.25 : _isCompression ? _alphaBase * 0.65 : _alphaBase
+    _alphaSmoothed = _alphaVol / imaSmoothing
+    _alpha = math.max(0.02, math.min(_alphaSmoothed, 0.65))
+
+    var float _ima = na
+    _ima := na(_ima[1]) ? _target : _ima[1] + _alpha * (_target - _ima[1])
+
+    _stackBull = _fast > _mid and _mid > _long and _long > _struct
+    _stackBear = _fast < _mid and _mid < _long and _long < _struct
+
+    _slope = _ima - nz(_ima[5], _ima)
+    _prevSlope = nz(_ima[5], _ima) - nz(_ima[10], _ima)
+    _slopeAtr = _slope / _safeAtr
+    _prevSlopeAtr = _prevSlope / _safeAtr
+
+    _slopeBull = _slope > _safeAtr * 0.05
+    _slopeBear = _slope < -_safeAtr * 0.05
+
+    _priceBull = src > _ima and src > _struct
+    _priceBear = src < _ima and src < _struct
+
+    _maxMA = math.max(math.max(_fast, _mid), math.max(_long, _struct))
+    _minMA = math.min(math.min(_fast, _mid), math.min(_long, _struct))
+    _spreadAtr = math.abs(_maxMA - _minMA) / _safeAtr
+
+    // La confluencia se mide en ATR para que el umbral sea comparable entre
+    // activos, precios y temporalidades.
+    _confluenceActive = _spreadAtr <= profileConfluenceAtr
+
+    _biasScore = 0
+    _biasScore += _priceBull ? 1 : _priceBear ? -1 : 0
+    _biasScore += _slopeBull ? 1 : _slopeBear ? -1 : 0
+    _biasScore += _stackBull ? 2 : _stackBear ? -2 : 0
+    _biasScore += _regimeState == 1 and _priceBull ? 1 : _regimeState == 1 and _priceBear ? -1 : 0
+
+    _canStrong = _spreadAtr >= strongSpreadAtr and not _isCompression and _regimeState == 1
+
+    _biasState = _biasScore >= 4 and _canStrong ? 2 :
+         _biasScore >= 2 ? 1 :
+         _biasScore <= -4 and _canStrong ? -2 :
+         _biasScore <= -2 ? -1 :
+         0
+
+    _crossMemory = ta.cross(_fast, _mid)
+    _priceNearIma = math.abs(src - _ima) <= _safeAtr * 0.35
+    _slopeWeakening = math.abs(_slopeAtr) < math.abs(_prevSlopeAtr) and math.abs(_prevSlopeAtr) > 0.08
+    _preChangeSetup = _confluenceActive and _priceNearIma and (_crossMemory or _slopeWeakening)
+
+    _phaseState =
+         _isCompression ? -2 :
+         _preChangeSetup ? -1 :
+         (_isExpansion and _slopeWeakening and _efficiency < nz(_efficiency[5], _efficiency)) ? 2 :
+         (_isTrend and _isExpansion) ? 1 :
+         0
+
+    _confMid = (_fast + _mid + _long + _struct) / 4.0
+    _confHalf = math.max(_safeAtr * 0.12, math.abs(_maxMA - _minMA) * 0.5)
+
+    _confTop = _confluenceActive ? _confMid + _confHalf : na
+    _confBottom = _confluenceActive ? _confMid - _confHalf : na
+
+    _decisionActive = decisionOnlyCompression ? (_phaseState == -2 or _phaseState == -1) : true
+    _decisionTop = _decisionActive ? _ima + _safeAtr * decisionAtr : na
+    _decisionBottom = _decisionActive ? _ima - _safeAtr * decisionAtr : na
+
+    [_confirmed ? _ima[1] : _ima, _confirmed ? _fast[1] : _fast, _confirmed ? _mid[1] : _mid, _confirmed ? _long[1] : _long, _confirmed ? _struct[1] : _struct, _confirmed ? _confTop[1] : _confTop, _confirmed ? _confBottom[1] : _confBottom, _confirmed ? _decisionTop[1] : _decisionTop, _confirmed ? _decisionBottom[1] : _decisionBottom, _confirmed ? _biasState[1] : _biasState, _confirmed ? _regimeState[1] : _regimeState, _confirmed ? _phaseState[1] : _phaseState, _confirmed ? _atrRatio[1] : _atrRatio, _confirmed ? _efficiency[1] : _efficiency, _confirmed ? _spreadAtr[1] : _spreadAtr, _confirmed ? _confluenceActive[1] : _confluenceActive]
+
+
+//=============================================================================
+// 9. LOCAL Y MTF SAFE
+//=============================================================================
+[locIma, locFast, locMid, locLong, locStruct, locConfTop, locConfBottom, locDecisionTop, locDecisionBottom, locBias, locRegime, locPhase, locAtrRatio, locEfficiency, locSpreadAtr, locConfluence] = f_atlasCore(false)
+
+resolvedTf = originTf == "" ? timeframe.period : originTf
+
+[mtfImaRaw, mtfFastRaw, mtfMidRaw, mtfLongRaw, mtfStructRaw, mtfConfTopRaw, mtfConfBottomRaw, mtfDecisionTopRaw, mtfDecisionBottomRaw, mtfBiasRaw, mtfRegimeRaw, mtfPhaseRaw, mtfAtrRatioRaw, mtfEfficiencyRaw, mtfSpreadAtrRaw, mtfConfluenceRaw] = request.security(
+     syminfo.tickerid,
+     resolvedTf,
+     f_atlasCore(useConfirmedMtf),
+     gaps = barmerge.gaps_off,
+     lookahead = useConfirmedMtf ? barmerge.lookahead_on : barmerge.lookahead_off
+)
+
+mtfIma = mtfImaRaw
+mtfFast = mtfFastRaw
+mtfMid = mtfMidRaw
+mtfLong = mtfLongRaw
+mtfStruct = mtfStructRaw
+mtfConfTop = mtfConfTopRaw
+mtfConfBottom = mtfConfBottomRaw
+mtfDecisionTop = mtfDecisionTopRaw
+mtfDecisionBottom = mtfDecisionBottomRaw
+mtfBias = mtfBiasRaw
+mtfRegime = mtfRegimeRaw
+mtfPhase = mtfPhaseRaw
+mtfAtrRatio = mtfAtrRatioRaw
+mtfEfficiency = mtfEfficiencyRaw
+mtfSpreadAtr = mtfSpreadAtrRaw
+mtfConfluence = mtfConfluenceRaw
+
+ima = useMtf ? mtfIma : locIma
+fastMA = useMtf ? mtfFast : locFast
+midMA = useMtf ? mtfMid : locMid
+longMA = useMtf ? mtfLong : locLong
+structMA = useMtf ? mtfStruct : locStruct
+confTop = useMtf ? mtfConfTop : locConfTop
+confBottom = useMtf ? mtfConfBottom : locConfBottom
+decisionTop = useMtf ? mtfDecisionTop : locDecisionTop
+decisionBottom = useMtf ? mtfDecisionBottom : locDecisionBottom
+biasState = useMtf ? mtfBias : locBias
+regimeState = useMtf ? mtfRegime : locRegime
+phaseState = useMtf ? mtfPhase : locPhase
+atrRatioOut = useMtf ? mtfAtrRatio : locAtrRatio
+efficiencyOut = useMtf ? mtfEfficiency : locEfficiency
+spreadAtrOut = useMtf ? mtfSpreadAtr : locSpreadAtr
+confluenceActive = useMtf ? mtfConfluence : locConfluence
+
+
+//=============================================================================
+// 10. VISUAL
+//=============================================================================
+showMemory = visualPreset == "Completo"
+showConfluenceNow = showConfluence and visualPreset != "Solo principal"
+showDecisionNow = showDecisionZone and visualPreset != "Solo principal"
+
+mainColor =
+     biasState == 2 ? bullColor :
+     biasState == 1 ? color.new(bullColor, 25) :
+     biasState == -2 ? bearColor :
+     biasState == -1 ? color.new(bearColor, 25) :
+     neutralColor
+
+memoryColor =
+     regimeState == 1 ? color.new(bullColor, 55) :
+     regimeState == -1 ? color.new(neutralColor, 55) :
+     color.new(confluenceColor, 45)
+
+plot(ima, "Atlas IMA", color = mainColor, linewidth = mainWidth)
+
+plot(showMemory ? fastMA : na, "IMA momentum", color = color.new(mainColor, 35), linewidth = memoryWidth)
+plot(showMemory ? midMA : na, "IMA tendencia", color = color.new(memoryColor, 20), linewidth = memoryWidth)
+plot(showMemory ? longMA : na, "IMA regimen", color = color.new(memoryColor, 35), linewidth = memoryWidth)
+plot(showMemory ? structMA : na, "IMA estructura", color = color.new(neutralColor, 30), linewidth = memoryWidth)
+
+pConfTop = plot(showConfluenceNow ? confTop : na, "Confluencia superior", color = color.new(confluenceColor, 70), linewidth = 1, style = plot.style_linebr)
+pConfBottom = plot(showConfluenceNow ? confBottom : na, "Confluencia inferior", color = color.new(confluenceColor, 70), linewidth = 1, style = plot.style_linebr)
+
+fill(
+     pConfTop,
+     pConfBottom,
+     color = showConfluenceNow ? color.new(confluenceColor, confluenceTransp) : na,
+     title = "Zona de confluencia"
+)
+
+pDecisionTop = plot(showDecisionNow ? decisionTop : na, "Zona IMA decision superior", color = color.new(decisionColor, 65), linewidth = 1, style = plot.style_linebr)
+pDecisionBottom = plot(showDecisionNow ? decisionBottom : na, "Zona IMA decision inferior", color = color.new(decisionColor, 65), linewidth = 1, style = plot.style_linebr)
+
+fill(
+     pDecisionTop,
+     pDecisionBottom,
+     color = showDecisionNow ? color.new(decisionColor, decisionTransp) : na,
+     title = "Zona IMA de decision"
+)
+
+bgcolor(
+     showBiasBackground ?
+         biasState > 0 ? color.new(bullColor, 94) :
+         biasState < 0 ? color.new(bearColor, 94) :
+         na :
+     na,
+     title = "Fondo de bias"
+)
+
+
+//=============================================================================
+// 11. SEÑALES
+//=============================================================================
+signalConfirmed = not confirmSignalsOnClose or barstate.isconfirmed
+
+biasBullChange = signalConfirmed and biasState > 0 and nz(biasState[1]) <= 0
+biasBearChange = signalConfirmed and biasState < 0 and nz(biasState[1]) >= 0
+
+strongBullChange = signalConfirmed and biasState == 2 and nz(biasState[1]) != 2
+strongBearChange = signalConfirmed and biasState == -2 and nz(biasState[1]) != -2
+
+phaseCompression = signalConfirmed and phaseState == -2 and nz(phaseState[1]) != -2
+phasePreChange = signalConfirmed and phaseState == -1 and nz(phaseState[1]) != -1
+phaseExpansion = signalConfirmed and phaseState == 1 and nz(phaseState[1]) != 1
+phaseExhaustion = signalConfirmed and phaseState == 2 and nz(phaseState[1]) != 2
+confluenceStart = signalConfirmed and confluenceActive and not confluenceActive[1]
+
+plotshape(
+     showSignals and biasBullChange,
+     title = "IMA bias alcista",
+     style = shape.triangleup,
+     location = location.belowbar,
+     color = bullColor,
+     size = size.tiny,
+     text = "IMA"
+)
+
+plotshape(
+     showSignals and biasBearChange,
+     title = "IMA bias bajista",
+     style = shape.triangledown,
+     location = location.abovebar,
+     color = bearColor,
+     size = size.tiny,
+     text = "IMA"
+)
+
+plotshape(
+     showSignals and strongBullChange,
+     title = "IMA bias alcista fuerte",
+     style = shape.circle,
+     location = location.belowbar,
+     color = color.new(bullColor, 0),
+     size = size.tiny,
+     text = "B+"
+)
+
+plotshape(
+     showSignals and strongBearChange,
+     title = "IMA bias bajista fuerte",
+     style = shape.circle,
+     location = location.abovebar,
+     color = color.new(bearColor, 0),
+     size = size.tiny,
+     text = "S+"
+)
+
+plotshape(
+     showPhaseSignals and phasePreChange ? ima : na,
+     title = "IMA pre-cambio",
+     style = shape.diamond,
+     location = location.absolute,
+     color = decisionColor,
+     size = size.tiny,
+     text = "PRE"
+)
+
+plotshape(
+     showPhaseSignals and phaseExhaustion ? ima : na,
+     title = "IMA agotamiento",
+     style = shape.xcross,
+     location = location.absolute,
+     color = confluenceColor,
+     size = size.tiny,
+     text = "AG"
+)
+
+
+//=============================================================================
+// 12. PANEL
+//=============================================================================
+var table originTbl = table.new(
+     f_panelPos(panelPos),
+     2,
+     7,
+     frame_color = color.new(color.gray, 70),
+     frame_width = 1,
+     border_color = color.new(color.gray, 80),
+     border_width = 1
+)
+
+if barstate.islast
+    table.clear(originTbl, 0, 0, 1, 6)
+
+    if showOriginPanel
+        _biasColor = biasState > 0 ? bullColor : biasState < 0 ? bearColor : neutralColor
+        _tfText = useMtf ? resolvedTf + (useConfirmedMtf ? " cerrado" : " vivo") : timeframe.period
+
+        table.cell(originTbl, 0, 0, "ATLAS IMA", text_color = color.white, bgcolor = color.new(color.black, 0), text_size = size.small)
+        table.cell(originTbl, 1, 0, f_biasText(biasState), text_color = color.white, bgcolor = _biasColor, text_size = size.small)
+
+        table.cell(originTbl, 0, 1, "Fase", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(originTbl, 1, 1, f_phaseText(phaseState), text_color = color.white, bgcolor = f_phaseColor(phaseState), text_size = size.tiny)
+
+        table.cell(originTbl, 0, 2, "Regimen", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(originTbl, 1, 2, f_regimeText(regimeState), text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.tiny)
+
+        table.cell(originTbl, 0, 3, "Origen", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(originTbl, 1, 3, _tfText, text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.tiny)
+
+        table.cell(originTbl, 0, 4, "Perfil", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(originTbl, 1, 4, resolvedProfile, text_color = color.white, bgcolor = color.new(color.black, 50), text_size = size.tiny)
+
+        table.cell(originTbl, 0, 5, "ATR/Eff/Sep", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(
+             originTbl,
+             1,
+             5,
+             str.tostring(atrRatioOut, "#.##") + " / " + str.tostring(efficiencyOut, "#.##") + " / " + str.tostring(spreadAtrOut, "#.##"),
+             text_color = color.white,
+             bgcolor = color.new(color.black, 50),
+             text_size = size.tiny
+        )
+
+        table.cell(originTbl, 0, 6, "Conf", text_color = color.white, bgcolor = color.new(color.black, 35), text_size = size.tiny)
+        table.cell(
+             originTbl,
+             1,
+             6,
+             confluenceActive ? "ACTIVA" : "NO",
+             text_color = color.white,
+             bgcolor = confluenceActive ? color.new(confluenceColor, 15) : color.new(color.black, 50),
+             text_size = size.tiny
+        )
+
+
+//=============================================================================
+// 13. ALERTAS
+//=============================================================================
+alertcondition(biasBullChange, "IMA Bias alcista", "ATLAS IMA cambio a bias alcista")
+alertcondition(biasBearChange, "IMA Bias bajista", "ATLAS IMA cambio a bias bajista")
+
+alertcondition(strongBullChange, "IMA Bias alcista fuerte", "ATLAS IMA confirma bias alcista fuerte")
+alertcondition(strongBearChange, "IMA Bias bajista fuerte", "ATLAS IMA confirma bias bajista fuerte")
+
+alertcondition(confluenceStart, "IMA Confluencia", "Atlas IMA detecta una zona de confluencia")
+
+alertcondition(phaseCompression, "IMA Fase compresion", "ATLAS IMA entra en fase de compresion")
+alertcondition(phasePreChange, "IMA Fase pre-cambio", "ATLAS IMA detecta fase de pre-cambio")
+alertcondition(phaseExpansion, "IMA Fase expansion", "ATLAS IMA entra en fase de expansion")
+alertcondition(phaseExhaustion, "IMA Fase agotamiento", "ATLAS IMA detecta posible agotamiento")

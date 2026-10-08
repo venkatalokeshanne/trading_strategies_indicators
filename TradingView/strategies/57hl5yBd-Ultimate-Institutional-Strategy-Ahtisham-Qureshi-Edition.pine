@@ -1,0 +1,503 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © AhtishamQureshi
+//@version=6
+strategy("ULTIMATE TEMA/LSMA + IDEAL + REVERSAL", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, max_bars_back=1000, process_orders_on_close=true)
+// === INPUTS - ORIGINAL TEMA/LSMA ===
+temaLength = input.int(9, "TEMA Length", minval=1, maxval=50)
+lsmaLength = input.int(25, "LSMA Length", minval=1, maxval=50)
+ema100Length = input.int(100, "EMA 100 Length", minval=50, maxval=200)
+takeProfitATRMult = input.float(3.0, "TP ATR Mult", minval=2.0, maxval=5.0)
+stopLossATRMult = input.float(1.5, "SL ATR Mult", minval=1.0, maxval=3.0)
+maxBarsInTrade = input.int(25, "Max Bars in Trade", minval=10, maxval=50)
+volLength = input.int(20, "Volume MA Length", minval=10, maxval=30)
+minVolMultiplier = input.float(1.2, "Volume Multiplier", minval=0.8, maxval=2.0)
+showPanel = input.bool(true, "Show Info Panel", group="Visual Settings")
+lineThickness = input.int(2, "Indicator Line Thickness", minval=1, maxval=4, group="Visual Settings")
+
+// === TREND FILTERS - ORIGINAL ===
+useTrendExhaustion = input.bool(true, "Use Trend Exhaustion Filter", group="Trend Filters")
+minTrendBars = input.int(10, "Min Trend Bars", minval=5, maxval=30, group="Trend Filters")
+momentumDivergence = input.bool(true, "Use Momentum Divergence", group="Trend Filters")
+requireTrendAlignment = input.bool(true, "Require All Indicators Aligned", group="Trend Filters")
+useTrendStrength = input.bool(true, "Use Trend Strength Filter", group="Trend Filters")
+trendStrengthThreshold = input.float(0.5, "Trend Strength Threshold", minval=0.1, maxval=1.0, group="Trend Filters")
+
+// === IDEAL CONDITIONS INPUTS ===
+useIdealConditions = input.bool(true, "Use IDEAL Conditions (Priority)", group="Ideal Conditions")
+pivotLookback = input.int(5, "Pivot Lookback for Sweeps", minval=3, maxval=20, group="Ideal Conditions")
+minSweepSizeATR = input.float(0.3, "Min Sweep Size (ATR %)", minval=0.1, maxval=1.0, group="Ideal Conditions")
+retestTolerance = input.float(0.001, "Retest Tolerance (%)", minval=0.0005, maxval=0.01, group="Ideal Conditions")
+maxTestCount = input.int(3, "Max Tests Before Failure", minval=2, maxval=5, group="Ideal Conditions")
+atrTestPercent = input.float(0.2, "ATR Test %", minval=0.1, maxval=0.5, group="Ideal Conditions")
+
+// === REVERSAL STRATEGY INPUTS ===
+enableReversals = input.bool(true, "Enable Reversal Trades?", group="Reversal Strategy")
+kamaLengthRev = input.int(10, "KAMA Length", minval=5, maxval=20, group="Reversal Strategy")
+adxLength = input.int(14, "ADX Length", minval=10, maxval=30, group="Reversal Strategy")
+adxStrongTrend = input.float(20.0, "ADX Strong Trend", minval=15, maxval=30, group="Reversal Strategy")
+rsiLength = input.int(14, "RSI Length", minval=10, maxval=30, group="Reversal Strategy")
+rsiOB = input.float(70.0, "RSI Overbought", minval=60, maxval=80, group="Reversal Strategy")
+rsiOS = input.float(30.0, "RSI Oversold", minval=20, maxval=40, group="Reversal Strategy")
+williamsLength = input.int(14, "Williams %R Length", minval=10, maxval=30, group="Reversal Strategy")
+williamsOB = input.float(-20.0, "Williams %R OB", minval=-30, maxval=-10, group="Reversal Strategy")
+williamsOS = input.float(-80.0, "Williams %R OS", minval=-90, maxval=-70, group="Reversal Strategy")
+williamsHTF_tf = input.timeframe("30", "Williams HTF", group="Reversal Strategy")
+liquidityZoneBars = input.int(8, "Liquidity Zone Bars", minval=5, maxval=15, group="Reversal Strategy")
+
+// Volume filter (shared)
+minVolMultiplierRev = input.float(1.0, "Volume Multiplier (Rev)", minval=0.5, maxval=1.5, group="Reversal Strategy")
+
+// Additional filters
+filterLong = input(true, "Enable Long Filter?", group="Reversal Strategy")
+filterShort = input(true, "Enable Short Filter?", group="Reversal Strategy")
+goldYieldCorr = input.float(0.0, "Gold-Yield Correlation", minval=-0.5, maxval=0.5, group="Reversal Strategy")
+activeHours = input(true, "Active Hours Filter?", group="Reversal Strategy")
+
+// === AUTO-INSTRUMENT DETECTION FOR ADAPTIVE PARAMETERS ===
+string instrumentType = "UNKNOWN"
+string ticker = syminfo.tickerid
+string baseCurrency = syminfo.basecurrency
+
+// Auto-detection logic
+isGoldFutures = str.contains(ticker, "GC") or str.contains(ticker, "MGC") or str.contains(ticker, "GOLD")
+isGoldSpot = ticker == "XAUUSD" or (baseCurrency == "XAU" and syminfo.currency == "USD")
+isBitcoin = str.contains(ticker, "BTC") or baseCurrency == "BTC" or str.contains(ticker, "BITCOIN")
+isEthereum = str.contains(ticker, "ETH") or baseCurrency == "ETH" or str.contains(ticker, "ETHEREUM")
+
+if isGoldFutures or isGoldSpot
+    instrumentType := "GOLD"
+else if isBitcoin
+    instrumentType := "BITCOIN"
+else if isEthereum
+    instrumentType := "ETHEREUM"
+else
+    instrumentType := "OTHER"
+
+// Adaptive parameter overrides based on instrument
+adaptivePivotLookback = instrumentType == "GOLD" ? 5 : instrumentType == "BITCOIN" ? 10 : instrumentType == "ETHEREUM" ? 8 : pivotLookback
+adaptiveMinSweepATR = instrumentType == "GOLD" ? 0.3 : instrumentType == "BITCOIN" ? 0.5 : instrumentType == "ETHEREUM" ? 0.4 : minSweepSizeATR
+adaptiveRetestTolerance = instrumentType == "GOLD" ? 0.001 : instrumentType == "BITCOIN" ? 0.005 : instrumentType == "ETHEREUM" ? 0.006 : retestTolerance
+adaptiveATRTestPercent = instrumentType == "GOLD" ? 0.2 : instrumentType == "BITCOIN" ? 0.5 : instrumentType == "ETHEREUM" ? 0.6 : atrTestPercent
+
+// === CORE CALCULATIONS - TEMA/LSMA ===
+src = close
+lsma = ta.linreg(src, lsmaLength, 0)
+xEMA1 = ta.ema(close, temaLength)
+xEMA2 = ta.ema(xEMA1, temaLength)
+xEMA3 = ta.ema(xEMA2, temaLength)
+tema = 3 * xEMA1 - 3 * xEMA2 + xEMA3
+ema100 = ta.ema(close, ema100Length)
+atr = ta.atr(14)
+rsi = ta.rsi(close, 14)
+volMA = ta.sma(volume, volLength)
+
+// === REVERSAL STRATEGY INDICATORS ===
+rsiRev = ta.rsi(close, rsiLength)
+stochK = ta.sma(ta.stoch(close, high, low, 9), 6)
+stochD = ta.sma(stochK, 3)
+rsi1 = ta.rsi(close, 14)
+stochRsi = (rsi1 - ta.lowest(rsi1, 14)) / (ta.highest(rsi1, 14) - ta.lowest(rsi1, 14)) * 100
+[macdLine, signalLine, histLine] = ta.macd(close, 12, 26, 9)
+dmiPlus  = ta.rma(math.max(ta.change(high), 0), adxLength)
+dmiMinus = ta.rma(-math.min(ta.change(low), 0), adxLength)
+trur     = ta.rma(ta.tr, adxLength)
+plusDI   = 100 * dmiPlus / trur
+minusDI  = 100 * dmiMinus / trur
+dx       = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+adx      = ta.rma(dx, adxLength)
+williams = -100 * (ta.highest(high, williamsLength) - close) / (ta.highest(high, williamsLength) - ta.lowest(low, williamsLength))
+williamsHTF = request.security(syminfo.tickerid, williamsHTF_tf, williams)
+cci = (close - ta.sma(close, 14)) / (0.015 * ta.dev(close, 14))
+
+// KAMA for reversal strategy
+kamaRev = ta.ema(close, kamaLengthRev)
+kamaRising = kamaRev > kamaRev[1]
+kamaFalling = kamaRev < kamaRev[1]
+
+// Volume MA for reversal
+volMARev = ta.sma(volume, volLength)
+
+// === MARKET SENTIMENT CALC (REVERSAL) ===
+rsiBearish = rsiRev < 50
+stochBearish = stochK < 50 or stochK < stochD
+stochRsiBearish = stochRsi < 50
+macdBearish = macdLine < signalLine
+williamsBearish = williams < -50
+cciBearish = cci < 0
+bearishScore = (rsiBearish ? 1 : 0) + (stochBearish ? 1 : 0) + (stochRsiBearish ? 1 : 0) + (macdBearish ? 1 : 0) + (williamsBearish ? 1 : 0) + (cciBearish ? 1 : 0)
+strongBearishConsensus = bearishScore >= 3
+
+rsiBullish = rsiRev > 50
+stochBullish = stochK > 50 or stochK > stochD
+stochRsiBullish = stochRsi > 50
+macdBullish = macdLine > signalLine
+williamsBullish = williams > -50
+cciBullish = cci > 0
+bullishScore = (rsiBullish ? 1 : 0) + (stochBullish ? 1 : 0) + (stochRsiBullish ? 1 : 0) + (macdBullish ? 1 : 0) + (williamsBullish ? 1 : 0) + (cciBullish ? 1 : 0)
+strongBullishConsensus = bullishScore >= 3
+neutralMarket = bullishScore >= 3 and bearishScore >= 3
+
+// === TREND LOGIC (REVERSAL) ===
+longTrendRev  = close > kamaRev and kamaRising and (adx > adxStrongTrend or plusDI > minusDI)
+shortTrendRev = close < kamaRev and kamaFalling and (adx > adxStrongTrend or minusDI > plusDI)
+
+// CHOCH & Liquidity Zones (REVERSAL)
+var float chochSwingHigh = na
+var float chochSwingLow = na
+isSwingHigh = ta.pivothigh(high, 3, 3)
+isSwingLow = ta.pivotlow(low, 3, 3)
+if not na(isSwingHigh)
+    chochSwingHigh := high[3]
+if not na(isSwingLow)
+    chochSwingLow := low[3]
+
+chochBrokenUp   = not na(chochSwingHigh) and close > chochSwingHigh
+chochBrokenDown = not na(chochSwingLow) and close < chochSwingLow
+
+var float liquidityZoneHigh = na
+var float liquidityZoneLow = na
+if not na(isSwingHigh)
+    liquidityZoneHigh := ta.highest(high, liquidityZoneBars)
+if not na(isSwingLow)
+    liquidityZoneLow := ta.lowest(low, liquidityZoneBars)
+
+// Volume filter (reversal)
+volumeOKRev = volume > volMARev * minVolMultiplierRev
+
+// === PIVOT DETECTION FOR IDEAL CONDITIONS ===
+pivotHigh = ta.pivothigh(high, adaptivePivotLookback, adaptivePivotLookback)
+pivotLow = ta.pivotlow(low, adaptivePivotLookback, adaptivePivotLookback)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+
+// === IDEAL CONDITION 2: LIQUIDITY SWEEP DETECTION ===
+float minSweepSize = atr * adaptiveMinSweepATR
+liquiditySweepDown = low < lastPivotLow and close > high[1] and (high[1] - low) > minSweepSize
+liquiditySweepUp = high > lastPivotHigh and close < low[1] and (high - low[1]) > minSweepSize
+
+// === IDEAL CONDITION 3: BREAK OF STRUCTURE RETEST ===
+bullishBoS = ta.crossover(close, ema100) and close > ema100
+bearishBoS = ta.crossunder(close, ema100) and close < ema100
+
+var float lastBullishBoSLevel = na
+var float lastBearishBoSLevel = na
+if bullishBoS
+    lastBullishBoSLevel := ema100
+if bearishBoS
+    lastBearishBoSLevel := ema100
+
+bullishBoSRetest = not na(lastBullishBoSLevel) and 
+                   close < lastBullishBoSLevel * (1 + adaptiveRetestTolerance) and 
+                   close > lastBullishBoSLevel * (1 - adaptiveRetestTolerance) and 
+                   close > open
+
+bearishBoSRetest = not na(lastBearishBoSLevel) and 
+                   close > lastBearishBoSLevel * (1 - adaptiveRetestTolerance) and 
+                   close < lastBearishBoSLevel * (1 + adaptiveRetestTolerance) and 
+                   close < open
+
+// === IDEAL CONDITION 4: SUPPORT/RESISTANCE TEST COUNTER ===
+var int ema100TestCount = 0
+var float lastTestPrice = na
+var int testBarIndex = na
+
+if math.abs(close - ema100) < atr * adaptiveATRTestPercent
+    if na(lastTestPrice) or (bar_index != testBarIndex and lastTestPrice != close)
+        ema100TestCount := ema100TestCount + 1
+        lastTestPrice := close
+        testBarIndex := bar_index
+
+if math.abs(close - ema100) > atr * 0.5
+    ema100TestCount := 0
+
+// === LOWER HIGH / HIGHER LOW DETECTION ===
+lowerHigh = high < lastPivotHigh and high > high[1]
+higherLow = low > lastPivotLow and low < low[1]
+
+// === ZONE DETECTION (OVERSOLD/OVERBOUGHT) ===
+float priceToTEMA = (close - tema) / tema * 100
+float priceToLSMA = (close - lsma) / lsma * 100
+float priceToEMA100 = (close - ema100) / ema100 * 100
+
+zoneScore = (priceToTEMA + priceToLSMA + priceToEMA100) / 3
+
+// Adaptive zone thresholds
+float zoneThreshold1 = instrumentType == "GOLD" ? 2.0 : instrumentType == "BITCOIN" ? 5.0 : instrumentType == "ETHEREUM" ? 6.0 : 2.0
+float zoneThreshold2 = instrumentType == "GOLD" ? 1.0 : instrumentType == "BITCOIN" ? 2.5 : instrumentType == "ETHEREUM" ? 3.0 : 1.0
+
+string zone = zoneScore <= -zoneThreshold1 ? "EXTREME_OVERSOLD" : 
+              zoneScore <= -zoneThreshold2 ? "OVERSOLD" : 
+              zoneScore <= 0.5 ? "NEUTRAL_LOW" : 
+              zoneScore <= 1.5 ? "NEUTRAL_HIGH" : 
+              zoneScore <= zoneThreshold2 ? "OVERBOUGHT" : "EXTREME_OVERBOUGHT"
+
+// === TREND DIRECTION DETECTION (ORIGINAL) ===
+isTemaBullish = tema > tema[1]
+isLsmaBullish = lsma > lsma[1]
+isEma100Bullish = ema100 > ema100[1]
+
+allBullish = isTemaBullish and isLsmaBullish and isEma100Bullish
+allBearish = not isTemaBullish and not isLsmaBullish and not isEma100Bullish
+
+// === TRADE ALLOWANCE VARIABLES ===
+bool longAllowed = false
+bool shortAllowed = false
+
+if requireTrendAlignment
+    longAllowed := allBullish
+    shortAllowed := allBearish
+else
+    longAllowed := tema > lsma and close > ema100
+    shortAllowed := tema < lsma and close < ema100
+
+// === TREND STRENGTH CALCULATION ===
+temaSlope = tema - tema[5]
+lsmaSlope = lsma - lsma[10]
+ema100Slope = ema100 - ema100[20]
+
+trendStrength = (temaSlope + lsmaSlope + ema100Slope) / 3
+normalizedStrength = math.abs(trendStrength) / atr
+
+// === TREND DURATION TRACKING ===
+var int trendBars = 0
+var bool currentTrendBullish = false
+var float trendStartPrice = 0.0
+
+if bar_index == 0
+    trendBars := 0
+    currentTrendBullish := false
+    trendStartPrice := 0.0
+else
+    if allBullish and (not currentTrendBullish or trendStartPrice == 0.0)
+        trendBars := 1
+        currentTrendBullish := true
+        trendStartPrice := close
+    else if allBearish and (currentTrendBullish or trendStartPrice == 0.0)
+        trendBars := 1
+        currentTrendBullish := false
+        trendStartPrice := close
+    else if (currentTrendBullish and allBullish) or (not currentTrendBullish and allBearish)
+        trendBars := trendBars + 1
+    else
+        trendBars := 0
+        currentTrendBullish := false
+        trendStartPrice := 0.0
+
+// === TREND EXHAUSTION DETECTION ===
+trendExhausted = false
+if trendBars > 0 and trendStartPrice > 0.0
+    trendMagnitude = currentTrendBullish ? ((close - trendStartPrice) / trendStartPrice) * 100 : ((trendStartPrice - close) / trendStartPrice) * 100
+    condition1 = trendBars > minTrendBars * 2
+    condition2 = normalizedStrength < trendStrengthThreshold
+    condition3 = (currentTrendBullish and not allBullish) or (not currentTrendBullish and not allBearish)
+    
+    rsiDivergence = false
+    if momentumDivergence
+        if currentTrendBullish
+            priceHigher = close > close[10]
+            rsiLower = rsi < rsi[10]
+            rsiDivergence := priceHigher and rsiLower
+        else
+            priceLower = close < close[10]
+            rsiHigher = rsi > rsi[10]
+            rsiDivergence := priceLower and rsiHigher
+    
+    trendExhausted = condition1 and (condition2 or condition3 or rsiDivergence)
+
+// === VOLUME CONFIRMATION (ORIGINAL) ===
+volumeOK = volume > volMA * minVolMultiplier
+
+// === ORIGINAL CROSSOVER SIGNALS ===
+temaCrossAboveLsma = ta.crossover(tema, lsma)
+temaCrossBelowLsma = ta.crossunder(tema, lsma)
+
+// === REVERSAL STRATEGY ENTRY CONDITIONS ===
+reversalLongCondition = enableReversals ? longTrendRev and strongBullishConsensus and volumeOKRev and activeHours : false
+reversalShortCondition = enableReversals ? shortTrendRev and strongBearishConsensus and volumeOKRev and activeHours : false
+
+// === IDEAL CONDITIONS SIGNALS ===
+string idealScenario = "WAIT"
+string idealAction = "WAIT"
+
+if useIdealConditions
+    // IDEAL B2: Liquidity Sweep + Reversal
+    if liquiditySweepDown and close > ema100 and volumeOK
+        idealScenario := "IDEAL B2: Liquidity Sweep"
+        idealAction := "BUY"
+    
+    // IDEAL B3: Break of Structure Retest
+    else if bullishBoSRetest and tema > lsma and volumeOK
+        idealScenario := "IDEAL B3: BoS Retest"
+        idealAction := "BUY"
+    
+    // IDEAL B4: Oversold Confluence
+    else if (zone == "EXTREME_OVERSOLD" or zone == "OVERSOLD") and close > ema100 and tema > lsma and volumeOK
+        idealScenario := "IDEAL B4: Oversold Confluence"
+        idealAction := "BUY"
+    
+    // IDEAL SELL CONDITIONS
+    // IDEAL S1: Broken Support Retest
+    if bearishBoSRetest and tema < lsma and volumeOK
+        idealScenario := "IDEAL S1: Broken Support"
+        idealAction := "SELL"
+    
+    // IDEAL S2: Lower High Formation
+    else if lowerHigh and (zone == "OVERBOUGHT" or zone == "EXTREME_OVERBOUGHT") and tema < lsma
+        idealScenario := "IDEAL S2: Lower High"
+        idealAction := "SELL"
+    
+    // IDEAL S4: 3rd Test Failure
+    else if ema100TestCount >= maxTestCount and close < ema100 and tema < lsma and ta.crossunder(close, ema100)
+        idealScenario := "IDEAL S4: 3rd Test Failure"
+        idealAction := "SELL"
+
+// === FINAL SIGNAL LOGIC (Priority: IDEAL > REVERSAL > ORIGINAL) ===
+bool longCondition = false
+bool shortCondition = false
+string activeScenario = ""
+string signalSource = ""
+
+// Priority 1: IDEAL Conditions
+if useIdealConditions and idealAction == "BUY" and strategy.position_size == 0
+    longCondition := true
+    activeScenario := idealScenario
+    signalSource := "IDEAL"
+else if useIdealConditions and idealAction == "SELL" and strategy.position_size == 0
+    shortCondition := true
+    activeScenario := idealScenario
+    signalSource := "IDEAL"
+
+// Priority 2: Reversal Strategy
+else if enableReversals and reversalLongCondition and strategy.position_size == 0
+    longCondition := true
+    activeScenario := "REVERSAL: Long"
+    signalSource := "REVERSAL"
+else if enableReversals and reversalShortCondition and strategy.position_size == 0
+    shortCondition := true
+    activeScenario := "REVERSAL: Short"
+    signalSource := "REVERSAL"
+
+// Priority 3: Original TEMA/LSMA Logic
+else
+    if useTrendExhaustion
+        longCondition := (longAllowed and temaCrossAboveLsma and volumeOK) or (trendExhausted and not currentTrendBullish and temaCrossAboveLsma and volumeOK)
+        shortCondition := (shortAllowed and temaCrossBelowLsma and volumeOK) or (trendExhausted and currentTrendBullish and temaCrossBelowLsma and volumeOK)
+        activeScenario := longCondition ? (trendExhausted ? "ORIGINAL: Exhaustion Long" : "ORIGINAL: Trend Long") : 
+                          shortCondition ? (trendExhausted ? "ORIGINAL: Exhaustion Short" : "ORIGINAL: Trend Short") : "WAIT"
+    else
+        longCondition := longAllowed and temaCrossAboveLsma and volumeOK
+        shortCondition := shortAllowed and temaCrossBelowLsma and volumeOK
+        activeScenario := longCondition ? "ORIGINAL: Long" : shortCondition ? "ORIGINAL: Short" : "WAIT"
+    signalSource := longCondition or shortCondition ? "ORIGINAL" : ""
+
+// === RISK MANAGEMENT ===
+longSL = strategy.position_size > 0 ? strategy.position_avg_price - stopLossATRMult * atr : na
+longTP = strategy.position_size > 0 ? strategy.position_avg_price + takeProfitATRMult * atr : na
+shortSL = strategy.position_size < 0 ? strategy.position_avg_price + stopLossATRMult * atr : na
+shortTP = strategy.position_size < 0 ? strategy.position_avg_price - takeProfitATRMult * atr : na
+trailOffset = atr * 0.5
+
+// === STRATEGY EXECUTION ===
+if longCondition and strategy.position_size == 0
+    strategy.entry("Long", strategy.long)
+
+if shortCondition and strategy.position_size == 0
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longSL, limit=longTP, trail_points=trailOffset, trail_offset=trailOffset)
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortSL, limit=shortTP, trail_points=trailOffset, trail_offset=trailOffset)
+
+if strategy.position_size != 0 and bar_index - strategy.opentrades.entry_bar_index(0) >= maxBarsInTrade
+    strategy.close_all()
+
+// === PLOTTING ===
+plot(tema, "TEMA 9", color=color.new(#2196F3, 0), linewidth=lineThickness)
+plot(lsma, "LSMA 25", color=color.new(#FF9800, 0), linewidth=lineThickness)
+plot(ema100, "EMA 100", color=color.new(#9C27B0, 0), linewidth=2)
+
+// Plot KAMA from reversal strategy
+plot(enableReversals ? kamaRev : na, "KAMA Rev", color=color.new(#FF00FF, 0), linewidth=1)
+
+// Liquidity zones
+plot(enableReversals ? liquidityZoneHigh : na, "Liquidity High", color.red, 1, plot.style_linebr)
+plot(enableReversals ? liquidityZoneLow : na, "Liquidity Low", color.green, 1, plot.style_linebr)
+
+// Signal shapes with different colors for each source
+plotshape(longCondition and signalSource == "IDEAL", "IDEAL BUY", shape.triangleup, location.belowbar, color=color.new(#00FF00, 0), size=size.large, offset=0)
+plotshape(longCondition and signalSource == "REVERSAL", "REV BUY", shape.triangleup, location.belowbar, color=color.new(#00FFFF, 0), size=size.normal, offset=0)
+plotshape(longCondition and signalSource == "ORIGINAL", "ORIGINAL BUY", shape.triangleup, location.belowbar, color=color.new(#4CAF50, 0), size=size.small, offset=0)
+
+plotshape(shortCondition and signalSource == "IDEAL", "IDEAL SELL", shape.triangledown, location.abovebar, color=color.new(#FF0000, 0), size=size.large, offset=0)
+plotshape(shortCondition and signalSource == "REVERSAL", "REV SELL", shape.triangledown, location.abovebar, color=color.new(#FF00FF, 0), size=size.normal, offset=0)
+plotshape(shortCondition and signalSource == "ORIGINAL", "ORIGINAL SELL", shape.triangledown, location.abovebar, color=color.new(#F44336, 0), size=size.small, offset=0)
+
+// Background colors
+bgcolor(allBullish ? color.new(#4CAF50, 90) : allBearish ? color.new(#F44336, 90) : color.new(#FFC107, 90))
+plotshape(trendExhausted, "Trend Exhausted", shape.labelup, location.belowbar, color=color.new(#FF9800, 0), textcolor=color.white, text="EXHAUSTED", size=size.tiny)
+
+// Plot sweep signals
+plotshape(liquiditySweepDown, "Sweep Long", shape.flag, location.belowbar, color=color.new(#00FF00, 50), size=size.tiny)
+plotshape(liquiditySweepUp, "Sweep Short", shape.flag, location.abovebar, color=color.new(#FF0000, 50), size=size.tiny)
+
+// === COMPREHENSIVE TABLE ===
+if showPanel and barstate.islast
+    var table infoTable = table.new(position.bottom_left, 14, 14, bgcolor=color.new(#0a0a0a, 90), border_width=1)
+    
+    // Header with instrument info
+    table.cell(infoTable, 0, 0, "⚡ " + instrumentType + " ULTIMATE TRADE PANEL", text_color=color.yellow, bgcolor=color.new(#2c3e50, 50), text_size=size.normal)
+    table.merge_cells(infoTable, 0, 0, 13, 0)
+    
+    // Row 1: Main indicators
+    table.cell(infoTable, 0, 1, "Indicator", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 1, 1, "TEMA", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 2, 1, "LSMA", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 3, 1, "EMA100", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 4, 1, "KAMA", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 5, 1, "Zone", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 6, 1, "Trend", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 7, 1, "Bars", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 8, 1, "Strength", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 9, 1, "RSI", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 10, 1, "Volume", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 11, 1, "Tests", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 12, 1, "Source", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 13, 1, "Signal", text_color=color.yellow, text_size=size.small)
+    
+    // Row 2: Values
+    table.cell(infoTable, 0, 2, "Value", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(tema, "#.##"), text_color=color.new(#2196F3, 0), text_size=size.small)
+    table.cell(infoTable, 2, 2, str.tostring(lsma, "#.##"), text_color=color.new(#FF9800, 0), text_size=size.small)
+    table.cell(infoTable, 3, 2, str.tostring(ema100, "#.##"), text_color=color.new(#9C27B0, 0), text_size=size.small)
+    table.cell(infoTable, 4, 2, str.tostring(kamaRev, "#.##"), text_color=color.new(#FF00FF, 0), text_size=size.small)
+    
+    zoneColor = zone == "EXTREME_OVERSOLD" ? color.green : zone == "EXTREME_OVERBOUGHT" ? color.red : color.white
+    table.cell(infoTable, 5, 2, zone, text_color=zoneColor, text_size=size.small)
+    
+    directionText = allBullish ? "↗️ BULL" : allBearish ? "↘️ BEAR" : "🔄 MIX"
+    directionColor = allBullish ? color.green : allBearish ? color.red : color.orange
+    table.cell(infoTable, 6, 2, directionText, text_color=directionColor, text_size=size.small)
+    
+    barsColor = trendBars >= minTrendBars ? color.green : color.yellow
+    table.cell(infoTable, 7, 2, str.tostring(trendBars), text_color=barsColor, text_size=size.small)
+    
+    strengthColor = normalizedStrength > trendStrengthThreshold ? color.green : normalizedStrength > 0 ? color.yellow : color.red
+    table.cell(infoTable, 8, 2, str.tostring(normalizedStrength, "#.##"), text_color=strengthColor, text_size=size.small)
+    
+    rsiColor = rsi > 70 ? color.red : rsi < 30 ? color.green : color.yellow
+    table.cell(infoTable, 9, 2, str.tostring(rsi, "#.#"), text_color=rsiColor, text_size=size.small)
+    
+    volColor = volumeOK ? color.green : color.red
+    volRatio = volume / volMA
+    table.cell(infoTable, 10, 2, str.tostring(volRatio, "#.##") + "x", text_color=volColor, text_size=size.small)
+    
+    table.cell(infoTable, 11, 2, str.tostring(ema100TestCount) + "/" + str.tostring(maxTestCount), text_color=color.white, text_size=size.small)
+    
+    sourceColor = signalSource == "IDEAL"

@@ -1,0 +1,270 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("Adaptive Regression Breakout Map (Fixed)", shorttitle="ARBM Fixed", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// UI inputs
+grp_model = "Regression Model"
+length    = input.int(50, "Regression Length", group=grp_model)
+devMult   = input.float(2.0, "Deviation Multiplier", group=grp_model)
+
+grp_sqz   = "Contraction Metrics"
+sqzLen    = input.int(100, "Lookback Period", group=grp_sqz)
+sqzPct    = input.float(20.0, "Contraction Threshold %", group=grp_sqz)
+
+grp_risk  = "Target Architecture"
+tp1Mult   = input.float(1.0, "TP1 Multiplier (x Bandwidth)", group=grp_risk)
+tp2Mult   = input.float(2.0, "TP2 Multiplier (x Bandwidth)", group=grp_risk)
+tp3Mult   = input.float(3.0, "TP3 Multiplier (x Bandwidth)", group=grp_risk)
+
+grp_trend = "Holographic Trendlines Overlay"
+showTrend = input.bool(true, "Show Holographic Trendlines", group=grp_trend)
+pivLen    = input.int(10, "Pivot Length", group=grp_trend)
+
+// Regression channel + squeeze state
+regBasis  = ta.linreg(close, length, 0)
+stdDev    = ta.stdev(close, length)
+upperBand = regBasis + (stdDev * devMult)
+lowerBand = regBasis - (stdDev * devMult)
+bandWidth = upperBand - lowerBand
+minWidth  = ta.lowest(bandWidth, sqzLen)
+maxWidth  = ta.highest(bandWidth, sqzLen)
+widthPct  = (bandWidth - minWidth) / math.max(maxWidth - minWidth, 0.000001) * 100
+isSqueeze = widthPct <= sqzPct
+
+// Trendline pivot state (cosmetic overlay only — not part of the signal)
+var float ph1_y = na
+var int   ph1_x = na
+var float ph2_y = na
+var int   ph2_x = na
+var float pl1_y = na
+var int   pl1_x = na
+var float pl2_y = na
+var int   pl2_x = na
+
+var line line_ph_core  = line.new(na, na, na, na, color=color.new(#00FFFF, 0), style=line.style_solid, width=1)
+var line line_ph_glow1 = line.new(na, na, na, na, color=color.new(#00FFFF, 60), style=line.style_solid, width=3)
+var line line_ph_glow2 = line.new(na, na, na, na, color=color.new(#00FFFF, 85), style=line.style_solid, width=6)
+
+var line line_pl_core  = line.new(na, na, na, na, color=color.new(#FF00FF, 0), style=line.style_solid, width=1)
+var line line_pl_glow1 = line.new(na, na, na, na, color=color.new(#FF00FF, 60), style=line.style_solid, width=3)
+var line line_pl_glow2 = line.new(na, na, na, na, color=color.new(#FF00FF, 85), style=line.style_solid, width=6)
+
+ph = ta.pivothigh(high, pivLen, pivLen)
+pl = ta.pivotlow(low, pivLen, pivLen)
+
+if not na(ph)
+    ph2_y := ph1_y
+    ph2_x := ph1_x
+    ph1_y := ph
+    ph1_x := bar_index - pivLen
+    if showTrend and not na(ph2_x)
+        line.set_xy1(line_ph_core, ph2_x, ph2_y)
+        line.set_xy2(line_ph_core, ph1_x, ph1_y)
+        line.set_extend(line_ph_core, extend.right)
+
+        line.set_xy1(line_ph_glow1, ph2_x, ph2_y)
+        line.set_xy2(line_ph_glow1, ph1_x, ph1_y)
+        line.set_extend(line_ph_glow1, extend.right)
+
+        line.set_xy1(line_ph_glow2, ph2_x, ph2_y)
+        line.set_xy2(line_ph_glow2, ph1_x, ph1_y)
+        line.set_extend(line_ph_glow2, extend.right)
+
+if not na(pl)
+    pl2_y := pl1_y
+    pl2_x := pl1_x
+    pl1_y := pl
+    pl1_x := bar_index - pivLen
+    if showTrend and not na(pl2_x)
+        line.set_xy1(line_pl_core, pl2_x, pl2_y)
+        line.set_xy2(line_pl_core, pl1_x, pl1_y)
+        line.set_extend(line_pl_core, extend.right)
+
+        line.set_xy1(line_pl_glow1, pl2_x, pl2_y)
+        line.set_xy2(line_pl_glow1, pl1_x, pl1_y)
+        line.set_extend(line_pl_glow1, extend.right)
+
+        line.set_xy1(line_pl_glow2, pl2_x, pl2_y)
+        line.set_xy2(line_pl_glow2, pl1_x, pl1_y)
+        line.set_extend(line_pl_glow2, extend.right)
+
+// Breakout triggers. rawBull/rawBear feed the alerts; the trade engine only acts on
+// confirmed bars so realtime behaviour matches the historical calculation (FIX 7).
+rawBull = close > upperBand and close[1] <= upperBand[1] and isSqueeze[1]
+rawBear = close < lowerBand and close[1] >= lowerBand[1] and isSqueeze[1]
+bullTrigger = rawBull and barstate.isconfirmed
+bearTrigger = rawBear and barstate.isconfirmed
+
+// Trade state
+var int   tradeDir = 0
+var int   entryBar = na
+var float entryPx  = na
+var float slPx     = na
+var float tp1Px    = na
+var float tp2Px    = na
+var float tp3Px    = na
+
+var bool  tp1Hit   = false
+var bool  tp2Hit   = false
+
+var float[] tradeReturns = array.new<float>()
+var int     totalTrades  = 0
+var int     winTrades    = 0
+
+var line  lineEp   = na
+var line  lineSl   = na
+var line  lineTp1  = na
+var line  lineTp2  = na
+var line  lineTp3  = na
+
+var label lblTp1   = na
+var label lblTp2   = na
+var label lblTp3   = na
+
+// Per-bar event flags for the exit alerts
+bool tpHitEvent = false
+bool slHitEvent = false
+
+if tradeDir == 0
+    if bullTrigger
+        tradeDir := 1
+        entryBar := bar_index
+        entryPx  := close
+        slPx     := lowerBand[1]
+        tp1Px    := entryPx + (bandWidth[1] * tp1Mult)
+        tp2Px    := entryPx + (bandWidth[1] * tp2Mult)
+        tp3Px    := entryPx + (bandWidth[1] * tp3Mult)
+        tp1Hit   := false
+        tp2Hit   := false
+
+        label.new(bar_index, low, "Breakout, Long", style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+
+    else if bearTrigger
+        tradeDir := -1
+        entryBar := bar_index
+        entryPx  := close
+        slPx     := upperBand[1]
+        tp1Px    := entryPx - (bandWidth[1] * tp1Mult)
+        tp2Px    := entryPx - (bandWidth[1] * tp2Mult)
+        tp3Px    := entryPx - (bandWidth[1] * tp3Mult)
+        tp1Hit   := false
+        tp2Hit   := false
+
+        label.new(bar_index, high, "Breakout, Short", style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.small)
+
+    if tradeDir != 0
+        lineEp  := line.new(bar_index, entryPx, bar_index + 10, entryPx, color=color.new(color.blue, 50), width=2)
+        lineSl  := line.new(bar_index, slPx, bar_index + 10, slPx, color=color.new(color.red, 50), width=2)
+        lineTp1 := line.new(bar_index, tp1Px, bar_index + 10, tp1Px, color=color.new(color.green, 50), style=line.style_dashed)
+        lineTp2 := line.new(bar_index, tp2Px, bar_index + 10, tp2Px, color=color.new(color.green, 50), style=line.style_dashed)
+        lineTp3 := line.new(bar_index, tp3Px, bar_index + 10, tp3Px, color=color.new(color.green, 50), style=line.style_dashed)
+
+        lblTp1  := label.new(bar_index + 10, tp1Px, "TP1", style=label.style_none, textcolor=color.green, size=size.small)
+        lblTp2  := label.new(bar_index + 10, tp2Px, "TP2", style=label.style_none, textcolor=color.green, size=size.small)
+        lblTp3  := label.new(bar_index + 10, tp3Px, "TP3", style=label.style_none, textcolor=color.green, size=size.small)
+
+if tradeDir != 0
+    line.set_x2(lineEp, bar_index + 5)
+    line.set_x2(lineSl, bar_index + 5)
+    line.set_x2(lineTp1, bar_index + 5)
+    line.set_x2(lineTp2, bar_index + 5)
+    line.set_x2(lineTp3, bar_index + 5)
+
+    label.set_x(lblTp1, bar_index + 5)
+    label.set_x(lblTp2, bar_index + 5)
+    label.set_x(lblTp3, bar_index + 5)
+
+    // FIX 3: the entry fills at the close of the signal bar, so that bar's high/low
+    // printed before the position existed — exit checks start on the next bar.
+    // FIX 7: confirmed bars only, so realtime matches the historical calculation.
+    if barstate.isconfirmed and bar_index > entryBar
+        bool hitSl  = (tradeDir == 1 and low <= slPx) or (tradeDir == -1 and high >= slPx)
+        bool hitTp1 = (tradeDir == 1 and high >= tp1Px) or (tradeDir == -1 and low <= tp1Px)
+        bool hitTp2 = (tradeDir == 1 and high >= tp2Px) or (tradeDir == -1 and low <= tp2Px)
+        bool hitTp3 = (tradeDir == 1 and high >= tp3Px) or (tradeDir == -1 and low <= tp3Px)
+
+        // FIX 4: OHLC bars don't reveal intrabar order — if the stop was touched at all,
+        // assume it filled before any TP on the same bar (worst case).
+        if hitSl
+            // FIX 6: an adverse opening gap fills the stop at the open, not at the stop price
+            float exitPx      = tradeDir == 1 ? math.min(open, slPx) : math.max(open, slPx)
+            float tradeReturn = (exitPx - entryPx) / entryPx * tradeDir * 100
+            array.push(tradeReturns, tradeReturn)
+            totalTrades += 1
+            // FIX 5: a win is a closed trade with a positive booked return
+            if tradeReturn > 0
+                winTrades += 1
+            slHitEvent := true
+
+            string exitText = (tp1Hit ? "Trail Stop Hit " : "Stop Loss Hit ") + str.tostring(tradeReturn, "#.##") + "%"
+            label.new(bar_index, tradeDir == 1 ? low : high, exitText, style=tradeDir == 1 ? label.style_label_up : label.style_label_down, color=tp1Hit ? color.blue : color.red, textcolor=color.white, size=size.small)
+            tradeDir := 0
+        else
+            if hitTp1 and not tp1Hit
+                tp1Hit := true
+                slPx   := entryPx
+                line.set_y1(lineSl, slPx)
+                line.set_y2(lineSl, slPx)
+                tpHitEvent := true
+                label.new(bar_index, tradeDir == 1 ? high : low, "TP1 Hit, Stop to Breakeven", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.blue, textcolor=color.white, size=size.small)
+
+            if hitTp2 and not tp2Hit
+                tp2Hit := true
+                slPx   := tp1Px
+                line.set_y1(lineSl, slPx)
+                line.set_y2(lineSl, slPx)
+                tpHitEvent := true
+                label.new(bar_index, tradeDir == 1 ? high : low, "TP2 Hit, Stop to TP1", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.blue, textcolor=color.white, size=size.small)
+
+            if hitTp3
+                // FIX 6: a favorable opening gap fills the target at the open
+                float exitPx      = tradeDir == 1 ? math.max(open, tp3Px) : math.min(open, tp3Px)
+                float tradeReturn = (exitPx - entryPx) / entryPx * tradeDir * 100
+                array.push(tradeReturns, tradeReturn)
+                totalTrades += 1
+                if tradeReturn > 0
+                    winTrades += 1
+                tpHitEvent := true
+
+                // FIX 2: draw the close label BEFORE resetting tradeDir
+                label.new(bar_index, tradeDir == 1 ? high : low, "TP3 Hit (Closed) " + str.tostring(tradeReturn, "#.##") + "%", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+                tradeDir := 0
+
+// Visuals and mapping
+bandColor = isSqueeze ? color.new(color.gray, 60) : color.new(color.navy, 80)
+pUpper    = plot(upperBand, color=bandColor, title="Upper Deviation")
+pLower    = plot(lowerBand, color=bandColor, title="Lower Deviation")
+fill(pUpper, pLower, color=color.new(bandColor, 90), title="Regression Channel")
+
+// Stats table
+if barstate.islast
+    var tbl = table.new(position.top_right, 2, 5, bgcolor=color.new(color.navy, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 50), frame_width=1)
+
+    float avgRet   = array.size(tradeReturns) > 0 ? array.avg(tradeReturns) : 0.0
+    float stdevRet = array.size(tradeReturns) > 1 ? array.stdev(tradeReturns) : 0.0
+    float ratio    = stdevRet > 0 ? avgRet / stdevRet : 0.0
+    // FIX 1: 100.0 forces float math — int/int division truncates in Pine
+    float winRate  = totalTrades > 0 ? 100.0 * winTrades / totalTrades : 0.0
+
+    table.cell(tbl, 0, 0, "Map Performance", text_halign=text.align_center, text_color=color.white, bgcolor=color.new(color.navy, 20))
+    table.merge_cells(tbl, 0, 0, 1, 0)
+
+    table.cell(tbl, 0, 1, "Closed Trades", text_color=color.gray, text_halign=text.align_left, tooltip="Signals that reached TP3 or a stop. A currently open trade is not counted.")
+    table.cell(tbl, 1, 1, str.tostring(totalTrades), text_color=color.white, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 2, "Win Rate", text_color=color.gray, text_halign=text.align_left, tooltip="Closed trades with a positive booked return. Breakeven stop-outs are NOT wins. Ambiguous bars (stop and target in one bar) are resolved stop-first.")
+    table.cell(tbl, 1, 2, str.tostring(winRate, "#.##") + "%", text_color=winRate >= 50 ? color.green : color.red, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 3, "Avg Return", text_color=color.gray, text_halign=text.align_left, tooltip="Mean booked return per closed trade. Single full-size exit — partial profit-taking at TP1/TP2 is not modeled.")
+    table.cell(tbl, 1, 3, str.tostring(avgRet, "#.##") + "%", text_color=avgRet >= 0 ? color.green : color.red, text_halign=text.align_right)
+
+    table.cell(tbl, 0, 4, "Ret / StdDev", text_color=color.gray, text_halign=text.align_left, tooltip="Average per-trade return divided by the standard deviation of per-trade returns. A consistency score — not an annualized Sharpe ratio.")
+    table.cell(tbl, 1, 4, str.tostring(ratio, "#.##"), text_color=ratio >= 1 ? color.green : color.white, text_halign=text.align_right)
+
+// FIX 7: alerts. Create an alert on this indicator and pick a condition below.
+// Use "Once Per Bar Close" — signals and exits are only final when the bar closes.
+alertcondition(rawBull, "ARBM Long Breakout", "ARBM: long breakout on {{ticker}} {{interval}}")
+alertcondition(rawBear, "ARBM Short Breakout", "ARBM: short breakout on {{ticker}} {{interval}}")
+alertcondition(tpHitEvent, "ARBM Take-Profit Hit", "ARBM: a take-profit level was hit on {{ticker}} {{interval}}")
+alertcondition(slHitEvent, "ARBM Stop Hit", "ARBM: stop / trailing stop was hit on {{ticker}} {{interval}}")

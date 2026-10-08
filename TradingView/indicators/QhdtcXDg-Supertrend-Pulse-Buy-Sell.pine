@@ -1,0 +1,392 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Salqi
+//@version=6
+indicator("Supertrend Pulse - Buy Sell", overlay = true, max_lines_count = 500, max_labels_count = 500)
+
+// ===== Pulse Settings =====
+float accelRate   = input.float(0.12, "Pulse Speed", step = 0.01, minval = 0.01)
+float startMult   = input.float(2.0,  "Start Distance (ATRx)", step = 0.1)
+int   smooth      = input.int(3, "Smoothing", minval = 1, maxval = 10)
+bool showLevels = input.bool(false, "Show Flip Levels")
+bool showCloud = input.bool(false, "Show Cloud Fill")
+bool showCandles = input.bool(false, "Color Candles")
+int   maxLevels   = input.int(10, "Max Levels", 5, 50)
+color colUp       = input.color(#1ac200, "Bull Color", inline = "c")
+color colDn       = input.color(#ff4040, "Bear Color", inline = "c")
+float arrowOffset = input.float(1.2, "Triangle Offset (ATRx)", step = 0.1, minval = 0.1)
+
+// ===== Signals =====
+string signalMode = input.string("All Flips", "Signal Mode",
+                     options = ["VWAP Confirmed Only", "All Flips"],
+                     group = "Signals")
+
+bool showBuySell = input.bool(true, "Show Buy/Sell", group = "Signals")
+bool showBP = input.bool(true, "Show Book Profit", group = "Signals")
+bool strictAlternation = input.bool(true, "Strict Buy/Sell Alternation", tooltip = "Prevents BUY-BUY or SELL-SELL repetition.", group = "Signals")
+int minSignalGap = input.int(0, "Minimum Bars Between Buy/Sell", minval = 0, maxval = 100, tooltip = "Optional spacing between opposite signals. 0 disables extra spacing.", group = "Signals")
+bool showFlipTriangles = input.bool(false, "Show Pulse Flip Triangles", group = "Signals")
+
+// ===== Flip Level Style =====
+string levelStyle  = input.string("Dashed", "Level Style",
+                         options = ["Solid", "Dashed", "Dotted"],
+                         group   = "Flip Levels")
+int    levelWidth  = input.int(1, "Level Width", minval = 1, maxval = 4, group = "Flip Levels")
+int    levelTransp = input.int(20, "Level Transparency", minval = 0, maxval = 90, group = "Flip Levels")
+bool   levelLabel  = input.bool(true, "Show Price Label", group = "Flip Levels")
+string levelLabelSize = input.string("tiny", "Label Size",
+                         options = ["auto", "tiny", "small", "normal", "large", "huge"],
+                         group   = "Flip Levels")
+
+// ===== VWAP Settings =====
+string filterPeriod  = input.string("Session", "Signal Filter Period",
+                           options = ["Session", "Week", "Month", "Any", "All"],
+                           group   = "VWAP")
+
+float vwapAccelBoost = input.float(1.5, "VWAP Distance Speed Boost",
+                           minval = 1.0, maxval = 5.0, step = 0.1,
+                           group   = "VWAP")
+
+// ===== VWAP Calculation =====
+bool  newSession  = timeframe.change("D")
+var float cumPvS  = 0.0
+var float cumVolS = 0.0
+if newSession
+    cumPvS  := 0.0
+    cumVolS := 0.0
+cumPvS  += hl2 * volume
+cumVolS += volume
+float vwapSession = cumVolS > 0 ? cumPvS / cumVolS : hl2
+
+bool  newWeek     = timeframe.change("W")
+var float cumPvW  = 0.0
+var float cumVolW = 0.0
+if newWeek
+    cumPvW  := 0.0
+    cumVolW := 0.0
+cumPvW  += hl2 * volume
+cumVolW += volume
+float vwapWeek = cumVolW > 0 ? cumPvW / cumVolW : hl2
+
+bool  newMonth    = timeframe.change("M")
+var float cumPvM  = 0.0
+var float cumVolM = 0.0
+if newMonth
+    cumPvM  := 0.0
+    cumVolM := 0.0
+cumPvM  += hl2 * volume
+cumVolM += volume
+float vwapMonth = cumVolM > 0 ? cumPvM / cumVolM : hl2
+
+// ===== VWAP Filter =====
+vwapAgrees(bool bullish) =>
+    bool s = bullish ? close >= vwapSession : close <= vwapSession
+    bool w = bullish ? close >= vwapWeek    : close <= vwapWeek
+    bool m = bullish ? close >= vwapMonth   : close <= vwapMonth
+    switch filterPeriod
+        "Session" => s
+        "Week"    => w
+        "Month"   => m
+        "Any"     => s or w or m
+        "All"     => s and w and m
+        => true
+
+float atr     = ta.atr(14)
+float atrSlow = ta.sma(ta.tr, 100)
+
+float refVwap = switch filterPeriod
+    "Session" => vwapSession
+    "Week"    => vwapWeek
+    "Month"   => vwapMonth
+    => vwapSession
+
+float vwapDistNorm   = nz(atr, 1) > 0 ? math.min(math.abs(close - refVwap) / (nz(atr, 1) * 4), 1.0) : 0.0
+float effectiveAccel = accelRate * (1.0 + (vwapAccelBoost - 1.0) * vwapDistNorm)
+
+// ===== Core Calculation =====
+var bool  trend         = true
+var float pulse           = na
+var float velocity      = 0.0
+var bool  initDone      = false
+
+var bool  rawFlipped    = false
+var bool  flipConfirmed = false
+var bool  flipFiltered  = false
+
+if not initDone and not na(atrSlow) and bar_index > 100
+    pulse      := low - atrSlow * startMult
+    trend    := true
+    initDone := true
+
+rawFlipped    := false
+flipConfirmed := false
+flipFiltered  := false
+
+if initDone and barstate.isconfirmed
+    bool prevTrend = trend
+    bool nextTrend = trend
+
+    if close < pulse
+        nextTrend := false
+    else if close > pulse
+        nextTrend := true
+
+    rawFlipped    := nextTrend != prevTrend
+    flipConfirmed := rawFlipped and vwapAgrees(nextTrend)
+    flipFiltered  := rawFlipped and not flipConfirmed
+
+    trend := nextTrend
+
+    if rawFlipped and trend
+        pulse      := low - nz(atrSlow, 1) * startMult
+        velocity := 0.0
+    else if rawFlipped and not trend
+        pulse      := high + nz(atrSlow, 1) * startMult
+        velocity := 0.0
+    else
+        float stepSize = nz(atrSlow, 1) * 0.15
+        if bar_index % smooth == 0
+            velocity += effectiveAccel
+            if trend
+                pulse += stepSize * velocity
+            else
+                pulse -= stepSize * velocity
+
+float pulseSmooth = ta.sma(pulse, smooth)
+float outerRaw  = trend ? pulse + nz(atrSlow, 1) * 0.4 : pulse - nz(atrSlow, 1) * 0.4
+float outer     = ta.sma(outerRaw, smooth)
+
+color trendClr = trend ? colUp : colDn
+
+// ===== Triangle Signal Logic =====
+bool greenTriangle = signalMode == "VWAP Confirmed Only" ? (flipConfirmed and trend)     : (rawFlipped and trend)
+bool redTriangle   = signalMode == "VWAP Confirmed Only" ? (flipConfirmed and not trend) : (rawFlipped and not trend)
+
+// ===== Pulse End Logic =====
+// pulseState:
+//  1 = current pulse started with BUY
+// -1 = current pulse started with SELL
+//  0 = none yet
+var int pulseState = 0
+
+bool buySignal   = false
+bool sellSignal  = false
+bool bpLong      = false
+bool bpShort     = false
+bool bookProfit  = false
+
+buySignal   := false
+sellSignal  := false
+bpLong      := false
+bpShort     := false
+bookProfit  := false
+
+bool greenBrick = close >= open
+bool redBrick   = close < open
+
+if greenTriangle
+    if pulseState == 0
+        // first bullish pulse start
+        buySignal := true
+        pulseState := 1
+    else if pulseState == -1
+        // bearish pulse ended, check ending brick color
+        if redBrick
+            // sell pulse ended on red brick => BP
+            bpShort := true
+            bookProfit := true
+            pulseState := 0
+        else
+            // sell pulse ended on green brick => BUY
+            buySignal := true
+            pulseState := 1
+
+if redTriangle
+    if pulseState == 0
+        // first bearish pulse start
+        sellSignal := true
+        pulseState := -1
+    else if pulseState == 1
+        // bullish pulse ended, check ending brick color
+        if greenBrick
+            // buy pulse ended on green brick => BP
+            bpLong := true
+            bookProfit := true
+            pulseState := 0
+        else
+            // buy pulse ended on red brick => SELL
+            sellSignal := true
+            pulseState := -1
+
+
+// ===== Clean Signal Filter =====
+//
+// The original script can visually duplicate signals because it draws both
+// plotshape labels and label.new labels for the same event. This version uses
+// only one Buy/Sell marker.
+//
+// Optional strict alternation also prevents:
+// BUY -> BUY
+// SELL -> SELL
+//
+// Allowed sequence:
+// BUY -> SELL -> BUY -> SELL
+//
+var int lastTradeSignal = 0
+var int lastTradeSignalBar = na
+
+bool signalGapOK = na(lastTradeSignalBar) or bar_index - lastTradeSignalBar >= minSignalGap
+
+bool cleanBuySignal = buySignal and signalGapOK and (not strictAlternation or lastTradeSignal != 1)
+bool cleanSellSignal = sellSignal and signalGapOK and (not strictAlternation or lastTradeSignal != -1)
+
+if cleanBuySignal
+    lastTradeSignal := 1
+    lastTradeSignalBar := bar_index
+else if cleanSellSignal
+    lastTradeSignal := -1
+    lastTradeSignalBar := bar_index
+
+// Replace raw Buy/Sell outputs with cleaned signals.
+buySignal := cleanBuySignal
+sellSignal := cleanSellSignal
+
+// ===== Flip Levels =====
+var flipLines  = array.new<line>()
+var flipLevels = array.new<float>()
+var flipBull   = array.new<bool>()
+var flipLabels = array.new<label>()
+
+string resolvedLabelSize = levelLabelSize == "auto"   ? size.auto   :
+                           levelLabelSize == "small"  ? size.small  :
+                           levelLabelSize == "normal" ? size.normal :
+                           levelLabelSize == "large"  ? size.large  :
+                           levelLabelSize == "huge"   ? size.huge   : size.tiny
+
+if rawFlipped and showLevels
+    float _price = trend ? low : high
+    color _clr   = color.new(trendClr, levelTransp)
+
+    _ln = line.new(bar_index, _price, bar_index + 1, _price,
+         color = _clr,
+         width = levelWidth,
+         style = levelStyle == "Dotted" ? line.style_dotted :
+                 levelStyle == "Solid"  ? line.style_solid  :
+                 line.style_dashed)
+
+    string _labelTxt = levelLabel ? str.tostring(_price, format.mintick) : ""
+    _lbl = label.new(bar_index + 1, _price, _labelTxt,
+         color     = color.new(trendClr, 80),
+         textcolor = trendClr,
+         style     = label.style_label_left,
+         size      = resolvedLabelSize)
+
+    flipLines.push(_ln)
+    flipLevels.push(_price)
+    flipBull.push(trend)
+    flipLabels.push(_lbl)
+
+if flipLines.size() > 0
+    for i = flipLines.size() - 1 to 0
+        if i >= flipLines.size()
+            break
+
+        ln = flipLines.get(i)
+        if na(ln)
+            flipLines.remove(i)
+            if i < flipLevels.size()
+                flipLevels.remove(i)
+            if i < flipBull.size()
+                flipBull.remove(i)
+            if i < flipLabels.size()
+                lbl = flipLabels.get(i)
+                if not na(lbl)
+                    label.delete(lbl)
+                flipLabels.remove(i)
+            continue
+
+        line.set_x2(ln, bar_index)
+
+        float lvl   = flipLevels.get(i)
+        bool isBull = flipBull.get(i)
+
+        if i < flipLabels.size()
+            lbl = flipLabels.get(i)
+            if not na(lbl)
+                label.set_x(lbl, bar_index)
+
+        bool broken = isBull ? (close < lvl and barstate.isconfirmed) : (close > lvl and barstate.isconfirmed)
+        if broken
+            line.delete(ln)
+            flipLines.set(i, line(na))
+            if i < flipLabels.size()
+                lbl = flipLabels.get(i)
+                if not na(lbl)
+                    label.delete(lbl)
+                flipLabels.set(i, label(na))
+
+while flipLines.size() > maxLevels
+    _old = flipLines.shift()
+    if not na(_old)
+        line.delete(_old)
+    if flipLevels.size() > 0
+        flipLevels.shift()
+    if flipBull.size() > 0
+        flipBull.shift()
+    if flipLabels.size() > 0
+        _oldLbl = flipLabels.shift()
+        if not na(_oldLbl)
+            label.delete(_oldLbl)
+
+// ===== Visualization =====
+float pulsePlotVal = initDone ? pulseSmooth : na
+float priceRef   = ta.sma(hl2, smooth * 5)
+
+p1 = plot(pulsePlotVal, "Pulse", color.new(chart.fg_color, 60), 1, plot.style_linebr)
+p2 = plot(priceRef, "Price Ref", display = display.none, editable = false)
+plot(outer, "Pulse Outer", color.new(trendClr, 70), 1, plot.style_linebr)
+
+color fillClr = showCloud and initDone ? color.new(trendClr, 65) : na
+fill(p1, p2, pulseSmooth, priceRef, fillClr, color(na))
+
+float distToPulse  = not na(pulseSmooth) ? math.abs(close - pulseSmooth) : 0
+float safAtr     = nz(atr, 1)
+float distNorm   = safAtr > 0 ? math.min(distToPulse / (safAtr * 3), 1.0) : 0.5
+color gradCandle = showCandles ? color.from_gradient(distNorm, 0, 1, color.new(trendClr, 55), trendClr) : na
+
+plotcandle(open, high, low, close, "Candles", gradCandle, gradCandle, bordercolor = gradCandle)
+
+// exact triangle positions
+float pulseArrowAtr   = nz(atr, nz(atrSlow, 1))
+float greenTriY  = greenTriangle ? pulseSmooth - pulseArrowAtr * arrowOffset : na
+float redTriY    = redTriangle   ? pulseSmooth + pulseArrowAtr * arrowOffset : na
+
+plotshape(showFlipTriangles ? greenTriY : na, "Bull Pulse Flip", shape.triangleup, location.absolute, colUp, size = size.tiny)
+plotshape(showFlipTriangles ? redTriY : na, "Bear Pulse Flip", shape.triangledown, location.absolute, colDn, size = size.tiny)
+
+// BUY / SELL markers
+plotshape(showBuySell and buySignal, title = "BUY", style = shape.labelup,
+     location = location.belowbar, color = colUp, text = "BUY", textcolor = color.white, size = size.tiny)
+
+plotshape(showBuySell and sellSignal, title = "SELL", style = shape.labeldown,
+     location = location.abovebar, color = colDn, text = "SELL", textcolor = color.white, size = size.tiny)
+
+// BOOK PROFIT markers
+plotshape(showBP and bpLong, title = "BP Long", style = shape.labeldown,
+     location = location.abovebar, color = color.new(colUp, 0), text = "BP", textcolor = color.white, size = size.tiny)
+
+plotshape(showBP and bpShort, title = "BP Short", style = shape.labelup,
+     location = location.belowbar, color = color.new(colDn, 0), text = "BP", textcolor = color.white, size = size.tiny)
+
+// ===== Alerts =====
+alertcondition(buySignal,  "BUY",  "Pulse ended with BUY")
+alertcondition(sellSignal, "SELL", "Pulse ended with SELL")
+alertcondition(buySignal or sellSignal, "BUY or SELL", "Pulse BUY/SELL signal")
+
+alertcondition(bpLong,     "BOOK PROFIT LONG",  "Book Profit for LONG pulse")
+alertcondition(bpShort,    "BOOK PROFIT SHORT", "Book Profit for SHORT pulse")
+alertcondition(bookProfit, "BOOK PROFIT", "Book Profit signal")
+
+alertcondition(flipConfirmed and trend,     "Bullish Flip (VWAP Confirmed)", "Bullish flip confirmed by VWAP")
+alertcondition(flipConfirmed and not trend, "Bearish Flip (VWAP Confirmed)", "Bearish flip confirmed by VWAP")
+alertcondition(flipFiltered  and trend,     "Bullish Flip (VWAP Filtered)",  "Bullish flip, VWAP disagrees")
+alertcondition(flipFiltered  and not trend, "Bearish Flip (VWAP Filtered)",  "Bearish flip, VWAP disagrees")

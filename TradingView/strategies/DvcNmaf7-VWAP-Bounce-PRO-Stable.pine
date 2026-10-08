@@ -1,0 +1,213 @@
+//@version=6
+// Pine v6 changed the strategy() default for margin_long/margin_short from 0% (v5) to 100%
+// (full cash-funded notional). Left unset, a futures position's notional value (e.g. 2x NQ)
+// vastly exceeds initial_capital and every entry is silently rejected for insufficient margin.
+// Explicitly restored to 0 (the old v5 default = no funds check) since real per-trade risk is
+// already capped separately via maxLossDollars, not by contract notional vs. account equity.
+strategy("VWAP Bounce PRO - Stable",
+     overlay=true,
+     default_qty_type=strategy.fixed,
+     default_qty_value=2,
+     initial_capital=10000,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.50,
+     slippage=1,
+     margin_long=0,
+     margin_short=0,
+     process_orders_on_close=true)
+
+// ===================== INPUTS =====================
+contracts       = input.int(2,      "Contracts",                          minval=1)
+pointValue      = input.float(2.0,  "Point Value (MNQ=2, NQ=20)",         minval=0.01, step=0.5)
+rrRatio         = input.float(2.0,  "R:R Ratio",                          step=0.25)
+atrLen          = input.int(14,     "ATR Length")
+atrMult         = input.float(0.3,  "ATR Stop Buffer")
+cooldown        = input.int(5,      "Cooldown Bars")
+maxTradesPerDay = input.int(2,      "Max Trades Per Day")
+maxLossDollars  = input.float(100.0,"Max Loss Per Trade ($)",              minval=1.0, step=5.0)
+lastEntryTime   = input.int(1500,   "No New Trades After (ET, 24h HHMM)",  minval=0, maxval=2359)
+useNYFilter     = input.bool(true,  "Restrict to NY Session")
+
+// ===================== WEEKDAY FILTERS =====================
+longMon  = input.bool(true, "Mon Long",  inline="mon", group="Weekday Filters")
+shortMon = input.bool(true, "Mon Short", inline="mon", group="Weekday Filters")
+longTue  = input.bool(true, "Tue Long",  inline="tue", group="Weekday Filters")
+shortTue = input.bool(true, "Tue Short", inline="tue", group="Weekday Filters")
+longWed  = input.bool(true, "Wed Long",  inline="wed", group="Weekday Filters")
+shortWed = input.bool(true, "Wed Short", inline="wed", group="Weekday Filters")
+longThu  = input.bool(true, "Thu Long",  inline="thu", group="Weekday Filters")
+shortThu = input.bool(true, "Thu Short", inline="thu", group="Weekday Filters")
+longFri  = input.bool(true, "Fri Long",  inline="fri", group="Weekday Filters")
+shortFri = input.bool(true, "Fri Short", inline="fri", group="Weekday Filters")
+
+// ===================== CORE =====================
+atr = ta.atr(atrLen)
+tp  = (high + low + close) / 3.0
+
+// ===================== NY DATE / WEEKDAY =====================
+// All keyed off America/New_York so day/week boundaries always agree with the NY session
+// filter and entry cutoff below, regardless of the chart's exchange timezone. time("D"/"W", tz)
+// does NOT work for this: the timezone argument to time() only affects how a *session* string
+// is interpreted, never the returned day/week boundary, which always follows the exchange
+// timezone regardless of what's passed. year()/month()/dayofmonth()/dayofweek() DO have real
+// timezone overloads, so the day/week keys are built manually from those instead.
+dow        = dayofweek(time, "America/New_York")
+nyYear     = year(time, "America/New_York")
+nyMonth    = month(time, "America/New_York")
+nyDayOfMon = dayofmonth(time, "America/New_York")
+
+nyDateKey = nyYear * 10000 + nyMonth * 100 + nyDayOfMon
+newNyDay  = barstate.isfirst or nyDateKey != nyDateKey[1]
+newNyWeek = barstate.isfirst or (newNyDay and dow == dayofweek.monday)
+
+// ===================== VWAPs =====================
+// Daily (resets on the NY calendar day so it lines up with the NY session / cutoff logic below)
+var float d_num = na
+var float d_den = na
+if newNyDay
+    d_num := 0
+    d_den := 0
+d_num += tp * volume
+d_den += volume
+dVwap = d_den != 0 ? d_num / d_den : na
+
+// Weekly (resets each NY Monday)
+var float w_num = na
+var float w_den = na
+if newNyWeek
+    w_num := 0
+    w_den := 0
+w_num += tp * volume
+w_den += volume
+wVwap = w_den != 0 ? w_num / w_den : na
+
+// NY VWAP
+nySession = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+
+var float ny_num = na
+var float ny_den = na
+if nySession and (barstate.isfirst or not nySession[1])
+    ny_num := 0
+    ny_den := 0
+if nySession
+    ny_num += tp * volume
+    ny_den += volume
+nyVwap = nySession and ny_den != 0 ? ny_num / ny_den : na
+
+sessionOK = useNYFilter ? nySession : true
+
+// ===================== TIME CUTOFF =====================
+nyHour       = hour(time, "America/New_York")
+nyMinute     = minute(time, "America/New_York")
+nyTimeNow    = nyHour * 100 + nyMinute
+beforeCutoff = nyTimeNow < lastEntryTime
+
+// ===================== WEEKDAY HELPERS =====================
+longDayOK =
+     (dow == dayofweek.monday    and longMon)  or
+     (dow == dayofweek.tuesday   and longTue)  or
+     (dow == dayofweek.wednesday and longWed)  or
+     (dow == dayofweek.thursday  and longThu)  or
+     (dow == dayofweek.friday    and longFri)
+
+shortDayOK =
+     (dow == dayofweek.monday    and shortMon) or
+     (dow == dayofweek.tuesday   and shortTue) or
+     (dow == dayofweek.wednesday and shortWed) or
+     (dow == dayofweek.thursday  and shortThu) or
+     (dow == dayofweek.friday    and shortFri)
+
+// ===================== BOUNCE LOGIC =====================
+bullBias = close > wVwap
+bearBias = close < wVwap
+
+bounceLong(v) =>
+    not na(v) and not na(v[1]) and low[1] <= v[1] and close > v
+
+bounceShort(v) =>
+    not na(v) and not na(v[1]) and high[1] >= v[1] and close < v
+
+rawLong  = sessionOK and bullBias and longDayOK  and beforeCutoff and (bounceLong(dVwap)  or bounceLong(nyVwap))
+rawShort = sessionOK and bearBias and shortDayOK and beforeCutoff and (bounceShort(dVwap) or bounceShort(nyVwap))
+
+// ===================== DAILY LIMIT =====================
+var int tradeCount = 0
+if newNyDay
+    tradeCount := 0
+
+underLimit = tradeCount < maxTradesPerDay
+
+// ===================== TRADE STATE =====================
+var bool tradeActive   = false
+var int  lastSignalBar = -1000
+
+tradeWasActive = tradeActive
+if tradeActive and strategy.position_size == 0
+    tradeActive := false
+
+cooldownOK = bar_index - lastSignalBar >= cooldown
+canTrade   = not tradeActive and cooldownOK and underLimit
+
+longSignal  = rawLong  and canTrade
+shortSignal = rawShort and canTrade and not longSignal
+
+if longSignal or shortSignal
+    tradeActive   := true
+    lastSignalBar := bar_index
+    tradeCount    += 1
+
+// ===================== LEVELS =====================
+// Max stop distance in points derived from dollar risk limit
+maxStopPoints = maxLossDollars / (contracts * pointValue)
+
+longEntry  = close
+// ATR stop, but capped so dollar risk never exceeds maxLossDollars
+longSL     = math.max(low  - atr * atrMult, longEntry  - maxStopPoints)
+longTP     = longEntry  + (longEntry  - longSL)  * rrRatio
+
+shortEntry = close
+shortSL    = math.min(high + atr * atrMult, shortEntry + maxStopPoints)
+shortTP    = shortEntry - (shortSL - shortEntry) * rrRatio
+
+// ===================== ORDERS =====================
+if longSignal
+    strategy.entry("Long", strategy.long, qty=contracts)
+    strategy.exit("Long Exit", from_entry="Long", stop=longSL, limit=longTP)
+
+if shortSignal
+    strategy.entry("Short", strategy.short, qty=contracts)
+    strategy.exit("Short Exit", from_entry="Short", stop=shortSL, limit=shortTP)
+
+// Force flat at NY session end
+if useNYFilter and not nySession and nySession[1]
+    strategy.close_all()
+
+// ===================== TRADE VISUALS =====================
+// riskBox/rewardBox track the CURRENT trade; their right edge is glued to bar_index every
+// bar the position stays open (via tradeWasActive) and freezes the instant it closes, so the
+// box always spans the trade's actual entry-to-exit duration instead of a fixed bar count.
+// Labels are drawn (as label.new, a drawing object) after the boxes so they stack on top --
+// plotshape markers would otherwise render underneath the boxes and be hidden.
+var box riskBox   = na
+var box rewardBox = na
+
+if longSignal
+    riskBox   := box.new(bar_index, longEntry, bar_index, longSL,    bgcolor=color.new(color.red,   75), border_color=color.new(color.red,   40))
+    rewardBox := box.new(bar_index, longTP,    bar_index, longEntry, bgcolor=color.new(color.green, 75), border_color=color.new(color.green, 40))
+    label.new(bar_index, low, text="BUY", style=label.style_label_up,
+         color=color.green, textcolor=color.white, size=size.small)
+
+if shortSignal
+    riskBox   := box.new(bar_index, shortSL,    bar_index, shortEntry, bgcolor=color.new(color.red,   75), border_color=color.new(color.red,   40))
+    rewardBox := box.new(bar_index, shortEntry, bar_index, shortTP,    bgcolor=color.new(color.green, 75), border_color=color.new(color.green, 40))
+    label.new(bar_index, high, text="SELL", style=label.style_label_down,
+         color=color.red, textcolor=color.white, size=size.small)
+
+if tradeWasActive and not na(riskBox)
+    box.set_right(riskBox, bar_index)
+    box.set_right(rewardBox, bar_index)
+
+// ===================== PLOTS =====================
+plot(dVwap,                   "Daily VWAP",  color=color.blue,   linewidth=2)
+plot(wVwap,                   "Weekly VWAP", color=color.purple, linewidth=2)
+plot(nySession ? nyVwap : na, "NY VWAP",     color=color.orange, linewidth=2)

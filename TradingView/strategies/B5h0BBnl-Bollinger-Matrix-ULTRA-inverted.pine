@@ -1,0 +1,116 @@
+//@version=5
+strategy("Bollinger Matrix ULTRA - Kapibara Mentor Edition", overlay=true, pyramiding=15, initial_capital=1000)
+
+// ========================================================================= //
+// 0. CONFIGURACIÓN Y GESTIÓN DE RIESGO
+// ========================================================================= //
+grp_risk = "💰 Gestión de Capital"
+pc_id    = input.string("TU_ID", "PineConnector ID", group=grp_risk)
+riskCash = input.float(100.0, "Riesgo Total de la Matriz ($)", group=grp_risk)
+invertLot = input.bool(true, "Invertir Lotaje (Mayor a Menor)", group=grp_risk)
+
+grp_time  = "⏰ Filtro Horario Kapibara"
+sessInput = input.session("0200-1530", "Ventana de Operativa (HHMM-HHMM)", group=grp_time)
+// Comprobamos si estamos dentro del horario (usando el tiempo del intercambio/Exchange)
+inSession = not na(time(timeframe.period, sessInput, "UTC-5")) // Ajusta UTC si tu servidor usa otro
+
+grp_kap   = "🐊 Filtros Kapibara (Narrativa)"
+useHTF    = input.bool(true, "Filtrar por Tendencia HTF (EMA)", group=grp_kap)
+htfTime   = input.timeframe("60", "Temporalidad Mayor (HTF)", group=grp_kap)
+emaLen    = input.int(200, "EMA HTF Periodos", group=grp_kap)
+adxThresh = input.int(25, "Filtro ADX (Solo Rangos)", group=grp_kap)
+useSweep  = input.bool(true, "Confirmar Neutralización (Sweep)", group=grp_kap)
+
+grp_bb    = "📊 Bandas de Bollinger"
+bbLen     = input.int(20, "Periodos", group=grp_bb)
+bbMult    = input.float(2.0, "Desviación", group=grp_bb)
+
+grp_grid  = "⛓️ Configuración de Matriz"
+slPips    = input.int(35, "Stop Loss Total (Pips)", group=grp_grid)
+useATR    = input.bool(true, "Step basado en ATR", group=grp_grid)
+fixedStep = input.int(7, "Step Fijo (Pips)", group=grp_grid)
+extraPips = input.float(5.0, "TP: Pips extras tras la Media", step=0.5, group=grp_grid)
+
+// --- Cálculos de Indicadores ---
+[basis, upper, lower] = ta.bb(close, bbLen, bbMult)
+[_, _, adx] = ta.dmi(14, 14)
+pipValue = syminfo.mintick * 10
+actualStep = useATR ? (ta.atr(14) / syminfo.mintick / 10) * 0.75 : fixedStep
+emaHTF = request.security(syminfo.tickerid, htfTime, ta.ema(close, emaLen))
+
+// ========================================================================= //
+// 1. LÓGICA DE ENTRADA (IPDA & LIQUIDEZ)
+// ========================================================================= //
+sweepLong  = useSweep ? (low[1] < lower[1] and close > lower) : ta.crossunder(low, lower)
+sweepShort = useSweep ? (high[1] > upper[1] and close < upper) : ta.crossover(high, upper)
+
+trendLong  = not useHTF or close > emaHTF
+trendShort = not useHTF or close < emaHTF
+
+// INCLUSIÓN DEL FILTRO HORARIO: Solo disparamos si inSession es verdadero
+longTrigger  = sweepLong and adx < adxThresh and trendLong and inSession
+shortTrigger = sweepShort and adx < adxThresh and trendShort and inSession
+
+// --- Cálculo de Lotaje ---
+pipValueCash = syminfo.pointvalue * syminfo.mintick * 10
+f_calc_qty() =>
+    float totalUnits = 0
+    for i = 0 to 6
+        pipsToSL = math.max(slPips - (i * actualStep), 0)
+        multiplier = invertLot ? (7 - i) : (i + 1)
+        totalUnits += (multiplier * pipsToSL)
+    riskCash / (totalUnits * pipValueCash)
+
+qBase = f_calc_qty()
+
+// ========================================================================= //
+// 2. MOTOR DE ÓRDENES Y CIERRE DE SESIÓN
+// ========================================================================= //
+
+// A) Si no hay posición, cancelamos todo para limpiar el gráfico
+if strategy.position_size == 0
+    strategy.cancel_all()
+
+// B) Lógica de CIERRE DE SESIÓN (3:30 PM):
+// Si salimos de la sesión y había órdenes pendientes, las borramos en TradingView y enviamos comando a Oanda.
+sessionEndTrigger = not inSession and inSession[1]
+if sessionEndTrigger
+    // strategy.cancel_all() en Pine Script borra las órdenes LIMIT que no se ejecutaron.
+    strategy.cancel_all()
+    // Enviamos mensaje a PineConnector para cancelar órdenes pendientes en el broker sin cerrar la actual.
+    if strategy.position_size != 0
+        alert(pc_id + ",cancelall," + syminfo.ticker, alert.freq_once_per_bar)
+
+float finalTP = strategy.position_size > 0 ? basis + (extraPips * pipValue) : basis - (extraPips * pipValue)
+
+// Ejecución de Matriz
+if (longTrigger or shortTrigger) and strategy.position_size == 0
+    entryPrice = close
+    sl = longTrigger ? entryPrice - (slPips * pipValue) : entryPrice + (slPips * pipValue)
+    initTP = longTrigger ? basis + (extraPips * pipValue) : basis - (extraPips * pipValue)
+
+    for i = 0 to 6
+        float offset = i * actualStep * pipValue
+        float price = longTrigger ? entryPrice - offset : entryPrice + offset
+        float multiplier = invertLot ? (7 - i) : (i + 1)
+        float size = qBase * multiplier
+        
+        string cmd = longTrigger ? "buy" : "sell"
+        string msg = str.format("{0},{1},{2},volume={3},sl={4},tp={5}", pc_id, cmd, syminfo.ticker, str.tostring(size, "#.##"), str.tostring(sl, "#.#####"), str.tostring(initTP, "#.#####"))
+        
+        strategy.entry(cmd + str.tostring(i), longTrigger ? strategy.long : strategy.short, qty=size, limit= i==0 ? na : price, comment=msg)
+
+// --- Gestión de Salida Inteligente ---
+if strategy.position_size != 0
+    bool touchTP = strategy.position_size > 0 ? ta.crossover(high, finalTP) : ta.crossunder(low, finalTP)
+    if touchTP
+        strategy.close_all(comment=pc_id + ",closeall," + syminfo.ticker)
+
+    float firstEntry = strategy.opentrades.entry_price(0)
+    float stopLevel = strategy.position_size > 0 ? firstEntry - (slPips * pipValue) : firstEntry + (slPips * pipValue)
+    strategy.exit("X", stop=stopLevel, limit=finalTP, comment=pc_id + ",cancelall," + syminfo.ticker)
+
+// --- Visualización ---
+bgcolor(inSession ? color.new(color.green, 90) : color.new(color.red, 90), title="Zona de Operativa")
+plot(emaHTF, color=color.new(color.orange, 0), linewidth=2, title="Filtro de Tendencia HTF")
+plot(strategy.position_size != 0 ? finalTP : na, color=color.green, style=plot.style_linebr, linewidth=2, title="Objetivo Kapibara")

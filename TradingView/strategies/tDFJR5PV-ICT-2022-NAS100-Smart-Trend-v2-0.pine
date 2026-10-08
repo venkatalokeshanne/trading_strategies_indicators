@@ -1,0 +1,305 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// ICT 2022 Model — Smart Trend Strategy | NAS100/USD | TradingView Pine Script v5
+// Optimized for higher trade frequency while maintaining high win rate
+// Supports: London + NY + Asian + NY-Lunch Killzones
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy(
+     title            = "ICT 2022 NAS100 | Smart Trend v2.0",
+     shorttitle       = "ICT NAS100",
+     overlay          = true,
+     pyramiding       = 0,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value= 1,
+     initial_capital  = 10000,
+     currency         = currency.USD,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.02,
+     slippage         = 2,
+     max_bars_back    = 500
+     )
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  INPUT GROUPS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── Killzone Times (Israel / Jerusalem Time UTC+3) ───────────────────────────
+grp_kz = "⏰ Killzone Times — Israel Time (UTC+3)"
+use_asian   = input.bool (true,  "✅ Asian Session",        group=grp_kz, tooltip="02:00–05:00 Israel — less volatile but valid ICT setup")
+asian_s     = input.int  (2,     "Asian Start Hour",        group=grp_kz, minval=0, maxval=23)
+asian_e     = input.int  (5,     "Asian End Hour",          group=grp_kz, minval=0, maxval=23)
+use_london  = input.bool (true,  "✅ London Session",        group=grp_kz)
+lon_s       = input.int  (9,     "London Start Hour",       group=grp_kz, minval=0, maxval=23)
+lon_e       = input.int  (12,    "London End Hour",         group=grp_kz, minval=0, maxval=23)
+use_ny      = input.bool (true,  "✅ NY Session",            group=grp_kz)
+ny_s_h      = input.int  (15,    "NY Start Hour",           group=grp_kz, minval=0, maxval=23)
+ny_s_m      = input.int  (30,    "NY Start Minute",         group=grp_kz, minval=0, maxval=59)
+ny_e_h      = input.int  (18,    "NY End Hour",             group=grp_kz, minval=0, maxval=23)
+ny_e_m      = input.int  (30,    "NY End Minute",           group=grp_kz, minval=0, maxval=59)
+use_lunch   = input.bool (true,  "✅ NY Lunch Reversal",     group=grp_kz, tooltip="19:30–21:00 Israel — often strong reversal")
+lunch_s     = input.int  (19,    "Lunch Start Hour",        group=grp_kz, minval=0, maxval=23)
+lunch_e     = input.int  (21,    "Lunch End Hour",          group=grp_kz, minval=0, maxval=23)
+utc_offset  = input.int  (3,     "Israel UTC Offset (3=summer / 2=winter)", group=grp_kz, minval=-12, maxval=14)
+
+// ─── H1 Trend Filter ─────────────────────────────────────────────────────────
+grp_trend = "📈 H1 Trend Filter"
+use_trend   = input.bool (true,  "Enable H1 EMA Trend Filter",  group=grp_trend)
+ema_len     = input.int  (50,    "EMA Period",                  group=grp_trend, minval=5)
+
+// ─── ICT Trade Logic ─────────────────────────────────────────────────────────
+grp_ict = "🧠 ICT Trade Logic"
+swing_lb    = input.int  (2,     "Pivot Lookback (bars each side)", group=grp_ict, minval=1, maxval=10,
+                           tooltip="Lower = more frequent pivots. 2=5 bars (75min on M15). Original was 4.")
+disp_mult   = input.float(1.3,   "Displacement Multiplier",        group=grp_ict, step=0.1, minval=0.5, maxval=5.0,
+                           tooltip="Body must be X times larger than avg body. Lower = more signals. Original was 1.7.")
+req_sweep   = input.bool (false, "Require Liquidity Sweep",         group=grp_ict,
+                           tooltip="OFF = more trades. ON = higher precision (original setting).")
+min_sl_pts  = input.float(30.0,  "Min SL (Points for NAS100)",     group=grp_ict, step=5,
+                           tooltip="Trades with smaller SL are skipped. Original was 50.")
+use_atr_sl  = input.bool (true,  "Use ATR-based SL (smarter)",     group=grp_ict,
+                           tooltip="ON: SL = ATR(14) × multiplier. OFF: SL = previous bar high/low.")
+atr_sl_mult = input.float(1.5,   "ATR SL Multiplier",              group=grp_ict, step=0.1, minval=0.5, maxval=5.0)
+cooldown    = input.int  (4,     "Cooldown Bars Between Trades",   group=grp_ict, minval=1, maxval=50,
+                           tooltip="Minimum bars to wait after a trade before next entry. 4 bars = 1 hour on M15.")
+
+// ─── Risk Management ─────────────────────────────────────────────────────────
+grp_risk = "💰 Risk Management"
+risk_pct    = input.float(1.0,   "Risk % per Trade",     group=grp_risk, step=0.1, minval=0.1, maxval=10.0)
+rr_ratio    = input.float(2.0,   "Risk:Reward Ratio",    group=grp_risk, step=0.1, minval=0.5, maxval=10.0)
+
+// ─── Direction Filter ────────────────────────────────────────────────────────
+grp_dir = "🔀 Direction Settings"
+enable_long  = input.bool(true,  "Enable LONG trades",  group=grp_dir)
+enable_short = input.bool(true,  "Enable SHORT trades", group=grp_dir)
+
+// ─── Visuals ─────────────────────────────────────────────────────────────────
+grp_vis = "🎨 Visuals"
+show_pivots  = input.bool(true,  "Show Pivot Dots",         group=grp_vis)
+show_kz      = input.bool(true,  "Highlight Killzone Bars", group=grp_vis)
+show_sweep   = input.bool(true,  "Show Sweep Labels",       group=grp_vis)
+show_mss     = input.bool(true,  "Show MSS Labels",         group=grp_vis)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── H1 Trend ────────────────────────────────────────────────────────────────
+h1_close = request.security(syminfo.tickerid, "60", close)
+h1_ema   = ta.ema(request.security(syminfo.tickerid, "60", close), ema_len)
+is_bull  = h1_close > h1_ema
+is_bear  = h1_close < h1_ema
+
+// ─── ATR ─────────────────────────────────────────────────────────────────────
+atr14 = ta.atr(14)
+
+// ─── Killzone (Israel Time) ───────────────────────────────────────────────────
+bar_hour_il = hour(time, "Asia/Jerusalem")
+bar_min_il  = minute(time, "Asia/Jerusalem")
+bar_tot_min = bar_hour_il * 60 + bar_min_il
+
+asian_start  = asian_s  * 60
+asian_end    = asian_e  * 60
+lon_start    = lon_s    * 60
+lon_end      = lon_e    * 60
+ny_start     = ny_s_h   * 60 + ny_s_m
+ny_end       = ny_e_h   * 60 + ny_e_m
+lunch_start  = lunch_s  * 60
+lunch_end    = lunch_e  * 60
+
+in_asian  = use_asian  and (bar_tot_min >= asian_start  and bar_tot_min < asian_end)
+in_london = use_london and (bar_tot_min >= lon_start    and bar_tot_min < lon_end)
+in_ny     = use_ny     and (bar_tot_min >= ny_start     and bar_tot_min < ny_end)
+in_lunch  = use_lunch  and (bar_tot_min >= lunch_start  and bar_tot_min < lunch_end)
+in_kz     = in_asian or in_london or in_ny or in_lunch
+
+// ─── Session Detection (for pivot/sweep reset) ────────────────────────────────
+// New session = first bar where we enter a killzone
+session_change = in_kz and not in_kz[1]
+
+// ─── Pivot High / Low ────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, swing_lb, swing_lb)
+pl = ta.pivotlow (low,  swing_lb, swing_lb)
+
+// Track the most recent valid pivot levels
+var float local_high = na
+var float local_low  = na
+
+// Reset pivots on new session start to always hunt fresh levels
+if session_change
+    local_high := na
+    local_low  := na
+
+if not na(ph)
+    local_high := ph
+if not na(pl)
+    local_low  := pl
+
+// ─── Liquidity Sweep Detection ────────────────────────────────────────────────
+var bool swept_high = false
+var bool swept_low  = false
+
+// Reset flags when session resets
+if session_change
+    swept_high := false
+    swept_low  := false
+
+if in_kz
+    if not na(local_high) and high > local_high
+        swept_high := true
+    if not na(local_low) and low < local_low
+        swept_low  := true
+
+// ─── Displacement ─────────────────────────────────────────────────────────────
+body_now = math.abs(close - open)
+avg_body = ta.sma(math.abs(close[1] - open[1]), 20)
+is_disp  = avg_body > 0 and body_now > avg_body * disp_mult
+
+// ─── MSS Conditions ───────────────────────────────────────────────────────────
+// Bullish MSS: close breaks above local high with displacement, in killzone
+mss_bull = not na(local_high)
+         and close > local_high
+         and is_disp
+         and in_kz
+         and (not req_sweep or swept_low)
+         and (use_trend ? is_bull : true)
+
+// Bearish MSS: close breaks below local low with displacement, in killzone
+mss_bear = not na(local_low)
+         and close < local_low
+         and is_disp
+         and in_kz
+         and (not req_sweep or swept_high)
+         and (use_trend ? is_bear : true)
+
+// ─── Cooldown Guard ───────────────────────────────────────────────────────────
+var int last_trade_bar = -999
+cooldown_ok = bar_index > last_trade_bar + cooldown
+
+// ─── SL Calculation ───────────────────────────────────────────────────────────
+// ATR-based SL (smarter, adapts to volatility)
+atr_sl_long  = use_atr_sl ? atr14 * atr_sl_mult : math.abs(close - low[1])
+atr_sl_short = use_atr_sl ? atr14 * atr_sl_mult : math.abs(high[1] - close)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  STRATEGY ENTRIES
+// ══════════════════════════════════════════════════════════════════════════════
+long_ok  = enable_long  and mss_bull and cooldown_ok and strategy.opentrades == 0
+short_ok = enable_short and mss_bear and cooldown_ok and strategy.opentrades == 0
+
+// Min SL filter (protect against tiny SLs)
+long_sl_pts  = atr_sl_long  / syminfo.mintick
+short_sl_pts = atr_sl_short / syminfo.mintick
+long_valid   = long_sl_pts  >= min_sl_pts
+short_valid  = short_sl_pts >= min_sl_pts
+
+// ─── LONG Entry ───────────────────────────────────────────────────────────────
+if long_ok and long_valid
+    sl_price = close - atr_sl_long
+    tp_price = close + atr_sl_long * rr_ratio
+    strategy.entry("LONG", strategy.long, comment="🚀 ICT LONG")
+    strategy.exit ("LONG_X", "LONG", stop=sl_price, limit=tp_price, comment="ICT EXIT")
+    last_trade_bar := bar_index
+    swept_low      := false
+    local_high     := na   // reset so we hunt new levels
+
+// ─── SHORT Entry ──────────────────────────────────────────────────────────────
+if short_ok and short_valid
+    sl_price = close + atr_sl_short
+    tp_price = close - atr_sl_short * rr_ratio
+    strategy.entry("SHORT", strategy.short, comment="🔻 ICT SHORT")
+    strategy.exit ("SHORT_X", "SHORT", stop=sl_price, limit=tp_price, comment="ICT EXIT")
+    last_trade_bar := bar_index
+    swept_high     := false
+    local_low      := na   // reset so we hunt new levels
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(long_ok  and long_valid,  "🚀 ICT LONG Signal",  "ICT LONG — MSS BULL + Displacement confirmed ✅")
+alertcondition(short_ok and short_valid, "🔻 ICT SHORT Signal", "ICT SHORT — MSS BEAR + Displacement confirmed ✅")
+alertcondition(in_kz and not in_kz[1],  "⏰ Killzone Open",    "Killzone is now OPEN — watch for setups")
+alertcondition(not na(ph),              "🔴 New Pivot High",   "New Pivot HIGH formed — potential liquidity above")
+alertcondition(not na(pl),              "🟢 New Pivot Low",    "New Pivot LOW formed — potential liquidity below")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  VISUALS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── Killzone Background ──────────────────────────────────────────────────────
+kz_col = in_asian  ? color.new(color.purple, 93)
+       : in_london ? color.new(color.blue,   90)
+       : in_ny     ? color.new(color.orange, 90)
+       : in_lunch  ? color.new(color.teal,   90)
+       : na
+bgcolor(show_kz ? kz_col : na, title="Killzone BG")
+
+// ─── H1 EMA line ─────────────────────────────────────────────────────────────
+plot(h1_ema, "H1 EMA", color=is_bull ? color.new(#00e676, 0) : color.new(#ff1744, 0), linewidth=2, style=plot.style_line)
+
+// ─── Pivot Dots ───────────────────────────────────────────────────────────────
+plotshape(show_pivots and not na(ph), "PH", shape.circle, location.abovebar, color.new(#ff1744, 0), size=size.tiny)
+plotshape(show_pivots and not na(pl), "PL", shape.circle, location.belowbar, color.new(#00e676, 0), size=size.tiny)
+
+// ─── Local High / Low Lines ───────────────────────────────────────────────────
+plot(local_high, "Local High", color=color.new(#ff1744, 60), style=plot.style_stepline, linewidth=1)
+plot(local_low,  "Local Low",  color=color.new(#00e676, 60), style=plot.style_stepline, linewidth=1)
+
+// ─── Sweep Labels ─────────────────────────────────────────────────────────────
+plotshape(show_sweep and swept_high and not swept_high[1], "Swept High", shape.labeldown,
+          location.abovebar, color.new(#ff6b6b, 0), text="SWEEP\nHIGH", textcolor=color.white, size=size.small)
+plotshape(show_sweep and swept_low  and not swept_low[1],  "Swept Low",  shape.labelup,
+          location.belowbar, color.new(#51cf66, 0), text="SWEEP\nLOW",  textcolor=color.white, size=size.small)
+
+// ─── MSS Labels ───────────────────────────────────────────────────────────────
+plotshape(show_mss and long_ok  and long_valid,  "MSS BULL", shape.labelup,
+          location.belowbar, color.new(#00e676, 0), text="MSS\n🚀", textcolor=color.black, size=size.normal)
+plotshape(show_mss and short_ok and short_valid, "MSS BEAR", shape.labeldown,
+          location.abovebar, color.new(#ff1744, 0), text="MSS\n🔻", textcolor=color.white, size=size.normal)
+
+// ─── Displacement candle highlight ────────────────────────────────────────────
+barcolor(is_disp and in_kz ? (close > open ? color.new(#00e676, 30) : color.new(#ff1744, 30)) : na, title="Displacement Bar")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 2, 12,
+     bgcolor       = color.new(#0d1117, 5),
+     border_color  = color.new(#30363d, 0),
+     border_width  = 1,
+     frame_color   = color.new(#58a6ff, 0),
+     frame_width   = 2)
+
+// Helper to add a row
+f_row(tbl, row, lbl, val, val_col) =>
+    table.cell(tbl, 0, row, " " + lbl, text_color=color.new(#8b949e, 0), text_size=size.small, bgcolor=color.new(#161b22, 0))
+    table.cell(tbl, 1, row, val + " ", text_color=val_col,                text_size=size.small, bgcolor=color.new(#0d1117, 0))
+
+// Win rate calculation
+total_trades = strategy.closedtrades
+wins         = strategy.wintrades
+win_rate_pct = total_trades > 0 ? math.round(wins / total_trades * 100, 1) : 0.0
+wr_col       = win_rate_pct >= 60 ? color.new(#00e676,0) : win_rate_pct >= 40 ? color.new(#ffd700,0) : color.new(#ff1744,0)
+
+net_pnl      = strategy.netprofit
+pnl_col      = net_pnl >= 0 ? color.new(#00e676,0) : color.new(#ff1744,0)
+
+kz_txt = in_asian  ? "🟣 ASIAN"  : in_london ? "🔵 LONDON" : in_ny ? "🟠 NY" : in_lunch ? "🩵 LUNCH" : "⚫ סגור"
+trend_txt = is_bull ? "📈 BULL" : is_bear ? "📉 BEAR" : "➡ ניטרלי"
+sweep_txt = (swept_high or swept_low) ? "✅ בוצע" : "⏳ ממתין"
+disp_txt  = is_disp ? "⚡ YES" : "– לא"
+
+if barstate.islast
+    table.cell(dash, 0, 0, " 📊 ICT 2022 NAS100 v2.0", text_color=color.new(#58a6ff,0), text_size=size.small, bgcolor=color.new(#1f2937,0))
+    table.cell(dash, 1, 0, "Smart Trend Strategy ",    text_color=color.new(#58a6ff,0), text_size=size.small, bgcolor=color.new(#1f2937,0))
+
+    f_row(dash, 1,  "Killzone",         kz_txt,                    color.white)
+    f_row(dash, 2,  "מגמה H1",          trend_txt,                 color.white)
+    f_row(dash, 3,  "נר Displacement",  disp_txt,                  is_disp ? color.new(#ffd700,0) : color.new(#8b949e,0))
+    f_row(dash, 4,  "לקיחת נזילות",     sweep_txt,                 color.white)
+    f_row(dash, 5,  "Local High",       str.tostring(local_high, format.mintick), color.new(#ff6b6b,0))
+    f_row(dash, 6,  "Local Low",        str.tostring(local_low,  format.mintick), color.new(#51cf66,0))
+    f_row(dash, 7,  "עסקאות סה\"כ",     str.tostring(total_trades),              color.white)
+    f_row(dash, 8,  "אחוז זכייה",       str.tostring(win_rate_pct) + "%",        wr_col)
+    f_row(dash, 9,  "רווח נקי",         "$" + str.tostring(net_pnl, "#.##"),     pnl_col)
+    f_row(dash, 10, "פוזיציות פתוחות",  str.tostring(strategy.opentrades),       color.white)
+    f_row(dash, 11, "Cooldown נותר",    str.tostring(math.max(0, last_trade_bar + cooldown - bar_index)) + " נרות", color.new(#8b949e,0))

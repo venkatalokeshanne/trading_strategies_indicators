@@ -1,0 +1,598 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator(
+     "Equalhigh — Shinohara Neon Energy Matrix v1.1.1",
+     shorttitle = "EH Shinohara v1.1.1",
+     overlay = false,
+     precision = 1,
+     max_labels_count = 300
+)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// EQUALHIGH — SHINOHARA NEON ENERGY MATRIX v1.1.1
+// Japanese name: 篠原レシオ / 強弱レシオ
+//
+// A-Ratio = 100 × Sum(High - Open) / Sum(Open - Low)
+//            Internal market energy.
+// B-Ratio = 100 × Sum(High - Previous Close) / Sum(Previous Close - Low)
+//            Crowd heat / popularity, including gap pressure.
+// C-Ratio = 100 × Sum(High - Previous Midpoint) /
+//                  Sum(Previous Midpoint - Low)
+//            Optional timing component from the original Japanese framework.
+//
+// The default Neon scale maps positive classic ratios to -100…+100:
+// Neon = 100 × (Ratio - 100) / (Ratio + 100)
+// Classic equilibrium 100 therefore becomes 0, without changing ordering.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+string GROUP_ENGINE  = "1. Japanese Engine"
+string GROUP_LEVELS  = "2. Traditional Levels"
+string GROUP_SIGNALS = "3. Signal Engine"
+string GROUP_VISUALS = "4. Neon Interface"
+string GROUP_ALERTS  = "5. Alerts"
+
+int length = input.int(
+     26,
+     "Shinohara period",
+     minval = 2,
+     maxval = 300,
+     tooltip = "The traditional Japanese setting is 26 periods.",
+     group = GROUP_ENGINE
+)
+
+string smoothingType = input.string(
+     "EMA",
+     "Ratio smoothing",
+     options = ["None", "EMA", "RMA", "SMA"],
+     group = GROUP_ENGINE
+)
+
+int smoothingLength = input.int(
+     3,
+     "Smoothing length",
+     minval = 1,
+     maxval = 50,
+     group = GROUP_ENGINE
+)
+
+bool showCRatio = input.bool(
+     false,
+     "Show optional C-Ratio",
+     tooltip = "C compares the current range with the previous bar's midpoint. It is the rarer timing component of the original framework.",
+     group = GROUP_ENGINE
+)
+
+float lowA = input.float(60.0, "A low-energy level", minval = 1.0, step = 5.0, group = GROUP_LEVELS)
+float lowB = input.float(70.0, "B low-popularity level", minval = 1.0, step = 5.0, group = GROUP_LEVELS)
+float hotA = input.float(150.0, "A high-energy level", minval = 10.0, step = 5.0, group = GROUP_LEVELS)
+float heatB = input.float(200.0, "B high-pressure level", minval = 10.0, step = 10.0, group = GROUP_LEVELS)
+float hotB = input.float(300.0, "B crowd-euphoria level", minval = 10.0, step = 10.0, group = GROUP_LEVELS)
+
+string signalPreset = input.string(
+     "Balanced",
+     "Signal filter",
+     options = ["Raw", "Balanced", "Strict"],
+     tooltip = "Raw uses the A/B event only. Balanced adds slope and trend confirmation. Strict also requires the Fusion pulse to improve or deteriorate.",
+     group = GROUP_SIGNALS
+)
+
+int slopeBars = input.int(2, "Slope confirmation bars", minval = 1, maxval = 10, group = GROUP_SIGNALS)
+int trendLength = input.int(50, "Price-trend EMA", minval = 2, maxval = 300, group = GROUP_SIGNALS)
+int fusionSmoothing = input.int(3, "Fusion pulse smoothing", minval = 1, maxval = 30, group = GROUP_SIGNALS)
+float leadershipGap = input.float(
+     15.0,
+     "Leadership gap",
+     minval = 0.0,
+     step = 1.0,
+     tooltip = "Minimum classic B-A difference required to classify Energy-led or Crowd-led pressure.",
+     group = GROUP_SIGNALS
+)
+int regimeConfirmBars = input.int(
+     2,
+     "Regime confirmation bars",
+     minval = 1,
+     maxval = 10,
+     tooltip = "A candidate regime must persist for this many closed bars before the background and dashboard switch.",
+     group = GROUP_SIGNALS
+)
+bool signalsOnClose = input.bool(true, "Confirm signals at bar close", group = GROUP_SIGNALS)
+
+string displayMode = input.string(
+     "Neon -100/+100",
+     "Display scale",
+     options = ["Neon -100/+100", "Classic ratio"],
+     tooltip = "Neon mode is bounded and centered on zero. Classic mode retains the original 100-centered ratios.",
+     group = GROUP_VISUALS
+)
+
+float classicPlotCap = input.float(
+     400.0,
+     "Classic display cap",
+     minval = 200.0,
+     maxval = 2000.0,
+     step = 50.0,
+     tooltip = "Visual cap only. It prevents large gaps from crushing the oscillator scale; calculations remain uncapped.",
+     group = GROUP_VISUALS
+)
+
+bool showGlow = input.bool(true, "Neon glow", group = GROUP_VISUALS)
+bool showFusion = input.bool(true, "Fusion pulse", group = GROUP_VISUALS)
+bool showGapHistogram = input.bool(true, "B-A leadership histogram", group = GROUP_VISUALS)
+bool showSignalLabels = input.bool(true, "Signal markers", group = GROUP_VISUALS)
+bool dynamicBackground = input.bool(true, "Regime background", group = GROUP_VISUALS)
+bool showDashboard = input.bool(true, "Matrix dashboard", group = GROUP_VISUALS)
+
+string dashboardPosition = input.string(
+     "Top Right",
+     "Dashboard position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+     group = GROUP_VISUALS
+)
+
+bool alertIgnition = input.bool(true, "Bullish ignition", group = GROUP_ALERTS)
+bool alertExhaustion = input.bool(true, "Bearish exhaustion", group = GROUP_ALERTS)
+bool alertExtremeHeat = input.bool(true, "Extreme-heat entry", group = GROUP_ALERTS)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. COLOR SYSTEM
+// ─────────────────────────────────────────────────────────────────────────────
+
+color CYAN     = #00F5FF
+color BLUE     = #2F7BFF
+color MAGENTA  = #FF2BD6
+color VIOLET   = #8B5CFF
+color LIME     = #39FF88
+color RED      = #FF3B6B
+color ORANGE   = #FF9F1C
+color GOLD     = #FFD166
+color WHITE    = #EAF6FF
+color MUTED    = #7891B2
+color NAVY     = #050816
+color GRID     = #23314F
+color PANEL    = #0A1024
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+f_smooth(float source, int smoothLength, string smoothingMethod) =>
+    switch smoothingMethod
+        "EMA" => ta.ema(source, smoothLength)
+        "RMA" => ta.rma(source, smoothLength)
+        "SMA" => ta.sma(source, smoothLength)
+        => source
+
+f_ratio(float numerator, float denominator) =>
+    math.abs(denominator) > 1e-10 ? 100.0 * numerator / denominator : na
+
+f_neon(float ratio) =>
+    // Negative classic values can occur after exceptional full-gap bars.
+    // They are treated as maximum downside pressure on the bounded scale.
+    float positiveRatio = math.max(ratio, 0.0)
+    100.0 * (positiveRatio - 100.0) / (positiveRatio + 100.0)
+
+f_display(float ratio, bool neonMode, float cap) =>
+    neonMode ? f_neon(ratio) : math.min(math.max(ratio, 0.0), cap)
+
+f_direction(bool rising, bool falling) =>
+    rising ? "CHARGING ▲" : falling ? "DRAINING ▼" : "STABLE •"
+
+f_signed(float value) =>
+    na(value) ? "—" : (value > 0.0 ? "+" : "") + str.tostring(value, "#.0")
+
+f_dashboardPosition(string selectedPosition) =>
+    switch selectedPosition
+        "Top Left" => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left" => position.bottom_left
+        => position.top_right
+
+f_cell(table panel, int column, int row, string cellText, color textColor, color backgroundColor, string alignment) =>
+    table.cell(
+         panel,
+         column,
+         row,
+         cellText,
+         text_color = textColor,
+         bgcolor = backgroundColor,
+         text_size = size.small,
+         text_halign = alignment,
+         text_font_family = font.family_monospace
+    )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. ORIGINAL SHINOHARA CALCULATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+float strongEnergy = high - open
+float weakEnergy = open - low
+
+float strongPopularity = high - close[1]
+float weakPopularity = close[1] - low
+
+float previousMidpoint = (high[1] + low[1]) * 0.5
+float strongTiming = high - previousMidpoint
+float weakTiming = previousMidpoint - low
+
+float aRaw = f_ratio(math.sum(strongEnergy, length), math.sum(weakEnergy, length))
+float bRaw = f_ratio(math.sum(strongPopularity, length), math.sum(weakPopularity, length))
+float cRaw = f_ratio(math.sum(strongTiming, length), math.sum(weakTiming, length))
+
+float aRatio = f_smooth(aRaw, smoothingLength, smoothingType)
+float bRatio = f_smooth(bRaw, smoothingLength, smoothingType)
+float cRatio = f_smooth(cRaw, smoothingLength, smoothingType)
+
+bool ready = not na(aRatio) and not na(bRatio)
+bool neonMode = displayMode == "Neon -100/+100"
+
+float aNeon = f_neon(aRatio)
+float bNeon = f_neon(bRatio)
+float cNeon = f_neon(cRatio)
+
+float aDisplay = f_display(aRatio, neonMode, classicPlotCap)
+float bDisplay = f_display(bRatio, neonMode, classicPlotCap)
+float cDisplay = f_display(cRatio, neonMode, classicPlotCap)
+
+float centerDisplay = neonMode ? 0.0 : 100.0
+float bottomDisplay = neonMode ? -100.0 : 0.0
+float topDisplay = neonMode ? 100.0 : classicPlotCap
+float lowDisplay = f_display(lowA, neonMode, classicPlotCap)
+float hotDisplay = f_display(hotA, neonMode, classicPlotCap)
+float extremeDisplay = f_display(hotB, neonMode, classicPlotCap)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. MATRIX LOGIC
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool aRising = ta.rising(aRatio, slopeBars)
+bool aFalling = ta.falling(aRatio, slopeBars)
+bool bRising = ta.rising(bRatio, slopeBars)
+bool bFalling = ta.falling(bRatio, slopeBars)
+bool cRising = ta.rising(cRatio, slopeBars)
+bool cFalling = ta.falling(cRatio, slopeBars)
+
+bool crossBOverA = ta.crossover(bRatio, aRatio)
+bool crossBUnderA = ta.crossunder(bRatio, aRatio)
+bool crossIntoAHeat = ta.crossover(aRatio, hotA)
+bool crossIntoBHeat = ta.crossover(bRatio, heatB)
+
+float priceTrend = ta.ema(close, trendLength)
+bool bullishPriceTrend = close > priceTrend and priceTrend >= priceTrend[1]
+bool bearishPriceTrend = close < priceTrend and priceTrend <= priceTrend[1]
+
+float fusion = ta.ema(0.55 * aNeon + 0.45 * bNeon, fusionSmoothing)
+float fusionDisplay = neonMode ? fusion : 100.0 * (100.0 + fusion) / math.max(100.0 - fusion, 0.001)
+fusionDisplay := neonMode ? fusionDisplay : math.min(math.max(fusionDisplay, 0.0), classicPlotCap)
+
+bool fusionRising = fusion > fusion[1]
+bool fusionFalling = fusion < fusion[1]
+bool confirmation = not signalsOnClose or barstate.isconfirmed
+float crowdGap = bRatio - aRatio
+bool energyLeads = crowdGap < -leadershipGap
+bool crowdLeads = crowdGap > leadershipGap
+bool synchronizedPressure = math.abs(crowdGap) <= leadershipGap
+
+bool rawIgnition = ready and crossBOverA and aRatio <= 100.0 and bRatio <= 120.0
+bool balancedIgnition = rawIgnition and aRising and bullishPriceTrend
+bool strictIgnition = balancedIgnition and fusionRising and fusion > -35.0
+
+bool rawExhaustion = ready and crossBUnderA and (aRatio >= hotA or bRatio >= 200.0)
+bool balancedExhaustion = rawExhaustion and aFalling and bearishPriceTrend
+bool strictExhaustion = balancedExhaustion and fusionFalling and fusion < 60.0
+
+bool ignitionBase = signalPreset == "Raw" ? rawIgnition : signalPreset == "Strict" ? strictIgnition : balancedIgnition
+bool exhaustionBase = signalPreset == "Raw" ? rawExhaustion : signalPreset == "Strict" ? strictExhaustion : balancedExhaustion
+
+bool ignitionSignal = confirmation and ignitionBase
+bool exhaustionSignal = confirmation and exhaustionBase
+bool extremeHeatSignal = confirmation and ready and (crossIntoAHeat or crossIntoBHeat)
+
+bool compressionState = ready and aRatio <= lowA and bRatio <= lowB
+bool elevatedPressure = ready and (aRatio >= hotA or bRatio >= heatB)
+bool extremeCrowdPressure = ready and bRatio >= hotB
+bool bullishFusion = fusion >= 25.0
+bool pressureAdvancing = aRising or bRising or fusionRising
+bool pressureDeteriorating = fusionFalling and (aFalling or bFalling)
+
+// v1.1 separates healthy high pressure from a deteriorating extreme.
+bool exhaustionState = elevatedPressure and aFalling and bFalling and fusionFalling
+bool fragileEuphoriaState = (extremeCrowdPressure or (bRatio >= heatB and crowdLeads)) and
+     (aFalling or fusionFalling)
+bool bullishHeatState = elevatedPressure and bullishFusion and not pressureDeteriorating
+bool energyLedExpansionState = ready and energyLeads and fusion > 0.0 and pressureAdvancing
+bool crowdLedExpansionState = ready and crowdLeads and fusion > 0.0 and pressureAdvancing
+bool synchronizedExpansionState = ready and synchronizedPressure and fusion > 0.0 and
+     (aRising and bRising)
+bool accumulationState = ready and aRatio < 100.0 and energyLeads and aRising and fusionRising
+bool distributionState = ready and crowdLeads and aFalling and bFalling
+
+// Priority matters: deterioration overrides heat; healthy heat overrides expansion.
+string candidateRegime = not ready ? "WARMING UP" :
+     exhaustionState ? "EXHAUSTION" :
+     fragileEuphoriaState ? "FRAGILE EUPHORIA" :
+     bullishHeatState ? "BULLISH HEAT" :
+     compressionState ? "COMPRESSION" :
+     accumulationState ? "ACCUMULATION" :
+     distributionState ? "DISTRIBUTION" :
+     energyLedExpansionState ? "ENERGY-LED EXP." :
+     crowdLedExpansionState ? "CROWD-LED EXP." :
+     synchronizedExpansionState ? "SYNC EXPANSION" :
+     "BALANCED"
+
+// Regimes only change after the candidate persists on closed bars.
+var string pendingRegime = "WARMING UP"
+var string regime = "WARMING UP"
+var int regimeStreak = 0
+
+if barstate.isconfirmed
+    if candidateRegime == pendingRegime
+        regimeStreak += 1
+    else
+        pendingRegime := candidateRegime
+        regimeStreak := 1
+    if regimeStreak >= regimeConfirmBars
+        regime := pendingRegime
+
+bool candidateAligned = candidateRegime == regime
+string candidateStatus = candidateAligned ? "ALIGNED" :
+     not barstate.isconfirmed ? "LIVE / NOT CLOSED" :
+     pendingRegime == candidateRegime ? "PENDING " + str.tostring(regimeStreak) + "/" + str.tostring(regimeConfirmBars) :
+     "NEW CANDIDATE"
+
+color regimeColor = regime == "ENERGY-LED EXP." ? CYAN :
+     regime == "CROWD-LED EXP." ? MAGENTA :
+     regime == "SYNC EXPANSION" ? LIME :
+     regime == "BULLISH HEAT" ? ORANGE :
+     regime == "FRAGILE EUPHORIA" ? MAGENTA :
+     regime == "ACCUMULATION" ? LIME :
+     regime == "EXHAUSTION" ? RED :
+     regime == "DISTRIBUTION" ? VIOLET :
+     regime == "COMPRESSION" ? BLUE :
+     MUTED
+
+color candidateColor = candidateRegime == "ENERGY-LED EXP." ? CYAN :
+     candidateRegime == "CROWD-LED EXP." ? MAGENTA :
+     candidateRegime == "SYNC EXPANSION" ? LIME :
+     candidateRegime == "BULLISH HEAT" ? ORANGE :
+     candidateRegime == "FRAGILE EUPHORIA" ? MAGENTA :
+     candidateRegime == "ACCUMULATION" ? LIME :
+     candidateRegime == "EXHAUSTION" ? RED :
+     candidateRegime == "DISTRIBUTION" ? VIOLET :
+     candidateRegime == "COMPRESSION" ? BLUE :
+     MUTED
+
+color regimeBackground = regime == "ENERGY-LED EXP." ? #061E2A :
+     regime == "CROWD-LED EXP." ? #210B28 :
+     regime == "SYNC EXPANSION" ? #071D19 :
+     regime == "BULLISH HEAT" ? #281805 :
+     regime == "FRAGILE EUPHORIA" ? #26091F :
+     regime == "ACCUMULATION" ? #071D19 :
+     regime == "EXHAUSTION" ? #240914 :
+     regime == "DISTRIBUTION" ? #1C0B27 :
+     regime == "COMPRESSION" ? #081329 :
+     NAVY
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. NEON VISUAL ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+bgcolor(dynamicBackground ? regimeBackground : NAVY, title = "Matrix background")
+
+// Structural levels and colored pressure zones.
+plotBottom = plot(bottomDisplay, "Scale floor", color = color.new(GRID, 100), editable = false)
+plotLow = plot(lowDisplay, "Low-energy threshold", color = color.new(BLUE, 48), linewidth = 1)
+plotCenter = plot(centerDisplay, "Equilibrium", color = color.new(WHITE, 58), linewidth = 1)
+plotHot = plot(hotDisplay, "High-energy threshold", color = color.new(ORANGE, 42), linewidth = 1)
+plotExtreme = plot(extremeDisplay, "Crowd-euphoria threshold", color = color.new(MAGENTA, 38), linewidth = 1)
+plotTop = plot(topDisplay, "Scale ceiling", color = color.new(GRID, 100), editable = false)
+
+fill(plotBottom, plotLow, color = color.new(BLUE, 89), title = "Compression field")
+fill(plotHot, plotExtreme, color = color.new(ORANGE, 92), title = "Heat field")
+fill(plotExtreme, plotTop, color = color.new(MAGENTA, 88), title = "Euphoria field")
+
+// Fusion pulse behind the principal energy curves.
+color fusionColor = fusion >= 0.0 ? color.new(CYAN, 82) : color.new(MAGENTA, 82)
+plotFusion = plot(showFusion ? fusionDisplay : na, "Fusion Pulse", color = color.new(regimeColor, 50), linewidth = 1)
+fill(plotFusion, plotCenter, color = showFusion ? fusionColor : na, title = "Fusion plasma")
+
+// B-A leadership histogram: cyan below center means Energy leads; magenta above
+// center means Crowd leads. The bounded Neon difference prevents scale damage.
+float leadershipPulse = 0.5 * (bNeon - aNeon)
+float leadershipDisplay = neonMode ? leadershipPulse : centerDisplay + leadershipPulse
+color leadershipColor = leadershipPulse >= 0.0 ? color.new(MAGENTA, 62) : color.new(CYAN, 62)
+plot(
+     showGapHistogram ? leadershipDisplay : na,
+     "B-A Leadership Pulse",
+     color = leadershipColor,
+     style = plot.style_columns,
+     histbase = centerDisplay,
+     linewidth = 1
+)
+
+// Wide translucent plots create the glow; narrow plots preserve sharp edges.
+plot(showGlow ? aDisplay : na, "A Energy Glow", color = color.new(CYAN, 76), linewidth = 4, editable = false)
+plot(showGlow ? bDisplay : na, "B Crowd Glow", color = color.new(MAGENTA, 76), linewidth = 4, editable = false)
+plot(showGlow and showCRatio ? cDisplay : na, "C Timing Glow", color = color.new(GOLD, 80), linewidth = 4, editable = false)
+
+plotA = plot(aDisplay, "A — Energy", color = aRising ? CYAN : BLUE, linewidth = 2)
+plotB = plot(bDisplay, "B — Crowd Heat", color = bRising ? MAGENTA : VIOLET, linewidth = 2)
+plotC = plot(showCRatio ? cDisplay : na, "C — Timing", color = GOLD, linewidth = 2)
+
+color energyField = bRatio >= aRatio ? color.new(MAGENTA, 86) : color.new(CYAN, 86)
+fill(plotA, plotB, color = energyField, title = "Energy / crowd field")
+
+// Keep the faithful ratios available in TradingView's Data Window.
+plot(aRatio, "Classic A Ratio", color = CYAN, display = display.data_window)
+plot(bRatio, "Classic B Ratio", color = MAGENTA, display = display.data_window)
+plot(cRatio, "Classic C Ratio", color = GOLD, display = display.data_window)
+plot(fusion, "Bounded Fusion Score", color = WHITE, display = display.data_window)
+
+// Signal markers are labels so their vertical position follows either display scale.
+if showSignalLabels and ignitionSignal
+    label.new(
+         bar_index,
+         bDisplay,
+         "IGNITION\n▲",
+         yloc = yloc.price,
+         style = label.style_label_up,
+         color = color.new(LIME, 8),
+         textcolor = NAVY,
+         size = size.tiny
+    )
+
+if showSignalLabels and exhaustionSignal
+    label.new(
+         bar_index,
+         bDisplay,
+         "EXHAUST\n▼",
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = color.new(RED, 5),
+         textcolor = WHITE,
+         size = size.tiny
+    )
+
+if showSignalLabels and extremeHeatSignal
+    label.new(
+         bar_index,
+         math.max(aDisplay, bDisplay),
+         "HEAT ◆",
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = color.new(ORANGE, 12),
+         textcolor = NAVY,
+         size = size.tiny
+    )
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. SINGLE MATRIX DASHBOARD — ONE TABLE, NO OVERLAP
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table matrixPanel = table.new(
+     f_dashboardPosition(dashboardPosition),
+     3,
+     11,
+     bgcolor = color.new(PANEL, 4),
+     frame_color = color.new(CYAN, 35),
+     frame_width = 1,
+     border_color = color.new(GRID, 25),
+     border_width = 1
+)
+
+var string lastEvent = "STANDBY"
+var color lastEventColor = MUTED
+var int lastEventBar = na
+
+if exhaustionSignal
+    lastEvent := "EXHAUSTION ▼"
+    lastEventColor := RED
+    lastEventBar := bar_index
+else if ignitionSignal
+    lastEvent := "IGNITION ▲"
+    lastEventColor := LIME
+    lastEventBar := bar_index
+else if extremeHeatSignal
+    lastEvent := "EXTREME HEAT ◆"
+    lastEventColor := ORANGE
+    lastEventBar := bar_index
+
+string currentSignal = exhaustionSignal ? "EXHAUSTION ▼" :
+     ignitionSignal ? "IGNITION ▲" :
+     extremeHeatSignal ? "EXTREME HEAT ◆" :
+     "NONE"
+color currentSignalColor = exhaustionSignal ? RED :
+     ignitionSignal ? LIME :
+     extremeHeatSignal ? ORANGE :
+     MUTED
+
+if barstate.islast
+    if showDashboard
+        string aValue = na(aRatio) ? "—" : str.tostring(aRatio, "#.0") + "%"
+        string bValue = na(bRatio) ? "—" : str.tostring(bRatio, "#.0") + "%"
+        string cValue = not showCRatio ? "HIDDEN" : na(cRatio) ? "—" : str.tostring(cRatio, "#.0") + "%"
+        string gapValue = f_signed(crowdGap)
+        string gapState = na(crowdGap) ? "WAIT" : crowdLeads ? "CROWD LEADS" : energyLeads ? "ENERGY LEADS" : "SYNCHRONIZED"
+        string fusionValue = f_signed(fusion)
+        string fusionState = na(fusion) ? "WAIT" : fusion > 25.0 ? "BULLISH" : fusion < -25.0 ? "BEARISH" : "NEUTRAL"
+        color fusionTextColor = na(fusion) ? MUTED : fusion > 25.0 ? CYAN : fusion < -25.0 ? MAGENTA : WHITE
+        string eventAge = na(lastEventBar) ? "NO EVENT" : bar_index == lastEventBar ? "NOW" : str.tostring(bar_index - lastEventBar) + " BARS AGO"
+
+        f_cell(matrixPanel, 0, 0, "SHINOHARA", CYAN, #101A35, text.align_left)
+        f_cell(matrixPanel, 1, 0, "NEON", MAGENTA, #101A35, text.align_center)
+        f_cell(matrixPanel, 2, 0, "MATRIX v1.1.1", WHITE, #101A35, text.align_right)
+
+        f_cell(matrixPanel, 0, 1, "CHANNEL", MUTED, PANEL, text.align_left)
+        f_cell(matrixPanel, 1, 1, "VALUE", MUTED, PANEL, text.align_center)
+        f_cell(matrixPanel, 2, 1, "STATE // " + timeframe.period, MUTED, PANEL, text.align_right)
+
+        f_cell(matrixPanel, 0, 2, "A // ENERGY", CYAN, color.new(CYAN, 92), text.align_left)
+        f_cell(matrixPanel, 1, 2, aValue, WHITE, color.new(CYAN, 94), text.align_center)
+        f_cell(matrixPanel, 2, 2, f_direction(aRising, aFalling), aRising ? CYAN : aFalling ? BLUE : MUTED, color.new(CYAN, 94), text.align_right)
+
+        f_cell(matrixPanel, 0, 3, "B // CROWD", MAGENTA, color.new(MAGENTA, 92), text.align_left)
+        f_cell(matrixPanel, 1, 3, bValue, WHITE, color.new(MAGENTA, 94), text.align_center)
+        f_cell(matrixPanel, 2, 3, f_direction(bRising, bFalling), bRising ? MAGENTA : bFalling ? VIOLET : MUTED, color.new(MAGENTA, 94), text.align_right)
+
+        f_cell(matrixPanel, 0, 4, "C // TIMING", GOLD, color.new(GOLD, 94), text.align_left)
+        f_cell(matrixPanel, 1, 4, cValue, showCRatio ? WHITE : MUTED, color.new(GOLD, 96), text.align_center)
+        f_cell(matrixPanel, 2, 4, showCRatio ? f_direction(cRising, cFalling) : "OPTIONAL", showCRatio ? GOLD : MUTED, color.new(GOLD, 96), text.align_right)
+
+        f_cell(matrixPanel, 0, 5, "B-A // GAP", WHITE, PANEL, text.align_left)
+        f_cell(matrixPanel, 1, 5, gapValue, WHITE, PANEL, text.align_center)
+        f_cell(matrixPanel, 2, 5, gapState, crowdGap >= 0.0 ? MAGENTA : CYAN, PANEL, text.align_right)
+
+        f_cell(matrixPanel, 0, 6, "FUSION", WHITE, color.new(regimeColor, 93), text.align_left)
+        f_cell(matrixPanel, 1, 6, fusionValue, fusionTextColor, color.new(regimeColor, 93), text.align_center)
+        f_cell(matrixPanel, 2, 6, fusionState, fusionTextColor, color.new(regimeColor, 93), text.align_right)
+
+        f_cell(matrixPanel, 0, 7, "CONFIRMED REGIME", WHITE, color.new(regimeColor, 84), text.align_left)
+        f_cell(matrixPanel, 1, 7, regime, regimeColor, color.new(regimeColor, 88), text.align_center)
+        f_cell(matrixPanel, 2, 7, "CONFIRMED", MUTED, color.new(regimeColor, 92), text.align_right)
+
+        f_cell(matrixPanel, 0, 8, "LIVE CANDIDATE", WHITE, color.new(candidateColor, 92), text.align_left)
+        f_cell(matrixPanel, 1, 8, candidateRegime, candidateColor, color.new(candidateColor, 94), text.align_center)
+        f_cell(matrixPanel, 2, 8, candidateStatus, candidateAligned ? MUTED : GOLD, color.new(candidateColor, 96), text.align_right)
+
+        f_cell(matrixPanel, 0, 9, "CURRENT SIGNAL", MUTED, PANEL, text.align_left)
+        f_cell(matrixPanel, 1, 9, currentSignal, currentSignalColor, PANEL, text.align_center)
+        f_cell(matrixPanel, 2, 9, signalPreset, WHITE, PANEL, text.align_right)
+
+        f_cell(matrixPanel, 0, 10, "LAST EVENT", MUTED, PANEL, text.align_left)
+        f_cell(matrixPanel, 1, 10, lastEvent, lastEventColor, PANEL, text.align_center)
+        f_cell(matrixPanel, 2, 10, eventAge, WHITE, PANEL, text.align_right)
+    else
+        table.clear(matrixPanel, 0, 0, 2, 10)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(
+     alertIgnition and ignitionSignal,
+     "Shinohara Bullish Ignition",
+     "Equalhigh Shinohara: bullish ignition on {{ticker}} ({{interval}})."
+)
+
+alertcondition(
+     alertExhaustion and exhaustionSignal,
+     "Shinohara Bearish Exhaustion",
+     "Equalhigh Shinohara: bearish exhaustion on {{ticker}} ({{interval}})."
+)
+
+alertcondition(
+     alertExtremeHeat and extremeHeatSignal,
+     "Shinohara Extreme Heat",
+     "Equalhigh Shinohara: A or B entered an extreme-heat zone on {{ticker}} ({{interval}})."
+)
+
+alertcondition(
+     confirmation and ready and (crossBOverA or crossBUnderA),
+     "Shinohara Any A/B Cross",
+     "Equalhigh Shinohara: A/B ratio cross on {{ticker}} ({{interval}})."
+)

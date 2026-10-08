@@ -1,0 +1,418 @@
+//@version=6
+// Tape Signals — four daily-bar marks in one overlay.
+//
+// Combines signals that normally need three panes and bar-by-bar eyeballing:
+//
+//   TOP of candle     yellow dot        ATR extension from the MA (over-extended)
+//   TOP of candle     green dot         upside reversal day
+//   BOTTOM of candle  green/red dot     price/volume-delta divergence
+//   BOTTOM of candle  cyan triangle     pocket pivot (Morales/Kacher)
+//
+// Convention: price/extension marks go on TOP, volume-derived marks go on the
+// BOTTOM. The two bottom marks are drawn at different offsets so a bar that
+// fires both stacks them instead of overlapping.
+//
+// Designed for DAILY bars on liquid US equities. Two components degrade on
+// other timeframes or thin symbols — see the volume-delta section below.
+indicator("Tape Signals", overlay = true, max_labels_count = 500)
+
+// Same library, same version, that TradingView's own CVD indicator imports.
+// The volume-delta leg below calls into this rather than re-deriving the
+// buy/sell classification — three hand-rolled attempts each disagreed with the
+// CVD pane in SIGN on real bars, because the classification TradingView uses
+// is not reproducible from OHLCV alone.
+//
+// Note the namespace: the import binds to `ta.`, so ta.requestVolumeDelta()
+// resolves through the library. WITHOUT this import line the same call fails
+// with CE10271 "Could not find function" — it is not a built-in.
+import TradingView/ta/12
+
+// ── 1. ATR extension from MA ──
+i_extOn     = input.bool(true,  "Enable", group = "1. ATR extension from MA")
+i_maType    = input.string("EMA", "MA type", options = ["EMA", "SMA"], group = "1. ATR extension from MA")
+i_maLen     = input.int(21,     "MA length", minval = 2, group = "1. ATR extension from MA")
+i_atrLen    = input.int(21,     "ATR length", minval = 2, group = "1. ATR extension from MA")
+i_atrMult   = input.float(5.0,  "ATR multiple to flag", minval = 0.5, step = 0.25, group = "1. ATR extension from MA")
+// Extension is measured on the CLOSE by default. Measuring on the HIGH flags
+// the bar that merely spiked that far intraday — noisier, but catches blowoff
+// wicks the close walks back from.
+i_extSource = input.string("Close", "Measure extension from", options = ["Close", "High"], group = "1. ATR extension from MA")
+
+// The IBD / O'Neil reversal day, three conditions:
+//
+//   1. Trades BELOW the prior day's low at some point intraday (the undercut)
+//   2. Closes in the upper half of the PRIOR bar's range
+//   3. Closes higher than it opened
+//
+// Condition 2 is measured against YESTERDAY's range, not the bar's own. An
+// earlier version of this script used the own-range version and it was far too
+// loose — a narrow inside day closing off its own low qualified while sitting
+// well below yesterday's midpoint.
+//
+// NOT required: closing above the prior CLOSE. A stock that gaps down hard,
+// plunges further, then rallies into the bell is the textbook reversal even if
+// it never regains yesterday's close.
+//
+// O'Neil writes far more about DOWNSIDE reversals ("reversal off the top" — a
+// sell rule). Upside reversals appear in his work as a feature of bottoms and
+// of shakeouts inside a base, never as a standalone buy signal — hence the
+// context filter below, which defaults ON. That prior-trend requirement is
+// also the one part of the pattern literature that replicates: Caginalp &
+// Laurent (1998) found strong significance for three-day reversals, but
+// Marshall et al. (2006, 2008) and Horton (2009) failed to reproduce it, and
+// what survives is that reversals perform better after an appropriate trend.
+//
+// In O'Neil's full rules this bar is only DAY ONE of a rally attempt, and the
+// following days must not undercut its low or the count restarts. That
+// confirmation step is deliberately not implemented here — it would delay
+// every mark by several bars.
+i_revOn = input.bool(true, "Enable", group = "2. Upside reversal")
+// Measured against the PRIOR bar's range (see revClosedHigh below), so 0.5 =
+// "closed in the upper half of yesterday's range" — IBD's published wording.
+// 0.33 for the stricter upper-third reading.
+i_revClosePos = input.float(0.5, "Close in top X of PRIOR bar's range (0.5 = upper half)",
+     minval = 0.1, maxval = 0.9, step = 0.05, group = "2. Upside reversal")
+// Volume above average is IBD's "makes it meaningful" qualifier. Not part of
+// the bare definition, so it's off by default — turn it on to cut the count.
+i_revVolOn  = input.bool(false, "Require volume > average", group = "2. Upside reversal")
+i_revVolLen = input.int(50,     "Volume average length", minval = 2, group = "2. Upside reversal")
+// Guards against calling a doji in a dead tape a "reversal" — the bar has to
+// have actually travelled somewhere to have reversed.
+i_revMinRange = input.float(0.5, "Min bar range (ATR) — 0 disables", minval = 0.0, step = 0.1, group = "2. Upside reversal")
+// Context. A reversal presupposes something to reverse FROM: in O'Neil's usage
+// it marks a bottom or a shakeout within a base, and means nothing in the
+// middle of an advance that is already going straight up. Without this gate
+// the signal fires on ordinary continuation bars, which is the main reason the
+// earlier version produced junk.
+//
+// Measured as a pullback off the recent high, which is the shakeout-in-a-base
+// case — the more actionable of the two O'Neil contexts.
+i_revCtxOn   = input.bool(true, "Require a prior decline", group = "2. Upside reversal")
+i_revCtxLen  = input.int(20,    "Lookback for the recent high (days)", minval = 3, group = "2. Upside reversal")
+i_revCtxPct  = input.float(5.0, "Min pullback off that high (%)", minval = 0.5, step = 0.5, group = "2. Upside reversal")
+
+// ── 3. Price / volume-delta divergence ──
+i_divOn = input.bool(true, "Enable", group = "3. Price / delta divergence")
+// Price direction is close vs OPEN — the candle body, exactly how TradingView
+// paints it and how the volume pane colors its bars.
+//
+// Deliberately NOT close vs prior close. The delta this is compared against is
+// built from regular-session intraday prints, so the price side has to be the
+// same session: bringing the prior close in would drag the overnight gap into
+// a signal that is about what happened between the open and the bell.
+// Lower timeframe used to classify intraday buy/sell volume. 1-minute is the
+// default: the finer the LTF, the more accurate the buy/sell split, and it
+// matches what a CVD indicator set to a 1m feed reports.
+//
+// The tradeoff is history depth, not accuracy. A daily chart on a 1m feed
+// consumes ~390 LTF bars per candle against the plan's budget (~20k bars on
+// Premium, less below), so delta covers roughly the last ~50 trading days and
+// the dots simply stop before that — older bars get no delta rather than wrong
+// delta. Step up to 5/15 only if you need the dots further back in history.
+i_divLTF = input.string("1", "Delta lower timeframe (minutes)", options = ["1", "5", "15", "60"], group = "3. Price / delta divergence")
+// Suppresses near-zero deltas, whose sign is noise. Expressed as a share of
+// the bar's own total volume. 0 = show every disagreement.
+i_divMinPct = input.float(0.0, "Min |delta| as % of bar volume", minval = 0.0, maxval = 100.0, step = 0.5, group = "3. Price / delta divergence")
+// Turn on to see exactly where delta data ends — shaded bars got NO intrabars
+// back, so a missing dot there means "no data", not "no divergence".
+i_divShowEdge = input.bool(false, "Shade bars with no delta data", group = "3. Price / delta divergence")
+
+// ── 4. Pocket pivot ──
+i_ppOn      = input.bool(true, "Enable", group = "4. Pocket pivot")
+i_ppLookback = input.int(10, "Down-volume lookback (days)", minval = 3, group = "4. Pocket pivot")
+// Core Morales/Kacher test is volume > the largest DOWN-day volume in the
+// lookback. The upper-half close is the common refinement that drops bars
+// which reversed off their highs on that volume.
+i_ppUpperHalf = input.bool(true, "Require close in upper half of range", group = "4. Pocket pivot")
+// Context filters. A pocket pivot is a BASE signal — the same volume pattern
+// well above the MAs is a late chase, which is what the extension filter
+// exists to reject.
+i_ppTrendOn  = input.bool(true,  "Require close above trend MA", group = "4. Pocket pivot")
+i_ppTrendLen = input.int(50,     "Trend MA length", minval = 2, group = "4. Pocket pivot")
+i_ppExtOn    = input.bool(true,  "Reject if extended from short MA", group = "4. Pocket pivot")
+i_ppExtLen   = input.int(10,     "Short MA length", minval = 2, group = "4. Pocket pivot")
+i_ppExtMult  = input.float(2.0,  "Max distance from short MA (ATR)", minval = 0.25, step = 0.25, group = "4. Pocket pivot")
+// Morales/Kacher treat a large gap-up as a separate setup (a "buyable gap-up"),
+// not a pocket pivot — so it's excluded here by default.
+// Morales/Kacher's carve-out is for a genuine "buyable gap-up" — a large,
+// news-driven opening gap that is its own setup with its own rules. It is NOT
+// meant to reject a stock that simply opened strong. At 2% this filter was
+// throwing away ordinary pocket pivots off a base, so the threshold is now 5%
+// and the filter is OFF by default: the extension test above already handles
+// "is this a chase", which is the real concern.
+i_ppGapOn    = input.bool(false, "Reject large gap-ups", group = "4. Pocket pivot")
+i_ppGapPct   = input.float(5.0,  "Gap-up % that disqualifies", minval = 0.1, step = 0.1, group = "4. Pocket pivot")
+
+// ── Appearance ──
+i_cExt   = input.color(color.yellow,           "ATR extension (top)",      group = "Appearance")
+i_cRev   = input.color(color.lime,             "Upside reversal (top)",    group = "Appearance")
+// Not TradingView's candle teal (#26A69A) — next to the lime used above it
+// that reads as blue rather than green.
+i_cDivUp = input.color(color.new(#00C853, 0),  "Divergence, buying (bot)", group = "Appearance")
+i_cDivDn = input.color(color.new(#EF5350, 0),  "Divergence, selling (bot)",group = "Appearance")
+i_cPP    = input.color(color.aqua,             "Pocket pivot (bottom)",    group = "Appearance")
+// plotshape()'s `size` is baked at compile time and only accepts a const
+// string, so this is NOT an input — an input.string() here fails with CE10123.
+// Change the literal to size.small / size.normal if the markers read too small.
+DOT_SIZE = size.tiny
+
+// Off by default so the newest bar always shows its marks. Turn ON to suppress
+// the newest bar until a later bar closes it out — no provisional marks, at
+// the cost of seeing the latest session's signals a day late.
+i_confirmOnly = input.bool(false, "Only show fully confirmed bars", group = "Appearance")
+
+// Marks are drawn only on the most recent N bars. On a multi-year daily chart
+// every signal competes for the same space and the overlay becomes unreadable;
+// limiting the window keeps recent action legible without changing any
+// threshold. 0 = no limit, mark the entire history.
+//
+// This is purely a DISPLAY filter. The conditions still evaluate on every bar,
+// so the alerts below fire on their own logic regardless of what is drawn, and
+// nothing about a signal's definition depends on how far back you are looking.
+i_maxBars = input.int(250, "Only mark the last N bars (0 = all)", minval = 0, group = "Appearance")
+
+// ── Shared primitives ──
+// Every ta.* series is evaluated HERE, unconditionally, and only the resulting
+// values are used inside conditionals further down. Pine short-circuits `and`/
+// `or`, so a ta.* call sitting inside one is skipped on bars where the guard
+// is false — and because these functions carry internal state that advances
+// per bar, skipping bars corrupts the series (warning CW10002).
+atr = ta.atr(i_atrLen)
+
+// Both MA flavours are computed every bar and the ternary only PICKS one.
+// Writing it as `kind == "EMA" ? ta.ema(..) : ta.sma(..)` would evaluate just
+// the selected branch, leaving the other's state stale — same CW10002 trap.
+// Wasting one MA calculation is the cost of keeping both series consistent.
+emaExt = ta.ema(close, i_maLen)
+smaExt = ta.sma(close, i_maLen)
+
+volAvg    = ta.sma(volume, i_revVolLen)
+ppTrendMA = ta.sma(close, i_ppTrendLen)
+ppShortMA = ta.sma(close, i_ppExtLen)
+// Recent high EXCLUDING today ([1]) — a bar that sets the high must not be
+// able to satisfy its own pullback test.
+revCtxHigh = ta.highest(high, i_revCtxLen)[1]
+
+barRange = high - low
+body     = math.abs(close - open)
+// Guard every "position within range" test: a bar whose high == low would
+// divide by zero and yield na, silently dropping the signal.
+closePos = barRange > 0 ? (close - low) / barRange : 0.5
+
+// Whether to evaluate signals on the newest bar.
+//
+// Two barstate approaches were tried here and BOTH silently discarded real,
+// completed sessions:
+//
+//   barstate.islast     — true for the rightmost bar whether or not it is
+//                         still forming, so it drops the latest finished bar
+//                         whenever the chart is viewed after the close.
+//   barstate.isconfirmed — false on the REALTIME bar, and TradingView keeps
+//                         treating the newest bar as realtime while a feed is
+//                         attached (post-market, weekends included). A bar
+//                         only becomes confirmed once a NEWER bar exists, so
+//                         the most recent session is never confirmed while you
+//                         are looking at it.
+//
+// So signals evaluate on every bar, including the newest. The cost is honest
+// and visible: while a session is genuinely still trading, its marks can
+// appear and change as the bar develops, because the conditions are computed
+// from a close/high/low that are not final yet. Marks on any bar that has
+// actually finished are stable.
+//
+// Turn this off to suppress the newest bar entirely if you would rather never
+// see a provisional mark.
+barDone = i_confirmOnly ? barstate.isconfirmed : true
+
+// ── 1. ATR extension ──
+extMA    = i_maType == "EMA" ? emaExt : smaExt
+extSrc   = i_extSource == "High" ? high : close
+extMult  = atr > 0 ? (extSrc - extMA) / atr : na
+isExtended = i_extOn and barDone and not na(extMult) and extMult >= i_atrMult
+
+// ── 2. Upside reversal ──
+// 1. Undercut: traded below the PRIOR day's low at some point intraday.
+revUndercut = low < low[1]
+
+// 2. Recovery, measured against the PRIOR bar's range — not this bar's own.
+// This is the actual IBD test and it is stricter than the own-range version
+// used earlier: a stock can close in the top third of a narrow inside day
+// while still sitting far below yesterday's midpoint. That passes an own-range
+// test and fails this one, which is the correct outcome — the point is that
+// the day recovered the ground the PREVIOUS session mapped out, not merely
+// that it closed off its own low.
+priorRange = high[1] - low[1]
+// Position of today's close inside yesterday's range. >1 means it closed above
+// yesterday's high, <0 below yesterday's low; both are legitimate values here.
+closeInPrior = priorRange > 0 ? (close - low[1]) / priorRange : na
+revClosedHigh = not na(closeInPrior) and closeInPrior >= (1.0 - i_revClosePos)
+
+// 3. Closed higher than it opened. O'Neil's rally-attempt wording is explicit
+// about this and it is what rejects a red candle carrying a "reversal" mark:
+// a bar that closed below its own open did not reverse, whatever else it did.
+revClosedUp = close > open
+
+// Qualifiers.
+revBigEnough = i_revMinRange <= 0 or (atr > 0 and barRange >= i_revMinRange * atr)
+revVolOk     = not i_revVolOn or (not na(volAvg) and volume > volAvg)
+
+// Context gate: how far below the recent high did this bar trade? Measured to
+// the bar's LOW, not its close — the question is whether the stock had sold
+// off into the reversal, and the low is where that selling actually reached.
+revPullbackPct = not na(revCtxHigh) and revCtxHigh > 0 ? (revCtxHigh - low) / revCtxHigh * 100.0 : na
+revCtxOk = not i_revCtxOn or (not na(revPullbackPct) and revPullbackPct >= i_revCtxPct)
+
+isReversal = i_revOn and barDone and revUndercut and revClosedHigh and revClosedUp and revBigEnough and revVolOk and revCtxOk
+
+// ── 3. Price / volume-delta divergence ──
+// Needs real intraday volume, so it yields nothing on symbols without it
+// (some indices, spreads, thin listings) and on history beyond the LTF bar
+// budget — the dots simply stop there.
+ltf = i_divLTF
+
+// Per-bar net delta, straight from the same library call TradingView's CVD
+// makes — so the sign here IS the sign the CVD pane shows, by construction
+// rather than by re-derivation.
+//
+//   [openVolume, maxVolume, minVolume, lastVolume]
+//       = ta.requestVolumeDelta(lowerTimeframe, anchorPeriod)
+//
+// Anchored to "1D", the anchor period is one session, so lastVolume is that
+// session's FINAL cumulative delta = the day's net delta, which is what the
+// divergence test needs. (openVolume/maxVolume/minVolume trace the intraday
+// path; CVD plots all four as a candle. Only the last value matters here.)
+//
+// This replaces three hand-rolled classifications, each of which disagreed
+// with the pane in SIGN on real bars — most clearly ILMN 2026-07-30, which
+// opened at its low and closed at its high yet has a NEGATIVE CVD (-7.14K).
+// The buy/sell split is not recoverable from OHLCV alone; stop trying.
+[_openDelta, _maxDelta, _minDelta, lastDelta] = ta.requestVolumeDelta(ltf, "1D")
+netDelta = lastDelta
+
+// na delta = no intraday data for this bar: an unsupported symbol, or history
+// past the lower-timeframe budget (at 1m a daily chart burns ~390 intrabars
+// per candle, so delta runs out a few dozen bars back and the dots just stop).
+// Surfaced in the Data Window so a missing dot is explainable rather than
+// mysterious — 1 means the bar had delta, 0 means it had none.
+hasDelta = na(netDelta) ? 0 : 1
+plot(hasDelta, title = "Delta available (0 = no data)", color = color.new(color.gray, 100),
+     display = display.data_window)
+plot(netDelta, title = "Net delta", color = color.new(color.gray, 100),
+     display = display.data_window)
+
+// Shades the bars that have no delta at all. The absence of divergence dots
+// there says nothing about those bars — there was simply no data.
+bgcolor(i_divShowEdge and na(netDelta) ? color.new(color.gray, 88) : na,
+     title = "No delta data")
+// No fallback proxy by design. The obvious one — signing the whole daily bar
+// by its own direction — can never disagree with price, so it would produce
+// exactly zero divergence dots while looking like it worked. Better that the
+// dots visibly stop where real delta data stops.
+//
+// barDone matters doubly here: mid-session the intrabar array holds only the
+// minutes printed SO FAR, so netDelta's sign can flip before the bell.
+deltaOk = not na(netDelta) and barDone
+
+priceUp   = close > open
+priceDown = close < open
+deltaUp   = deltaOk and netDelta > 0
+deltaDown = deltaOk and netDelta < 0
+deltaBigEnough = deltaOk and volume > 0 and (math.abs(netDelta) / volume) * 100.0 >= i_divMinPct
+
+// Red bar absorbed by net buying — hidden accumulation.
+divBuying  = i_divOn and deltaOk and priceDown and deltaUp   and deltaBigEnough
+// Green bar sold into — hidden distribution.
+divSelling = i_divOn and deltaOk and priceUp   and deltaDown and deltaBigEnough
+
+// ── 4. Pocket pivot ──
+// The defining test: today's volume vs the largest DOWN-day volume of the
+// prior N days. Not "above average volume" — the comparison is specifically
+// against recent supply, which is what makes it a pocket pivot rather than a
+// generic volume surge.
+// A "down day" here means the SESSION was down — close below its own open,
+// i.e. a red candle body. Deliberately NOT close vs prior close: that folds
+// the overnight gap into the day's character, so a stock that gaps down 4%,
+// rallies all session and closes well above its open counts as a down day and
+// contributes its volume to the supply comparison. Intraday that was an
+// accumulation day; the selling happened while the market was shut.
+//
+// The pocket pivot is a claim about supply ABSORBED DURING THE SESSION, so
+// both sides of the comparison are measured the same way — close vs open.
+//
+// downVol is 0 on up days so ta.highest() ignores them. The [1] shifts the
+// window back one bar, making it exactly the PRIOR i_ppLookback days —
+// today's own volume must not be part of the bar it's being compared against.
+downVol = close < open ? volume : 0.0
+maxDownVol = ta.highest(downVol, i_ppLookback)[1]
+
+// Today must likewise be an up SESSION, not merely up on a gap.
+ppUp        = close > open
+// maxDownVol == 0 means there was NO down day in the lookback at all. That's
+// not a failed test — it's the strongest possible version of it (zero supply
+// to overcome), so it passes rather than being silently dropped.
+ppVolOk     = not na(maxDownVol) and volume > maxDownVol
+ppRangeOk   = not i_ppUpperHalf or closePos >= 0.5
+ppTrendOk   = not i_ppTrendOn or (not na(ppTrendMA) and close > ppTrendMA)
+// Extension is measured from the PRIOR bar's close, not today's.
+//
+// A big-volume pocket pivot MOVES price, which pushes the close away from the
+// 10-day MA — so measuring from today's close makes the bar's own strength
+// disqualify it, and the stronger the pivot the more certainly it is rejected.
+// That inverted the whole signal: FSLY fired on two moderate bars and then
+// rejected the two LARGER-volume bars that followed, and MAKO's highest-volume
+// day ever was dropped.
+//
+// The question the filter is meant to answer is "was the stock extended BEFORE
+// this happened" — i.e. is this emerging from a base or chasing an advance
+// already underway. That is a property of yesterday, so it reads close[1].
+ppNotExt    = not i_ppExtOn or (not na(ppShortMA[1]) and atr[1] > 0 and (close[1] - ppShortMA[1]) <= i_ppExtMult * atr[1])
+// This one DOES use open vs prior close — measuring the overnight gap is
+// precisely its job, unlike the up/down-session tests above.
+ppGapOk     = not i_ppGapOn or close[1] <= 0 or ((open - close[1]) / close[1]) * 100.0 < i_ppGapPct
+
+isPocketPivot = i_ppOn and barDone and ppUp and ppVolOk and ppRangeOk and ppTrendOk and ppNotExt and ppGapOk
+
+// ── Plots ──
+// location.abovebar/belowbar put every shape at the SAME distance from the
+// bar, so two signals firing on one bar would sit on top of each other. These
+// use location.absolute with ATR-scaled offsets instead, giving each mark its
+// own lane: a bar that is both extended and a reversal shows two stacked dots,
+// and likewise for a divergence + pocket pivot day.
+//
+// Offsets scale with ATR so the spacing looks the same on a $5 stock and a
+// $500 one, and stays put as you zoom.
+padNear = 0.45 * atr
+padMid  = 1.15 * atr
+
+// Display window. last_bar_index is the index of the newest bar on the chart;
+// comparing it to this bar's index gives how many bars back we are. Pine keeps
+// last_bar_index up to date on every bar (it is not restricted to barstate.
+// islast), so this evaluates correctly across the whole history in one pass.
+inWindow = i_maxBars <= 0 or (last_bar_index - bar_index) < i_maxBars
+
+plotshape(isExtended and inWindow ? high + padNear : na, title = "ATR extension", style = shape.circle,
+     location = location.absolute, color = i_cExt, size = DOT_SIZE)
+plotshape(isReversal and inWindow ? high + padMid  : na, title = "Upside reversal", style = shape.triangleup,
+     location = location.absolute, color = i_cRev, size = DOT_SIZE)
+
+// Bottom lane: divergence dot nearest the low, pocket pivot triangle below it.
+// The two divergence colors share one lane — they are mutually exclusive on a
+// given bar (price can't be both up and down), so they can never collide.
+plotshape(divBuying and inWindow ? low - padNear : na, title = "Divergence — hidden buying", style = shape.circle,
+     location = location.absolute, color = i_cDivUp, size = DOT_SIZE)
+plotshape(divSelling and inWindow ? low - padNear : na, title = "Divergence — hidden selling", style = shape.circle,
+     location = location.absolute, color = i_cDivDn, size = DOT_SIZE)
+plotshape(isPocketPivot and inWindow ? low - padMid : na, title = "Pocket pivot", style = shape.triangleup,
+     location = location.absolute, color = i_cPP, size = DOT_SIZE)
+
+// Optional MA reference for the extension leg — off by default so the overlay
+// stays clean on a chart that already draws its own MAs.
+i_showMA = input.bool(false, "Plot the extension MA", group = "Appearance")
+plot(i_showMA ? extMA : na, title = "Extension MA", color = color.new(i_cExt, 40), linewidth = 1)
+
+// ── Alerts ──
+alertcondition(isExtended,     title = "ATR extension",  message = "{{ticker}} extended from MA")
+alertcondition(isReversal,     title = "Upside reversal", message = "{{ticker}} upside reversal day")
+alertcondition(divBuying,      title = "Hidden buying",   message = "{{ticker}} down day, net buying delta")
+alertcondition(divSelling,     title = "Hidden selling",  message = "{{ticker}} up day, net selling delta")
+alertcondition(isPocketPivot,  title = "Pocket pivot",    message = "{{ticker}} pocket pivot")

@@ -1,0 +1,225 @@
+//@version=5
+strategy("Dual MA Crossover + Volatility Filter", 
+     overlay=true, 
+     initial_capital=100000, 
+     default_qty_type=strategy.cash, 
+     commission_type=strategy.commission.cash_per_contract, 
+     commission_value=2.50, 
+     slippage=1, 
+     process_orders_on_close=false, 
+     close_entries_rule="ANY", 
+     max_lines_count=500, 
+     max_labels_count=500)
+
+// ==========================================
+// === INPUT SECTION ===
+// ==========================================
+
+// --- Moving Averages ---
+grp_ma = "Moving Averages"
+fastLength = input.int(20, "Fast MA Length", minval=5, maxval=100, group=grp_ma)
+slowLength = input.int(50, "Slow MA Length", minval=20, maxval=200, group=grp_ma)
+maType     = input.string("EMA", "MA Type", options=["EMA", "SMA", "WMA", "HMA"], group=grp_ma)
+showMA     = input.bool(true, "Show MA Lines", group=grp_ma)
+
+// --- Volatility Filter ---
+grp_vol = "Volatility Filter"
+enableVolFilter   = input.bool(true, "Enable Volatility Filter", group=grp_vol)
+atrFilterLength   = input.int(14, "ATR Filter Period", minval=5, group=grp_vol)
+atrCompareLength  = input.int(20, "ATR Comparison Period", minval=10, group=grp_vol)
+
+// --- RSI Momentum ---
+grp_rsi = "RSI Filter"
+enableRsiFilter   = input.bool(true, "Enable RSI Filter", group=grp_rsi)
+rsiLength         = input.int(14, "RSI Length", minval=5, group=grp_rsi)
+rsiLongThreshold  = input.int(50, "RSI Long Threshold", minval=30, maxval=70, group=grp_rsi)
+rsiShortThreshold = input.int(50, "RSI Short Threshold", minval=30, maxval=70, group=grp_rsi)
+
+// --- Session & Time ---
+grp_time = "Time Filter"
+enableTimeFilter   = input.bool(true, "Enable Session Filter", group=grp_time)
+sessionStartHour   = input.int(9, "Start Hour (EST)", minval=0, maxval=23, group=grp_time)
+sessionStartMinute = input.int(30, "Start Minute", minval=0, maxval=59, group=grp_time)
+barsToSkip         = input.int(6, "Bars to Skip after Open", minval=0, group=grp_time)
+
+// --- Risk Management ---
+grp_risk = "Risk & Exit Management"
+riskPercent      = input.float(1.0, "Risk % Per Trade", minval=0.1, maxval=5.0, step=0.1, group=grp_risk)
+atrStopMult      = input.float(2.0, "Initial Stop ATR Mult", minval=0.5, step=0.1, group=grp_risk)
+atrTrailMult     = input.float(3.0, "Trail ATR Mult", minval=0.5, step=0.1, group=grp_risk)
+breakevenTrigger = input.float(1.0, "Breakeven Trigger (R)", minval=0.5, step=0.1, group=grp_risk)
+timeStopBars     = input.int(10, "Time Stop (Bars)", minval=5, group=grp_risk)
+enableLongs      = input.bool(true, "Enable Longs", group=grp_risk)
+enableShorts     = input.bool(true, "Enable Shorts", group=grp_risk)
+
+// ==========================================
+// === FUNCTIONS & HELPERS ===
+// ==========================================
+
+// MA Selection Helper
+getMA(type, len) =>
+    switch type
+        "SMA" => ta.sma(close, len)
+        "WMA" => ta.wma(close, len)
+        "HMA" => ta.hma(close, len)
+        => ta.ema(close, len)
+
+// Futures Point Value Lookup
+getPointValue() =>
+    s = syminfo.tickerid
+    str.contains(s, "ES1!") ? 50.0 : 
+     str.contains(s, "NQ1!") ? 20.0 : 
+     str.contains(s, "YM1!") ? 5.0 : 
+     str.contains(s, "RTY1!") ? 50.0 : 
+     str.contains(s, "CL1!") ? 1000.0 : 
+     str.contains(s, "GC1!") ? 100.0 : 
+     str.contains(s, "SI1!") ? 5000.0 : 
+     syminfo.pointvalue
+
+// ==========================================
+// === CALCULATIONS ===
+// ==========================================
+
+// Core Indicators
+fastMA = getMA(maType, fastLength)
+slowMA = getMA(maType, slowLength)
+atrVal = ta.atr(atrFilterLength)
+atrComp = ta.atr(atrCompareLength)
+rsiVal = ta.rsi(close, rsiLength)
+
+// Logic: Volatility Filter
+volatilityExpanding = not enableVolFilter or (atrVal > atrComp)
+
+// Logic: RSI Filter
+rsiLongOK  = not enableRsiFilter or (rsiVal > rsiLongThreshold)
+rsiShortOK = not enableRsiFilter or (rsiVal < rsiShortThreshold)
+
+// Logic: Time Filter
+var int barsSinceOpen = 0
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    barsSinceOpen := 0
+else
+    barsSinceOpen += 1
+
+timeFilterPassed = not enableTimeFilter or (barsSinceOpen >= barsToSkip)
+
+// Logic: Crossovers
+longCross  = ta.crossover(fastMA, slowMA)
+shortCross = ta.crossunder(fastMA, slowMA)
+
+// ==========================================
+// === STATE MANAGEMENT & RISK ===
+// ==========================================
+
+var float entryPrice      = na
+var float currentStop     = na
+var bool  breakevenActive = false
+var int   entryBarIndex   = na
+var float maxPriceReached = na
+var float minPriceReached = na
+
+// Position Sizing
+riskAmount   = strategy.equity * (riskPercent / 100)
+stopDist     = atrVal * atrStopMult
+pointVal     = getPointValue()
+posSize      = math.floor(riskAmount / (stopDist * pointVal))
+finalQty     = math.max(1, posSize)
+
+// ==========================================
+// === ENTRY CONDITIONS ===
+// ==========================================
+
+canEnterLong  = enableLongs and longCross and volatilityExpanding and rsiLongOK and 
+     timeFilterPassed and strategy.position_size == 0
+canEnterShort = enableShorts and shortCross and volatilityExpanding and rsiShortOK and 
+     timeFilterPassed and strategy.position_size == 0
+
+if canEnterLong
+    strategy.entry("Long", strategy.long, qty=finalQty, comment="MA Cross Up")
+    entryPrice      := close
+    currentStop     := close - stopDist
+    breakevenActive := false
+    entryBarIndex   := bar_index
+    maxPriceReached := close
+
+if canEnterShort
+    strategy.entry("Short", strategy.short, qty=finalQty, comment="MA Cross Down")
+    entryPrice      := close
+    currentStop     := close + stopDist
+    breakevenActive := false
+    entryBarIndex   := bar_index
+    minPriceReached := close
+
+// ==========================================
+// === EXIT & TRAILING LOGIC ===
+// ==========================================
+
+if strategy.position_size > 0 // Long Management
+    maxPriceReached := math.max(maxPriceReached, high)
+    runInR = (maxPriceReached - entryPrice) / stopDist
+    
+    // Breakeven Logic
+    if not breakevenActive and runInR >= breakevenTrigger
+        currentStop := entryPrice
+        breakevenActive := true
+        
+    // Trailing Logic (Active after breakeven)
+    if breakevenActive
+        trailLevel = maxPriceReached - (atrVal * atrTrailMult)
+        currentStop := math.max(currentStop, trailLevel)
+        
+    // Time Stop Logic
+    noNewHigh = ta.highest(high, timeStopBars) <= ta.highest(high, timeStopBars)[1]
+    if (bar_index - entryBarIndex >= timeStopBars) and noNewHigh
+        strategy.close("Long", comment="Time Exit")
+
+if strategy.position_size < 0 // Short Management
+    minPriceReached := math.min(minPriceReached, low)
+    runInR = (entryPrice - minPriceReached) / stopDist
+    
+    // Breakeven Logic
+    if not breakevenActive and runInR >= breakevenTrigger
+        currentStop := entryPrice
+        breakevenActive := true
+        
+    // Trailing Logic
+    if breakevenActive
+        trailLevel = minPriceReached + (atrVal * atrTrailMult)
+        currentStop := math.min(currentStop, trailLevel)
+
+    // Time Stop Logic
+    noNewLow = ta.lowest(low, timeStopBars) >= ta.lowest(low, timeStopBars)[1]
+    if (bar_index - entryBarIndex >= timeStopBars) and noNewLow
+        strategy.close("Short", comment="Time Exit")
+
+// Submit Exits
+if strategy.position_size != 0
+    strategy.exit("Exit", "Long", stop=currentStop, comment_loss="Stop", comment_profit="Trail/BE")
+    strategy.exit("Exit", "Short", stop=currentStop, comment_loss="Stop", comment_profit="Trail/BE")
+
+// ==========================================
+// === VISUALIZATION ===
+// ==========================================
+
+plot(showMA ? fastMA : na, "Fast MA", color=color.blue, linewidth=2)
+plot(showMA ? slowMA : na, "Slow MA", color=color.red, linewidth=2)
+
+// Volatility Background
+bgCol = volatilityExpanding ? color.new(color.green, 90) : color.new(color.red, 90)
+bgcolor(enableVolFilter ? bgCol : na, title="Volatility Filter")
+
+// Signals
+plotshape(canEnterLong, "Long Label", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(canEnterShort, "Short Label", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// Exit Levels
+plot(strategy.position_size != 0 ? currentStop : na, "Current Stop", 
+     color=breakevenActive ? color.purple : color.orange, style=plot.style_linebr)
+
+// ==========================================
+// === ALERTS ===
+// ==========================================
+
+alertcondition(canEnterLong, "Long Entry", "MA Cross Long")
+alertcondition(canEnterShort, "Short Entry", "MA Cross Short")

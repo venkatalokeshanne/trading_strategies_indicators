@@ -1,0 +1,243 @@
+// Kit Bot v1.1 - Silver Only, 15% Stake// Kit Bot v1.2 - Silver Only, 15% Stake
+// STRICTER entries: gate checks + confirmation scoring
+// Platform: TradingView -> Signum -> Hyperliquid
+// Asset: Silver/USD 30m ONLY
+
+//@version=5
+strategy("Kit Bot v1.2 - Silver", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=15, initial_capital=1000, commission_type=strategy.commission.percent, commission_value=0.05, slippage=1)
+
+// ==========================================
+// INPUTS
+// ==========================================
+
+minConfirmations = input.int(2, "Min Bonus Confirmations (on top of gates)", minval=1, maxval=4, group="Strategy")
+maxTradesPerDay  = input.int(3, "Max Trades Per Day", minval=1, maxval=5, group="Strategy")
+leverage         = input.float(2.0, "Leverage", minval=1.0, maxval=5.0, step=0.5, group="Strategy")
+minRR            = input.float(2.0, "Min Risk:Reward", minval=1.0, maxval=5.0, step=0.5, group="Strategy")
+
+// Indicator settings
+rsiLen     = input.int(14, "RSI Length", group="Indicators")
+bbLen      = input.int(20, "BB Length", group="Indicators")
+bbMult     = input.float(2.0, "BB Multiplier", group="Indicators")
+emaLen     = input.int(9, "EMA Length", group="Indicators")
+ema50Len   = input.int(50, "EMA 50 Length (trend)", group="Indicators")
+atrLen     = input.int(14, "ATR Length", group="Indicators")
+atrMult    = input.float(1.5, "ATR Stop Multiplier", minval=0.5, maxval=3.0, step=0.25, group="Indicators")
+volMult    = input.float(1.2, "Min Volume vs Average", minval=0.5, maxval=3.0, step=0.1, group="Indicators")
+
+// Session filters (GMT)
+useLondon  = input.bool(true, "Trade London Session (07:00-16:00 GMT)", group="Sessions")
+useNYC     = input.bool(true, "Trade NYC Session (13:30-21:00 GMT)", group="Sessions")
+useAsian   = input.bool(false, "Trade Asian Session (21:00-01:30 GMT) - Caution", group="Sessions")
+
+// ==========================================
+// INDICATORS
+// ==========================================
+
+rsi = ta.rsi(close, rsiLen)
+[bbMid, bbUpper, bbLower] = ta.bb(close, bbLen, bbMult)
+ema9  = ta.ema(close, emaLen)
+ema50 = ta.ema(close, ema50Len)
+atr = ta.atr(atrLen)
+avgVol = ta.sma(volume, 20)
+
+// RSI divergence detection (stricter - look back 3 bars)
+swingHigh = ta.pivothigh(high, 3, 3)
+swingLow  = ta.pivotlow(low, 3, 3)
+bearishDiv = not na(swingHigh) and high[3] > high[6] and rsi[3] < rsi[6] and rsi[3] > 60
+bullishDiv = not na(swingLow) and low[3] < low[6] and rsi[3] > rsi[6] and rsi[3] < 40
+
+// Candle patterns (stricter ratios)
+bodySize    = math.abs(close - open)
+upperWick   = high - math.max(close, open)
+lowerWick   = math.min(close, open) - low
+candleRange = high - low
+isGravestone = candleRange > 0 and upperWick > bodySize * 2.5 and lowerWick < bodySize * 0.3 and bodySize > 0
+isHammer     = candleRange > 0 and lowerWick > bodySize * 2.5 and upperWick < bodySize * 0.3 and bodySize > 0
+isDoji       = candleRange > 0 and bodySize < candleRange * 0.08
+isBullishEngulf = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+isBearishEngulf = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+
+// ==========================================
+// SESSION FILTER
+// ==========================================
+
+hourGMT = hour(time, "GMT")
+minGMT  = minute(time, "GMT")
+timeGMT = hourGMT * 100 + minGMT
+
+inLondon = useLondon and (timeGMT >= 700 and timeGMT < 1600)
+inNYC    = useNYC and (timeGMT >= 1330 and timeGMT < 2100)
+inAsian  = useAsian and (timeGMT >= 2100 or timeGMT < 130)
+
+inSession = inLondon or inNYC or inAsian
+
+// ==========================================
+// TRADE COUNTER (per day)
+// ==========================================
+
+var int tradesToday = 0
+newDay = ta.change(time("D")) != 0
+if newDay
+    tradesToday := 0
+
+canTrade = tradesToday < maxTradesPerDay and inSession
+
+// ==========================================
+// LONG ENTRY LOGIC
+// ==========================================
+// GATE CHECKS (ALL must pass - these are non-negotiable)
+// Gate 1: RSI is in buy zone and turning up
+longGate1 = rsi > rsi[1] and rsi < 50 and rsi > 18
+// Gate 2: Price is above 9 EMA (confirmed direction)
+longGate2 = close > ema9
+// Gate 3: Price was recently stressed (touched lower BB in last 5 bars)
+longGate3 = ta.lowest(low, 5) <= bbLower
+
+longGatesPass = longGate1 and longGate2 and longGate3
+
+// BONUS CONFIRMATIONS (need minConfirmations of these)
+// B1: Price closing back inside BB from outside
+longB1 = close > bbLower and close[1] <= bbLower
+// B2: Bullish rejection candle
+longB2 = isHammer or isBullishEngulf or (isDoji and close > open and lowerWick > upperWick)
+// B3: RSI bullish divergence
+longB3 = bullishDiv
+// B4: Volume spike (above average = real interest)
+longB4 = volume > avgVol * volMult
+// B5: Trend aligned (price above EMA 50 = trading with trend)
+longB5 = close > ema50
+
+longBonusScore = (longB1 ? 1 : 0) + (longB2 ? 1 : 0) + (longB3 ? 1 : 0) + (longB4 ? 1 : 0) + (longB5 ? 1 : 0)
+longSignal = longGatesPass and longBonusScore >= minConfirmations and canTrade and strategy.position_size == 0
+
+// ==========================================
+// SHORT ENTRY LOGIC
+// ==========================================
+// GATE CHECKS (ALL must pass)
+// Gate 1: RSI is in sell zone and turning down
+shortGate1 = rsi < rsi[1] and rsi > 55 and rsi < 82
+// Gate 2: Price is below 9 EMA (confirmed direction)
+shortGate2 = close < ema9
+// Gate 3: Price was recently extended (touched upper BB in last 5 bars)
+shortGate3 = ta.highest(high, 5) >= bbUpper
+
+shortGatesPass = shortGate1 and shortGate2 and shortGate3
+
+// BONUS CONFIRMATIONS (need minConfirmations of these)
+// B1: Price closing back inside BB from outside
+shortB1 = close < bbUpper and close[1] >= bbUpper
+// B2: Bearish rejection candle
+shortB2 = isGravestone or isBearishEngulf or (isDoji and close < open and upperWick > lowerWick)
+// B3: RSI bearish divergence
+shortB3 = bearishDiv
+// B4: Volume spike
+shortB4 = volume > avgVol * volMult
+// B5: Trend aligned (price below EMA 50 = trading with trend)
+shortB5 = close < ema50
+
+shortBonusScore = (shortB1 ? 1 : 0) + (shortB2 ? 1 : 0) + (shortB3 ? 1 : 0) + (shortB4 ? 1 : 0) + (shortB5 ? 1 : 0)
+shortSignal = shortGatesPass and shortBonusScore >= minConfirmations and canTrade and strategy.position_size == 0
+
+// ==========================================
+// STOP LOSS & TAKE PROFIT (ATR-based)
+// ==========================================
+
+longStop    = close - (atr * atrMult)
+longTarget  = close + (atr * atrMult * minRR)
+shortStop   = close + (atr * atrMult)
+shortTarget = close - (atr * atrMult * minRR)
+
+// ==========================================
+// ENTRIES
+// ==========================================
+
+if longSignal
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=longTarget)
+    tradesToday += 1
+
+if shortSignal
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortTarget)
+    tradesToday += 1
+
+// ==========================================
+// PLOTS
+// ==========================================
+
+plot(ema9, "EMA 9", color=color.orange, linewidth=2)
+plot(ema50, "EMA 50", color=color.purple, linewidth=1)
+plot(bbUpper, "BB Upper", color=color.gray)
+plot(bbMid, "BB Mid", color=color.gray, style=plot.style_cross)
+plot(bbLower, "BB Lower", color=color.gray)
+
+plotshape(longSignal, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+plot(strategy.position_size > 0 ? longStop : na, "Long Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size > 0 ? longTarget : na, "Long Target", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortStop : na, "Short Stop", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortTarget : na, "Short Target", color=color.green, style=plot.style_linebr, linewidth=2)
+
+// ==========================================
+// INFO TABLE
+// ==========================================
+
+var table infoTable = table.new(position.top_right, 2, 12, bgcolor=color.new(color.black, 80), border_width=1)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "KIT v1.2", text_color=color.white, text_size=size.normal, bgcolor=color.new(color.blue, 60))
+    table.cell(infoTable, 1, 0, "SILVER", text_color=color.silver, text_size=size.normal, bgcolor=color.new(color.blue, 60))
+
+    rsiColor = rsi > 70 ? color.red : rsi < 30 ? color.green : color.white
+    table.cell(infoTable, 0, 1, "RSI", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(rsi, "#.#"), text_color=rsiColor, text_size=size.small)
+
+    lgColor = longGatesPass ? color.green : color.red
+    table.cell(infoTable, 0, 2, "L GATE", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 2, longGatesPass ? "PASS" : "FAIL", text_color=lgColor, text_size=size.small)
+
+    lbColor = longBonusScore >= minConfirmations ? color.green : color.gray
+    table.cell(infoTable, 0, 3, "L BONUS", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(longBonusScore) + "/5", text_color=lbColor, text_size=size.small)
+
+    sgColor = shortGatesPass ? color.red : color.gray
+    table.cell(infoTable, 0, 4, "S GATE", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 4, shortGatesPass ? "PASS" : "FAIL", text_color=sgColor, text_size=size.small)
+
+    sbColor = shortBonusScore >= minConfirmations ? color.red : color.gray
+    table.cell(infoTable, 0, 5, "S BONUS", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 5, str.tostring(shortBonusScore) + "/5", text_color=sbColor, text_size=size.small)
+
+    tradeColor = tradesToday >= maxTradesPerDay ? color.red : color.white
+    table.cell(infoTable, 0, 6, "TRADES", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 6, str.tostring(tradesToday) + "/" + str.tostring(maxTradesPerDay), text_color=tradeColor, text_size=size.small)
+
+    sessionText = inLondon ? "LONDON" : inNYC ? "NYC" : inAsian ? "ASIAN" : "CLOSED"
+    sessionColor = inSession ? color.green : color.gray
+    table.cell(infoTable, 0, 7, "SESSION", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 7, sessionText, text_color=sessionColor, text_size=size.small)
+
+    trendText = close > ema50 ? "BULL" : "BEAR"
+    trendColor = close > ema50 ? color.green : color.red
+    table.cell(infoTable, 0, 8, "TREND", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 8, trendText, text_color=trendColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 9, "ATR", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 9, str.tostring(atr, "#.###"), text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 10, "STOP", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 10, str.tostring(atr * atrMult, "#.###"), text_color=color.yellow, text_size=size.small)
+
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(infoTable, 0, 11, "POS", text_color=color.gray, text_size=size.small)
+    table.cell(infoTable, 1, 11, posText, text_color=posColor, text_size=size.small)
+
+// ==========================================
+// ALERTS (for Signum webhook)
+// ==========================================
+
+alertcondition(longSignal, title="Kit Long Entry", message='{"action":"buy","symbol":"SILVER","leverage":2,"qty_pct":15}')
+alertcondition(shortSignal, title="Kit Short Entry", message='{"action":"sell","symbol":"SILVER","leverage":2,"qty_pct":15}')

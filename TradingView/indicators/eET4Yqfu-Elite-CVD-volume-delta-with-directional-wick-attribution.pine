@@ -1,0 +1,315 @@
+//@version=6
+// =============================================================================
+//  ORIGINALITY AND ATTRIBUTION
+//  Cumulative volume delta is a public, widely implemented idea and I claim no
+//  ownership of it. There are many open-source CVD scripts on this platform.
+//  This one is written from scratch: no code in it is copied or adapted from
+//  another author's script here or anywhere else.
+//
+//  WHAT IS DIFFERENT HERE, stated plainly so you can judge it yourself:
+//  Almost every volume-delta proxy splits a bar's volume by where the close
+//  sits in the range, which implicitly treats both wicks as neutral. This one
+//  attributes wick volume DIRECTIONALLY based on which wick it is and whether
+//  the bar closed up or down: on an up bar the lower wick is read as absorbed
+//  selling that buyers overcame, so most of it is credited to buyers, and the
+//  upper wick is read as rejection, so most of it is credited to sellers. The
+//  split is 75/25 rather than 50/50. All three models are exposed side by side
+//  so you can compare them rather than take my word for it.
+//
+//  HONEST LIMITATIONS, because this matters more than the feature list:
+//   - This is a PROXY, not real order flow. It infers aggressor side from bar
+//     shape. It has no access to bid and ask data. On any instrument where the
+//     true delta is available, the true delta is better and you should use it.
+//   - The directional wick reading is an assumption about intent, not a
+//     measurement. It is defensible and it is still an assumption.
+//   - With relative-volume weighting on, the running total is no longer in
+//     contracts or shares, because each bar is scaled by the square root of
+//     its relative volume. The shape stays comparable; the units do not.
+//     Turn the weighting off if you need the axis to mean volume.
+//   - The session reset follows the exchange's own daily session, so on
+//     futures it resets at the futures open rather than at the cash open.
+//   - Divergences are confirmed, which means they appear only after the pivot
+//     right-bars have elapsed. They do not appear in real time and they are
+//     not predictions.
+// =============================================================================
+indicator("Elite CVD: volume delta with directional wick attribution", "Elite CVD", format=format.volume, overlay=false, max_boxes_count=500)
+
+string GRP_PROXY = "Volume Proxy Model"
+string PROXY_CTX = "Context-Aware (Recommended)"
+string PROXY_BLD = "Blended (OC + HL Average)"
+string PROXY_HL  = "Classic High-Low"
+string proxy_method = input.string(PROXY_CTX, "Proxy Method", options=[PROXY_CTX, PROXY_BLD, PROXY_HL], group=GRP_PROXY,
+     tooltip="Context-Aware uses candle structure to weight wick volume directionally instead of splitting 50/50.")
+
+string GRP_CVD   = "CVD Engine"
+string RST_SESS  = "Session"
+string RST_FIXED = "Fixed Length"
+string RST_NONE  = "None (Running)"
+string cvd_reset    = input.string(RST_SESS, "CVD Reset Mode", options=[RST_SESS, RST_FIXED, RST_NONE], group=GRP_CVD)
+int    cvd_fix_len  = input.int(50, "Fixed Reset Length", minval=5, group=GRP_CVD, tooltip="Only used when Reset = Fixed Length")
+bool   show_cvd_ma  = input.bool(true, "Show CVD Signal Line", group=GRP_CVD)
+int    cvd_ma_len   = input.int(8, "Signal Line Length", minval=2, group=GRP_CVD)
+string cvd_ma_type  = input.string("EMA", "Signal Line Type", options=["EMA", "SMA", "WMA"], group=GRP_CVD)
+
+string GRP_DISP = "Display"
+string DISP_CVD  = "CVD Line Only"
+string DISP_HIST = "Histogram Only"
+string DISP_BOTH = "Both (CVD + Histogram)"
+string display_mode = input.string(DISP_CVD, "Display Mode", options=[DISP_CVD, DISP_HIST, DISP_BOTH], group=GRP_DISP,
+     tooltip="CVD Line Only is cleanest. Histogram shows per-bar delta. Both overlays them.")
+bool   show_roc     = input.bool(true, "Delta Acceleration Coloring", group=GRP_DISP,
+     tooltip="4-tier: bright = accelerating, dim = decelerating")
+int    roc_len      = input.int(3, "Acceleration Lookback", minval=1, maxval=10, group=GRP_DISP)
+bool   show_fill    = input.bool(true, "CVD Zero Fill", group=GRP_DISP, tooltip="Subtle shading above/below zero line")
+
+string GRP_VOL  = "Volume Context"
+bool   weight_rvol   = input.bool(true, "RVOL-Weight the Delta", group=GRP_VOL,
+     tooltip="Amplifies delta on high-volume bars via sqrt scaling.")
+int    rvol_avg_len  = input.int(20, "RVOL Average Length", minval=5, group=GRP_VOL)
+string rvol_avg_type = input.string("EMA", "RVOL Average Type", options=["EMA", "SMA", "RMA"], group=GRP_VOL)
+float  rvol_spike_th = input.float(2.0, "RVOL Spike Threshold", minval=1.1, step=0.1, group=GRP_VOL)
+bool   show_rvol_dots = input.bool(true, "RVOL Spike Dots", group=GRP_VOL, tooltip="Marks bars where volume exceeds the spike threshold, directly on the CVD line.")
+
+string GRP_DIV  = "Divergence Detection"
+bool   show_div     = input.bool(true, "Show Divergences", group=GRP_DIV)
+int    div_pivot_lb = input.int(5, "Pivot Lookback", minval=2, maxval=20, group=GRP_DIV)
+int    div_pivot_rb = input.int(2, "Pivot Right Bars", minval=1, maxval=10, group=GRP_DIV)
+
+string GRP_TBL  = "Info Table"
+bool   show_table   = input.bool(true, "Show Table", group=GRP_TBL)
+string tbl_pos      = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_TBL)
+string tbl_sz       = input.string("small", "Size", options=["tiny", "small", "normal"], group=GRP_TBL)
+
+string GRP_CLR  = "Colors"
+color  col_bull    = input.color(#00e676, "Bull", inline="c1", group=GRP_CLR)
+color  col_bear    = input.color(#ff1744, "Bear", inline="c1", group=GRP_CLR)
+color  col_signal  = input.color(#ffa726, "Signal Line", group=GRP_CLR)
+
+float spread   = high - low
+bool  is_valid = spread > 0
+
+float hl_buy  = is_valid ? volume * (close - low) / spread : volume * 0.5
+float hl_sell = is_valid ? volume * (high - close) / spread : volume * 0.5
+
+bool  is_bull = close >= open
+float body    = math.abs(close - open)
+float u_wick  = is_bull ? high - close : high - open
+float l_wick  = is_bull ? open - low   : close - low
+
+float wick_bias = 0.75
+
+float ctx_buy  = na
+float ctx_sell = na
+
+if is_valid
+    float body_pct = body / spread
+    float u_pct    = u_wick / spread
+    float l_pct    = l_wick / spread
+
+    if is_bull
+        ctx_buy  := (body_pct + l_pct * wick_bias + u_pct * (1.0 - wick_bias)) * volume
+        ctx_sell := (u_pct * wick_bias + l_pct * (1.0 - wick_bias)) * volume
+    else
+        ctx_sell := (body_pct + u_pct * wick_bias + l_pct * (1.0 - wick_bias)) * volume
+        ctx_buy  := (l_pct * wick_bias + u_pct * (1.0 - wick_bias)) * volume
+else
+    ctx_buy  := volume * 0.5
+    ctx_sell := volume * 0.5
+
+float bld_buy  = (hl_buy + ctx_buy) / 2.0
+float bld_sell = (hl_sell + ctx_sell) / 2.0
+
+float buy_vol = switch proxy_method
+    PROXY_CTX => ctx_buy
+    PROXY_BLD => bld_buy
+    PROXY_HL  => hl_buy
+
+float sell_vol = switch proxy_method
+    PROXY_CTX => ctx_sell
+    PROXY_BLD => bld_sell
+    PROXY_HL  => hl_sell
+
+float vol_avg = switch rvol_avg_type
+    "EMA" => ta.ema(volume, rvol_avg_len)
+    "SMA" => ta.sma(volume, rvol_avg_len)
+    "RMA" => ta.rma(volume, rvol_avg_len)
+
+float rvol     = vol_avg > 0 ? volume / vol_avg : 1.0
+bool  is_spike = rvol >= rvol_spike_th
+
+// Square-root scaling rather than linear, so a 4x volume bar counts twice, not
+// four times. NOTE: with this on, the running total is no longer in contracts
+// or shares. The axis still reads as volume because the indicator declares that
+// format, but the number is a weighted quantity. Turn the weighting off if you
+// need the axis to be literal.
+float rvol_weight = weight_rvol ? math.sqrt(math.max(rvol, 0.1)) : 1.0
+
+float raw_delta = buy_vol - sell_vol
+float bar_delta = raw_delta * rvol_weight
+
+// Follows the EXCHANGE daily session, not the cash session. On futures this
+// resets at the futures open rather than at the equity open, which is the
+// correct behaviour for a futures instrument and is worth knowing if you apply
+// the script to something else.
+bool new_session = ta.change(time("D")) != 0
+
+var float cvd = 0.0
+
+switch cvd_reset
+    RST_SESS =>
+        if new_session
+            cvd := bar_delta
+        else
+            cvd += bar_delta
+    RST_FIXED =>
+        cvd := math.sum(bar_delta, cvd_fix_len)
+    RST_NONE =>
+        cvd += bar_delta
+
+float cvd_signal = switch cvd_ma_type
+    "EMA" => ta.ema(cvd, cvd_ma_len)
+    "SMA" => ta.sma(cvd, cvd_ma_len)
+    "WMA" => ta.wma(cvd, cvd_ma_len)
+
+float delta_roc   = bar_delta - nz(bar_delta[roc_len])
+bool  delta_accel = (bar_delta > 0 and delta_roc > 0) or (bar_delta < 0 and delta_roc < 0)
+
+color hist_col_accel = bar_delta >= 0 ?
+     (delta_accel ? col_bull : color.new(col_bull, 65)) :
+     (delta_accel ? col_bear : color.new(col_bear, 65))
+color hist_col_flat  = bar_delta >= 0 ? col_bull : col_bear
+color hist_color     = show_roc ? hist_col_accel : hist_col_flat
+
+// DIVERGENCE FIX. This previously paired a price pivot with ta.pivothigh(cvd),
+// which is non-na only on bars where CVD ITSELF pivoted. Price and CVD pivot on
+// the same bar only by coincidence, so the stored CVD reading was almost always
+// na, the na then became the previous reading, and the not-na guard below
+// silently blocked the comparison. The feature fired only on the rare bars
+// where both pivoted together.
+// What a divergence actually needs is the CVD VALUE at the price pivot bar.
+// A pivot confirmed now occurred div_pivot_rb bars ago, so that value is
+// cvd[div_pivot_rb].
+float ph = ta.pivothigh(high, div_pivot_lb, div_pivot_rb)
+float pl = ta.pivotlow(low, div_pivot_lb, div_pivot_rb)
+float cvd_at_pivot = cvd[div_pivot_rb]
+
+var float last_price_high = na
+var float last_price_low  = na
+var float last_cvd_high   = na
+var float last_cvd_low    = na
+var float prev_price_high = na
+var float prev_price_low  = na
+var float prev_cvd_high   = na
+var float prev_cvd_low    = na
+
+if not na(ph)
+    prev_price_high := last_price_high
+    prev_cvd_high   := last_cvd_high
+    last_price_high := ph
+    last_cvd_high   := cvd_at_pivot
+
+if not na(pl)
+    prev_price_low := last_price_low
+    prev_cvd_low   := last_cvd_low
+    last_price_low := pl
+    last_cvd_low   := cvd_at_pivot
+
+bool bear_div = not na(ph) and not na(prev_price_high) and not na(prev_cvd_high) and
+     last_price_high > prev_price_high and last_cvd_high < prev_cvd_high
+
+bool bull_div = not na(pl) and not na(prev_price_low) and not na(prev_cvd_low) and
+     last_price_low < prev_price_low and last_cvd_low > prev_cvd_low
+
+bool draw_hist = display_mode == DISP_HIST or display_mode == DISP_BOTH
+bool draw_cvd  = display_mode == DISP_CVD  or display_mode == DISP_BOTH
+
+color hist_draw_color = draw_cvd and draw_hist ? color.new(hist_color, 40) : hist_color
+
+plot(draw_hist ? bar_delta : na, "Bar Delta", color=hist_draw_color, style=plot.style_columns)
+
+color cvd_col = cvd >= 0 ? col_bull : col_bear
+plot(draw_cvd ? cvd : na, "CVD", color=cvd_col, linewidth=3)
+
+plot(draw_cvd and show_cvd_ma ? cvd_signal : na, "Signal", color=color.new(col_signal, 20), linewidth=1)
+
+hline(0, "Zero", color=color.new(#546e7a, 50), linestyle=hline.style_solid, linewidth=1)
+
+p_cvd  = plot(draw_cvd and show_fill ? cvd : na, "CVD_F", color=color(na), display=display.none, editable=false)
+p_zero = plot(draw_cvd and show_fill ? 0.0 : na, "Zero_F", color=color(na), display=display.none, editable=false)
+fill(p_cvd, p_zero, color=cvd >= 0 ? color.new(col_bull, 92) : color.new(col_bear, 92), title="CVD Zone")
+
+plotshape(draw_cvd and show_rvol_dots and is_spike ? cvd : na, "RVOL Spike", shape.diamond,
+     location.absolute, color=color.white, size=size.auto)
+
+// The offset shifts the marker back to the pivot bar, so the plotted VALUE has
+// to be shifted with it. Plotting the live cvd with an offset put the triangle
+// at the pivot's x-position and the current bar's y-position, which on a
+// trending CVD floats it away from the swing it is describing.
+plotshape(show_div and bear_div ? cvd_at_pivot : na, "Bear divergence", shape.triangledown,
+     location.absolute, color=col_bear, size=size.small, offset=-div_pivot_rb, text="div", textcolor=col_bear)
+plotshape(show_div and bull_div ? cvd_at_pivot : na, "Bull divergence", shape.triangleup,
+     location.absolute, color=col_bull, size=size.small, offset=-div_pivot_rb, text="div", textcolor=col_bull)
+
+bgcolor(cvd_reset == RST_SESS and new_session ? color.new(#455a64, 88) : na, title="Session")
+
+table_position = switch tbl_pos
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left"  => position.bottom_left
+
+table_text_size = switch tbl_sz
+    "tiny"   => size.tiny
+    "small"  => size.small
+    "normal" => size.normal
+
+// Allocated inside the guard, so switching the table off does not leave an
+// empty table object on every chart.
+if barstate.islast and show_table
+    var table tbl = table.new(table_position, 2, 6, border_width=0, border_color=color(na))
+    color  bg     = color.new(#0d1117, 10)
+    color  txt    = #c9d1d9
+    color  txt_d  = #8b949e
+
+    float  buy_pct  = volume > 0 ? buy_vol / volume * 100 : 50.0
+    float  sell_pct = 100.0 - buy_pct
+    bool   bwin     = buy_pct >= sell_pct
+
+    color  bias_col = bwin ? col_bull : col_bear
+    string bias_str = (bwin ? "Buy " + str.tostring(buy_pct, '#.#') : "Sell " + str.tostring(sell_pct, '#.#')) + "%"
+    table.cell(tbl, 0, 0, "Bias", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 0, bias_str, text_color=bias_col, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+    string d_sign = bar_delta >= 0 ? "+" : ""
+    color  d_col  = bar_delta >= 0 ? col_bull : col_bear
+    string a_icon = delta_accel ? " >>" : " >"
+    table.cell(tbl, 0, 1, "Bar delta", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 1, d_sign + str.tostring(bar_delta, '#') + a_icon, text_color=d_col, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+    string c_sign = cvd >= 0 ? "+" : ""
+    color  c_col  = cvd >= 0 ? col_bull : col_bear
+    string r_tag  = cvd_reset == RST_SESS ? "S" : cvd_reset == RST_FIXED ? str.tostring(cvd_fix_len) : "run"
+    table.cell(tbl, 0, 2, "CVD (" + r_tag + ")", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 2, c_sign + str.tostring(cvd, '#'), text_color=c_col, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+    bool   above = cvd >= cvd_signal
+    table.cell(tbl, 0, 3, "Signal", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 3, above ? "CVD above" : "CVD below", text_color=above ? col_bull : col_bear, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+    color rv_col = is_spike ? #ffd740 : rvol >= 1.0 ? col_bull : col_bear
+    table.cell(tbl, 0, 4, "RVOL", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 4, str.tostring(rvol, '#.##') + "x" + (is_spike ? " !" : ""), text_color=rv_col, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+    table.cell(tbl, 0, 5, "Volume", text_color=txt_d, bgcolor=bg, text_size=table_text_size, text_halign=text.align_right)
+    table.cell(tbl, 1, 5, str.tostring(volume, format.volume), text_color=txt, bgcolor=bg, text_size=table_text_size, text_halign=text.align_left)
+
+alertcondition(ta.crossover(cvd, 0),  "CVD Cross Above Zero",  "CVD flipped bullish")
+alertcondition(ta.crossunder(cvd, 0), "CVD Cross Below Zero",  "CVD flipped bearish")
+alertcondition(ta.crossover(cvd, cvd_signal),  "CVD > Signal", "CVD crossed above signal, bullish momentum")
+alertcondition(ta.crossunder(cvd, cvd_signal), "CVD < Signal", "CVD crossed below signal, bearish momentum")
+alertcondition(is_spike and bar_delta > 0, "RVOL Spike Buyers",  "High RVOL and buy-side dominance")
+alertcondition(is_spike and bar_delta < 0, "RVOL Spike Sellers", "High RVOL and sell-side dominance")
+alertcondition(bear_div, "Bearish Divergence", "Price higher high, CVD lower high, weakening demand")
+alertcondition(bull_div, "Bullish Divergence", "Price lower low, CVD higher low, weakening supply")
+alertcondition(bar_delta > 0 and not delta_accel and delta_accel[1], "Buy Delta Fading", "Buy delta decelerating")
+alertcondition(bar_delta < 0 and not delta_accel and delta_accel[1], "Sell Delta Fading", "Sell delta decelerating")

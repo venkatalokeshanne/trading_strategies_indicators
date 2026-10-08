@@ -1,0 +1,223 @@
+//@version=6
+indicator("MYND Distribution/Capitulation Exit Engine v1.0", shorttitle="MYND DCE v1.0", overlay=true, max_labels_count=500)
+
+// =====================================================================================
+// MYND DISTRIBUTION / CAPITULATION EXIT ENGINE v1.0
+// Two genuinely different detection engines under one tool, built around the fact that
+// topping (long-exit) and bottoming (short-exit) signatures are NOT mirror images of
+// each other. Distribution (why longs should exit) is a SLOW, multi-bar process:
+// classic O'Neil-style Distribution Day counting, rising down-day volume dominance, and
+// a gradual momentum roll-over while price is still near its highs. Capitulation (why
+// shorts should exit) is a FAST, single/few-bar process: a volume climax, a sharp
+// rejection candle, and an immediate RSI extreme-and-uptick - live-scored every bar
+// rather than waiting on a multi-bar confirmation window, because by the time a slow
+// confirmation resolves on a capitulation move, the exit opportunity is often gone.
+//
+// Built to the "Total Control" customization standard (see MYND_Project_Notes.md).
+//
+// Revised 2026-08-13 (pre-publish review pass): (1) capCandleScore changed from a hard
+// AND-gate (all-or-nothing on range/close qualifying) to a continuous blend of the two
+// factors, removing a scoring cliff at the qualification boundary; (2) capExtremity now
+// requires an actual RSI uptick to count at all, so being deeply oversold with no bounce
+// no longer scores as "capitulation" on its own; (3) distIsFalling replaced a strict
+// bar-by-bar ta.falling() check with a simple two-point RSI comparison, since requiring
+// RSI to fall on every single bar in the window was too strict for noisy real data and
+// left the momentum roll-over component near-permanently at 0 despite its 30% weight.
+// =====================================================================================
+
+// ---------------------------- INPUTS: DISTRIBUTION ENGINE (LONG EXIT) ----------------------------
+distDayLookback = input.int(25, "Distribution Day Lookback (bars)", minval=5, group="Distribution Engine (Long Exit)", tooltip="Classic O'Neil-style window for counting Distribution Days.")
+distMinDeclinePct = input.float(0.2, "Minimum Decline for 'Down Day' (%)", minval=0.0, step=0.05, group="Distribution Engine (Long Exit)")
+distVolMult = input.float(1.0, "Distribution Day Volume Multiplier (vs prior day)", minval=0.5, step=0.1, group="Distribution Engine (Long Exit)", tooltip="A down day counts as a Distribution Day only if volume is at least this multiple of the prior day's volume.")
+distDayCriticalCount = input.int(5, "Critical Distribution Day Count", minval=1, group="Distribution Engine (Long Exit)", tooltip="Number of Distribution Days within the lookback window that maxes out this component's score.")
+distDownVolRatioLen = input.int(10, "Down-Volume Ratio Window (bars)", minval=2, group="Distribution Engine (Long Exit)")
+distMomLen = input.int(14, "Momentum RSI Length", minval=1, group="Distribution Engine (Long Exit)")
+distMomRollBars = input.int(5, "Momentum Roll-Over Bars", minval=1, group="Distribution Engine (Long Exit)", tooltip="How many bars back RSI must have been elevated and falling ever since, to count as a quiet momentum roll-over.")
+distNearHighPct = input.float(5.0, "Near-High Context (%)", minval=0.1, step=0.5, group="Distribution Engine (Long Exit)", tooltip="Distribution only fully counts while price is still within this % of its recent high - if price has already dropped well off its high, the score is dampened rather than zeroed.")
+distNearHighLookback = input.int(20, "Near-High Lookback (bars)", minval=2, group="Distribution Engine (Long Exit)")
+
+// ---------------------------- INPUTS: CAPITULATION ENGINE (SHORT EXIT) ----------------------------
+capVolZLen = input.int(20, "Volume Z-Score Length", minval=2, group="Capitulation Engine (Short Exit)")
+capVolZThreshold = input.float(2.0, "Volume Climax Z-Score Threshold", minval=0.1, step=0.1, group="Capitulation Engine (Short Exit)")
+capAtrLen = input.int(14, "ATR Length", minval=1, group="Capitulation Engine (Short Exit)")
+capRangeATRMult = input.float(1.2, "Minimum Bar Range (x ATR)", minval=0.1, step=0.1, group="Capitulation Engine (Short Exit)")
+capClosePositionMin = input.float(0.6, "Minimum Close Position in Bar Range", minval=0.0, maxval=1.0, step=0.05, group="Capitulation Engine (Short Exit)", tooltip="0 = closed at the low, 1 = closed at the high. Higher values require a stronger rejection off the low.")
+capRsiLen = input.int(14, "Momentum RSI Length", minval=1, group="Capitulation Engine (Short Exit)")
+capRsiOversold = input.float(25, "RSI Oversold Level", group="Capitulation Engine (Short Exit)")
+capRsiUptickBars = input.int(2, "RSI Uptick Lookback (bars)", minval=1, group="Capitulation Engine (Short Exit)")
+
+// ---------------------------- INPUTS: SCORE WEIGHTS ----------------------------
+distDayWeight = input.float(40, "Distribution Days Weight", minval=0, group="Score Weights")
+distVolRatioWeight = input.float(30, "Down-Volume Ratio Weight", minval=0, group="Score Weights")
+distMomWeight = input.float(30, "Momentum Roll-Over Weight", minval=0, group="Score Weights")
+capVolWeight = input.float(35, "Volume Climax Weight", minval=0, group="Score Weights")
+capCandleWeight = input.float(35, "Rejection Candle Weight", minval=0, group="Score Weights")
+capMomWeight = input.float(30, "Momentum Exhaustion Weight", minval=0, group="Score Weights")
+
+// ---------------------------- INPUTS: THRESHOLDS ----------------------------
+longWarningThreshold = input.float(40, "Long Exit Warning Threshold", group="Thresholds")
+longExitThreshold = input.float(65, "Long Exit Signal Threshold", group="Thresholds")
+shortWarningThreshold = input.float(40, "Short Exit Warning Threshold", group="Thresholds")
+shortExitThreshold = input.float(65, "Short Exit Signal Threshold", group="Thresholds")
+
+// ---------------------------- INPUTS: DISPLAY ----------------------------
+showTable = input.bool(true, "Show Dashboard Table", group="Display")
+tablePosIn = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group="Display")
+tableSizeIn = input.string("Normal", "Table Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="Display")
+headerBgColor = input.color(color.new(color.navy, 0), "Table Header Background", group="Display")
+headerTextColor = input.color(color.new(color.white, 0), "Table Header Text", group="Display")
+colLongWarning = input.color(color.new(color.orange, 0), "Long Exit Warning Color", group="Display")
+colLongExit = input.color(color.new(color.red, 0), "Long Exit Signal Color", group="Display")
+colShortWarning = input.color(color.new(color.aqua, 0), "Short Exit Warning Color", group="Display")
+colShortExit = input.color(color.new(color.lime, 0), "Short Exit Signal Color", group="Display")
+
+// =====================================================================================
+// DISTRIBUTION ENGINE (slow, multi-bar - warns longs to exit)
+// =====================================================================================
+priceChangePct = (close - close[1]) / close[1] * 100
+isDownDay = priceChangePct <= -distMinDeclinePct
+isVolElevated = volume >= distVolMult * volume[1]
+isDistDay = isDownDay and isVolElevated
+
+distDayCount = math.sum(isDistDay ? 1.0 : 0.0, distDayLookback)
+distDayScore = math.min(100.0, (distDayCount / distDayCriticalCount) * 100)
+
+downVol = close < close[1] ? volume : 0.0
+downVolSum = math.sum(downVol, distDownVolRatioLen)
+totalVolSum = math.sum(volume, distDownVolRatioLen)
+downVolRatio = totalVolSum > 0 ? downVolSum / totalVolSum * 100 : 50.0
+distVolRatioScore = math.max(0.0, (downVolRatio - 50) * 2)
+
+distRsiVal = ta.rsi(close, distMomLen)
+distWasElevated = distRsiVal[distMomRollBars] >= 55
+distIsFalling = distRsiVal < distRsiVal[distMomRollBars]
+distMomScore = distWasElevated and distIsFalling ? math.min(100.0, (distRsiVal[distMomRollBars] - distRsiVal) * 10) : 0.0
+
+recentHigh = ta.highest(high, distNearHighLookback)
+nearHighOk = recentHigh > 0 ? close >= recentHigh * (1 - distNearHighPct / 100) : true
+
+distWeightSum = distDayWeight + distVolRatioWeight + distMomWeight
+distScoreRaw = distWeightSum > 0 ? (distDayWeight * distDayScore + distVolRatioWeight * distVolRatioScore + distMomWeight * distMomScore) / distWeightSum : 0.0
+distributionScore = nearHighOk ? distScoreRaw : distScoreRaw * 0.5
+
+// =====================================================================================
+// CAPITULATION ENGINE (fast, single/few-bar - warns shorts to exit)
+// =====================================================================================
+avgVolCap = ta.sma(volume, capVolZLen)
+stdVolCap = ta.stdev(volume, capVolZLen)
+volZCap = stdVolCap > 0 ? (volume - avgVolCap) / stdVolCap : 0.0
+capVolScore = math.max(0.0, math.min(100.0, (volZCap / capVolZThreshold) * 100))
+
+atrValCap = ta.atr(capAtrLen)
+barRangeCap = high - low
+rangeATRRatio = atrValCap > 0 ? barRangeCap / atrValCap : 0.0
+closePosition = barRangeCap > 0 ? (close - low) / barRangeCap : 0.5
+rangeScoreComponent = math.min(100.0, (rangeATRRatio / capRangeATRMult) * 100.0)
+closeScoreComponent = capClosePositionMin > 0 ? math.min(100.0, (closePosition / capClosePositionMin) * 100.0) : 100.0
+capCandleScore = (rangeScoreComponent + closeScoreComponent) / 2.0
+
+capRsiVal = ta.rsi(close, capRsiLen)
+capUptick = math.max(0.0, capRsiVal - capRsiVal[capRsiUptickBars])
+capExtremity = capUptick > 0 ? math.max(0.0, capRsiOversold - math.min(capRsiVal, capRsiVal[capRsiUptickBars])) : 0.0
+capMomScore = math.min(100.0, capExtremity * 5 + capUptick * 5)
+
+capWeightSum = capVolWeight + capCandleWeight + capMomWeight
+capitulationScore = capWeightSum > 0 ? (capVolWeight * capVolScore + capCandleWeight * capCandleScore + capMomWeight * capMomScore) / capWeightSum : 0.0
+
+// =====================================================================================
+// SIGNAL LOGIC
+// =====================================================================================
+distCrossWarning = ta.crossover(distributionScore, longWarningThreshold)
+distCrossExit = ta.crossover(distributionScore, longExitThreshold)
+capCrossWarning = ta.crossover(capitulationScore, shortWarningThreshold)
+capCrossExit = ta.crossover(capitulationScore, shortExitThreshold)
+
+longExitWarning = distCrossWarning and distributionScore < longExitThreshold
+longExitSignal = distCrossExit
+shortExitWarning = capCrossWarning and capitulationScore < shortExitThreshold
+shortExitSignal = capCrossExit
+
+distZone = distributionScore >= longExitThreshold ? "EXIT" : distributionScore >= longWarningThreshold ? "Warning" : "Normal"
+capZone = capitulationScore >= shortExitThreshold ? "EXIT" : capitulationScore >= shortWarningThreshold ? "Warning" : "Normal"
+
+var string lastEventType = "None"
+var int lastEventBar = na
+if longExitWarning
+    lastEventType := "Long Exit Warning"
+    lastEventBar := bar_index
+if longExitSignal
+    lastEventType := "LONG EXIT SIGNAL"
+    lastEventBar := bar_index
+if shortExitWarning
+    lastEventType := "Short Exit Warning"
+    lastEventBar := bar_index
+if shortExitSignal
+    lastEventType := "SHORT EXIT SIGNAL"
+    lastEventBar := bar_index
+barsSinceEvent = na(lastEventBar) ? na : bar_index - lastEventBar
+
+// =====================================================================================
+// PLOTS
+// =====================================================================================
+plotshape(longExitWarning, title="Long Exit Warning", style=shape.labeldown, location=location.abovebar, color=colLongWarning, textcolor=color.white, text="DIST?", size=size.tiny)
+plotshape(longExitSignal, title="Long Exit Signal", style=shape.triangledown, location=location.abovebar, color=colLongExit, text="EXIT LONG", size=size.small)
+plotshape(shortExitWarning, title="Short Exit Warning", style=shape.labelup, location=location.belowbar, color=colShortWarning, textcolor=color.black, text="CAP?", size=size.tiny)
+plotshape(shortExitSignal, title="Short Exit Signal", style=shape.triangleup, location=location.belowbar, color=colShortExit, text="EXIT SHORT", size=size.small)
+
+// =====================================================================================
+// DASHBOARD TABLE
+// =====================================================================================
+tablePosConst = tablePosIn == "Top Left" ? position.top_left : tablePosIn == "Top Right" ? position.top_right : tablePosIn == "Bottom Left" ? position.bottom_left : position.bottom_right
+tableSizeConst = tableSizeIn == "Tiny" ? size.tiny : tableSizeIn == "Small" ? size.small : tableSizeIn == "Large" ? size.large : tableSizeIn == "Huge" ? size.huge : size.normal
+
+var table dash = table.new(tablePosConst, 2, 7, border_width=1)
+
+f_cell(_col, _row, _txt, _bg, _txtcol) =>
+    table.cell(dash, _col, _row, _txt, bgcolor=_bg, text_color=_txtcol, text_size=tableSizeConst)
+
+if showTable and barstate.islast
+    f_cell(0, 0, "MYND DCE v1.0", headerBgColor, headerTextColor)
+    f_cell(1, 0, "Status", headerBgColor, headerTextColor)
+
+    distColor = distZone == "EXIT" ? color.new(colLongExit, 65) : distZone == "Warning" ? color.new(colLongWarning, 75) : color.new(color.gray, 85)
+    f_cell(0, 1, "Distribution Score (Long)", color.new(color.gray, 85), color.black)
+    f_cell(1, 1, str.tostring(distributionScore, "#.#") + " (" + distZone + ")", distColor, color.black)
+
+    capColor = capZone == "EXIT" ? color.new(colShortExit, 65) : capZone == "Warning" ? color.new(colShortWarning, 75) : color.new(color.gray, 85)
+    f_cell(0, 2, "Capitulation Score (Short)", color.new(color.gray, 85), color.black)
+    f_cell(1, 2, str.tostring(capitulationScore, "#.#") + " (" + capZone + ")", capColor, color.black)
+
+    f_cell(0, 3, "Distribution Days", color.new(color.gray, 85), color.black)
+    f_cell(1, 3, str.tostring(distDayCount, "#") + " / " + str.tostring(distDayLookback) + " bars", color.new(color.gray, 88), color.black)
+
+    f_cell(0, 4, "Down-Volume Ratio", color.new(color.gray, 85), color.black)
+    f_cell(1, 4, str.tostring(downVolRatio, "#.#") + "%", color.new(color.gray, 88), color.black)
+
+    f_cell(0, 5, "Near Recent High", color.new(color.gray, 85), color.black)
+    f_cell(1, 5, nearHighOk ? "Yes" : "No (dampened)", color.new(color.gray, 88), color.black)
+
+    lastColor = lastEventType == "LONG EXIT SIGNAL" or lastEventType == "Long Exit Warning" ? color.new(colLongExit, 70) : lastEventType == "SHORT EXIT SIGNAL" or lastEventType == "Short Exit Warning" ? color.new(colShortExit, 70) : color.new(color.gray, 85)
+    lastTxt = na(barsSinceEvent) ? "None yet" : lastEventType + " (" + str.tostring(barsSinceEvent) + " bars ago)"
+    f_cell(0, 6, "Last Event", color.new(color.gray, 85), color.black)
+    f_cell(1, 6, lastTxt, lastColor, color.black)
+
+// =====================================================================================
+// ALERTS - INDIVIDUAL
+// =====================================================================================
+alertcondition(longExitWarning, title="Long Exit Warning", message="MYND DCE: Distribution building on {{ticker}} ({{interval}}) - long exit warning")
+alertcondition(longExitSignal, title="Long Exit Signal", message="MYND DCE: LONG EXIT signal on {{ticker}} ({{interval}}) - distribution score crossed the exit threshold")
+alertcondition(shortExitWarning, title="Short Exit Warning", message="MYND DCE: Capitulation building on {{ticker}} ({{interval}}) - short exit warning")
+alertcondition(shortExitSignal, title="Short Exit Signal", message="MYND DCE: SHORT EXIT signal on {{ticker}} ({{interval}}) - capitulation score crossed the exit threshold")
+
+// =====================================================================================
+// ALERTS - COMBO BUNDLES (see MYND_Project_Notes.md for the standing convention)
+// =====================================================================================
+allSignals = longExitWarning or longExitSignal or shortExitWarning or shortExitSignal
+allLongSide = longExitWarning or longExitSignal
+allShortSide = shortExitWarning or shortExitSignal
+allActionable = longExitSignal or shortExitSignal
+
+alertcondition(allSignals, title="ALL Signals", message="MYND DCE: Signal on {{ticker}} ({{interval}}) - check chart")
+alertcondition(allLongSide, title="ALL Long-Side (Distribution)", message="MYND DCE: Long-side distribution signal on {{ticker}} ({{interval}})")
+alertcondition(allShortSide, title="ALL Short-Side (Capitulation)", message="MYND DCE: Short-side capitulation signal on {{ticker}} ({{interval}})")
+alertcondition(allActionable, title="ALL Actionable Exit Signals", message="MYND DCE: Actionable exit signal (Long or Short, warnings excluded) on {{ticker}} ({{interval}})")

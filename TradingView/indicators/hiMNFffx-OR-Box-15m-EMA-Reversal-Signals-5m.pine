@@ -1,0 +1,340 @@
+//@version=6
+indicator("OR Box + 15m EMA Reversal Signals (5m)", shorttitle="OR+EMA Reversal", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================
+// SYMBOL RESTRICTION (warning label only, does not block plotting)
+// ============================================================
+grpSym          = "Symbol"
+warnOtherSymbols = input.bool(true, "Warn if Symbol Isn't SPY/QQQ/IWM/SMH", group=grpSym)
+allowedSymbols   = array.from("SPY", "QQQ", "IWM", "SMH")
+isAllowedSymbol  = array.includes(allowedSymbols, syminfo.ticker)
+
+// ============================================================
+// OPENING RANGE BOX  (1-minute feed via request.security, proven pattern)
+// ============================================================
+grpOR            = "Opening Range Box"
+orMinutes        = input.int(15, "OR Window (minutes)", minval=1, group=grpOR)
+orStartHour      = input.int(9, "Session Start Hour (ET)", minval=0, maxval=23, group=grpOR)
+orStartMinute    = input.int(30, "Session Start Minute (ET)", minval=0, maxval=59, group=grpOR)
+sessionEndHour   = input.int(16, "Session End Hour (ET)", minval=0, maxval=23, group=grpOR)
+sessionEndMinute = input.int(0, "Session End Minute (ET)", minval=0, maxval=59, group=grpOR)
+showMidline      = input.bool(true, "Show OR Midline", group=grpOR)
+boxBorderColor   = input.color(color.green, "Box Border Color", group=grpOR)
+boxFillColor     = input.color(color.blue, "Box Fill Color", group=grpOR)
+boxFillTrans     = input.int(85, "Fill Transparency", minval=0, maxval=100, group=grpOR)
+borderWidth      = input.int(1, "Border Width", minval=1, maxval=5, group=grpOR)
+borderStyleIn    = input.string("Dashed", "Border Style", options=["Solid", "Dashed", "Dotted"], group=grpOR)
+midlineColor     = input.color(color.gray, "Midline Color", group=grpOR)
+midlineStyleIn   = input.string("Dashed", "Midline Style", options=["Solid", "Dashed", "Dotted"], group=grpOR)
+
+boxBgColor       = color.new(boxFillColor, boxFillTrans)
+borderStyleFinal = borderStyleIn == "Dashed" ? line.style_dashed : borderStyleIn == "Dotted" ? line.style_dotted : line.style_solid
+midlineStyleFinal = midlineStyleIn == "Solid" ? line.style_solid : midlineStyleIn == "Dotted" ? line.style_dotted : line.style_dashed
+
+tz = "America/New_York"
+
+pad2(n) =>
+    n < 10 ? "0" + str.tostring(n) : str.tostring(n)
+
+orStartStr    = pad2(orStartHour) + pad2(orStartMinute)
+orEndTotalMin = orStartHour * 60 + orStartMinute + orMinutes
+orEndHour     = int(orEndTotalMin / 60)
+orEndMin      = orEndTotalMin % 60
+orEndStr      = pad2(orEndHour) + pad2(orEndMin)
+orSession     = orStartStr + "-" + orEndStr
+sessionEndStr = pad2(sessionEndHour) + pad2(sessionEndMinute)
+
+// 1-minute helper: computes OR high/low/start-time regardless of chart timeframe
+f_sessionHL() =>
+    var float hi = na
+    var float lo = na
+    var int   st = na
+    newD = ta.change(time("D", tz)) != 0
+    if newD
+        hi := na
+        lo := na
+        st := na
+    t = time("1", orSession, tz)
+    if not na(t)
+        hi := na(hi) ? high : math.max(hi, high)
+        lo := na(lo) ? low : math.min(lo, low)
+        st := na(st) ? time : st
+    [hi, lo, st]
+
+[orHigh, orLow, orStartBarTime] = request.security(syminfo.tickerid, "1", f_sessionHL(), lookahead=barmerge.lookahead_off)
+
+// Main-timeframe session logic (works at any chart resolution)
+postOR = not na(time(timeframe.period, orEndStr + "-" + sessionEndStr, tz))
+postOR_prev = postOR[1]
+newDay = ta.change(time("D", tz)) != 0
+
+var box  orBoxDrawing = na
+var line orMidLine    = na
+var bool orLocked     = false
+
+if newDay
+    orBoxDrawing := na
+    orMidLine    := na
+    orLocked     := false
+
+if postOR and not postOR_prev and not na(orHigh) and not na(orLow)
+    orBoxDrawing := box.new(left=orStartBarTime, top=orHigh, right=time, bottom=orLow, border_color=boxBorderColor, bgcolor=boxBgColor, border_width=borderWidth, border_style=borderStyleFinal, extend=extend.none, xloc=xloc.bar_time)
+    if showMidline
+        orMidLine := line.new(x1=orStartBarTime, y1=(orHigh + orLow) / 2, x2=time, y2=(orHigh + orLow) / 2, color=midlineColor, style=midlineStyleFinal, xloc=xloc.bar_time)
+    orLocked := true
+
+if orLocked and postOR and not na(orBoxDrawing)
+    box.set_right(orBoxDrawing, time)
+    if showMidline and not na(orMidLine)
+        line.set_x2(orMidLine, time)
+
+// ============================================================
+// 15-MINUTE EMA ON 5-MINUTE CHART
+// ============================================================
+grpEMA         = "15-Minute EMA"
+emaLen         = input.int(15, "EMA Length (on the 15m feed)", minval=1, group=grpEMA)
+useConfirmed15 = input.bool(true, "Use Confirmed 15m Bar (avoid repaint)", group=grpEMA)
+emaColorBull   = input.color(color.lime, "EMA Color - Bullish Regime", group=grpEMA)
+emaColorBear   = input.color(color.red, "EMA Color - Bearish Regime", group=grpEMA)
+emaColorFlat   = input.color(color.gray, "EMA Color - Neutral", group=grpEMA)
+
+emaSeries      = ta.ema(close, emaLen)
+ema15Confirmed = request.security(syminfo.tickerid, "15", emaSeries[1], lookahead=barmerge.lookahead_off)
+ema15Live      = request.security(syminfo.tickerid, "15", emaSeries, lookahead=barmerge.lookahead_off)
+ema15          = useConfirmed15 ? ema15Confirmed : ema15Live
+
+// ============================================================
+// SIGNAL LOGIC
+// ============================================================
+grpSig           = "Signal Logic"
+requireStructure = input.bool(true, "Require Close Beyond Box During Watch", group=grpSig)
+
+var bool bullArmed       = false
+var bool bullAwaitBounce = false
+var bool bearArmed       = false
+var bool bearAwaitBounce = false
+
+if newDay
+    bullArmed := false
+    bullAwaitBounce := false
+    bearArmed := false
+    bearAwaitBounce := false
+
+haveContext = orLocked and not na(ema15)
+
+// ---- Bullish: EMA closes above the OR box -> arm -> watch -> touch = signal ----
+bullArmCond = haveContext and ema15 > orHigh
+if not bullArmed and bullArmCond
+    bullArmed := true
+    bullAwaitBounce := false
+
+// Reset if price closes back inside the OR box, OR the EMA itself falls back into/below the box
+if bullArmed and ((close <= orHigh and close >= orLow) or ema15 <= orHigh)
+    bullArmed := false
+    bullAwaitBounce := false
+
+bullStructureOK = requireStructure ? close > orHigh : true
+bullTouch = bullArmed and bullStructureOK and not bullAwaitBounce and low <= ema15 and close > ema15 and barstate.isconfirmed
+
+if bullAwaitBounce and low > ema15
+    bullAwaitBounce := false
+
+// ---- Bearish: EMA closes below the OR box -> arm -> watch -> touch = signal ----
+bearArmCond = haveContext and ema15 < orLow
+if not bearArmed and bearArmCond
+    bearArmed := true
+    bearAwaitBounce := false
+
+// Reset if price closes back inside the OR box, OR the EMA itself rises back into/above the box
+if bearArmed and ((close <= orHigh and close >= orLow) or ema15 >= orLow)
+    bearArmed := false
+    bearAwaitBounce := false
+
+bearStructureOK = requireStructure ? close < orLow : true
+bearTouch = bearArmed and bearStructureOK and not bearAwaitBounce and high >= ema15 and close < ema15 and barstate.isconfirmed
+
+if bearAwaitBounce and high < ema15
+    bearAwaitBounce := false
+
+if bullTouch
+    bullAwaitBounce := true
+if bearTouch
+    bearAwaitBounce := true
+
+// ============================================================
+// NATIVE 15-MINUTE CONFIRMATION
+// At the moment of the 5m touch, check whether the 15-minute candle
+// that CONTAINS this bar has itself crossed the EMA and is sitting
+// back on the trend side. This uses the live, still-forming 15m
+// candle rather than waiting for a future one to close, so the
+// arrow can print immediately at the touch. Note: because the 15m
+// candle is still forming, this can repaint until that 15m bar closes.
+// ============================================================
+grpNative15 = "15m Confirmation"
+enable15Confirm = input.bool(true, "Require 15m Candle Confirmation", group=grpNative15)
+
+h15Live = request.security(syminfo.tickerid, "15", high, lookahead=barmerge.lookahead_off)
+l15Live = request.security(syminfo.tickerid, "15", low, lookahead=barmerge.lookahead_off)
+c15Live = request.security(syminfo.tickerid, "15", close, lookahead=barmerge.lookahead_off)
+
+// The containing 15m candle has crossed the EMA but sits back on the trend side
+bull15ContainCond = l15Live < ema15Live and c15Live > ema15Live
+bear15ContainCond = h15Live > ema15Live and c15Live < ema15Live
+
+bullConfirmed = enable15Confirm ? (bullTouch and bull15ContainCond) : bullTouch
+bearConfirmed = enable15Confirm ? (bearTouch and bear15ContainCond) : bearTouch
+
+grpArrows = "Signal Arrow Colors"
+bullArrowColor = input.color(color.lime, "Bull Arrow Color", group=grpArrows)
+bearArrowColor = input.color(color.red, "Bear Arrow Color", group=grpArrows)
+
+// EMA plot colored by current regime
+emaPlotColor = bullArmed ? emaColorBull : bearArmed ? emaColorBear : emaColorFlat
+plot(ema15, "15m EMA", color=emaPlotColor, linewidth=2)
+
+// Arrows only at the confirmed signal bar
+plotshape(bullConfirmed, title="Bull Signal (Confirmed)", style=shape.triangleup, location=location.belowbar, color=bullArrowColor, size=size.small)
+plotshape(bearConfirmed, title="Bear Signal (Confirmed)", style=shape.triangledown, location=location.abovebar, color=bearArrowColor, size=size.small)
+
+alertcondition(bullTouch, title="Bullish 5m Touch (Watching)", message="Bullish 5m EMA touch - watching for 15m confirmation")
+alertcondition(bearTouch, title="Bearish 5m Touch (Watching)", message="Bearish 5m EMA touch - watching for 15m confirmation")
+alertcondition(bullConfirmed, title="Bullish Confirmed Entry", message="15m candle confirmed the 5m touch - buy calls")
+alertcondition(bearConfirmed, title="Bearish Confirmed Entry", message="15m candle confirmed the 5m touch - buy puts")
+
+// ============================================================
+// TRADE VALIDATION
+// ============================================================
+grpVal         = "Trade Validation"
+targetType     = input.string("Percent", "Target Type", options=["Dollar", "Percent"], group=grpVal)
+targetValue    = input.float(0.5, "Target Move", minval=0.01, step=0.01, group=grpVal)
+maxBars        = input.int(60, "Max Bars to Track (timeout = fail)", minval=5, group=grpVal, tooltip="After a signal is confirmed, the script watches it for this many bars. If price hasn't hit the target OR closed back through the EMA by then, it's automatically marked a loss (timeout).")
+labelDistance  = input.float(3.0, "Check/Fail Label Distance ($)", step=0.1, minval=0, group=grpVal)
+checkColor     = input.color(color.new(#4CAF50, 0), "Success Label Color", group=grpVal)
+failColor      = input.color(color.new(#D32F2F, 0), "Fail Label Color", group=grpVal)
+showTable      = input.bool(true, "Show Success Rate Table", group=grpVal)
+tablePosInput  = input.string("Top Right", "Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grpVal)
+tableSizeInput = input.string("Normal", "Text Size", options=["Tiny", "Small", "Normal", "Large"], group=grpVal)
+limitLookback  = input.bool(true, "Limit Success Rate to Lookback Window", group=grpVal)
+lookbackDays   = input.int(20, "Lookback (days)", minval=1, group=grpVal, tooltip="Only signals from the last N calendar days count toward the success rate table. Turn off 'Limit Success Rate to Lookback Window' to use all-time stats instead.")
+
+type SignalRecord
+    int   startBar
+    float entryPrice
+    bool  isBull
+    bool  resolved
+    bool  success
+    int   startTime
+
+var array<SignalRecord> records = array.new<SignalRecord>()
+
+targetAmount(float px) =>
+    targetType == "Dollar" ? targetValue : px * targetValue / 100.0
+
+if bullConfirmed
+    array.push(records, SignalRecord.new(bar_index, close, true, false, false, time))
+
+if bearConfirmed
+    array.push(records, SignalRecord.new(bar_index, close, false, false, false, time))
+
+if barstate.isconfirmed and array.size(records) > 0
+    for i = 0 to array.size(records) - 1
+        rec = array.get(records, i)
+        if not rec.resolved
+            tgt = targetAmount(rec.entryPrice)
+            barsElapsed = bar_index - rec.startBar
+            bool justResolved = false
+            bool win = false
+
+            if rec.isBull
+                targetPrice = rec.entryPrice + tgt
+                if high >= targetPrice
+                    justResolved := true
+                    win := true
+                else if close < ema15
+                    justResolved := true
+                    win := false
+                else if barsElapsed >= maxBars
+                    justResolved := true
+                    win := false
+            else
+                targetPrice = rec.entryPrice - tgt
+                if low <= targetPrice
+                    justResolved := true
+                    win := true
+                else if close > ema15
+                    justResolved := true
+                    win := false
+                else if barsElapsed >= maxBars
+                    justResolved := true
+                    win := false
+
+            if justResolved
+                rec.resolved := true
+                rec.success := win
+
+                labelY = rec.isBull ? rec.entryPrice - labelDistance : rec.entryPrice + labelDistance
+                if win
+                    label.new(rec.startBar, labelY, "✓", style=rec.isBull ? label.style_label_up : label.style_label_down, color=checkColor, textcolor=color.white, size=size.tiny)
+                else
+                    label.new(rec.startBar, labelY, "🚫", style=rec.isBull ? label.style_label_up : label.style_label_down, color=color.new(failColor, 100), textcolor=failColor, size=size.tiny)
+
+// ============================================================
+// SUCCESS RATE TABLE
+// ============================================================
+var table statsTable = na
+
+if showTable and barstate.islast
+    if na(statsTable)
+        tblPos = tablePosInput == "Top Right" ? position.top_right : tablePosInput == "Top Left" ? position.top_left : tablePosInput == "Bottom Left" ? position.bottom_left : position.bottom_right
+        statsTable := table.new(tblPos, 2, 4, border_width=1, border_color=color.white, frame_width=1, frame_color=color.white)
+
+    txtSize = tableSizeInput == "Tiny" ? size.tiny : tableSizeInput == "Normal" ? size.normal : tableSizeInput == "Large" ? size.large : size.small
+
+    cutoffTime = time - lookbackDays * 86400000
+
+    bullWins = 0
+    bullLosses = 0
+    bearWins = 0
+    bearLosses = 0
+
+    for i = 0 to array.size(records) - 1
+        rec = array.get(records, i)
+        if rec.resolved and (not limitLookback or rec.startTime >= cutoffTime)
+            if rec.isBull
+                if rec.success
+                    bullWins += 1
+                else
+                    bullLosses += 1
+            else
+                if rec.success
+                    bearWins += 1
+                else
+                    bearLosses += 1
+
+    bullTotal = bullWins + bullLosses
+    bearTotal = bearWins + bearLosses
+    bullPct = bullTotal > 0 ? (bullWins / float(bullTotal)) * 100 : na
+    bearPct = bearTotal > 0 ? (bearWins / float(bearTotal)) * 100 : na
+    overallTotal = bullTotal + bearTotal
+    overallWins = bullWins + bearWins
+    overallPct = overallTotal > 0 ? (overallWins / float(overallTotal)) * 100 : na
+    overallPctColor = na(overallPct) ? color.white : overallPct >= 50 ? color.new(color.green, 0) : color.new(color.red, 0)
+
+    headerLabel = limitLookback ? "Signal (" + str.tostring(lookbackDays) + "d)" : "Signal (All-Time)"
+    table.cell(statsTable, 0, 0, headerLabel, text_color=color.white, bgcolor=color.gray, text_size=txtSize)
+    table.cell(statsTable, 1, 0, "Success %", text_color=color.white, bgcolor=color.gray, text_size=txtSize)
+
+    table.cell(statsTable, 0, 1, "Bull (" + str.tostring(bullTotal) + ")", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=txtSize)
+    table.cell(statsTable, 1, 1, na(bullPct) ? "—" : str.tostring(bullPct, "#.0") + "%", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=txtSize)
+
+    table.cell(statsTable, 0, 2, "Bear (" + str.tostring(bearTotal) + ")", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=txtSize)
+    table.cell(statsTable, 1, 2, na(bearPct) ? "—" : str.tostring(bearPct, "#.0") + "%", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=txtSize)
+
+    table.cell(statsTable, 0, 3, "Overall (" + str.tostring(overallTotal) + ")", text_color=color.white, bgcolor=color.new(color.black, 40), text_size=txtSize)
+    table.cell(statsTable, 1, 3, na(overallPct) ? "—" : str.tostring(overallPct, "#.0") + "%", text_color=overallPctColor, bgcolor=color.new(color.black, 40), text_size=txtSize)
+
+// ============================================================
+// SYMBOL WARNING
+// ============================================================
+if warnOtherSymbols and not isAllowedSymbol and barstate.islast
+    label.new(bar_index, high, "⚠ Built for SPY/QQQ/IWM/SMH\nCurrent: " + syminfo.ticker, style=label.style_label_down, color=color.orange, textcolor=color.white, size=size.small)

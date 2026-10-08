@@ -1,0 +1,162 @@
+//@version=5
+strategy("Institutional Flow [STRICT ANCHOR + PRO]", 
+     overlay           = true, 
+     max_lines_count   = 500, 
+     max_labels_count  = 500, 
+     max_boxes_count   = 500)
+
+// ── INPUTS ──
+grpSig = "── Signal Engine ──"
+swingLen    = input.int(10, "Structure Lookback", group=grpSig)
+fvgLookback = input.int(5, "FVG Lookback Window", group=grpSig)
+
+grpFilter = "── Trend Filter (Both Must Match) ──"
+useMAFilter = input.bool(true, "Enable MA Filter", group=grpFilter)
+smaLength   = input.int(290, "SMA Length", group=grpFilter)
+emaLength   = input.int(200, "EMA Length", group=grpFilter)
+
+grpRisk = "── Risk Management ──"
+fixedSL_pips = input.float(20.0, "Fixed SL (Pips/Points)", group=grpRisk)
+rrRatio      = input.float(2.0, "Risk:Reward Ratio", group=grpRisk)
+tpTickOffset = input.int(0, "TP Ticks Beyond Line", minval=0, group=grpRisk, tooltip="Adds extra buffer to TP. SL remains strict/exact.")
+
+grpBE = "── Break Even ──"
+useBE      = input.bool(true, "Enable Break Even", group=grpBE)
+beAtRR     = input.float(1.0, "Trigger BE at RR", minval=0.1, step=0.1, group=grpBE)
+
+// ── MATH ENGINE ──
+var float multiplier = syminfo.mintick == 0.00001 or syminfo.mintick == 0.001 ? 10.0 : 1.0
+float pipSize   = syminfo.mintick * multiplier
+float slDist    = fixedSL_pips * pipSize
+float tpDist    = slDist * rrRatio
+float tpBuffer  = tpTickOffset * syminfo.mintick
+
+// Moving Averages
+smaVal = ta.sma(close, smaLength)
+emaVal = ta.ema(close, emaLength)
+
+// Trend Logic: Above BOTH for Buys, Below BOTH for Sells
+trendBull = not useMAFilter or (close > smaVal and close > emaVal)
+trendBear = not useMAFilter or (close < smaVal and close < emaVal)
+
+// ── SMC LOGIC ──
+high_    = ta.pivothigh(high, swingLen, swingLen)
+low_     = ta.pivotlow(low, swingLen, swingLen)
+var float lastHigh = na
+var float lastLow  = na
+
+if not na(high_) 
+    lastHigh := high_
+if not na(low_)
+    lastLow  := low_
+
+bullBOS = ta.crossover(close, lastHigh)
+bearBOS = ta.crossunder(close, lastLow)
+
+bullFVG = low > high[2]
+bearFVG = high < low[2]
+hasRecentBullFVG = ta.barssince(bullFVG) <= fvgLookback
+hasRecentBearFVG = ta.barssince(bearFVG) <= fvgLookback
+
+// ── SIGNALS ──
+longSignal  = bullBOS and hasRecentBullFVG and trendBull
+shortSignal = bearBOS and hasRecentBearFVG and trendBear
+
+// ── THE ANCHOR ENGINE ──
+var int wins = 0
+var int losses = 0
+var bool tActive = false
+var bool beMoved = false
+var float tEnt = na, var float tSL = na, var float tTP = na
+
+// Visual IDs (Using xloc.bar_index for Strict Candle Anchoring)
+var box activeTPBox = na
+var box activeSLBox = na
+var line entLine = na
+var line slLine = na
+var line tpLine = na
+
+if (longSignal or shortSignal) and not tActive
+    tActive  := true
+    beMoved  := false
+    tEnt     := close
+    
+    // Strategy Entry Trigger
+    if longSignal
+        strategy.entry("Long", strategy.long)
+    if shortSignal
+        strategy.entry("Short", strategy.short)
+    
+    // SL is strict. TP includes the Tick Buffer.
+    tSL      := longSignal ? tEnt - slDist : tEnt + slDist
+    tTP      := longSignal ? tEnt + tpDist + tpBuffer : tEnt - tpDist - tpBuffer
+    
+    // Create Visual Boxes: Anchored to Bar Index
+    activeTPBox := box.new(left=bar_index, top=longSignal ? tTP : tEnt, right=bar_index, bottom=longSignal ? tEnt : tTP, 
+         bgcolor=color.new(color.green, 80), border_color=na, xloc=xloc.bar_index)
+    
+    activeSLBox := box.new(left=bar_index, top=longSignal ? tEnt : tSL, right=bar_index, bottom=longSignal ? tSL : tEnt, 
+         bgcolor=color.new(color.red, 80), border_color=na, xloc=xloc.bar_index)
+         
+    // Create Extended Lines: Strictly Anchored to the entry bar_index
+    entLine := line.new(bar_index, tEnt, bar_index, tEnt, color=color.gray, width=1, style=line.style_dashed, xloc=xloc.bar_index)
+    slLine  := line.new(bar_index, tSL, bar_index, tSL, color=color.red, width=2, xloc=xloc.bar_index)
+    tpLine  := line.new(bar_index, tTP, bar_index, tTP, color=color.green, width=2, xloc=xloc.bar_index)
+    
+    label.new(bar_index, tEnt, "ORDER EXECUTION", xloc=xloc.bar_index, yloc=yloc.price, 
+         color=color.white, textcolor=color.black, style=label.style_label_left, size=size.small)
+
+// ── MONITOR AND EXTEND ACTIVE TRADE ──
+if tActive
+    // Update visuals to follow price (Trail) - Strictly following candle index
+    box.set_right(activeTPBox, bar_index)
+    box.set_right(activeSLBox, bar_index)
+    
+    line.set_x2(entLine, bar_index)
+    line.set_x2(slLine, bar_index)
+    line.set_x2(tpLine, bar_index)
+
+    isLong = tTP > tSL
+    
+    // Break-Even Logic
+    if useBE and not beMoved
+        float triggerPrice = isLong ? tEnt + (slDist * beAtRR) : tEnt - (slDist * beAtRR)
+        if (isLong and high >= triggerPrice) or (not isLong and low <= triggerPrice)
+            tSL := tEnt
+            beMoved := true
+            // Update the SL Line to the new BE level
+            line.set_y1(slLine, tSL)
+            line.set_y2(slLine, tSL)
+            label.new(bar_index, tSL, "BE MOVED", xloc=xloc.bar_index, color=color.blue, textcolor=color.white, size=size.tiny)
+
+    // Check for SL Hit (Strict: Exact price touch)
+    if (isLong and low <= tSL) or (not isLong and high >= tSL)
+        losses  += 1
+        tActive := false
+        label.new(bar_index, tSL, "SL HIT", xloc=xloc.bar_index, yloc=yloc.price, color=color.red, textcolor=color.white, size=size.tiny)
+        // Strategy Exit Trigger
+        strategy.close("Long", comment="SL Hit")
+        strategy.close("Short", comment="SL Hit")
+    
+    // Check for TP Hit (Includes Ticks Beyond)
+    else if (isLong and high >= tTP) or (not isLong and low <= tTP)
+        wins    += 1
+        tActive := false
+        label.new(bar_index, tTP, "TP HIT", xloc=xloc.bar_index, yloc=yloc.price, color=color.green, textcolor=color.white, size=size.tiny)
+        // Strategy Exit Trigger
+        strategy.close("Long", comment="TP Hit")
+        strategy.close("Short", comment="TP Hit")
+
+// ── DASHBOARD ──
+var table tbl = table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 40), border_width=1)
+if barstate.islast
+    table.cell(tbl, 0, 0, "Wins", text_color=color.green)
+    table.cell(tbl, 1, 0, str.tostring(wins), text_color=color.green)
+    table.cell(tbl, 0, 1, "Losses", text_color=color.red)
+    table.cell(tbl, 1, 1, str.tostring(losses), text_color=color.red)
+    table.cell(tbl, 0, 2, "Win Rate", text_color=color.white)
+    table.cell(tbl, 1, 2, str.tostring(math.round(wins/math.max(1, (wins+losses))*100, 1)) + "%", text_color=color.white)
+
+// Plot MAs for visual reference
+plot(useMAFilter ? smaVal : na, "SMA Filter", color=color.new(color.white, 50))
+plot(useMAFilter ? emaVal : na, "EMA Filter", color=color.new(color.blue, 50))

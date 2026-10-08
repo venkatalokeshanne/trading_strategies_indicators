@@ -1,0 +1,113 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}}
+strategy("MNQ 15m NY Open ORB Strategy",
+     overlay = true,
+     initial_capital = 25000,
+     currency = currency.USD,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 1.20,
+     slippage = 2,
+     pyramiding = 0,
+     calc_on_every_tick = false,
+     calc_on_order_fills = false,
+     process_orders_on_close = true,
+     margin_long = 1,
+     margin_short = 1)
+
+// === INPUTS ===
+string tz = input.string("America/New_York", "Zeitzone")
+string orbSession = input.session("0930-0945", "ORB Session")
+string tradeSession = input.session("0945-1600", "Trade Session")
+
+bool useCloseBreak = input.bool(true, "Breakout nur per Kerzenschluss")
+bool oneTradePerDay = input.bool(true, "Max. 1 Trade pro Tag")
+bool allowLong = input.bool(true, "Long erlauben")
+bool allowShort = input.bool(true, "Short erlauben")
+bool closeEod = input.bool(true, "Position zum Session-Ende schliessen")
+
+string tradovateSymbol = input.string("MNQM6", "Tradovate Symbol")
+
+// ✅ FIXE CONTRACTS (Prop Firm Style)
+int fixedContracts = input.int(8, "Feste Kontraktanzahl", minval = 1)
+
+// === RISK PARAMETER ===
+float pointsPerPricePoint = input.float(10.0, "Umrechnung: 10 Punkte = 1 Preis-Punkt", minval = 1.0)
+float takeProfitPts = input.float(200.0, "Take Profit in Punkten", minval = 1.0)
+float stopLossPts = input.float(200.0, "Stop Loss in Punkten", minval = 1.0)
+float trailStopPts = input.float(10.0, "Trailing Stop Loss in Punkten", minval = 1.0)
+float trailActivationPts = input.float(15.0, "Profit vor Trailing-Aktivierung", minval = 1.0)
+
+// === BERECHNUNGEN ===
+float takeProfitDistance = takeProfitPts / pointsPerPricePoint
+float stopLossDistance = stopLossPts / pointsPerPricePoint
+float trailStopDistance = trailStopPts / pointsPerPricePoint
+float trailActivationDistance = trailActivationPts / pointsPerPricePoint
+
+int takeProfitTicks = int(math.max(1, math.round(takeProfitDistance / syminfo.mintick)))
+int stopLossTicks = int(math.max(1, math.round(stopLossDistance / syminfo.mintick)))
+int trailStopTicks = int(math.max(1, math.round(trailStopDistance / syminfo.mintick)))
+int trailActivationTicks = int(math.max(1, math.round(trailActivationDistance / syminfo.mintick)))
+
+float autoTrailFrequency = syminfo.mintick
+
+// === ALERTS ===
+string exitAlertMsg = '{"event":"backtest_exit","ignore":true}'
+
+string longAlertMsg = '{"event":"entry","broker":"tradovate","strategy":"MNQ_NY_ORB","symbol":"' + tradovateSymbol + '","action":"Buy","qty":' + str.tostring(fixedContracts) + ',"orderType":"Market","takeProfitPoints":' + str.tostring(takeProfitDistance, format.mintick) + ',"stopLossPoints":' + str.tostring(stopLossDistance, format.mintick) + ',"autoTrail":{"triggerPoints":' + str.tostring(trailActivationDistance, format.mintick) + ',"stopLossPoints":' + str.tostring(trailStopDistance, format.mintick) + ',"frequencyPoints":' + str.tostring(autoTrailFrequency, format.mintick) + '}}'
+
+string shortAlertMsg = '{"event":"entry","broker":"tradovate","strategy":"MNQ_NY_ORB","symbol":"' + tradovateSymbol + '","action":"Sell","qty":' + str.tostring(fixedContracts) + ',"orderType":"Market","takeProfitPoints":' + str.tostring(takeProfitDistance, format.mintick) + ',"stopLossPoints":' + str.tostring(stopLossDistance, format.mintick) + ',"autoTrail":{"triggerPoints":' + str.tostring(trailActivationDistance, format.mintick) + ',"stopLossPoints":' + str.tostring(trailStopDistance, format.mintick) + ',"frequencyPoints":' + str.tostring(autoTrailFrequency, format.mintick) + '}}'
+
+// === SESSION LOGIK ===
+bool inOrb = not na(time(timeframe.period, orbSession, tz))
+bool inTradeSession = not na(time(timeframe.period, tradeSession, tz))
+bool newNyDay = ta.change(time("D", "0000-2359", tz)) != 0
+
+var float orbHigh = na
+var float orbLow = na
+var bool orbLocked = false
+var bool tradedToday = false
+
+if newNyDay
+    orbHigh := na
+    orbLow := na
+    orbLocked := false
+    tradedToday := false
+
+if inOrb
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+
+if not inOrb and inOrb[1] and not na(orbHigh) and not na(orbLow)
+    orbLocked := true
+
+bool confirmedBar = barstate.isconfirmed
+bool canTrade = confirmedBar and orbLocked and inTradeSession and strategy.position_size == 0 and (not oneTradePerDay or not tradedToday)
+
+bool longBreak = useCloseBreak ? close > orbHigh : high > orbHigh
+bool shortBreak = useCloseBreak ? close < orbLow : low < orbLow
+
+// === ENTRIES + EXITS (zusammen, kein doppelter Block) ===
+if canTrade and allowLong and longBreak
+    strategy.entry("ORB Long", strategy.long, qty = fixedContracts, alert_message = longAlertMsg)
+    strategy.exit("L Exit", "ORB Long", profit = takeProfitTicks, loss = stopLossTicks, trail_points = trailActivationTicks, trail_offset = trailStopTicks, alert_message = exitAlertMsg)
+    tradedToday := true
+
+else if canTrade and allowShort and shortBreak
+    strategy.entry("ORB Short", strategy.short, qty = fixedContracts, alert_message = shortAlertMsg)
+    strategy.exit("S Exit", "ORB Short", profit = takeProfitTicks, loss = stopLossTicks, trail_points = trailActivationTicks, trail_offset = trailStopTicks, alert_message = exitAlertMsg)
+    tradedToday := true
+
+// === EOD CLOSE ===
+if closeEod and not inTradeSession and inTradeSession[1]
+    strategy.close_all("NY Session Close")
+
+// === PLOTS ===
+plot(orbHigh, "ORB High", color = color.new(color.lime, 0), linewidth = 2, style = plot.style_linebr)
+plot(orbLow, "ORB Low", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+
+bgcolor(inOrb ? color.new(color.yellow, 85) : na)
+
+plotshape(canTrade and allowLong and longBreak, title = "Long", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny)
+plotshape(canTrade and allowShort and shortBreak, title = "Short", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny)

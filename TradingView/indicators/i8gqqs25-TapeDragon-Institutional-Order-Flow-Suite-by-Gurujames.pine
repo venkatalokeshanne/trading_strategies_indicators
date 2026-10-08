@@ -1,0 +1,369 @@
+//@version=6
+// ==============================================================================
+// TapeDragon - Institutional Order Flow & Footprint Suite
+// Based on the Institutional Trading Series by TapeDragon
+// Key Concepts: Volume Delta, CVD, VWAP & Bands, Absorption/Icebergs, 
+//               Volume Imbalances, TWAP Execution, and Volume Profile (HVN/LVN).
+// ==============================================================================
+indicator("TapeDragon - Institutional Order Flow Suite", shorttitle="TapeD OrderFlow", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ------------------------------------------------------------------------------
+// INPUT GROUPS
+// ------------------------------------------------------------------------------
+GRP_DELTA     = "1. Volume Delta & Cumulative Delta (CVD)"
+GRP_VWAP      = "2. Institutional VWAP, TWAP & StdDev Bands"
+GRP_ABSORP    = "3. Institutional Absorption & Iceberg Detector"
+GRP_IMBAL     = "4. Order Flow Imbalance & Delta Spikes"
+GRP_PROFILE   = "5. Session Volume Profile (POC, VAH, VAL, HVN/LVN)"
+GRP_HUD       = "6. Order Flow Dashboard / HUD"
+
+// --- 1. Delta Inputs ---
+enableDelta     = input.bool(true, "Enable Volume Delta Engine", group=GRP_DELTA)
+useLTFDelta     = input.bool(true, "Use Lower Timeframe Granularity (1m)", group=GRP_DELTA, tooltip="Analyzes lower timeframe sub-bars for precise buy/sell order flow delta.")
+ltfTimeframe    = input.timeframe("1", "Lower Timeframe Resolution", group=GRP_DELTA)
+showDivergence  = input.bool(true, "Detect Delta Divergences", group=GRP_DELTA, tooltip="Identifies when price makes new extremes but Delta/CVD fails to confirm (Passive Accumulation/Distribution).")
+
+// --- 2. VWAP & TWAP Inputs ---
+showVWAP        = input.bool(true, "Show Institutional VWAP", group=GRP_VWAP)
+showTWAP        = input.bool(true, "Show TWAP Line (Execution Algo Anchor)", group=GRP_VWAP)
+vwapAnchor      = input.string("Session", "VWAP Anchor Period", options=["Session", "Week", "Month"], group=GRP_VWAP)
+showStdBands    = input.bool(true, "Show Standard Deviation Bands", group=GRP_VWAP)
+stdev1Mult      = input.float(1.0, "Band 1 Multiplier (Fair Value Area)", group=GRP_VWAP)
+stdev2Mult      = input.float(2.0, "Band 2 Multiplier (Institutional Stretch)", group=GRP_VWAP)
+
+// --- 3. Absorption & Icebergs ---
+enableAbsorp    = input.bool(true, "Enable Absorption & Iceberg Detector", group=GRP_ABSORP)
+absorpVolMult   = input.float(1.8, "Absorption Vol Multiplier (x SMA20)", group=GRP_ABSORP, tooltip="Triggers when volume exceeds this multiple of average volume while price is absorbed.")
+absorpMaxRatio  = input.float(0.35, "Max Body/Range Ratio", group=GRP_ABSORP, tooltip="Small candle body relative to range indicates passive resting limit orders absorbing aggressive volume.")
+showAbsorpLines = input.bool(true, "Draw Active Absorption Levels", group=GRP_ABSORP)
+maxAbsorpLines  = input.int(12, "Max Absorption Level Lines", minval=1, maxval=50, group=GRP_ABSORP)
+
+// --- 4. Volume Imbalance & Spikes ---
+enableImbal     = input.bool(true, "Enable Volume Imbalance Tracking", group=GRP_IMBAL)
+imbalThreshold  = input.float(2.5, "Imbalance Threshold Ratio (Buy/Sell or Sell/Buy)", minval=1.2, step=0.1, group=GRP_IMBAL, tooltip="e.g. 2.5 means 250%+ aggressive order imbalance.")
+highlightSpikes = input.bool(true, "Highlight Imbalance Boxes on Chart", group=GRP_IMBAL)
+
+// --- 5. Volume Profile Inputs ---
+showVolProfile  = input.bool(true, "Show Developing Volume Profile", group=GRP_PROFILE)
+vpRows          = input.int(24, "Volume Bins Count", minval=10, maxval=80, group=GRP_PROFILE)
+vpWidthPct      = input.int(22, "Profile Bar Max Width (%)", minval=5, maxval=50, group=GRP_PROFILE)
+
+// --- 6. HUD Inputs ---
+showHUD         = input.bool(true, "Show Order Flow Dashboard HUD", group=GRP_HUD)
+hudPosition     = input.string("Top Right", "HUD Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=GRP_HUD)
+hudTextSize     = input.string("Small", "HUD Font Size", options=["Tiny", "Small", "Normal"], group=GRP_HUD)
+
+// ------------------------------------------------------------------------------
+// COLOR PALETTE
+// ------------------------------------------------------------------------------
+color c_bull        = color.rgb(0, 230, 118)      
+color c_bear        = color.rgb(255, 23, 68)      
+color c_vwap        = color.rgb(156, 39, 176)     
+color c_twap        = color.rgb(0, 188, 212)      
+color c_poc         = color.rgb(255, 193, 7)      
+color c_hvn         = color.rgb(0, 230, 118, 60)   
+color c_lvn         = color.rgb(255, 23, 68, 60)    
+color c_text_white  = color.rgb(240, 240, 245)
+color c_bg_dark     = color.rgb(18, 20, 28)
+
+// ------------------------------------------------------------------------------
+// 1. VOLUME DELTA & CUMULATIVE VOLUME DELTA (CVD)
+// ------------------------------------------------------------------------------
+ltf_close = useLTFDelta ? request.security_lower_tf(syminfo.tickerid, ltfTimeframe, close) : na
+ltf_open  = useLTFDelta ? request.security_lower_tf(syminfo.tickerid, ltfTimeframe, open) : na
+ltf_vol   = useLTFDelta ? request.security_lower_tf(syminfo.tickerid, ltfTimeframe, volume) : na
+
+calcBarVolumeDelta() =>
+    float buyVol  = 0.0
+    float sellVol = 0.0
+    
+    if useLTFDelta and not na(ltf_close) and array.size(ltf_close) > 0
+        for i = 0 to array.size(ltf_close) - 1
+            float c = array.get(ltf_close, i)
+            float o = array.get(ltf_open, i)
+            float v = array.get(ltf_vol, i)
+            if c > o
+                buyVol += v
+            else if c < o
+                sellVol += v
+            else
+                buyVol  += v * 0.5
+                sellVol += v * 0.5
+    else
+        float barRange = high - low
+        if barRange > 0
+            float ratio = math.max(0.0, math.min(1.0, (close - low) / barRange))
+            buyVol  := volume * ratio
+            sellVol := volume * (1.0 - ratio)
+        else
+            buyVol  := volume * 0.5
+            sellVol := volume * 0.5
+            
+    float delta = buyVol - sellVol
+    [buyVol, sellVol, delta]
+
+[buyVolume, sellVolume, barDelta] = calcBarVolumeDelta()
+
+// Cumulative Delta (CVD)
+var float cvd = 0.0
+string anchorRes = vwapAnchor == "Session" ? "D" : vwapAnchor == "Week" ? "W" : "M"
+bool isNewSession = timeframe.change(anchorRes)
+
+if isNewSession
+    cvd := barDelta
+else
+    cvd += barDelta
+
+// Delta % Breakdown
+float totalVol = buyVolume + sellVolume
+float buyPct   = totalVol > 0 ? (buyVolume / totalVol) * 100.0 : 50.0
+
+// Delta Divergence Detection 
+var float lastHighPrice = na
+var float lastHighDelta = na
+var float lastLowPrice  = na
+var float lastLowDelta  = na
+
+bool bullDivergence = false
+bool bearDivergence = false
+
+if showDivergence
+    float pivH = ta.pivothigh(high, 3, 3)
+    float pivL = ta.pivotlow(low, 3, 3)
+    
+    if not na(pivH)
+        float currHighPrice = high[3]
+        float currHighDelta = barDelta[3]
+        if not na(lastHighPrice)
+            if currHighPrice > lastHighPrice and currHighDelta < lastHighDelta
+                bearDivergence := true
+        lastHighPrice := currHighPrice
+        lastHighDelta := currHighDelta
+        
+    if not na(pivL)
+        float currLowPrice = low[3]
+        float currLowDelta = barDelta[3]
+        if not na(lastLowPrice)
+            if currLowPrice < lastLowPrice and currLowDelta > lastLowDelta
+                bullDivergence := true
+        lastLowPrice := currLowPrice
+        lastLowDelta := currLowDelta
+
+plotshape(bullDivergence, title="Bullish Delta Divergence", style=shape.triangleup, location=location.belowbar, color=c_bull, size=size.small, text="BULL DIV")
+plotshape(bearDivergence, title="Bearish Delta Divergence", style=shape.triangledown, location=location.abovebar, color=c_bear, size=size.small, text="BEAR DIV")
+
+// ------------------------------------------------------------------------------
+// 2. INSTITUTIONAL VWAP, TWAP & STANDARD DEVIATION BANDS
+// ------------------------------------------------------------------------------
+var float vwapSumVol  = 0.0
+var float vwapSumPV   = 0.0
+var float vwapSumP2V  = 0.0
+var float twapSumP    = 0.0
+var int   twapCount   = 0
+
+if isNewSession
+    vwapSumVol := volume
+    vwapSumPV  := hlc3 * volume
+    vwapSumP2V := hlc3 * hlc3 * volume
+    twapSumP   := hlc3
+    twapCount  := 1
+else
+    vwapSumVol += volume
+    vwapSumPV  += hlc3 * volume
+    vwapSumP2V += hlc3 * hlc3 * volume
+    twapSumP   += hlc3
+    twapCount  += 1
+
+float instVWAP = vwapSumVol > 0 ? vwapSumPV / vwapSumVol : hlc3
+float instTWAP = twapCount > 0 ? twapSumP / twapCount : hlc3
+
+float variance = math.max(0.0, (vwapSumP2V / vwapSumVol) - (instVWAP * instVWAP))
+float stdevVal = math.sqrt(variance)
+
+float vwapUpper1 = instVWAP + (stdevVal * stdev1Mult)
+float vwapLower1 = instVWAP - (stdevVal * stdev1Mult)
+float vwapUpper2 = instVWAP + (stdevVal * stdev2Mult)
+float vwapLower2 = instVWAP - (stdevVal * stdev2Mult)
+
+p_vwap   = plot(showVWAP ? instVWAP : na, title="Institutional VWAP", color=c_vwap, linewidth=2)
+p_twap   = plot(showTWAP ? instTWAP : na, title="Institutional TWAP (Algo Ref)", color=c_twap, linewidth=1, style=plot.style_linebr)
+p_up1    = plot(showVWAP and showStdBands ? vwapUpper1 : na, title="VWAP +1 STD", color=color.new(c_vwap, 40), linewidth=1)
+p_low1   = plot(showVWAP and showStdBands ? vwapLower1 : na, title="VWAP -1 STD", color=color.new(c_vwap, 40), linewidth=1)
+p_up2    = plot(showVWAP and showStdBands ? vwapUpper2 : na, title="VWAP +2 STD", color=color.new(c_vwap, 70), linewidth=1)
+p_low2   = plot(showVWAP and showStdBands ? vwapLower2 : na, title="VWAP -2 STD", color=color.new(c_vwap, 70), linewidth=1)
+
+fill(p_up1, p_low1, title="Fair Value Area", color=color.new(c_vwap, 94))
+fill(p_up2, p_up1, title="Upper Stretch Zone", color=color.new(c_bear, 92))
+fill(p_low1, p_low2, title="Lower Stretch Zone", color=color.new(c_bull, 92))
+
+// ------------------------------------------------------------------------------
+// 3. INSTITUTIONAL ABSORPTION & ICEBERG ORDER DETECTOR
+// ------------------------------------------------------------------------------
+float avgVol      = ta.sma(volume, 20)
+float candleRange = high - low
+float candleBody  = math.abs(close - open)
+float bodyRatio   = candleRange > 0 ? candleBody / candleRange : 1.0
+
+bool highVol     = volume >= avgVol * absorpVolMult
+bool smallBody   = bodyRatio <= absorpMaxRatio
+bool buyAbsorp   = enableAbsorp and highVol and (smallBody or barDelta < -avgVol * 0.4) and close >= low + (candleRange * 0.35)
+bool sellAbsorp  = enableAbsorp and highVol and (smallBody or barDelta > avgVol * 0.4) and close <= high - (candleRange * 0.35)
+
+plotshape(buyAbsorp, title="Bullish Iceberg Absorption", style=shape.diamond, location=location.belowbar, color=c_bull, size=size.normal, text="ABSORB BUY")
+plotshape(sellAbsorp, title="Bearish Iceberg Absorption", style=shape.diamond, location=location.abovebar, color=c_bear, size=size.normal, text="ABSORB SELL")
+
+var line[] absorpLines = array.new_line()
+
+// Ensure lines are only drawn on confirmed bars to prevent real-time phantom lines
+if enableAbsorp and showAbsorpLines and barstate.isconfirmed
+    if buyAbsorp
+        line l = line.new(bar_index, low, bar_index + 12, low, color=c_bull, width=2, style=line.style_dashed)
+        array.push(absorpLines, l)
+    if sellAbsorp
+        line l = line.new(bar_index, high, bar_index + 12, high, color=c_bear, width=2, style=line.style_dashed)
+        array.push(absorpLines, l)
+        
+    if array.size(absorpLines) > maxAbsorpLines
+        line oldLine = array.shift(absorpLines)
+        line.delete(oldLine)
+
+// ------------------------------------------------------------------------------
+// 4. ORDER FLOW IMBALANCE & FOOTPRINT HIGHLIGHT (AMENDED TO BOXES)
+// ------------------------------------------------------------------------------
+bool buyImbalance  = enableImbal and sellVolume > 0 and (buyVolume / sellVolume) >= imbalThreshold
+bool sellImbalance = enableImbal and buyVolume > 0 and (sellVolume / buyVolume) >= imbalThreshold
+
+// State variables for stretching the box
+var int imbalState = 0
+var float imbalOrigin = na
+var box activeImbalBox = na
+
+// Check invalidation for the current state (closes below origin low, or above origin high)
+if imbalState == 1 and close < imbalOrigin
+    imbalState := 0
+else if imbalState == -1 and close > imbalOrigin
+    imbalState := 0
+
+// Only set new states on bar close to prevent box limit crashes on real-time live ticks
+if barstate.isconfirmed
+    if buyImbalance
+        imbalState := 1
+        imbalOrigin := low
+        if highlightSpikes
+            activeImbalBox := box.new(left=bar_index, top=high, right=bar_index, bottom=low, border_color=na, bgcolor=color.new(c_bull, 85))
+    else if sellImbalance
+        imbalState := -1
+        imbalOrigin := high
+        if highlightSpikes
+            activeImbalBox := box.new(left=bar_index, top=high, right=bar_index, bottom=low, border_color=na, bgcolor=color.new(c_bear, 85))
+
+// Stretch the active box forward if it hasn't been invalidated yet
+if imbalState != 0 and highlightSpikes and not na(activeImbalBox)
+    box.set_right(activeImbalBox, bar_index)
+
+// ------------------------------------------------------------------------------
+// 5. SESSION VOLUME PROFILE (POC, HVN, LVN)
+// ------------------------------------------------------------------------------
+var box[] vpBoxes = array.new_box()
+
+var float sessionHigh = na
+var float sessionLow  = na
+var float[] profileVol = array.new_float(vpRows, 0.0)
+
+if isNewSession
+    sessionHigh := high
+    sessionLow  := low
+    profileVol  := array.new_float(vpRows, 0.0)
+else
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow  := math.min(nz(sessionLow, low), low)
+
+if showVolProfile and not na(sessionHigh) and sessionHigh > sessionLow
+    float step = (sessionHigh - sessionLow) / vpRows
+    if step > 0
+        int bin = math.min(vpRows - 1, math.max(0, math.floor((close - sessionLow) / step)))
+        float currentBinVol = array.get(profileVol, bin)
+        array.set(profileVol, bin, currentBinVol + volume)
+
+if barstate.islast and showVolProfile and not na(sessionHigh) and sessionHigh > sessionLow
+    // Clear boxes drawn on previous live ticks to prevent box limits from crashing
+    if array.size(vpBoxes) > 0
+        for b in vpBoxes
+            box.delete(b)
+        array.clear(vpBoxes)
+
+    float maxBinVol = array.max(profileVol)
+    float step = (sessionHigh - sessionLow) / vpRows
+    
+    if maxBinVol > 0 and step > 0
+        int maxBinIndex = array.indexof(profileVol, maxBinVol)
+        int startBar = bar_index
+        
+        for i = 0 to vpRows - 1
+            float vol = array.get(profileVol, i)
+            if vol > 0
+                float bLow  = sessionLow + (i * step)
+                float bHigh = bLow + step
+                int bWidth  = math.round((vol / maxBinVol) * vpWidthPct)
+                
+                color boxColor = (i == maxBinIndex) ? c_poc : (vol > maxBinVol * 0.55) ? c_hvn : c_lvn
+                box b = box.new(left=startBar, top=bHigh, right=startBar + bWidth, bottom=bLow, 
+                                bgcolor=boxColor, border_color=color.new(boxColor, 60))
+                array.push(vpBoxes, b)
+
+// ------------------------------------------------------------------------------
+// 6. ORDER FLOW HUD / DASHBOARD TABLE
+// ------------------------------------------------------------------------------
+// Initialize Table Properties Once
+string pos = hudPosition == "Top Right" ? position.top_right :
+             hudPosition == "Top Left" ? position.top_left :
+             hudPosition == "Bottom Right" ? position.bottom_right : position.bottom_left
+             
+string txtSz = hudTextSize == "Tiny" ? size.tiny : hudTextSize == "Small" ? size.small : size.normal
+
+var table hudTable = table.new(position=pos, columns=2, rows=8, bgcolor=c_bg_dark, border_color=color.rgb(50, 55, 70), border_width=1)
+
+if showHUD and barstate.islast
+    // Dynamically update cells (avoids massive memory leaks recreating tables every tick)
+    table.merge_cells(hudTable, 0, 0, 1, 0)
+    table.cell(hudTable, 0, 0, "TAPEDRAGON ORDER FLOW", text_color=c_poc, text_size=txtSz, bgcolor=color.rgb(30, 34, 45))
+    
+    table.cell(hudTable, 0, 1, "Bar Delta", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 1, str.tostring(barDelta, "#,###") + " (" + str.tostring(buyPct, "0.0") + "% B)", text_color=barDelta >= 0 ? c_bull : c_bear, text_size=txtSz)
+               
+    table.cell(hudTable, 0, 2, "Session CVD", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 2, str.tostring(cvd, "#,###"), text_color=cvd >= 0 ? c_bull : c_bear, text_size=txtSz)
+    
+    float vwapDist = ((close - instVWAP) / instVWAP) * 100.0
+    table.cell(hudTable, 0, 3, "VWAP Dist", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 3, str.tostring(vwapDist, "+0.00;-0.00") + "%", text_color=close >= instVWAP ? c_bull : c_bear, text_size=txtSz)
+               
+    string imbalText = buyImbalance ? "BUY IMBALANCE" : sellImbalance ? "SELL IMBALANCE" : "BALANCED"
+    color imbalCol   = buyImbalance ? c_bull : sellImbalance ? c_bear : color.gray
+    table.cell(hudTable, 0, 4, "Order Imbalance", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 4, imbalText, text_color=imbalCol, text_size=txtSz)
+    
+    string absorpText = buyAbsorp ? "BUY ABSORPTION" : sellAbsorp ? "SELL ABSORPTION" : "NONE"
+    color absorpCol   = buyAbsorp ? c_bull : sellAbsorp ? c_bear : color.gray
+    table.cell(hudTable, 0, 5, "Absorption", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 5, absorpText, text_color=absorpCol, text_size=txtSz)
+    
+    string divText = bullDivergence ? "BULL DIV" : bearDivergence ? "BEAR DIV" : "NORMAL"
+    color divCol   = bullDivergence ? c_bull : bearDivergence ? c_bear : color.gray
+    table.cell(hudTable, 0, 6, "Delta Divergence", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 6, divText, text_color=divCol, text_size=txtSz)
+    
+    string biasText = (barDelta > 0 and close > instVWAP) ? "ACCUMULATION" : (barDelta < 0 and close < instVWAP) ? "DISTRIBUTION" : "NEUTRAL / CHOP"
+    color biasCol   = (barDelta > 0 and close > instVWAP) ? c_bull : (barDelta < 0 and close < instVWAP) ? c_bear : color.orange
+    table.cell(hudTable, 0, 7, "Inst. Regime", text_color=c_text_white, text_size=txtSz)
+    table.cell(hudTable, 1, 7, biasText, text_color=biasCol, text_size=txtSz)
+
+// ------------------------------------------------------------------------------
+// 7. ALERTS CONFIGURATION
+// ------------------------------------------------------------------------------
+alertcondition(buyAbsorp, title="Bullish Absorption Alert", message="TapeDragon: Institutional Buy Absorption detected at {{close}}!")
+alertcondition(sellAbsorp, title="Bearish Absorption Alert", message="TapeDragon: Institutional Sell Absorption detected at {{close}}!")
+alertcondition(buyImbalance, title="Buying Imbalance Alert", message="TapeDragon: Aggressive Buying Imbalance detected!")
+alertcondition(sellImbalance, title="Selling Imbalance Alert", message="TapeDragon: Aggressive Selling Imbalance detected!")
+alertcondition(bullDivergence, title="Bullish Delta Divergence Alert", message="TapeDragon: Bullish Delta Divergence (Price Low vs CVD High)!")
+alertcondition(bearDivergence, title="Bearish Delta Divergence Alert", message="TapeDragon: Bearish Delta Divergence (Price High vs CVD Low)!")

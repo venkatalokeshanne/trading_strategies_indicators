@@ -1,0 +1,138 @@
+//@version=6
+indicator(title="ATR Daily (Classic vs Robust, NY-Fix, Spike Control)", shorttitle="ATR_Daily_Lag_Robust", overlay=false, precision=4)
+
+// --- helper: clamp without math.clamp
+f_clamp(x, lo, hi) =>
+    math.max(lo, math.min(x, hi))
+
+// ===== Inputs
+length           = input.int(14, "ATR period", minval=1)
+multiplier       = input.float(1.0, "ATR Multiplier", minval=0.1, step=0.1)
+exclude_weekends = input.bool(false, "Freeze ATR on Sat/Sun (daily)")
+mad_multiplier   = input.float(3.0, "MAD multiplier (k)", minval=0.5, step=0.5)
+cap_mult         = input.float(4.0, "Hard cap × median(TR)", minval=1.0, step=0.5)
+mode_robust      = input.string("Clamp", "Robust mode", options=["Clamp","Freeze","Off"])
+base_for_passed  = input.string("Robust", "Base for Passed ATR", options=["Classic","Robust"])
+show_compare     = input.bool(true, "Show Classic & Robust lines")
+use_percent      = input.bool(false, "Show passed ATR in %")
+show_table       = input.bool(true, "Show table (top-right)")
+
+line_cl_color    = input.color(color.orange, "Classic ATR line")
+line_rb_color    = input.color(color.teal,    "Robust ATR line")
+hist_color       = input.color(color.new(color.green, 0), "Passed ATR bars")
+hist_w           = input.int(2, "Bars width", minval=1)
+
+// ===== NY day change (America/New_York) + intraday day high/low
+var bool newNY = false
+newNY := ta.change(dayofmonth(time, "America/New_York")) != 0
+plot(newNY ? 1 : 0, "New NY Day (debug)", color=color.new(color.red, 0), style=plot.style_histogram)
+
+var float dayHigh = na
+var float dayLow  = na
+if newNY
+    dayHigh := high
+    dayLow  := low
+else
+    dayHigh := math.max(nz(dayHigh, high), high)
+    dayLow  := math.min(nz(dayLow, low),  low)
+
+range_today = nz(dayHigh - dayLow, 0)
+
+// ===== Daily block: TR -> robust thresholds -> Classic & Robust ATR (Wilder) with options
+f_daily_all(len, k, cap_mul, excl_weekend, mode) =>
+    // Daily series context
+    _tr  = ta.tr
+    _med = ta.median(_tr, len)
+    _mad = ta.median(math.abs(_tr - _med), len)
+    _lo  = math.max(0.0, _med - k * _mad)
+    _hiS = _med + k * _mad
+    _cap = _med * cap_mul
+    _hi  = math.min(_hiS, _cap)
+    _is_spike = _tr > _hiS or _tr > _cap
+
+    _tr_clamped = f_clamp(_tr, _lo, _hi)
+
+    // Classic Wilder ATR (manual, so we can freeze on weekends if needed)
+    var float _atr_cl = na
+    if na(_atr_cl)
+        _atr_cl := ta.sma(_tr, len)
+    else
+        if excl_weekend and (dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday)
+            _atr_cl := _atr_cl[1]
+        else
+            _atr_cl := (_atr_cl[1] * (len - 1) + _tr) / len
+
+    // Robust Wilder ATR on clamped TR (+ Freeze/Off)
+    var float _atr_rb = na
+    if na(_atr_rb)
+        _atr_rb := ta.sma(_tr_clamped, len)
+    else
+        if excl_weekend and (dayofweek == dayofweek.saturday or dayofweek == dayofweek.sunday)
+            _atr_rb := _atr_rb[1]
+        else
+            if mode == "Freeze" and _is_spike
+                _atr_rb := _atr_rb[1]
+            else if mode == "Off"
+                _atr_rb := (_atr_cl)   // в режиме Off ведём себя как классика
+            else
+                _atr_rb := (_atr_rb[1] * (len - 1) + _tr_clamped) / len
+
+    [_tr, _med, _mad, _lo, _hi, _is_spike, _atr_cl, _atr_rb]
+
+// === Pull daily series to intraday stream
+[dTR, dMed, dMAD, dLo, dHi, dSpike, dATR_cl, dATR_rb] =  request.security( syminfo.tickerid, "D",f_daily_all(length, mad_multiplier, cap_mult, exclude_weekends, mode_robust),lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+
+// Spike highlight (daily)
+bgcolor(dSpike ? color.new(color.red, 88) : na)
+
+// === Fix yesterday’s daily ATRs at the start of the new NY day
+var float fixed_atr_classic = na
+var float fixed_atr_robust  = na
+if newNY
+    fixed_atr_classic := nz(dATR_cl[1], 0) * multiplier
+    fixed_atr_robust  := nz(dATR_rb[1], 0) * multiplier
+
+// === Base for passed ATR
+fixed_base = base_for_passed == "Robust" ? fixed_atr_robust : fixed_atr_classic
+
+// === Passed ATR
+passed_atr = fixed_base == 0 ? 0.0 : (range_today / fixed_base) * 100.0
+passed_classic = fixed_atr_classic == 0 ? 0.0 : (range_today / fixed_atr_classic) * 100.0
+passed_robust = fixed_atr_robust == 0 ? 0.0 : (range_today / fixed_atr_robust) * 100.0
+
+// === Plots
+// Lines: show horizontal fixed lines or 100% if use_percent
+plot(show_compare ? (use_percent ? 100.0 : fixed_atr_classic) : na, "Classic ATR (fixed)", color=line_cl_color, linewidth=2)
+plot(show_compare ? (use_percent ? 100.0 : fixed_atr_robust ) : na, "Robust ATR (fixed)",  color=line_rb_color, linewidth=2)
+// Plots for strategy (always in $, not visible)
+plot(fixed_atr_classic, "Classic ATR ($ for strategy)", display=display.none)
+plot(fixed_atr_robust, "Robust ATR ($ for strategy)", display=display.none)
+// New plots for strategy (always in %, not visible)
+plot(passed_classic, "Passed Classic (% for strategy)", display=display.none)
+plot(passed_robust, "Passed Robust (% for strategy)", display=display.none)
+// Bars: passed ATR
+bars_val  = use_percent ? passed_atr : range_today
+bars_col  = use_percent ? (bars_val > 100 ? color.red : hist_color) : (bars_val > fixed_base ? color.red : hist_color)
+plot(bars_val, "Passed ATR", style=plot.style_histogram, color=bars_col, linewidth=hist_w)
+
+// === Table (top-right)
+if show_table and barstate.islast
+    var table t = table.new(position.top_right, 1, 9, bgcolor=color.new(color.blue, 85), frame_color=color.blue, frame_width=1, border_width=1)
+    table.cell(t, 0, 0, "ATR Info (Daily, NY-fixed)", text_color=color.white, bgcolor=color.new(color.blue, 15), text_size=size.normal, text_halign=text.align_center)
+    table.cell(t, 0, 1, "Classic (fixed): " + str.tostring(fixed_atr_classic), text_color=color.white)
+    table.cell(t, 0, 2, "Robust  (fixed): " + str.tostring(fixed_atr_robust),  text_color=color.white)
+    delta_pct = (fixed_atr_robust == 0) ? na : ((fixed_atr_classic / fixed_atr_robust) - 1.0) * 100.0
+    table.cell(t, 0, 3, "Extension Classic vs Robust: " + (na(delta_pct) ? "—" : str.tostring(delta_pct, "#.##") + "%"), text_color=(na(delta_pct) ? color.white : (delta_pct>0? color.red: color.lime)))
+    table.cell(t, 0, 4, "Base for passed: " + base_for_passed + (use_percent ? " (100% line shown)" : ""), text_color=color.white)
+    table.cell(t, 0, 5, "Passed Classic: " + str.tostring(passed_classic, "#.##") + "%", text_color=color.white)
+    table.cell(t, 0, 6, "Passed Robust: " + str.tostring(passed_robust, "#.##") + "%", text_color=color.white)
+    alpha = (length - 1.0) / length
+    half_life = math.abs(math.log(0.5) / math.log(alpha))
+    table.cell(t, 0, 7, "Half-life L=" + str.tostring(length) + ": ~" + str.tostring(half_life, "#.##") + " дней", text_color=color.white)
+    table.cell(t, 0, 8, "Mode=" + mode_robust + "  |  k=" + str.tostring(mad_multiplier) + "  |  cap×=" + str.tostring(cap_mult), text_color=color.white)
+
+// === Optional alert on spike day
+alertcondition(dSpike, "Spike day (daily TR)", "Daily spike detected")
+
+// === Debug line for NY day range
+plot(nz(dayHigh - dayLow, 0), title="Debug Range (NY)", color=color.orange, style=plot.style_line)

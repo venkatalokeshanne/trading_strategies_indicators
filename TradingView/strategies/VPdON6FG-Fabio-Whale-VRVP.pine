@@ -1,0 +1,467 @@
+// © saivivek0192 — Fabio + Whale + VRVP [Pure]
+// State → Volume Profile Location → Whale Aggression
+// VRVP only — POC, VAH, VAL — the institutional levels
+
+//@version=6
+strategy("Fabio + Whale + VRVP", 
+     overlay=true, 
+     max_lines_count=200, 
+     max_labels_count=100,
+     max_boxes_count=100,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05,
+     slippage=1,
+     process_orders_on_close=true)
+
+// ============================================================
+// INPUTS
+// ============================================================
+g_main = "🎯 Direction"
+allowLongs  = input.bool(true, "CALLs", group=g_main, inline="dir")
+allowShorts = input.bool(true, "PUTs", group=g_main, inline="dir")
+
+g_state = "1️⃣ State"
+trendBars = input.int(20, "Trend lookback", minval=10, maxval=100, group=g_state)
+trendStrength = input.float(0.5, "Trend strength", minval=0.2, maxval=0.9, step=0.1, group=g_state)
+
+g_vp = "2️⃣ Volume Profile (VRVP)"
+vpLookback = input.int(100, "Profile lookback (bars)", minval=30, maxval=500, group=g_vp, tooltip="How many bars to build profile from. 100 = ~8 hrs on 5min")
+vpRows = input.int(40, "Profile rows", minval=20, maxval=100, group=g_vp, tooltip="More rows = finer detail")
+vaPercent = input.float(70.0, "Value Area %", minval=50, maxval=90, step=5, group=g_vp, tooltip="Standard is 70% of volume")
+levelTolerance = input.float(0.15, "Tolerance to level (%)", minval=0.05, maxval=0.5, step=0.05, group=g_vp)
+showProfile = input.bool(true, "Show POC/VAH/VAL lines", group=g_vp)
+
+g_agg = "3️⃣ Whale"
+bt_lookback = input.int(5, "Lookback", minval=5, group=g_agg)
+bt_sigma = input.float(3.0, "Sigma", minval=1.0, step=0.1, group=g_agg)
+min_tier = input.int(1, "Min Tier", minval=1, maxval=3, group=g_agg)
+showWhaleDots = input.bool(true, "Show whale dots", group=g_agg)
+
+g_exec = "✅ Execution"
+requireConfirm = input.bool(false, "Confirm candle", group=g_exec, tooltip="OFF = more trades. ON = wait for confirmation.")
+session_start = input.string("0830", "Open CST", group=g_exec, inline="s")
+session_end = input.string("1400", "Close CST", group=g_exec, inline="s")
+cooldownBars = input.int(5, "Cooldown", minval=0, group=g_exec)
+
+g_risk = "💰 Risk"
+atrLen = input.int(14, "ATR", group=g_risk)
+atrStopMult = input.float(1.0, "Stop ATR×", minval=0.5, maxval=3.0, step=0.1, group=g_risk)
+rrTarget = input.float(2.0, "R:R", minval=1.0, maxval=5.0, step=0.1, group=g_risk)
+maxBarsInTrade = input.int(20, "Max bars", minval=5, maxval=100, group=g_risk)
+
+g_alerts = "🔔 Signals"
+plotEntrySignals = input.bool(true, "Plot entry/exit shapes", group=g_alerts)
+showLabels = input.bool(true, "Entry/exit text labels", group=g_alerts)
+
+g_viz = "🎨 Visuals"
+showEMAs = input.bool(true, "EMAs 9/21", group=g_viz)
+showTradeLines = input.bool(true, "Active trade lines", group=g_viz)
+showStats = input.bool(true, "Compact dashboard", group=g_viz)
+dashPos = input.string("top_right", "Dashboard position", options=["top_right", "top_left", "bottom_right", "bottom_left", "middle_right"], group=g_viz)
+
+// ============================================================
+// SESSION
+// ============================================================
+inSession = not na(time(timeframe.period, session_start + "-" + session_end, "America/Chicago"))
+
+// ============================================================
+// CORE INDICATORS
+// ============================================================
+atrVal = ta.atr(atrLen)
+ema9 = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+
+// RULE 1: STATE
+priceRange = ta.highest(high, trendBars) - ta.lowest(low, trendBars)
+priceMove = math.abs(close - close[trendBars])
+efficiency = priceRange == 0 ? 0.0 : priceMove / priceRange
+
+isTrending = efficiency > trendStrength
+trendUp = isTrending and close > close[trendBars]
+trendDown = isTrending and close < close[trendBars]
+isRanging = not isTrending
+
+// ============================================================
+// RULE 2: VOLUME PROFILE (VRVP) — POC, VAH, VAL
+// ============================================================
+profileHigh = ta.highest(high, vpLookback)
+profileLow = ta.lowest(low, vpLookback)
+profileRange = profileHigh - profileLow
+rowSize = profileRange / vpRows
+
+// Build profile arrays
+var array<float> volumes = array.new_float(0)
+var array<float> prices = array.new_float(0)
+
+// Rebuild profile each confirmed bar
+if barstate.isconfirmed and rowSize > 0
+    array.clear(volumes)
+    array.clear(prices)
+    
+    // Initialize rows
+    for i = 0 to vpRows - 1
+        array.push(volumes, 0.0)
+        array.push(prices, profileLow + rowSize * (i + 0.5))
+    
+    // Distribute each bar's volume across the rows it touched
+    for b = 0 to vpLookback - 1
+        bar_h = high[b]
+        bar_l = low[b]
+        bar_v = volume[b]
+        if bar_h > bar_l
+            volPerUnit = bar_v / (bar_h - bar_l)
+            for i = 0 to vpRows - 1
+                rowLow = profileLow + rowSize * i
+                rowHigh = rowLow + rowSize
+                overlapLow = math.max(bar_l, rowLow)
+                overlapHigh = math.min(bar_h, rowHigh)
+                if overlapHigh > overlapLow
+                    addVol = (overlapHigh - overlapLow) * volPerUnit
+                    array.set(volumes, i, array.get(volumes, i) + addVol)
+
+// Calculate POC, VAH, VAL
+var float poc = 0.0
+var float vah = 0.0
+var float val_ = 0.0
+var bool profileReady = false
+
+if barstate.isconfirmed and array.size(volumes) > 0
+    // Find POC (highest volume row)
+    pocVol = 0.0
+    pocIdx = 0
+    for i = 0 to array.size(volumes) - 1
+        v = array.get(volumes, i)
+        if v > pocVol
+            pocVol := v
+            pocIdx := i
+    poc := array.get(prices, pocIdx)
+    
+    // Calculate Value Area (70% of volume around POC)
+    totalVol = array.sum(volumes)
+    targetVol = totalVol * vaPercent / 100
+    accumVol = pocVol
+    upperIdx = pocIdx
+    lowerIdx = pocIdx
+    
+    while accumVol < targetVol and (upperIdx < vpRows - 1 or lowerIdx > 0)
+        upVol = upperIdx < vpRows - 1 ? array.get(volumes, upperIdx + 1) : 0.0
+        dnVol = lowerIdx > 0 ? array.get(volumes, lowerIdx - 1) : 0.0
+        if upVol >= dnVol and upperIdx < vpRows - 1
+            upperIdx := upperIdx + 1
+            accumVol := accumVol + upVol
+        else if lowerIdx > 0
+            lowerIdx := lowerIdx - 1
+            accumVol := accumVol + dnVol
+        else
+            break
+    
+    vah := array.get(prices, upperIdx)
+    val_ := array.get(prices, lowerIdx)
+    profileReady := true
+
+// Location detection
+nearLevel(price, level) =>
+    not na(level) and level > 0 and math.abs(price - level) / price * 100 < levelTolerance
+
+nearPOC = profileReady and nearLevel(close, poc)
+nearVAH = profileReady and nearLevel(close, vah)
+nearVAL = profileReady and nearLevel(close, val_)
+
+atLevel = nearPOC or nearVAH or nearVAL
+
+// What level is being touched
+activeLevel() =>
+    nearPOC ? "POC" : nearVAH ? "VAH" : nearVAL ? "VAL" : "—"
+
+// Where is price relative to value area
+inValueArea = profileReady and close <= vah and close >= val_
+aboveVA = profileReady and close > vah
+belowVA = profileReady and close < val_
+
+// ============================================================
+// RULE 3: WHALE (HK detector)
+// ============================================================
+range_size = high - low
+
+raw_buy_vol = range_size == 0 ? 0 : (close - low) / range_size * volume
+raw_sell_vol = range_size == 0 ? 0 : (high - close) / range_size * volume
+
+avg_buy_vol = ta.sma(raw_buy_vol, bt_lookback)[1]
+std_buy_vol = ta.stdev(raw_buy_vol, bt_lookback)[1]
+avg_sell_vol = ta.sma(raw_sell_vol, bt_lookback)[1]
+std_sell_vol = ta.stdev(raw_sell_vol, bt_lookback)[1]
+
+is_bt_buy_t1 = raw_buy_vol > avg_buy_vol + std_buy_vol * bt_sigma
+is_bt_buy_t2 = raw_buy_vol > avg_buy_vol + std_buy_vol * (bt_sigma + 1.5)
+is_bt_buy_t3 = raw_buy_vol > avg_buy_vol + std_buy_vol * (bt_sigma + 3.0)
+is_bt_sell_t1 = raw_sell_vol > avg_sell_vol + std_sell_vol * bt_sigma
+is_bt_sell_t2 = raw_sell_vol > avg_sell_vol + std_sell_vol * (bt_sigma + 1.5)
+is_bt_sell_t3 = raw_sell_vol > avg_sell_vol + std_sell_vol * (bt_sigma + 3.0)
+
+buy_tier = is_bt_buy_t3 ? 3 : is_bt_buy_t2 ? 2 : is_bt_buy_t1 ? 1 : 0
+sell_tier = is_bt_sell_t3 ? 3 : is_bt_sell_t2 ? 2 : is_bt_sell_t1 ? 1 : 0
+
+aggressiveBuy = buy_tier >= min_tier
+aggressiveSell = sell_tier >= min_tier
+
+// ============================================================
+// SETUP DETECTION
+// ============================================================
+var int lastTradeBar = -1000
+cooldownOk = bar_index - lastTradeBar >= cooldownBars
+
+// LONGS
+// Trend long: trending up + at any VRVP level + buy whale
+// Range long: ranging + at VAL (bottom of value area) + buy whale
+// Imbalance long: extended below value + at VAL + buy whale (mean reversion)
+longTrend = trendUp and atLevel and aggressiveBuy
+longRange = isRanging and (nearVAL or nearPOC) and aggressiveBuy
+longMR = belowVA and nearVAL and aggressiveBuy
+longSetup = (longTrend or longRange or longMR) and inSession and cooldownOk and strategy.position_size == 0
+
+// SHORTS
+shortTrend = trendDown and atLevel and aggressiveSell
+shortRange = isRanging and (nearVAH or nearPOC) and aggressiveSell
+shortMR = aboveVA and nearVAH and aggressiveSell
+shortSetup = (shortTrend or shortRange or shortMR) and inSession and cooldownOk and strategy.position_size == 0
+
+// ============================================================
+// CONFIRMATION
+// ============================================================
+var float pendingHi = na
+var float pendingLo = na
+var int pendingDir = 0
+var bool pendingActive = false
+var int pendingBars = 0
+
+if longSetup and not pendingActive
+    pendingHi := high
+    pendingLo := low
+    pendingDir := 1
+    pendingActive := true
+    pendingBars := 0
+
+if shortSetup and not pendingActive
+    pendingHi := high
+    pendingLo := low
+    pendingDir := -1
+    pendingActive := true
+    pendingBars := 0
+
+if pendingActive
+    pendingBars := pendingBars + 1
+
+longConfirmed = pendingActive and pendingDir == 1 and pendingBars == 1 and close > open and close > pendingHi
+shortConfirmed = pendingActive and pendingDir == -1 and pendingBars == 1 and close < open and close < pendingLo
+
+if pendingBars > 2 or longConfirmed or shortConfirmed
+    pendingActive := false
+    pendingDir := 0
+    pendingBars := 0
+
+fireLong = allowLongs and (requireConfirm ? longConfirmed : longSetup)
+fireShort = allowShorts and (requireConfirm ? shortConfirmed : shortSetup)
+
+var string entryTier = ""
+if fireLong
+    entryTier := buy_tier == 3 ? "T3" : buy_tier == 2 ? "T2" : "T1"
+if fireShort
+    entryTier := sell_tier == 3 ? "T3" : sell_tier == 2 ? "T2" : "T1"
+
+var string entryMode = ""
+if fireLong
+    entryMode := longMR ? "MR" : longTrend ? "TREND" : "RANGE"
+if fireShort
+    entryMode := shortMR ? "MR" : shortTrend ? "TREND" : "RANGE"
+
+// ============================================================
+// EXECUTION
+// ============================================================
+var float entryPrice = na
+var float stopPrice = na
+var float targetPrice = na
+var int entryBar = na
+var string entryReason = ""
+
+if fireLong
+    entryPrice := close
+    sigLow = requireConfirm ? pendingLo : low
+    stopPrice := sigLow - atrVal * atrStopMult
+    risk = entryPrice - stopPrice
+    targetPrice := entryPrice + risk * rrTarget
+    entryBar := bar_index
+    entryReason := entryMode + " " + activeLevel() + " " + entryTier
+    strategy.entry("Long", strategy.long, comment=entryReason)
+    lastTradeBar := bar_index
+
+if fireShort
+    entryPrice := close
+    sigHigh = requireConfirm ? pendingHi : high
+    stopPrice := sigHigh + atrVal * atrStopMult
+    risk = stopPrice - entryPrice
+    targetPrice := entryPrice - risk * rrTarget
+    entryBar := bar_index
+    entryReason := entryMode + " " + activeLevel() + " " + entryTier
+    strategy.entry("Short", strategy.short, comment=entryReason)
+    lastTradeBar := bar_index
+
+if strategy.position_size > 0
+    strategy.exit("LongExit", from_entry="Long", stop=stopPrice, limit=targetPrice)
+    if bar_index - entryBar >= maxBarsInTrade
+        strategy.close("Long", comment="TimeOut")
+    if not inSession
+        strategy.close("Long", comment="EOD")
+
+if strategy.position_size < 0
+    strategy.exit("ShortExit", from_entry="Short", stop=stopPrice, limit=targetPrice)
+    if bar_index - entryBar >= maxBarsInTrade
+        strategy.close("Short", comment="TimeOut")
+    if not inSession
+        strategy.close("Short", comment="EOD")
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entryPrice := na
+    stopPrice := na
+    targetPrice := na
+    entryBar := na
+
+just_closed_long = strategy.position_size[1] > 0 and strategy.position_size == 0
+just_closed_short = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+// ============================================================
+// VISUALS — VRVP LINES (the key levels)
+// ============================================================
+plot(showEMAs ? ema9 : na, "EMA 9", color=color.new(#FF9800, 60), linewidth=1)
+plot(showEMAs ? ema21 : na, "EMA 21", color=color.new(#2196F3, 60), linewidth=1)
+
+// VRVP horizontal lines extending right
+var line pocLine = na
+var line vahLine = na
+var line valLine = na
+
+if showProfile and barstate.islast and profileReady
+    if not na(pocLine)
+        line.delete(pocLine)
+    if not na(vahLine)
+        line.delete(vahLine)
+    if not na(valLine)
+        line.delete(valLine)
+    pocLine := line.new(bar_index - vpLookback, poc, bar_index + 10, poc, color=color.new(#FFEB3B, 0), width=2, extend=extend.right)
+    vahLine := line.new(bar_index - vpLookback, vah, bar_index + 10, vah, color=color.new(#F44336, 30), width=1, style=line.style_dashed, extend=extend.right)
+    valLine := line.new(bar_index - vpLookback, val_, bar_index + 10, val_, color=color.new(#4CAF50, 30), width=1, style=line.style_dashed, extend=extend.right)
+
+// Trade lines
+plot(showTradeLines and strategy.position_size != 0 ? entryPrice : na, "Entry", color=color.new(color.yellow, 30), style=plot.style_linebr, linewidth=2)
+plot(showTradeLines and strategy.position_size != 0 ? stopPrice : na, "Stop", color=color.new(#E53935, 0), style=plot.style_linebr, linewidth=2)
+plot(showTradeLines and strategy.position_size != 0 ? targetPrice : na, "Target", color=color.new(#43A047, 0), style=plot.style_linebr, linewidth=2)
+
+// HK WHALE DOTS — UNCHANGED
+c_bt_buy = color.new(color.lime, 20)
+c_bt_sell = color.new(color.red, 20)
+pos_buy = math.avg(close, low)
+pos_sell = math.avg(close, high)
+
+plotshape(showWhaleDots and is_bt_buy_t1 and not is_bt_buy_t2 ? pos_buy : na, title="Big Buy (Small)", style=shape.circle, location=location.absolute, color=c_bt_buy, size=size.small)
+plotshape(showWhaleDots and is_bt_buy_t2 and not is_bt_buy_t3 ? pos_buy : na, title="Big Buy (Med)", style=shape.circle, location=location.absolute, color=c_bt_buy, size=size.normal)
+plotshape(showWhaleDots and is_bt_buy_t3 ? pos_buy : na, title="Big Buy (Large)", style=shape.circle, location=location.absolute, color=c_bt_buy, size=size.large)
+
+plotshape(showWhaleDots and is_bt_sell_t1 and not is_bt_sell_t2 ? pos_sell : na, title="Big Sell (Small)", style=shape.circle, location=location.absolute, color=c_bt_sell, size=size.small)
+plotshape(showWhaleDots and is_bt_sell_t2 and not is_bt_sell_t3 ? pos_sell : na, title="Big Sell (Med)", style=shape.circle, location=location.absolute, color=c_bt_sell, size=size.normal)
+plotshape(showWhaleDots and is_bt_sell_t3 ? pos_sell : na, title="Big Sell (Large)", style=shape.circle, location=location.absolute, color=c_bt_sell, size=size.large)
+
+// ============================================================
+// ENTRY/EXIT SIGNALS — Alertable
+// ============================================================
+plotshape(plotEntrySignals and fireLong, title="🟢 BUY CALL Signal", style=shape.triangleup, location=location.belowbar, color=color.new(#00C853, 0), size=size.normal, text="CALL", textcolor=color.white)
+plotshape(plotEntrySignals and fireShort, title="🔴 BUY PUT Signal", style=shape.triangledown, location=location.abovebar, color=color.new(#D50000, 0), size=size.normal, text="PUT", textcolor=color.white)
+plotshape(plotEntrySignals and just_closed_long, title="🚪 EXIT CALL Signal", style=shape.xcross, location=location.abovebar, color=color.new(#FF9800, 0), size=size.normal, text="EXIT", textcolor=color.white)
+plotshape(plotEntrySignals and just_closed_short, title="🚪 EXIT PUT Signal", style=shape.xcross, location=location.belowbar, color=color.new(#FF9800, 0), size=size.normal, text="EXIT", textcolor=color.white)
+
+// ============================================================
+// LABELS
+// ============================================================
+if showLabels and fireLong
+    label.new(bar_index, low, "🟢 BUY CALL\n" + entryReason + "\n$" + str.tostring(close, "#.##") + "\nSL $" + str.tostring(stopPrice, "#.##") + " · TP $" + str.tostring(targetPrice, "#.##"), style=label.style_label_up, color=color.new(#00C853, 0), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+
+if showLabels and fireShort
+    label.new(bar_index, high, "🔴 BUY PUT\n" + entryReason + "\n$" + str.tostring(close, "#.##") + "\nSL $" + str.tostring(stopPrice, "#.##") + " · TP $" + str.tostring(targetPrice, "#.##"), style=label.style_label_down, color=color.new(#D50000, 0), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
+if showLabels and just_closed_long
+    pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    label.new(bar_index, high, "🚪 EXIT\n" + (pnl > 0 ? "+$" : "-$") + str.tostring(math.abs(pnl), "#.##"), style=label.style_label_down, color=pnl > 0 ? color.new(#00C853, 0) : color.new(#D50000, 0), textcolor=color.white, size=size.small, yloc=yloc.abovebar)
+
+if showLabels and just_closed_short
+    pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    label.new(bar_index, low, "🚪 EXIT\n" + (pnl > 0 ? "+$" : "-$") + str.tostring(math.abs(pnl), "#.##"), style=label.style_label_up, color=pnl > 0 ? color.new(#00C853, 0) : color.new(#D50000, 0), textcolor=color.white, size=size.small, yloc=yloc.belowbar)
+
+// ============================================================
+// COMPACT DASHBOARD
+// ============================================================
+dashPosition = dashPos == "top_left" ? position.top_left : dashPos == "top_right" ? position.top_right : dashPos == "bottom_left" ? position.bottom_left : dashPos == "bottom_right" ? position.bottom_right : position.middle_right
+
+if showStats and barstate.islast
+    var table dash = table.new(dashPosition, 2, 11, bgcolor=color.new(#0D1117, 5), border_width=0, frame_color=color.new(#21262D, 0), frame_width=1)
+    
+    cTextLight = #C9D1D9
+    cTextDim = #8B949E
+    cBgRow = color.new(#161B22, 0)
+    cBgRowAlt = color.new(#0D1117, 0)
+    cAccent = #58A6FF
+    cGreen = #3FB950
+    cRed = #F85149
+    cYellow = #D29922
+    
+    closed_trades = strategy.closedtrades
+    wins_n = strategy.wintrades
+    losses_n = strategy.losstrades
+    wr = closed_trades == 0 ? 0.0 : (wins_n / closed_trades) * 100
+    pf = strategy.grossloss == 0 ? 0.0 : strategy.grossprofit / strategy.grossloss
+    
+    stateStr = trendUp ? "▲ UP" : trendDown ? "▼ DOWN" : isRanging ? "↔ RANGE" : "—"
+    stateCol = trendUp ? cGreen : trendDown ? cRed : isRanging ? cAccent : cTextDim
+    
+    locStr = atLevel ? activeLevel() : aboveVA ? "above VA" : belowVA ? "below VA" : inValueArea ? "in VA" : "—"
+    locCol = atLevel ? cYellow : (aboveVA or belowVA) ? cAccent : cTextDim
+    
+    whaleStr = aggressiveBuy ? "▲ T" + str.tostring(buy_tier) : aggressiveSell ? "▼ T" + str.tostring(sell_tier) : buy_tier > 0 ? "buy t" + str.tostring(buy_tier) : sell_tier > 0 ? "sell t" + str.tostring(sell_tier) : "—"
+    whaleCol = aggressiveBuy ? cGreen : aggressiveSell ? cRed : cTextDim
+    
+    verdict = strategy.position_size > 0 ? "🟢 IN CALL" : strategy.position_size < 0 ? "🔴 IN PUT" : fireLong ? "🟢 BUY CALL" : fireShort ? "🔴 BUY PUT" : (atLevel and isTrending) ? "👀 watch" : "wait"
+    verdictCol = strategy.position_size > 0 or fireLong ? cGreen : strategy.position_size < 0 or fireShort ? cRed : atLevel ? cYellow : cTextDim
+    verdictBg = strategy.position_size > 0 or fireLong ? color.new(cGreen, 80) : strategy.position_size < 0 or fireShort ? color.new(cRed, 80) : cBgRow
+    
+    pocStr = profileReady ? "$" + str.tostring(poc, "#.##") : "—"
+    
+    table.cell(dash, 0, 0, "FABIO·🐋·VRVP", text_color=cAccent, bgcolor=cBgRow, text_size=size.small)
+    table.cell(dash, 1, 0, syminfo.ticker, text_color=cTextLight, bgcolor=cBgRow, text_size=size.small)
+    table.cell(dash, 0, 1, "①", text_color=cTextDim, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 1, 1, stateStr, text_color=stateCol, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 0, 2, "②", text_color=cTextDim, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 1, 2, locStr, text_color=locCol, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 0, 3, "③", text_color=cTextDim, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 1, 3, whaleStr, text_color=whaleCol, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 0, 4, "→", text_color=verdictCol, bgcolor=verdictBg, text_size=size.small)
+    table.cell(dash, 1, 4, verdict, text_color=verdictCol, bgcolor=verdictBg, text_size=size.small)
+    table.cell(dash, 0, 5, "POC", text_color=cTextDim, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 1, 5, pocStr, text_color=cYellow, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 0, 6, "VA", text_color=cTextDim, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 1, 6, profileReady ? "$" + str.tostring(val_, "#.##") + "-" + str.tostring(vah, "#.##") : "—", text_color=cTextLight, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 0, 7, "Trades", text_color=cTextDim, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 1, 7, str.tostring(closed_trades), text_color=cTextLight, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 0, 8, "Win", text_color=cTextDim, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 1, 8, str.tostring(wr, "#") + "%", text_color=wr >= 50 ? cGreen : cRed, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 0, 9, "PF", text_color=cTextDim, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 1, 9, str.tostring(pf, "#.##"), text_color=pf >= 1.5 ? cGreen : pf >= 1.0 ? cYellow : cRed, bgcolor=cBgRow, text_size=size.tiny)
+    table.cell(dash, 0, 10, "P&L", text_color=cTextDim, bgcolor=cBgRowAlt, text_size=size.tiny)
+    table.cell(dash, 1, 10, "$" + str.tostring(strategy.netprofit, "#"), text_color=strategy.netprofit > 0 ? cGreen : cRed, bgcolor=cBgRowAlt, text_size=size.tiny)
+
+// ============================================================
+// ALERTS
+// ============================================================
+alertcondition(fireLong, "🟢 BUY CALL", "BUY CALL on {{ticker}} @ {{close}}")
+alertcondition(fireShort, "🔴 BUY PUT", "BUY PUT on {{ticker}} @ {{close}}")
+alertcondition(just_closed_long, "🚪 EXIT CALL", "EXIT CALL on {{ticker}} @ {{close}}")
+alertcondition(just_closed_short, "🚪 EXIT PUT", "EXIT PUT on {{ticker}} @ {{close}}")

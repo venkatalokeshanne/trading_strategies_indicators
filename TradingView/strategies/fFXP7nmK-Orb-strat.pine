@@ -1,0 +1,316 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+
+// With NY Opening Bell Scalp + EMA/VOL Filters - micky v1.0
+
+strategy("Nils Version", overlay = true,
+     margin_long = 100, margin_short = 100,
+     default_qty_value = 2,
+     calc_on_every_tick = false)
+
+// ─────────────────────────────────────────────
+//  GROUPS
+// ─────────────────────────────────────────────
+groupEntry     = "Entry Settings"
+groupAnti      = "Anti Fakeout"
+groupRisk      = "Risk Management"
+groupTrail     = "Trailing Stop"
+groupReentry   = "Re-Entry"
+groupVisual    = "Visuals"
+groupDashboard = "Dashboard"
+
+// ─────────────────────────────────────────────
+//  INPUTS
+// ─────────────────────────────────────────────
+// Entry
+rangeDurationInput = input.int(15,   "Opening Range (min)",    minval = 1, maxval = 60,  group = groupEntry)
+entryWindowInput   = input.session("0930-1100", "Trade Window",                          group = groupEntry)
+sessionEndInput    = input.session("1100-1105", "Session Exit",                          group = groupEntry)
+timezoneInput      = input.string("America/New_York", "Timezone",                        group = groupEntry)
+rrInput            = input.float(2.0, "Risk/Reward Ratio",     minval = 0.1, step = 0.1, group = groupEntry)
+
+// Risk Management
+stopLossType       = input.string("Mid Range", "Stop Loss Placement", options=["Full Range", "Mid Range", "Tight (ATR)"], group=groupRisk, 
+     tooltip="Full Range: Stop at opposite OR. Mid Range: Stop at 50% of OR. Tight: 1.5x ATR from entry.")
+
+// Anti Fakeout
+useCloseConfirm    = input.bool(true,  "Close Confirmation (candle must CLOSE beyond range)", group = groupAnti,
+     tooltip = "Waits for the 15m candle to fully close above/below the OR level instead of reacting mid-candle. Major fakeout filter for NQ.")
+useAdxFilter       = input.bool(true,  "ADX Trend Filter (min strength)", group = groupAnti,
+     tooltip = "Only trade when the market is trending. ADX > threshold filters choppy/ranging sessions.")
+adxThreshold       = input.int(20,    "ADX Threshold",          minval = 10, maxval = 50, group = groupAnti,
+     tooltip = "Recommended 18-22 for NQ 15M. Higher = fewer but higher quality trades.")
+adxRisingOnly      = input.bool(false, "Require Rising ADX",    group = groupAnti)
+adxLen             = input.int(14,    "ADX Length",             minval = 5,  maxval = 30, group = groupAnti)
+useRsiFilter       = input.bool(true,  "RSI Filter (Avoid Overextended)", group = groupAnti, 
+     tooltip = "Blocks entries if RSI is already over 70 (long) or under 30 (short).")
+useTrendFilter     = input.bool(true,  "EMA 200 Trend Filter",                            group = groupAnti)
+useTrendFilterMicro= input.bool(true,  "EMA 50 Micro Trend Filter",                       group = groupAnti)
+useVolumeFilter    = input.bool(true,  "Volume Filter (> 20 SMA)",                        group = groupAnti,
+     tooltip = "Breakout candle volume must exceed the 20-period average.")
+useVwapFilter      = input.bool(false, "VWAP Bias Filter",                                group = groupAnti)
+
+// Trailing Stop
+useTrailing        = input.bool(true,  "Enable Trailing Stop",   group = groupTrail)
+trailActivateR     = input.float(1.0,  "Activate after R:",      minval = 0.1, step = 0.1, group = groupTrail,
+     tooltip = "Trail kicks in once price moves this many R in your favour.")
+trailAtrMult       = input.float(1.5,  "Trail distance (× ATR)", minval = 0.1, step = 0.1, group = groupTrail)
+atrLen             = input.int(14,    "ATR Length",              minval = 1,               group = groupTrail)
+
+// Re-Entry
+useReentry         = input.bool(true,  "Enable Re-Entry",        group = groupReentry,
+     tooltip = "If price pulls back into the range and breaks out again, allows a second trade.")
+maxTradesPerDay    = input.int(2,      "Max Trades per Day",     minval = 1, maxval = 3,   group = groupReentry)
+
+// Visuals
+bullColorInput     = input.color(#089981, "Bullish Color", group = groupVisual)
+bearColorInput     = input.color(#f23645, "Bearish Color", group = groupVisual)
+showRangeInput     = input.bool(true,  "Show Opening Range Box", group = groupVisual)
+showEmaInput       = input.bool(true,  "Show 200 EMA",           group = groupVisual)
+showVwapInput      = input.bool(true,  "Show VWAP",              group = groupVisual)
+showAdxInput       = input.bool(false, "Show ADX (separate pane)",group = groupVisual)
+showDashboard      = input.bool(true,  "Show Dashboard",         group = groupDashboard)
+
+// ─────────────────────────────────────────────
+//  ALIASES
+// ─────────────────────────────────────────────
+bullColor = bullColorInput
+bearColor = bearColorInput
+
+// ─────────────────────────────────────────────
+//  TIME LOGIC
+// ─────────────────────────────────────────────
+nyYear  = year(time,  timezoneInput)
+nyMonth = month(time, timezoneInput)
+nyDay   = dayofmonth(time, timezoneInput)
+
+rangeStart = timestamp(timezoneInput, nyYear, nyMonth, nyDay, 9, 30)
+rangeEnd   = rangeStart + (rangeDurationInput * 60 * 1000)
+
+isOpeningRange = time >= rangeStart and time < rangeEnd
+isStartOfRange = isOpeningRange and not (time[1] >= rangeStart and time[1] < rangeEnd)
+inEntryWindow  = not na(time(timeframe.period, entryWindowInput, timezoneInput))
+isEndOfDay     = not na(time(timeframe.period, sessionEndInput,  timezoneInput))
+
+// ─────────────────────────────────────────────
+//  DAILY RESET & OR CAPTURE
+// ─────────────────────────────────────────────
+var float orHigh      = na
+var float orLow       = na
+var bool  rangeSet    = false
+var int   tradesCount = 0   // re-entry counter
+
+newDay = ta.change(time("D", "", timezoneInput)) != 0
+
+if newDay
+    orHigh      := na
+    orLow       := na
+    rangeSet    := false
+    tradesCount := 0
+
+if isStartOfRange
+    orHigh      := high
+    orLow       := low
+    rangeSet    := false
+    tradesCount := 0
+
+if isOpeningRange
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow,  low)
+else if time >= rangeEnd and not na(orHigh)
+    rangeSet := true
+
+// ─────────────────────────────────────────────
+//  INDICATORS
+// ─────────────────────────────────────────────
+ema200  = ta.ema(close, 200)
+ema50   = ta.ema(close, 50)
+avgVol  = ta.sma(volume, 20)
+vwapVal = ta.vwap(hlc3)
+atrVal  = ta.atr(atrLen)
+rsiVal  = ta.rsi(close, 14)
+
+// ADX calculation (manual — Pine v6 compatible)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+adxRising = adxVal > adxVal[1]
+
+// ─────────────────────────────────────────────
+//  FILTERS
+// ─────────────────────────────────────────────
+adxOk             = not useAdxFilter    or (adxVal > adxThreshold and (not adxRisingOnly or adxRising))
+volConfirm        = not useVolumeFilter or volume  > avgVol
+trendConfirmLong  = (not useTrendFilter or close > ema200) and (not useTrendFilterMicro or close > ema50)
+trendConfirmShort = (not useTrendFilter or close < ema200) and (not useTrendFilterMicro or close < ema50)
+vwapConfirmLong   = not useVwapFilter   or close   > vwapVal
+vwapConfirmShort  = not useVwapFilter   or close   < vwapVal
+rsiOkLong         = not useRsiFilter    or rsiVal  < 70
+rsiOkShort        = not useRsiFilter    or rsiVal  > 30
+midRange          = (orHigh + orLow) / 2
+
+// ─────────────────────────────────────────────
+//  BREAKOUT SIGNALS
+//  useCloseConfirm → require full candle close beyond level
+//  else            → classic intracandle crossover
+// ─────────────────────────────────────────────
+longSignal  = useCloseConfirm ? (close > orHigh and close[1] <= orHigh) : ta.crossover( close, orHigh)
+shortSignal = useCloseConfirm ? (close < orLow  and close[1] >= orLow)  : ta.crossunder(close, orLow)
+
+// ─────────────────────────────────────────────
+//  TRAILING STOP PARAMETERS
+// ─────────────────────────────────────────────
+// When trailing is enabled, strategy.exit uses trail_points + trail_offset
+// We compute in price distance using ATR
+trailOffsetPrice = trailAtrMult * atrVal
+
+// ─────────────────────────────────────────────
+//  ENTRY CONDITIONS
+// ─────────────────────────────────────────────
+canEnter = inEntryWindow and rangeSet and not isOpeningRange
+         and strategy.position_size == 0
+         and tradesCount < maxTradesPerDay
+
+if canEnter
+    longStop  = close * 0.995      // 0.5% Stop Loss unter Entry
+    shortStop = close * 1.005      // 0.5% Stop Loss über Entry
+    
+    longRisk  = close * 0.005      // 0.5% Risk
+    shortRisk = close * 0.005
+
+    if longSignal and volConfirm and adxOk and trendConfirmLong and vwapConfirmLong and rsiOkLong
+        strategy.entry("Long", strategy.long, comment = "ORB Long ▲")
+        if useTrailing
+            strategy.exit("Exit Long", "Long",
+                 stop          = longStop,
+                 limit         = close + longRisk * rrInput,
+                 trail_price   = close + longRisk * trailActivateR,
+                 trail_offset  = trailOffsetPrice / syminfo.mintick,
+                 comment_loss  = "SL ✗",
+                 comment_profit = "TP ✓")
+        else
+            strategy.exit("Exit Long", "Long",
+                 stop          = longStop,
+                 limit         = close + longRisk * rrInput,
+                 comment_loss  = "SL ✗",
+                 comment_profit = "TP ✓")
+        tradesCount += 1
+
+    if shortSignal and volConfirm and adxOk and trendConfirmShort and vwapConfirmShort and rsiOkShort
+        strategy.entry("Short", strategy.short, comment = "ORB Short ▼")
+        if useTrailing
+            strategy.exit("Exit Short", "Short",
+                 stop          = shortStop,
+                 limit         = close - shortRisk * rrInput,
+                 trail_price   = close - shortRisk * trailActivateR,
+                 trail_offset  = trailOffsetPrice / syminfo.mintick,
+                 comment_loss  = "SL ✗",
+                 comment_profit = "TP ✓")
+        else
+            strategy.exit("Exit Short", "Short",
+                 stop          = shortStop,
+                 limit         = close - shortRisk * rrInput,
+                 comment_loss  = "SL ✗",
+                 comment_profit = "TP ✓")
+        tradesCount += 1
+
+// ─────────────────────────────────────────────
+//  SESSION END CLEANUP
+// ─────────────────────────────────────────────
+if isEndOfDay and strategy.position_size != 0
+    strategy.close_all(comment = "EOD ⏱")
+
+// ─────────────────────────────────────────────
+//  VISUALS — OPENING RANGE BOX
+// ─────────────────────────────────────────────
+var box rangeBox = na
+
+if isOpeningRange and showRangeInput
+    if isStartOfRange
+        rangeBox := box.new(bar_index, orHigh, bar_index, orLow,
+             bgcolor      = color.new(chart.fg_color, 88),
+             border_color = chart.fg_color,
+             border_style = line.style_dashed,
+             border_width = 1)
+    else
+        box.set_top(rangeBox,    orHigh)
+        box.set_bottom(rangeBox, orLow)
+        box.set_right(rangeBox,  bar_index)
+
+// ─────────────────────────────────────────────
+//  VISUALS — LEVEL PLOTS
+// ─────────────────────────────────────────────
+plot(rangeSet ? orHigh : na, "OR High", color.new(bullColor, 15), 2, plot.style_linebr)
+plot(rangeSet ? orLow  : na, "OR Low",  color.new(bearColor, 15), 2, plot.style_linebr)
+plot(showEmaInput  ? ema200  : na, "EMA 200", color.new(color.gray,   50), 1)
+plot(showVwapInput ? vwapVal : na, "VWAP",    color.new(color.purple, 40), 1)
+plot(showAdxInput  ? adxVal  : na, "ADX",     color.new(color.orange, 20), 1, display = display.pane)
+
+// ADX threshold reference line
+hline(useAdxFilter and showAdxInput ? adxThreshold : na, "ADX Threshold",
+     color = color.new(color.orange, 60), linestyle = hline.style_dashed)
+
+// ─────────────────────────────────────────────
+//  VISUALS — BACKGROUNDS
+// ─────────────────────────────────────────────
+bgcolor(isOpeningRange                       ? color.new(chart.fg_color, 90) : na, title = "Opening Range Highlight")
+bgcolor(inEntryWindow and not isOpeningRange ? color.new(chart.fg_color, 96) : na, title = "Trade Window")
+
+// ─────────────────────────────────────────────
+//  DASHBOARD
+// ─────────────────────────────────────────────
+if showDashboard and barstate.islast
+    var table t = table.new(
+         position.top_right, 2, 7,
+         bgcolor      = color.new(chart.bg_color, 5),
+         border_width = 1,
+         border_color = color.new(chart.fg_color, 60),
+         frame_width  = 1,
+         frame_color  = chart.fg_color)
+
+    wr     = strategy.wintrades / math.max(strategy.closedtrades, 1) * 100
+    pf     = strategy.grossprofit / math.max(math.abs(strategy.grossloss), 1)
+    netPnl = strategy.netprofit
+    avgW   = strategy.grossprofit  / math.max(strategy.wintrades,  1)
+    avgL   = strategy.grossloss    / math.max(strategy.losstrades, 1)
+
+    // Row 0 — Header
+    table.cell(t, 0, 0, "Nils Strategy",
+         text_color = color.white, text_size = size.small,
+         bgcolor    = color.new(color.teal, 20))
+    table.cell(t, 1, 0, "NQ · 15M",
+         text_color = color.white, text_size = size.small,
+         bgcolor    = color.new(color.teal, 20))
+
+    // Row 1 — Win Rate
+    table.cell(t, 0, 1, "Win Rate",       text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 1, str.format("{0,number,#.##}%", wr),
+         text_color = wr >= 55 ? bullColor : wr >= 45 ? color.orange : bearColor,
+         text_size  = size.small)
+
+    // Row 2 — Profit Factor
+    table.cell(t, 0, 2, "Profit Factor",  text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 2, str.format("{0,number,#.##}", pf),
+         text_color = pf >= 1.5 ? bullColor : pf >= 1 ? color.orange : bearColor,
+         text_size  = size.small)
+
+    // Row 3 — Net P&L
+    table.cell(t, 0, 3, "Net P&L",        text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 3, str.format("${0,number,#}", netPnl),
+         text_color = netPnl >= 0 ? bullColor : bearColor,
+         text_size  = size.small)
+
+    // Row 4 — Avg Win / Avg Loss
+    table.cell(t, 0, 4, "Avg W / L",      text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 4, str.format("{0,number,#} / {1,number,#}", avgW, math.abs(avgL)),
+         text_color = chart.fg_color, text_size = size.small)
+
+    // Row 5 — Daily Bias
+    table.cell(t, 0, 5, "Daily Bias",     text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 5, close > vwapVal ? "BULLISH ▲" : "BEARISH ▼",
+         text_color = close > vwapVal ? bullColor : bearColor,
+         text_size  = size.small)
+
+    // Row 6 — ADX
+    table.cell(t, 0, 6, "ADX",            text_color = chart.fg_color, text_size = size.small)
+    table.cell(t, 1, 6, str.format("{0,number,#.#}  {1}", adxVal, adxVal > adxThreshold ? "✓ Trending" : "✗ Choppy"),
+         text_color = adxVal > adxThreshold ? bullColor : color.orange,
+         text_size  = size.small)

@@ -1,0 +1,983 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// (c) FlipOnDip
+
+//@version=6
+// Rolling VWAP over a moving window plus a per-session volume profile.
+// The VWAP is not anchored, so it never jumps at the session open.
+//
+// Two horizons:
+//   Micro - daily profiles, week-long VWAP window, tuned for day trading
+//   Macro - weekly profiles, fortnight-long VWAP window, tuned for position work
+//
+// Works on anything with candles. Session length is measured off the chart
+// rather than assumed, so exchange hours, the gold break and 24/7 crypto all
+// land on the right boundaries without a setting. Where a ticker has no real
+// volume, as with most spot gold and FX feeds, the panel says so and the
+// profile degrades into a time-at-price histogram instead of lying quietly.
+//
+// Notes for anyone reading the source:
+//   * everything expensive stays inside a window near the right edge. old bars
+//     cost two comparisons and produce no drawing objects
+//   * boxes and lines are pooled. sessions rotate through slots, so the oldest
+//     profile is overwritten rather than deleted. delete/new on redraw is what
+//     makes profile scripts stutter
+//   * the VWAP sums live in a ring buffer, one add and one evict per sample
+//   * samples come from the chart bars by default, or from a fixed step so the
+//     same line appears on every timeframe. see the VWAP step setting
+//   * the developing session redraws on a wall clock minute, not per tick
+//   * every loop over a collection is written `if size > 0` first. pine picks
+//     the loop direction from its bounds, so `0 to size - 1` on an empty array
+//     counts down into index -1 instead of skipping
+//
+// With the step off, cost scales with the number of bars inside the window, so
+// a higher chart timeframe is always cheaper. With the step on, cost is fixed
+// by the step instead: lighter below it, heavier above it.
+indicator("Rolling VWAP + Volume Profile by Flip On Dip", "RVWVP FOD", overlay = true,
+     max_boxes_count = 500, max_lines_count = 60, max_labels_count = 20)
+
+
+//------------------------------------------------------------------ inputs ---
+gH = "Horizon"
+mode   = input.string("Micro", "Horizon", options = ["Micro", "Macro"], group = gH,
+     tooltip = "Micro builds one volume profile per day and averages the VWAP over about a week. Use it for intraday work.\n\nMacro builds one profile per week and averages the VWAP over about a fortnight, drawn across a longer stretch of history. Use it for position work.\n\nEach horizon stores its own settings, so switching back and forth never loses your tuning.")
+hintOn = input.bool(true, "Show horizon hint in the panel", group = gH)
+
+gT = "Theme"
+theme = input.string("Default", "Colour preset", options = ["Default", "Light", "Dark", "Custom"], group = gT,
+     tooltip = "Default is the graphite look. Light is built for white chart backgrounds, Dark for black ones.\n\nPick Custom to unlock every colour and transparency control in the groups below. They are pre-filled with the Default values, so switching to Custom changes nothing until you touch something.")
+
+gMi = "Micro horizon"
+winMicro  = input.int(7,  "VWAP window (days)", minval = 1, maxval = 14, group = gMi,
+     tooltip = "Number of trading sessions the average covers. The window slides with every bar, so unlike a session VWAP this line never resets at the open.\n\nSessions are measured from the chart, so a 6.5 hour stock day, a 23 hour gold day and a 24 hour crypto day all count as one day.\n\nThe chart has to hold at least this much history at its current timeframe. If it cannot, the panel says so and the line waits rather than drawing a half-filled average.")
+histMicro = input.int(30, "VWAP history (days)", minval = 1, maxval = 365, group = gMi,
+     tooltip = "How far back the line is drawn. Nothing is calculated outside this window, so shortening it is the single cheapest way to lighten a busy chart.")
+stepMicro = input.string("Chart", "VWAP step", options = ["Chart", "1", "3", "5", "15", "30", "60"], group = gMi,
+     tooltip = "Candle size the average is built from.\n\nChart uses whatever bars you are looking at, which means the line differs slightly between timeframes: a 15m bar contributes one price weighted by fifteen minutes of volume, where 1m bars contribute fifteen separate points.\n\nSet a fixed step and the line becomes identical on every timeframe. Below the step the script folds chart bars into step-sized candles, which is also faster than the default. Above the step it requests intrabar data, which is slower to load.")
+sessMicro = input.int(7, "Profile sessions", minval = 1, maxval = 10, group = gMi, inline = "mi")
+resMicro  = input.string("5", "step", options = ["1", "3", "5", "15", "30", "60"], group = gMi, inline = "mi",
+     tooltip = "Left: how many past days get their own profile. Right: the candle size each profile is built from.\n\nThis step is already independent of your chart timeframe. The same 5m profile is produced whether you view it on a 1m or a 1h chart.")
+
+gMa = "Macro horizon"
+winMacro  = input.int(14, "VWAP window (days)", minval = 7, maxval = 90, group = gMa,
+     tooltip = "Calendar days, not weeks. 14 is a fortnight, 30 is roughly a month.\n\nOn low chart timeframes a long window needs a lot of history. If the chart cannot supply it, the panel will tell you and suggest a higher timeframe.")
+histMacro = input.int(90, "VWAP history (days)", minval = 7, maxval = 730, group = gMa,
+     tooltip = "How far back the line is drawn. 90 days is about three months.")
+stepMacro = input.string("Chart", "VWAP step", options = ["Chart", "15", "30", "60", "240", "D"], group = gMa,
+     tooltip = "Candle size the average is built from. Chart uses the bars you are looking at, a fixed step makes the line identical across timeframes.\n\nKeep this coarse on Macro. A 90 day history at a 5m step is tens of thousands of samples, where 60m keeps it in the low thousands for the same picture.")
+sessMacro = input.int(8, "Profile sessions", minval = 1, maxval = 10, group = gMa, inline = "ma")
+resMacro  = input.string("60", "step", options = ["15", "30", "60", "240", "D"], group = gMa, inline = "ma",
+     tooltip = "Left: how many past weeks get their own profile. Right: the candle size each profile is built from.\n\nA week of 5m candles is over 2000 buckets, which is why the options start at 15m here. 60m is a good balance for most symbols.")
+
+gC = "VWAP - Calculation"
+srcMode  = input.string("hlc3", "Price source", options = ["hlc3", "ohlc4", "hl2", "close"], group = gC,
+     tooltip = "hlc3 is the usual choice for VWAP and matches how most desks quote it. Close tracks settlement prints more tightly.\n\nThe same formula is applied to folded candles when a VWAP step is set, so the source stays meaningful whichever step you pick.")
+noVolFix = input.bool(true, "Substitute volume = 1 when unavailable", group = gC,
+     tooltip = "Spot gold, most FX feeds, indices and many CFDs report no volume at all. With this on the VWAP degrades into a plain unweighted average and the profile counts time spent at each price, which is still a usable map of where the market lingered.\n\nTurn it off if you would rather see nothing than see an unweighted line. Either way the panel tells you which ticker is affected.")
+
+gS = "VWAP - Style"
+vwShow    = input.bool(true, "Show VWAP line", group = gS)
+vwMode    = input.string("Static", "Color mode", options = ["Static", "Gradient by z-score"], group = gS,
+     tooltip = "Gradient tints the line by how many standard deviations price sits from the mean, so stretched conditions are visible without reading the bands.")
+uVwap     = input.color(#9aa1ab, "Line color", group = gS, inline = "vw")
+uVwTr     = input.int(45, "Transp", minval = 0, maxval = 95, group = gS, inline = "vw")
+vwWidth   = input.int(2, "Line width", minval = 1, maxval = 6, group = gS)
+uUp       = input.color(#cfd4dc, "Gradient high", group = gS, inline = "gr")
+uDn       = input.color(#565c66, "Low", group = gS, inline = "gr")
+glowOn    = input.bool(true, "Glow", group = gS, inline = "fx")
+shadowOn  = input.bool(false, "3D shadow", group = gS, inline = "fx")
+shadowAmt = input.float(0.25, "Shadow offset (x sigma)", minval = 0.0, maxval = 1.0, step = 0.05, group = gS,
+     tooltip = "Drop distance of the shadow, measured in standard deviations so it scales with the instrument instead of being a fixed number of ticks.")
+labelsOn  = input.bool(false, "Price labels on last bar", group = gS)
+
+gB = "Deviation Bands"
+b1On     = input.bool(true, "Band 1", group = gB, inline = "b1")
+dev1     = input.float(1.0, "x sigma", minval = 0.1, maxval = 10, step = 0.1, group = gB, inline = "b1")
+b2On     = input.bool(true, "Band 2", group = gB, inline = "b2")
+dev2     = input.float(2.0, "x sigma", minval = 0.1, maxval = 10, step = 0.1, group = gB, inline = "b2",
+     tooltip = "Bands sit at multiples of the volume weighted standard deviation, so they widen when heavy volume trades away from the mean rather than simply tracking range.\n\nOn a ticker without volume they fall back to an unweighted deviation, which still frames the range but no longer says anything about size.")
+uBand    = input.color(#9aa1ab, "Band color", group = gB, inline = "bc")
+uBandTr  = input.int(72, "Transp", minval = 0, maxval = 99, group = gB, inline = "bc")
+bandW    = input.int(1, "Band width", minval = 1, maxval = 4, group = gB)
+fillMode = input.string("Outer", "Zone fill", options = ["Off", "Inner", "Outer"], group = gB,
+     tooltip = "Inner shades from the VWAP out to band 1, Outer shades all the way to band 2. The gradient is densest at the mean and fades to nothing at the edge.")
+uFillUp  = input.color(#7c828c, "Fill above", group = gB, inline = "fl")
+uFillDn  = input.color(#3d434b, "Below", group = gB, inline = "fl")
+uFillTr  = input.int(86, "Fill transparency", minval = 50, maxval = 99, group = gB)
+
+gV = "Volume Profile - Calculation"
+vpOn      = input.bool(true, "Enable volume profile", group = gV)
+vpRows    = input.int(24, "Rows per session", minval = 6, maxval = 60, group = gV,
+     tooltip = "TradingView allows a script 500 boxes in total. This value is clamped internally so the profiles never run out of room, and the panel tells you when clamping happens. Fewer sessions, or turning off the 3D shadow, frees up rows.")
+vpVA      = input.float(70, "Value area %", minval = 30, maxval = 95, step = 5, group = gV,
+     tooltip = "Share of session volume inside the value area. 70 percent is the market profile convention.")
+vpLive    = input.bool(true, "Show developing session", group = gV,
+     tooltip = "Draws the session in progress, rebuilt as it fills. It is shown slightly more transparent than the finished ones so the two never get confused.")
+vpRefresh = input.string("Every 1 min", "Developing session refresh", options = ["Every 1 min", "Every bar close", "Every tick"], group = gV,
+     tooltip = "How often the session in progress is rebuilt. Every 1 min follows a real wall clock and is the recommended setting. Every tick looks marginally smoother and costs far more.")
+
+gP = "Volume Profile - Style"
+vpWidth   = input.float(30, "Width (% of session)", minval = 5, maxval = 100, step = 5, group = gP,
+     tooltip = "Width of the widest row, as a share of the session it belongs to. All profiles use the same scale, so their widths stay comparable.")
+vpSide    = input.string("Right", "Grow direction", options = ["Right", "Left"], group = gP)
+rowGap    = input.float(22, "Row gap %", minval = 0, maxval = 60, step = 2, group = gP,
+     tooltip = "Empty space between rows. Zero gives a solid histogram, higher values give the separated look.")
+uHi       = input.color(#7c828c, "Gradient high", group = gP, inline = "pg")
+uLo       = input.color(#3d434b, "Low", group = gP, inline = "pg")
+uTrIn     = input.int(55, "Transparency inside VA", minval = 0, maxval = 99, group = gP)
+uTrOut    = input.int(80, "Transparency outside VA", minval = 0, maxval = 99, group = gP)
+trLive    = input.int(10, "Extra transparency, developing", minval = 0, maxval = 40, group = gP)
+borderOn  = input.bool(true, "Row border", group = gP, inline = "bd")
+uBorder   = input.color(#ffffff, "", group = gP, inline = "bd")
+uBorderTr = input.int(90, "Transp", minval = 0, maxval = 99, group = gP, inline = "bd")
+vp3d      = input.bool(true, "3D shadow", group = gP, inline = "sh")
+uShadow   = input.color(#000000, "", group = gP, inline = "sh")
+uVp3dTr   = input.int(82, "Transp", minval = 0, maxval = 99, group = gP, inline = "sh",
+     tooltip = "Offset copy of every row, drawn behind it. Costs one extra box per row, so switching it off doubles the rows available.")
+vp3dDep   = input.float(0.16, "Shadow depth (x row)", minval = 0.0, maxval = 0.6, step = 0.02, group = gP)
+pocHl     = input.bool(true, "Highlight POC row", group = gP)
+pocOn     = input.bool(true, "POC line", group = gP, inline = "poc")
+uPoc      = input.color(#cfd4dc, "", group = gP, inline = "poc")
+uPocTr    = input.int(35, "Transp", minval = 0, maxval = 99, group = gP, inline = "poc")
+pocW      = input.int(1, "POC width", minval = 1, maxval = 4, group = gP)
+pocSty    = input.string("Solid", "POC style", options = ["Solid", "Dashed", "Dotted"], group = gP)
+pocExt    = input.bool(false, "Extend POC lines to current bar", group = gP,
+     tooltip = "Stretches every past point of control forward. Useful for spotting untouched levels, busy on charts with many sessions.")
+vaOn      = input.bool(false, "VAH / VAL lines", group = gP, inline = "va")
+uVa       = input.color(#8b919b, "", group = gP, inline = "va")
+uVaTr     = input.int(55, "Transp", minval = 0, maxval = 99, group = gP, inline = "va")
+vaSty     = input.string("Dotted", "VAH / VAL style", options = ["Solid", "Dashed", "Dotted"], group = gP)
+
+gI = "Info Panel"
+hudOn   = input.bool(true, "Show info panel", group = gI)
+notesOn = input.bool(true, "Show warnings and tips", group = gI,
+     tooltip = "Adds a diagnostics block to the panel: whether this ticker actually reports traded volume, what is limiting the drawing, what is loading slowly and what to change.\n\nLeave this on until the indicator is set up the way you like it. It is the fastest way to find out why something looks wrong.")
+hudPos  = input.string("Top right", "Position", options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = gI)
+hudSz   = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal", "Large"], group = gI)
+uHudBg  = input.color(#0d0f12, "Background", group = gI, inline = "hb")
+uHudTr  = input.int(25, "Transp", minval = 0, maxval = 100, group = gI, inline = "hb")
+uHudTx  = input.color(#ffffff, "Text color", group = gI)
+uWarn   = input.color(#d0705f, "Warning", group = gI, inline = "wn")
+uNote   = input.color(#b99760, "Tip", group = gI, inline = "wn")
+
+
+//----------------------------------------------------------------- palette ---
+// A preset overwrites every colour and transparency below it. "Custom" hands
+// control back to the pickers, which hold the Default values already, so the
+// switch is visually a no-op until something is changed.
+cVwap    = uVwap
+vwTr     = uVwTr
+cUp      = uUp
+cDn      = uDn
+cBand    = uBand
+bandTr   = uBandTr
+cFillUp  = uFillUp
+cFillDn  = uFillDn
+fillTr   = uFillTr
+cHi      = uHi
+cLo      = uLo
+trIn     = uTrIn
+trOut    = uTrOut
+cBorder  = uBorder
+borderTr = uBorderTr
+cShadow  = uShadow
+vp3dTr   = uVp3dTr
+cPoc     = uPoc
+pocTr    = uPocTr
+cVa      = uVa
+vaTr     = uVaTr
+hudBg    = uHudBg
+hudTr    = uHudTr
+hudTx    = uHudTx
+cWarn    = uWarn
+cNote    = uNote
+
+if theme == "Default"
+    cVwap    := #9aa1ab
+    vwTr     := 45
+    cUp      := #cfd4dc
+    cDn      := #565c66
+    cBand    := #9aa1ab
+    bandTr   := 72
+    cFillUp  := #7c828c
+    cFillDn  := #3d434b
+    fillTr   := 86
+    cHi      := #7c828c
+    cLo      := #3d434b
+    trIn     := 55
+    trOut    := 80
+    cBorder  := #ffffff
+    borderTr := 90
+    cShadow  := #000000
+    vp3dTr   := 82
+    cPoc     := #cfd4dc
+    pocTr    := 35
+    cVa      := #8b919b
+    vaTr     := 55
+    hudBg    := #0d0f12
+    hudTr    := 25
+    hudTx    := #ffffff
+    cWarn    := #d0705f
+    cNote    := #b99760
+else if theme == "Light"
+    cVwap    := #3f4650
+    vwTr     := 20
+    cUp      := #10151b
+    cDn      := #7d848f
+    cBand    := #5b626c
+    bandTr   := 60
+    cFillUp  := #6e757f
+    cFillDn  := #aab0b9
+    fillTr   := 88
+    cHi      := #4a5158
+    cLo      := #b4bac2
+    trIn     := 45
+    trOut    := 76
+    cBorder  := #000000
+    borderTr := 88
+    cShadow  := #000000
+    vp3dTr   := 88
+    cPoc     := #12171d
+    pocTr    := 25
+    cVa      := #5b626c
+    vaTr     := 45
+    hudBg    := #ffffff
+    hudTr    := 8
+    hudTx    := #10151b
+    cWarn    := #a8412f
+    cNote    := #7d5f22
+else if theme == "Dark"
+    cVwap    := #e3e8ef
+    vwTr     := 22
+    cUp      := #ffffff
+    cDn      := #8b929d
+    cBand    := #c6ccd6
+    bandTr   := 62
+    cFillUp  := #aeb5c0
+    cFillDn  := #454b55
+    fillTr   := 84
+    cHi      := #c6ccd6
+    cLo      := #454b55
+    trIn     := 48
+    trOut    := 78
+    cBorder  := #ffffff
+    borderTr := 84
+    cShadow  := #000000
+    vp3dTr   := 70
+    cPoc     := #ffffff
+    pocTr    := 22
+    cVa      := #b7bec9
+    vaTr     := 45
+    hudBg    := #000000
+    hudTr    := 12
+    hudTx    := #ffffff
+    cWarn    := #e8836f
+    cNote    := #d4ab6a
+
+
+// resolve the horizon once, everything below this line is horizon agnostic
+macro    = mode == "Macro"
+winDays  = macro ? winMacro  : winMicro
+histDays = macro ? histMacro : histMicro
+vwStep   = macro ? stepMacro : stepMicro
+vpSess   = macro ? sessMacro : sessMicro
+vpRes    = macro ? resMacro  : resMicro
+
+tfSec   = timeframe.in_seconds()
+resSec  = timeframe.in_seconds(vpRes)
+stepOn  = vwStep != "Chart"
+stepSec = stepOn ? timeframe.in_seconds(vwStep) : tfSec
+layers  = vp3d ? 2 : 1
+slots   = vpSess + 1                                                    // finished sessions + the developing one
+nRows   = math.max(4, math.min(vpRows, int(490.0 / (slots * layers))))  // platform caps a script at 500 boxes
+gapK    = 1.0 - rowGap / 100.0
+
+// three ways to feed the average, decided once
+aggMode = stepOn and tfSec < stepSec      // fold chart bars into step candles
+ltfMode = stepOn and tfSec > stepSec      // pull step candles from below the chart
+
+styleOf(string s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+fmtTf(string t) =>
+    out = t
+    if t == "D"
+        out := "1D"
+    else if t == "W"
+        out := "1W"
+    else if t == "M"
+        out := "1M"
+    else if not str.contains(t, "S")
+        n = str.tonumber(t)
+        if not na(n)
+            k = int(n)
+            out := k >= 60 and k % 60 == 0 ? str.tostring(k / 60) + "h" : str.tostring(k) + "m"
+    out
+
+kfmt(float v) =>
+    v >= 10000 ? str.tostring(math.round(v / 1000)) + "k" : str.tostring(int(v))
+
+// applied to chart bars and to folded candles alike, so the source keeps its
+// meaning whatever the step is
+pickSrc(float o, float h, float l, float c) =>
+    srcMode == "close" ? c : srcMode == "hl2" ? (h + l) / 2 : srcMode == "ohlc4" ? (o + h + l + c) / 4 : (h + l + c) / 3
+
+
+//----------------------------------------------------------- session clock ---
+// Bars per session, measured off the chart instead of assumed. This is what
+// keeps the windows correct on a 6.5 hour stock day, a 23 hour gold day and a
+// 24 hour crypto day alike. The median is used rather than the mean so one
+// half day around a holiday cannot drag the window with it.
+// Each call site keeps its own state, so calling it twice gives two counters.
+sessionBars(bool boundary) =>
+    var int  len   = 0
+    var bool ready = false
+    var array<int> hist = array.new<int>()
+    if boundary
+        if len > 0
+            if ready
+                array.push(hist, len)
+                if array.size(hist) > 6
+                    array.shift(hist)
+            else
+                ready := true                    // first session on screen is usually a partial one
+        len := 0
+    len += 1
+    float mid = na
+    if array.size(hist) > 0
+        mid := array.median(hist)
+    mid
+
+// Period boundaries are stateful, so they are read every bar and never from
+// inside a branch. v6 short circuits and/or, which would otherwise skip them.
+newDay  = timeframe.change("D")
+newWeek = timeframe.change("W")
+newStep = timeframe.change(stepOn ? vwStep : timeframe.period)
+newBkt  = timeframe.change(vpRes)
+
+rawDay  = sessionBars(newDay)
+rawWeek = sessionBars(newWeek)
+
+bpDay  = na(rawDay)  ? 86400.0 / math.max(tfSec, 1)  : rawDay
+bpWeek = na(rawWeek) ? 604800.0 / math.max(tfSec, 1) : rawWeek
+
+sessNew = macro ? newWeek : newDay
+bpSess  = macro ? bpWeek  : bpDay
+
+
+//--------------------------------------------------------- compute windows ---
+age      = last_bar_index - bar_index
+vwapCalc = age <= int((histDays + winDays + 2) * bpDay)   // accumulate, warm-up included
+vwapDraw = age <= int(histDays * bpDay)                   // actually plotted
+vpWin    = age <= int((vpSess + 2) * bpSess)
+
+
+//------------------------------------------------------------ volume feeds ---
+// Spot gold, most FX and index feeds publish nothing here, and forex or CFD
+// tickers that do publish usually count ticks rather than contracts. Both cases
+// change what the profile means, so both get named in the panel.
+var sawVol = false
+if vwapCalc and not na(volume) and volume > 0
+    sawVol := true
+
+volProxy = syminfo.type == "forex" or syminfo.type == "cfd" or syminfo.type == "index" or syminfo.type == "economic"
+volKind  = not sawVol ? "none" : volProxy ? "tick" : "traded"
+
+
+//-------------------------------------------------------------- rolling vwap -
+// Ring buffer of price and volume. Sums are kept incrementally, so a sample
+// costs one add and one evict no matter how wide the window is.
+sampleSec = stepOn ? stepSec : tfSec
+capWant   = int(winDays * 86400.0 / math.max(sampleSec, 1)) + 32
+CAP       = math.max(64, math.min(50000, capWant))
+
+// samples per day at the sampling resolution, derived from measured session
+// length so it holds on part-day markets too
+spd           = stepOn ? bpDay * tfSec / math.max(stepSec, 1) : bpDay
+samplesWanted = math.round(spd * winDays)
+want          = math.max(1, math.min(samplesWanted, CAP))
+
+vol = na(volume) ? (noVolFix ? 1.0 : na) : volume
+src = pickSrc(open, high, low, close)
+
+// keeping the argument legal even when the branch is idle: the engine checks it
+// regardless of the guard, and asking for data above the chart raises RE10066
+vwLtf = ltfMode ? vwStep : timeframe.period
+
+var rP   = array.new<float>(CAP, 0.0)
+var rV   = array.new<float>(CAP, 0.0)
+var head = 0
+var cnt  = 0
+var sV   = 0.0
+var sP   = 0.0
+var sQ   = 0.0
+
+// whatever this bar contributes lands here first: one chart bar, one finished
+// step candle, or a batch of intrabars. one drain loop then handles all three
+var stP = array.new<float>()
+var stV = array.new<float>()
+
+// the step candle being built, when folding
+var fO  = float(na)
+var fH  = float(na)
+var fL  = float(na)
+var fC  = float(na)
+var fV  = 0.0
+var fOn = false
+
+if vwapCalc
+    array.clear(stP)
+    array.clear(stV)
+
+    if ltfMode
+        [iO, iH, iL, iC, iV] = request.security_lower_tf(syminfo.tickerid, vwLtf, [open, high, low, close, volume])
+        // the five series can come back ragged, so trust the shortest of them
+        mv = array.size(iV)
+        m  = math.min(array.size(iC), array.size(iO))
+        m := math.min(m, array.size(iH))
+        m := math.min(m, array.size(iL))
+        if m > 0
+            for i = 0 to m - 1
+                ic = array.get(iC, i)
+                if not na(ic)
+                    float sv = noVolFix ? 1.0 : 0.0
+                    if i < mv
+                        iv = array.get(iV, i)
+                        sv := na(iv) ? (noVolFix ? 1.0 : 0.0) : iv
+                    array.push(stP, pickSrc(array.get(iO, i), array.get(iH, i), array.get(iL, i), ic))
+                    array.push(stV, sv)
+    else if aggMode
+        if fOn and newStep
+            array.push(stP, pickSrc(fO, fH, fL, fC))
+            array.push(stV, fV)
+            fOn := false
+        if not fOn
+            fO  := open
+            fH  := high
+            fL  := low
+            fC  := close
+            fV  := nz(vol, 0.0)
+            fOn := true
+        else
+            fH := math.max(fH, high)
+            fL := math.min(fL, low)
+            fC := close
+            fV += nz(vol, 0.0)
+    else
+        if not na(vol) and not na(src) and vol >= 0
+            array.push(stP, src)
+            array.push(stV, vol)
+
+    ns = math.min(array.size(stP), array.size(stV))
+    if ns > 0
+        for i = 0 to ns - 1
+            while cnt >= want
+                tail = (head - cnt + CAP) % CAP
+                pOld = array.get(rP, tail)
+                vOld = array.get(rV, tail)
+                qOld = pOld * vOld
+                sV -= vOld
+                sP -= qOld
+                sQ -= pOld * qOld
+                cnt -= 1
+            p  = array.get(stP, i)
+            v  = array.get(stV, i)
+            pv = p * v
+            array.set(rP, head, p)
+            array.set(rV, head, v)
+            sV += v
+            sP += pv
+            sQ += p * pv
+            head := head + 1 == CAP ? 0 : head + 1
+            cnt  += 1
+
+// The step candle in progress is folded in without being stored, so the line
+// still moves on every bar instead of stepping once per period.
+liveV = 0.0
+liveP = 0.0
+liveQ = 0.0
+if aggMode and fOn and fV > 0
+    fp    = pickSrc(fO, fH, fL, fC)
+    liveV := fV
+    liveP := fp * fV
+    liveQ := fp * liveP
+
+tV = sV + liveV
+tP = sP + liveP
+tQ = sQ + liveQ
+
+// A rolling average is meaningless until its window is full. Holding the line
+// back is the same convention the built-in moving averages follow.
+vwapReady = cnt >= want
+
+// volume weighted mean, and sigma from the volume weighted variance:
+//   sigma = sqrt( sum(p^2 v) / sum(v) - vwap^2 )
+vwapV  = tV > 0 ? tP / tV : na
+vari   = tV > 0 ? math.max(tQ / tV - vwapV * vwapV, 0.0) : na
+sd     = math.sqrt(vari)
+zScore = sd > 0 ? (close - vwapV) / sd : 0.0
+
+vis = vwapDraw and vwShow and vwapReady
+pVw = vis ? vwapV : na
+pU1 = vis and b1On ? vwapV + sd * dev1 : na
+pL1 = vis and b1On ? vwapV - sd * dev1 : na
+pU2 = vis and b2On ? vwapV + sd * dev2 : na
+pL2 = vis and b2On ? vwapV - sd * dev2 : na
+
+zC    = math.max(math.min(zScore, dev2), -dev2)
+cBase = vwMode == "Static" ? cVwap : color.from_gradient(zC, -dev2, dev2, cDn, cUp)
+cLine = color.new(cBase, vwTr)
+
+
+//--------------------------------------------------- volume profile: input ---
+// Daily profiles need an intraday chart. Weekly profiles are fine on daily too.
+tfOk     = macro ? tfSec <= 86400 : timeframe.isintraday
+vpValid  = vpOn and tfOk
+useLTF   = tfSec > resSec
+vpActive = vpValid and vpWin
+vpLtf    = useLTF ? vpRes : timeframe.period
+
+var cH = array.new<float>()
+var cL = array.new<float>()
+var cV = array.new<float>()
+var cX = array.new<int>()
+
+// Session extremes, taken from what actually lands in the arrays rather than
+// from the chart bars. If a bucket is ever refused the range cannot drift past
+// the data and leave empty rows hanging off the top of the histogram.
+var sHi = float(na)
+var sLo = float(na)
+
+var bkH  = float(na)
+var bkL  = float(na)
+var bkV  = 0.0
+var bkX  = 0
+var bkOn = false
+
+// pools. allocated once, rotated through, never deleted
+var pBox  = array.new<box>()
+var pShad = array.new<box>()
+var pLine = array.new<line>()
+var bins  = array.new<float>(nRows, 0.0)
+
+var slotY  = array.new<float>(slots, na)
+var slotUp = array.new<bool>(slots, false)
+var doneCount = 0
+var spanRef   = 0
+var vpBegun   = false
+var bucketCap = false                 // set when a session outgrows the bucket limit
+
+MAX_BUCKETS = 4000                    // hard stop, a runaway session must not eat memory
+
+// returns false when the cap is hit, callers rely on that to stay in sync
+pushBucket() =>
+    ok = array.size(cV) < MAX_BUCKETS and not na(bkH) and not na(bkL)
+    if ok
+        array.push(cH, bkH)
+        array.push(cL, bkL)
+        array.push(cV, bkV)
+        array.push(cX, bkX)
+    ok
+
+ensurePool() =>
+    need = slots * nRows
+    while array.size(pBox) < need
+        array.push(pBox, box.new(bar_index, close, bar_index, close, border_width = 1, border_color = na, bgcolor = na, xloc = xloc.bar_index))
+        if vp3d
+            array.push(pShad, box.new(bar_index, close, bar_index, close, border_width = 0, bgcolor = na, xloc = xloc.bar_index))
+    while array.size(pLine) < slots * 3
+        array.push(pLine, line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, color = na))
+
+// Candle volume is spread across every level it touches, weighted by overlap.
+// Dumping the whole thing at the close skews the shape badly on wide candles.
+// On a ticker with no volume every candle carries one unit, which turns the
+// same machinery into a time-at-price histogram.
+calcProfile(float hi, float lo) =>
+    array.fill(bins, 0.0)
+    stp = na(hi) or na(lo) ? 0.0 : (hi - lo) / nRows
+    poc = 0
+    vaL = 0
+    vaU = 0
+    mx  = 0.0
+    n   = math.min(array.size(cV), math.min(array.size(cH), array.size(cL)))
+    if stp > 0 and n > 0
+        for i = 0 to n - 1
+            bv = array.get(cV, i)
+            bl = array.get(cL, i)
+            bh = array.get(cH, i)
+            if bv > 0 and not na(bl) and not na(bh)
+                i0 = math.max(0, math.min(nRows - 1, int((bl - lo) / stp)))
+                i1 = math.max(0, math.min(nRows - 1, int((bh - lo) / stp)))
+                if i0 == i1
+                    array.set(bins, i0, array.get(bins, i0) + bv)
+                else
+                    sp = bh - bl
+                    for j = i0 to i1
+                        blo = lo + j * stp
+                        ov  = math.min(bh, blo + stp) - math.max(bl, blo)
+                        if ov > 0
+                            array.set(bins, j, array.get(bins, j) + bv * ov / sp)
+        mx  := array.max(bins)
+        poc := math.max(0, array.indexof(bins, mx))
+        vaU := poc
+        vaL := poc
+        acc = array.get(bins, poc)
+        tgt = array.sum(bins) * vpVA / 100.0
+        while acc < tgt and (vaL > 0 or vaU < nRows - 1)        // grow outward from the POC
+            up = vaU < nRows - 1 ? array.get(bins, vaU + 1) : -1.0
+            dn = vaL > 0 ? array.get(bins, vaL - 1) : -1.0
+            if up >= dn
+                vaU += 1
+                acc += up
+            else
+                vaL -= 1
+                acc += dn
+    [stp, poc, vaL, vaU, mx]
+
+rowColor(int r, int poc, int vaL, int vaU, int extra) =>
+    c = color(na)
+    if r == poc and pocHl
+        c := color.new(cPoc, math.min(pocTr + 7 + extra, 99))
+    else
+        t  = nRows > 1 ? r / (nRows - 1.0) : 1.0
+        tr = (r >= vaL and r <= vaU ? trIn : trOut) + extra
+        c := color.new(color.from_gradient(t, 0, 1, cLo, cHi), math.min(tr, 99))
+    c
+
+// Writes a histogram into a pool slot. Boxes get repositioned, so a full redraw
+// is a few dozen property writes instead of hundreds of new objects.
+drawSlot(int slot, float lo, float stp, int poc, int vaL, int vaU, float mx, int xs, int xe, int maxW, bool dev) =>
+    base  = slot * nRows
+    extra = dev ? trLive : 0
+    for r = 0 to nRows - 1
+        b = array.get(pBox, base + r)
+        w = 0
+        if stp > 0 and mx > 0
+            w := int(math.round(maxW * array.get(bins, r) / mx))
+        if w > 0
+            y0 = lo + r * stp
+            y1 = y0 + stp * gapK
+            xa = vpSide == "Right" ? xs : xe - w
+            box.set_lefttop(b, xa, y1)
+            box.set_rightbottom(b, xa + w, y0)
+            box.set_bgcolor(b, rowColor(r, poc, vaL, vaU, extra))
+            box.set_border_color(b, borderOn ? color.new(cBorder, borderTr) : na)
+            if vp3d
+                s  = array.get(pShad, base + r)
+                dy = stp * vp3dDep
+                box.set_lefttop(s, xa + 1, y1 - dy)
+                box.set_rightbottom(s, xa + w + 1, y0 - dy)
+                box.set_bgcolor(s, color.new(cShadow, vp3dTr))
+        else
+            box.set_bgcolor(b, na)
+            box.set_border_color(b, na)
+            if vp3d
+                box.set_bgcolor(array.get(pShad, base + r), na)
+
+    lb = slot * 3
+    lP = array.get(pLine, lb)
+    lH = array.get(pLine, lb + 1)
+    lV = array.get(pLine, lb + 2)
+    py = stp > 0 ? lo + (poc + 0.5) * stp : na
+    if pocOn and stp > 0
+        line.set_xy1(lP, xs, py)
+        line.set_xy2(lP, xe, py)
+        line.set_color(lP, color.new(cPoc, math.min(pocTr + extra * 2, 99)))
+        line.set_width(lP, pocW)
+        line.set_style(lP, styleOf(pocSty))
+    else
+        line.set_color(lP, na)
+    if vaOn and stp > 0
+        vah = lo + (vaU + 1) * stp
+        val = lo + vaL * stp
+        line.set_xy1(lH, xs, vah)
+        line.set_xy2(lH, xe, vah)
+        line.set_color(lH, color.new(cVa, math.min(vaTr + extra * 2, 99)))
+        line.set_style(lH, styleOf(vaSty))
+        line.set_xy1(lV, xs, val)
+        line.set_xy2(lV, xe, val)
+        line.set_color(lV, color.new(cVa, math.min(vaTr + extra * 2, 99)))
+        line.set_style(lV, styleOf(vaSty))
+    else
+        line.set_color(lH, na)
+        line.set_color(lV, na)
+    array.set(slotY, slot, py)
+    array.set(slotUp, slot, stp > 0)
+
+
+if vpActive
+    // extremes follow the bucket into the arrays, never ahead of it
+    if bkOn and (newBkt or sessNew)
+        if pushBucket()
+            sHi := na(sHi) ? bkH : math.max(sHi, bkH)
+            sLo := na(sLo) ? bkL : math.min(sLo, bkL)
+        else
+            bucketCap := true
+        bkOn := false
+
+    // a finished session is drawn once into its slot and then left alone
+    if sessNew
+        nn = array.size(cX)
+        if vpBegun and nn > 0
+            ensurePool()
+            xs = array.get(cX, 0)
+            xe = array.get(cX, nn - 1)
+            spanRef := xe - xs + 1
+            [stp, poc, vaL, vaU, mx] = calcProfile(sHi, sLo)
+            drawSlot(doneCount % vpSess, sLo, stp, poc, vaL, vaU, mx, xs, xe, math.max(1, int(spanRef * vpWidth / 100.0)), false)
+            doneCount += 1
+        vpBegun := true
+        array.clear(cH)
+        array.clear(cL)
+        array.clear(cV)
+        array.clear(cX)
+        sHi := na
+        sLo := na
+        bucketCap := false
+
+    if useLTF
+        // one request covering three series beats three separate requests
+        [aH, aL, aV] = request.security_lower_tf(syminfo.tickerid, vpLtf, [high, low, volume])
+        mv = array.size(aV)
+        m  = math.min(array.size(aH), array.size(aL))
+        if m > 0
+            if array.size(cV) + m < MAX_BUCKETS
+                for i = 0 to m - 1
+                    ih = array.get(aH, i)
+                    il = array.get(aL, i)
+                    if not na(ih) and not na(il)
+                        float bv = noVolFix ? 1.0 : 0.0
+                        if i < mv
+                            bv := nz(array.get(aV, i), noVolFix ? 1.0 : 0.0)
+                        array.push(cH, ih)
+                        array.push(cL, il)
+                        array.push(cV, bv)
+                        array.push(cX, bar_index)
+                        sHi := na(sHi) ? ih : math.max(sHi, ih)
+                        sLo := na(sLo) ? il : math.min(sLo, il)
+            else
+                bucketCap := true
+    else
+        if not bkOn
+            bkH  := high
+            bkL  := low
+            bkV  := nz(vol, 0.0)
+            bkX  := bar_index
+            bkOn := true
+        else
+            bkH := math.max(bkH, high)
+            bkL := math.min(bkL, low)
+            bkV += nz(vol, 0.0)
+
+
+//------------------------------------------ volume profile: developing one ---
+// Rebuilt on a wall clock minute. The half-filled bucket is thrown in as well,
+// otherwise the histogram would sit still between resolution boundaries.
+var lastMin  = -1
+var drewOnce = false
+nowMin = math.floor(timenow / 60000)
+tickOk = vpRefresh == "Every tick" or (vpRefresh == "Every 1 min" and (nowMin != lastMin or barstate.isnew)) or (vpRefresh == "Every bar close" and barstate.isnew)
+redraw = barstate.islast and vpActive and vpLive and (tickOk or not drewOnce)
+
+if redraw
+    lastMin  := nowMin
+    drewOnce := true
+    ensurePool()
+    pushed = false
+    liveHi = sHi
+    liveLo = sLo
+    if bkOn and not useLTF
+        pushed := pushBucket()
+        if pushed
+            liveHi := na(liveHi) ? bkH : math.max(liveHi, bkH)
+            liveLo := na(liveLo) ? bkL : math.min(liveLo, bkL)
+    n  = array.size(cX)
+    xs = bar_index
+    xe = bar_index
+    if n > 0
+        xs := array.get(cX, 0)
+        xe := array.get(cX, n - 1)
+    [stp, poc, vaL, vaU, mx] = calcProfile(liveHi, liveLo)
+    drawSlot(vpSess, liveLo, stp, poc, vaL, vaU, mx, xs, xe, math.max(1, int(math.max(spanRef, xe - xs + 1) * vpWidth / 100.0)), true)
+    if pushed
+        array.pop(cH)
+        array.pop(cL)
+        array.pop(cV)
+        array.pop(cX)
+    if pocExt and pocOn
+        for s = 0 to vpSess - 1
+            if array.get(slotUp, s)
+                line.set_xy2(array.get(pLine, s * 3), bar_index, array.get(slotY, s))
+
+
+//------------------------------------------------------------- diagnostics ---
+// Anything that quietly changes what the drawing means, or quietly limits it,
+// gets turned into plain advice here and ranked worst first. Data quality on
+// the ticker comes before performance, because a gold chart with no volume is
+// not a slow indicator, it is a different indicator.
+barsInRange = (histDays + winDays) * bpDay
+vwIntra     = ltfMode ? (histDays + winDays) * spd : 0.0
+vpIntra     = useLTF ? (vpSess + 2) * bpSess * tfSec / resSec : 0.0
+
+var noteBuf = array.new<string>()
+
+buildNotes() =>
+    array.clear(noteBuf)
+    bad = false
+    tk  = syminfo.ticker
+
+    // things that stop the drawing outright
+    if vpOn and not tfOk
+        array.push(noteBuf, macro ? "Profile off: needs a daily or lower chart" : "Profile off: needs an intraday chart")
+        bad := true
+    if volKind == "none" and not noVolFix
+        array.push(noteBuf, "No volume on " + tk + ", VWAP is off")
+        array.push(noteBuf, "Turn on the volume substitute in settings")
+        bad := true
+    if not vwapReady
+        array.push(noteBuf, "History too short for a " + str.tostring(winDays) + "D window here")
+        bad := true
+    if vpOn and tfOk and bucketCap
+        array.push(noteBuf, "Session too long for " + fmtTf(vpRes) + ", profile trimmed")
+        bad := true
+
+    // what the numbers on this ticker actually mean
+    if volKind == "none" and noVolFix
+        array.push(noteBuf, "No volume feed on " + tk)
+        array.push(noteBuf, "Profile counts time at price, VWAP unweighted")
+    if volKind == "tick"
+        array.push(noteBuf, tk + " reports tick volume, not traded size")
+
+    // limits and load
+    if samplesWanted > CAP
+        array.push(noteBuf, "VWAP window capped near " + str.tostring(int(CAP / math.max(spd, 1))) + "d")
+    if vwIntra > 20000
+        array.push(noteBuf, "VWAP pulls ~" + kfmt(vwIntra) + " intrabars, widen its step")
+    if vpIntra > 20000
+        array.push(noteBuf, "Profile pulls ~" + kfmt(vpIntra) + " intrabars, widen its step")
+    if barsInRange > 30000 and not stepOn
+        array.push(noteBuf, kfmt(barsInRange) + " bars in range, a higher chart TF is lighter")
+    if nRows < vpRows
+        array.push(noteBuf, "Rows capped at " + str.tostring(nRows) + " by the box limit")
+    if vpRefresh == "Every tick"
+        array.push(noteBuf, "Tick refresh is the heaviest option")
+    bad
+
+var warn = label(na)
+if barstate.islast and vpOn and not tfOk and (not hudOn or not notesOn)
+    label.delete(warn)
+    txt = macro ? "Volume profile needs a daily or intraday chart" : "Volume profile needs an intraday chart"
+    warn := label.new(bar_index, high, txt, style = label.style_label_down,
+         color = color.new(cWarn, 20), textcolor = color.new(hudBg, 5), size = size.small)
+
+
+//------------------------------------------------------------------- plots ---
+plot(shadowOn and vis ? pVw - sd * shadowAmt : na, "VWAP shadow", color = color.new(cShadow, 80), linewidth = vwWidth + 1, offset = 1)
+plot(glowOn ? pVw : na, "VWAP glow", color = color.new(cBase, math.min(vwTr + 45, 98)), linewidth = vwWidth + 4)
+pvw = plot(pVw, "Rolling VWAP", color = cLine, linewidth = vwWidth)
+
+plot(pU2, "Upper band 2", color = color.new(cBand, math.min(bandTr + 6, 99)), linewidth = bandW)
+plot(pU1, "Upper band 1", color = color.new(cBand, bandTr), linewidth = bandW)
+plot(pL1, "Lower band 1", color = color.new(cBand, bandTr), linewidth = bandW)
+plot(pL2, "Lower band 2", color = color.new(cBand, math.min(bandTr + 6, 99)), linewidth = bandW)
+
+// two hidden anchor plots feed the gradients, so flipping inner/outer is free
+fU  = fillMode == "Inner" ? pU1 : fillMode == "Outer" ? pU2 : na
+fD  = fillMode == "Inner" ? pL1 : fillMode == "Outer" ? pL2 : na
+pfu = plot(fU, "fill anchor up", display = display.none)
+pfd = plot(fD, "fill anchor down", display = display.none)
+fill(pfu, pvw, top_value = fU, bottom_value = pVw, top_color = color.new(cFillUp, 99), bottom_color = color.new(cFillUp, fillTr), title = "Upper zone")
+fill(pvw, pfd, top_value = pVw, bottom_value = fD, top_color = color.new(cFillDn, fillTr), bottom_color = color.new(cFillDn, 99), title = "Lower zone")
+
+var lbV = label(na)
+var lbU = label(na)
+var lbD = label(na)
+if labelsOn and barstate.islast and not na(pVw)
+    if na(lbV)
+        lbV := label.new(bar_index, vwapV, "", style = label.style_label_left, size = size.tiny)
+        lbU := label.new(bar_index, vwapV, "", style = label.style_label_left, size = size.tiny)
+        lbD := label.new(bar_index, vwapV, "", style = label.style_label_left, size = size.tiny)
+    label.set_xy(lbV, bar_index + 1, vwapV)
+    label.set_text(lbV, str.tostring(vwapV, format.mintick))
+    label.set_color(lbV, color.new(cVwap, 20))
+    label.set_textcolor(lbV, color.new(hudBg, 5))
+    if b2On
+        label.set_xy(lbU, bar_index + 1, vwapV + sd * dev2)
+        label.set_text(lbU, str.tostring(vwapV + sd * dev2, format.mintick))
+        label.set_color(lbU, color.new(cBand, 45))
+        label.set_textcolor(lbU, color.new(hudBg, 5))
+        label.set_xy(lbD, bar_index + 1, vwapV - sd * dev2)
+        label.set_text(lbD, str.tostring(vwapV - sd * dev2, format.mintick))
+        label.set_color(lbD, color.new(cBand, 45))
+        label.set_textcolor(lbD, color.new(hudBg, 5))
+    else
+        label.set_color(lbU, na)
+        label.set_textcolor(lbU, na)
+        label.set_color(lbD, na)
+        label.set_textcolor(lbD, na)
+
+
+//-------------------------------------------------------------- info panel ---
+// Built once, then only text and colours are rewritten. Rows 5 and 6 are merged
+// across both columns, so only column 0 may be touched on those.
+var hud   = table.new(position.top_right, 2, 7, border_width = 1)
+var built = false
+
+if hudOn and barstate.islast
+    if not built
+        built := true
+        for r = 0 to 6
+            table.cell(hud, 0, r, "", text_halign = text.align_left)
+            table.cell(hud, 1, r, "", text_halign = text.align_right)
+        table.merge_cells(hud, 0, 5, 1, 5)
+        table.merge_cells(hud, 0, 6, 1, 6)
+
+    pos = hudPos == "Top left" ? position.top_left : hudPos == "Bottom right" ? position.bottom_right : hudPos == "Bottom left" ? position.bottom_left : hudPos == "Middle right" ? position.middle_right : position.top_right
+    sz  = hudSz == "Tiny" ? size.tiny : hudSz == "Normal" ? size.normal : hudSz == "Large" ? size.large : size.small
+    table.set_position(hud, pos)
+    table.set_bgcolor(hud, color.new(hudBg, hudTr))
+    table.set_border_color(hud, color.new(hudTx, 93))
+    table.set_frame_color(hud, color.new(hudTx, 90))
+    table.set_frame_width(hud, 1)
+
+    bad    = buildNotes()
+    nNotes = array.size(noteBuf)
+    body   = ""
+    if notesOn and nNotes > 0                    // an empty array here would loop backwards into index -1
+        shown = math.min(nNotes, 4)
+        for i = 0 to shown - 1
+            body += (i > 0 ? "\n" : "") + array.get(noteBuf, i)
+
+    vwTxt  = str.tostring(winDays) + "D" + (stepOn ? " @ " + fmtTf(vwStep) : " rolling")
+    vpTxt  = vpOn and tfOk ? fmtTf(vpRes) + " x " + str.tostring(vpSess) + (macro ? "W" : "D") : "off"
+    volTxt = volKind == "none" ? "none" : volKind == "tick" ? "tick only" : "traded"
+    volCol = volKind == "none" ? cWarn : volKind == "tick" ? cNote : color.new(hudTx, 12)
+
+    table.cell_set_text(hud, 0, 0, "RVWVP FOD")
+    table.cell_set_text(hud, 1, 0, fmtTf(timeframe.period))
+    table.cell_set_text(hud, 0, 1, "Horizon")
+    table.cell_set_text(hud, 1, 1, macro ? "Macro" : "Micro")
+    table.cell_set_text(hud, 0, 2, "VWAP")
+    table.cell_set_text(hud, 1, 2, vwTxt)
+    table.cell_set_text(hud, 0, 3, "Profile")
+    table.cell_set_text(hud, 1, 3, vpTxt)
+    table.cell_set_text(hud, 0, 4, "Volume")
+    table.cell_set_text(hud, 1, 4, volTxt)
+    table.cell_set_text(hud, 0, 5, body)
+    table.cell_set_text(hud, 0, 6, hintOn ? "Switch to " + (macro ? "Micro" : "Macro") + " in settings" : "")
+
+    table.cell_set_text_color(hud, 0, 0, color.new(hudTx, 40))
+    table.cell_set_text_color(hud, 1, 0, color.new(hudTx, 55))
+    table.cell_set_text_color(hud, 1, 4, volCol)
+    table.cell_set_text_color(hud, 0, 5, bad ? cWarn : cNote)
+    table.cell_set_text_color(hud, 0, 6, color.new(hudTx, 72))
+    for r = 1 to 4
+        table.cell_set_text_color(hud, 0, r, color.new(hudTx, 60))
+    for r = 1 to 3
+        table.cell_set_text_color(hud, 1, r, color.new(hudTx, 12))
+
+    // rows 5 and 6 are merged, writing to column 1 there would hit a dead cell
+    for r = 0 to 4
+        table.cell_set_text_size(hud, 0, r, sz)
+        table.cell_set_text_size(hud, 1, r, sz)
+    table.cell_set_text_size(hud, 0, 5, sz)
+    table.cell_set_text_size(hud, 0, 6, sz)

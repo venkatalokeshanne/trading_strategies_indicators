@@ -1,0 +1,184 @@
+//@version=5
+strategy("ES/NQ Execution System v2 (Scaling + Risk + Trailing)", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     pyramiding=0)
+
+// ─────────────────────────────
+// INPUTS
+// ─────────────────────────────
+baseRisk   = input.float(1.0, "Base Risk %", step=0.25)
+maxTrades  = input.int(4, "Max Trades Per Day")
+
+atrLen     = input.int(14, "ATR Length")
+atrMult    = input.float(0.35, "Stop Buffer ATR")
+
+// ─────────────────────────────
+// ATR
+// ─────────────────────────────
+atr = ta.atr(atrLen)
+buffer = atr * atrMult
+
+// ─────────────────────────────
+// DAILY RESET
+// ─────────────────────────────
+var int tradesToday = 0
+
+if ta.change(time("D"))
+    tradesToday := 0
+
+canTrade = tradesToday < maxTrades
+
+// ─────────────────────────────
+// SESSION FILTER (NY CORE)
+// ─────────────────────────────
+nySession = not na(time(timeframe.period, "0930-1130"))
+
+// ─────────────────────────────
+// LEVELS
+// ─────────────────────────────
+previousDayHigh = request.security(syminfo.tickerid, "D", high[1])
+previousDayLow  = request.security(syminfo.tickerid, "D", low[1])
+
+var float premarketHigh = na
+var float premarketLow  = na
+
+if ta.change(time("D"))
+    premarketHigh := na
+    premarketLow := na
+
+if not na(time(timeframe.period, "0400-0930"))
+    premarketHigh := na(premarketHigh) ? high : math.max(premarketHigh, high)
+    premarketLow  := na(premarketLow) ? low : math.min(premarketLow, low)
+
+var float openingRangeHigh = na
+var float openingRangeLow  = na
+
+if ta.change(time("D"))
+    openingRangeHigh := na
+    openingRangeLow := na
+
+if not na(time(timeframe.period, "0930-1000"))
+    openingRangeHigh := na(openingRangeHigh) ? high : math.max(openingRangeHigh, high)
+    openingRangeLow  := na(openingRangeLow) ? low : math.min(openingRangeLow, low)
+
+// ─────────────────────────────
+// SWEEP LOGIC
+// ─────────────────────────────
+sweepAbove(level) =>
+    high > level and close < level
+
+sweepBelow(level) =>
+    low < level and close > level
+
+// ─────────────────────────────
+// SCORE SYSTEM
+// ─────────────────────────────
+scoreLong = 0
+scoreShort = 0
+
+if sweepBelow(previousDayLow)
+    scoreLong += 1
+if sweepBelow(premarketLow)
+    scoreLong += 1
+if sweepBelow(openingRangeLow)
+    scoreLong += 1
+
+if sweepAbove(previousDayHigh)
+    scoreShort += 1
+if sweepAbove(premarketHigh)
+    scoreShort += 1
+if sweepAbove(openingRangeHigh)
+    scoreShort += 1
+
+// ─────────────────────────────
+// ENTRY CONDITIONS
+// ─────────────────────────────
+longCond  = canTrade and nySession and scoreLong >= 2
+shortCond = canTrade and nySession and scoreShort >= 2
+
+// ─────────────────────────────
+// RISK MODEL (FIXED PER TRADE)
+// ─────────────────────────────
+longStop  = low - buffer
+shortStop = high + buffer
+
+longRisk  = close - longStop
+shortRisk = shortStop - close
+
+// 1R / 2R / Runner targets
+longTP1 = close + longRisk * 1
+longTP2 = close + longRisk * 2
+
+shortTP1 = close - shortRisk * 1
+shortTP2 = close - shortRisk * 2
+
+// ─────────────────────────────
+// POSITION SIZING (SIMPLE ADAPTIVE)
+// ─────────────────────────────
+size = baseRisk
+
+// ─────────────────────────────
+// TRADE STATE TRACKING
+// ─────────────────────────────
+var bool longActive = false
+var bool shortActive = false
+var float entryPrice = na
+var float stopLevel = na
+
+// ─────────────────────────────
+// ENTRY
+// ─────────────────────────────
+if longCond
+    strategy.entry("LONG", strategy.long, qty=size)
+    entryPrice := close
+    stopLevel := longStop
+    longActive := true
+    tradesToday += 1
+
+if shortCond
+    strategy.entry("SHORT", strategy.short, qty=size)
+    entryPrice := close
+    stopLevel := shortStop
+    shortActive := true
+    tradesToday += 1
+
+// ─────────────────────────────
+// MANAGEMENT (BREAKEVEN + TRAILING)
+// ─────────────────────────────
+if longActive
+    // move stop to breakeven after 1R
+    if close >= entryPrice + longRisk
+        stopLevel := math.max(stopLevel, entryPrice)
+
+    // trail after 2R
+    if close >= longTP2
+        stopLevel := math.max(stopLevel, close - buffer)
+
+    strategy.exit("LONG EXIT", "LONG", stop=stopLevel, limit=longTP2)
+
+if shortActive
+    if close <= entryPrice - shortRisk
+        stopLevel := math.min(stopLevel, entryPrice)
+
+    if close <= shortTP2
+        stopLevel := math.min(stopLevel, close + buffer)
+
+    strategy.exit("SHORT EXIT", "SHORT", stop=stopLevel, limit=shortTP2)
+
+// ─────────────────────────────
+// VISUALS
+// ─────────────────────────────
+plot(previousDayHigh, "Previous Day High", color=color.green)
+plot(previousDayLow,  "Previous Day Low", color=color.blue)
+
+plot(premarketHigh, "Premarket High", color=color.green)
+plot(premarketLow,  "Premarket Low", color=color.green)
+
+plot(openingRangeHigh, "Opening Range High", color=color.purple)
+plot(openingRangeLow,  "Opening Range Low", color=color.purple)
+
+plotshape(longCond, location=location.belowbar,
+     color=color.green, style=shape.labelup, text="LONG")
+
+plotshape(shortCond, location=location.abovebar,
+     color=color.red, style=shape.labeldown, text="SHORT")

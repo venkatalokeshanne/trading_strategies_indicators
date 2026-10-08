@@ -1,0 +1,682 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © AdaptiveTrend
+
+//@version=6
+indicator(
+     "Adaptive Trend Direction Indicator [ATR Trail + Regime]",
+     shorttitle       = "ATD",
+     overlay          = true,
+     max_labels_count = 500,
+     max_bars_back    = 5000
+     )
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ABOUT THIS SCRIPT
+//
+// This is an INDICATOR, not a strategy. It places no orders and produces no
+// Strategy Tester report. It runs an internal *virtual* position state
+// (long / short / flat) for one purpose only: so that the chart can colour
+// bars, print entry/exit markers, and report the price move of each completed
+// signal leg. Every reference to "position", "size" or "P&L" below is a
+// hypothetical read-out derived from close prices, with no commission,
+// slippage, funding or fill modelling of any kind.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMPONENT TOGGLES
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_toggles = "═══ Component Toggles ═══"
+use_rsi_filter     = input.bool(true,  "Use RSI Momentum Filter",           group=grp_toggles)
+use_ema_exit       = input.bool(false, "Use EMA Slope Reversal Exit",       group=grp_toggles)
+use_time_exit      = input.bool(true,  "Use Time-Based Stale Signal Exit",  group=grp_toggles)
+use_vol_sizing     = input.bool(true,  "Use Volatility-Scaled Sizing",      group=grp_toggles)
+allow_shorts       = input.bool(true,  "Allow Short Signals",               group=grp_toggles)
+use_regime_filter  = input.bool(true,  "Use Regime Detection (ADX+ER)",     group=grp_toggles)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIGNAL START DATE
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_dates = "═══ Signal Start Date ═══"
+use_date_filter = input.bool(false, "Enable Date Filter",                    group=grp_dates)
+start_year      = input.int(2020, "Start Year",  minval=2015, maxval=2030,  group=grp_dates)
+start_month     = input.int(1,    "Start Month", minval=1,    maxval=12,    group=grp_dates)
+start_day       = input.int(1,    "Start Day",   minval=1,    maxval=31,    group=grp_dates)
+
+start_time      = timestamp(start_year, start_month, start_day, 0, 0)
+in_date_range   = use_date_filter ? time >= start_time : true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CORE ATR TRAILING STOP
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_atr = "═══ ATR Trailing Stop ═══"
+atr_period    = input.int(23,    "ATR Period",           minval=5,   maxval=50,   group=grp_atr)
+atr_mult      = input.float(3.0, "ATR Multiplier",       minval=1.0, maxval=6.0, step=0.1, group=grp_atr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RSI MOMENTUM FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_rsi = "═══ RSI Filter ═══"
+rsi_period    = input.int(20,   "RSI Period",            minval=5,   maxval=30,   group=grp_rsi)
+rsi_long_th   = input.float(48.0, "RSI Long Threshold",  minval=40,  maxval=65,  step=1, group=grp_rsi)
+rsi_short_th  = input.float(43.0, "RSI Short Threshold", minval=35,  maxval=60,  step=1, group=grp_rsi)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EMA SLOPE EXIT
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_ema = "═══ EMA Slope Exit ═══"
+ema_period    = input.int(20,   "EMA Period",            minval=10,  maxval=50,   group=grp_ema)
+ema_slope_len = input.int(3,    "Slope Lookback Bars",   minval=1,   maxval=10,   group=grp_ema)
+ema_exit_grace = input.int(0,   "EMA Exit Grace Bars",   minval=0,   maxval=10,   group=grp_ema)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TIME EXIT
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_time = "═══ Time Exit ═══"
+max_bars_in_trade = input.int(140, "Max Bars in Signal", minval=5, maxval=300, group=grp_time)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIZING MODEL — DISPLAY ONLY
+// Nothing here affects the signals. It only drives the dashboard read-out and
+// the alert payload, so that a discretionary or external user can see what
+// volatility-normalised exposure would look like at the current ATR.
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_risk = "═══ Sizing Model (display only) ═══"
+ref_equity    = input.float(10000, "Reference Account Size", minval=1, step=1000, group=grp_risk, tooltip="Notional reference used only to convert leverage into units and P&L. Leverage itself is independent of this number.")
+risk_pct      = input.float(2.0, "Risk Per Signal (%)",  minval=0.25, maxval=3.0, step=0.25, group=grp_risk)
+max_leverage  = input.float(3.5, "Max Leverage",     minval=1.0, maxval=20.0, step=0.5, group=grp_risk)
+min_leverage  = input.float(0.2, "Min Leverage",     minval=0.1, maxval=2.0, step=0.1, group=grp_risk)
+vol_target_pct = input.float(2.0, "Vol Target % (0=use Risk sizing)", minval=0.0, maxval=4.0, step=0.25, group=grp_risk)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REGIME DETECTION — ADX + Efficiency Ratio
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_regime = "═══ Regime Detection ═══"
+adx_period      = input.int(10,      "ADX Period",           minval=10, maxval=30, group=grp_regime)
+adx_threshold   = input.float(21.0, "ADX Threshold",        minval=15, maxval=35, step=1, group=grp_regime)
+er_period       = input.int(5,        "Efficiency Ratio Period", minval=5, maxval=30, group=grp_regime)
+er_threshold    = input.float(0.15,  "Efficiency Ratio Threshold", minval=0.1, maxval=0.6, step=0.05, group=grp_regime)
+confirmation_bars = input.int(3, "Confirmation Bars",  minval=1, maxval=5, group=grp_regime)
+regime_mode     = input.int(0,       "Ranging Mode (0=Stand Aside, 1=Mean-Revert)", minval=0, maxval=1, group=grp_regime)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MEAN-REVERSION PARAMETERS (when regime_mode = 1)
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_mr = "═══ Mean-Reversion ═══"
+mr_rsi_oversold   = input.float(30.0, "MR RSI Oversold",      minval=20, maxval=35, step=1, group=grp_mr)
+mr_rsi_overbought = input.float(70.0, "MR RSI Overbought",  minval=65, maxval=80, step=1, group=grp_mr)
+mr_tp_atr_mult    = input.float(1.0, "MR Take-Profit ATR Mult", minval=0.5, maxval=2.0, step=0.25, group=grp_mr)
+mr_sl_atr_mult    = input.float(1.0, "MR Stop-Loss ATR Mult",   minval=0.5, maxval=1.5, step=0.25, group=grp_mr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERT PAYLOAD
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_webhook = "═══ Alert Payload ═══"
+use_json_alerts = input.bool(false, "Emit JSON Alert Payload", group=grp_webhook, tooltip="Off: plain-text alerts. On: alert() fires a JSON body for programmatic consumers.")
+alert_ticker    = input.string("BTCUSDT", "Ticker Label in Payload",  group=grp_webhook)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VWAP / ANCHORED VWAP
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_vwap = "═══ VWAP ═══"
+show_vwap       = input.bool(true, "Show VWAP", group=grp_vwap)
+vwap_anchor     = input.string("Session", "Anchor", options=["Session", "Week", "Month", "Quarter", "Year", "Custom Date"], group=grp_vwap)
+vwap_anchor_ts  = input.time(timestamp("1 Jan 2026 00:00 +0000"), "Custom Anchor Date", group=grp_vwap, tooltip="Only used when Anchor = Custom Date. Nothing is plotted before this bar.")
+vwap_src        = input.source(hlc3, "VWAP Source", group=grp_vwap)
+c_vwap_up       = input.color(#2962FF, "VWAP Colour — Price Above", group=grp_vwap)
+c_vwap_dn       = input.color(#7B1FA2, "VWAP Colour — Price Below", group=grp_vwap)
+show_vwap_area  = input.bool(true,  "Fill VWAP ↔ Price", group=grp_vwap)
+vwap_area_transp = input.int(92, "VWAP Fill Transparency", minval=60, maxval=99, group=grp_vwap)
+show_vwap_bands = input.bool(false, "Show Volume-Weighted StDev Bands", group=grp_vwap)
+vwap_band_mult  = input.float(2.0, "Band Multiplier", minval=0.5, maxval=4.0, step=0.5, group=grp_vwap)
+use_vwap_filter = input.bool(false, "Gate Trend Entries by VWAP Side", group=grp_vwap, tooltip="Requires close above VWAP for long trend entries and below for short. Applies to TREND entries only — mean-reversion entries are counter-trend by definition, so gating them on trend side would make them unreachable.")
+use_vwap_ext_guard = input.bool(false, "Block Over-Extended Trend Entries", group=grp_vwap, tooltip="Rejects a trend entry when price is already further than N standard deviations from VWAP — the flip is real but the good entry is gone. Inert on symbols without volume data.")
+vwap_max_ext_sd    = input.float(2.5, "Max Entry Distance from VWAP (σ)", minval=0.5, maxval=6.0, step=0.25, group=grp_vwap)
+vwap_mr_mode       = input.string("Off", "VWAP Band Mean-Reversion", options=["Off", "Replace RSI", "Confirm RSI"], group=grp_vwap, tooltip="Replace RSI: mean-reversion entries trigger on a VWAP band touch instead of an RSI extreme. Confirm RSI: both must agree. Requires Ranging Mode = 1 to have any effect.")
+vwap_mr_sd         = input.float(2.0, "MR Band Distance (σ)", minval=1.0, maxval=4.0, step=0.25, group=grp_vwap)
+vwap_mr_tp_vwap    = input.bool(false, "MR Take-Profit at VWAP", group=grp_vwap, tooltip="Replaces the fixed ATR take-profit with VWAP itself, tracked live. Reverting to the volume-weighted average is the premise the entry was taken on.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL SETTINGS
+// ══════════════════════════════════════════════════════════════════════════════
+
+grp_visual = "═══ Visual Settings ═══"
+show_trailing_stop = input.bool(true, "Show Trailing Stop Line", group=grp_visual)
+show_trend_glow    = input.bool(true, "Fill Trailing Stop ↔ Price", group=grp_visual)
+glow_transp_near   = input.int(82, "Fill Transparency — Near Price", minval=50, maxval=99, group=grp_visual, tooltip="Lower = more solid. This edge sits against price.")
+glow_transp_far    = input.int(96, "Fill Transparency — At Stop",   minval=50, maxval=99, group=grp_visual)
+show_entry_signals = input.bool(true, "Show Entry/Exit Markers", group=grp_visual)
+show_pnl_labels    = input.bool(true, "Show Leg Result Labels",  group=grp_visual)
+show_bar_colors    = input.bool(true, "Colour Bars While In Signal", group=grp_visual)
+show_info_table    = input.bool(true, "Show Info Dashboard",     group=grp_visual)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// --- ATR ---
+atr_val = ta.atr(atr_period)
+nLoss   = atr_mult * atr_val
+
+// --- ATR Trailing Stop ---
+var float trail_stop = na
+var int   direction  = 0
+
+long_stop  = close - nLoss
+short_stop = close + nLoss
+
+if na(trail_stop[1])
+    trail_stop := long_stop
+    direction  := 1
+else if direction[1] == 1
+    if close > trail_stop[1]
+        trail_stop := math.max(trail_stop[1], long_stop)
+    else
+        trail_stop := trail_stop[1]
+    if close < trail_stop
+        direction  := -1
+        trail_stop := short_stop
+    else
+        direction := 1
+else if direction[1] == -1
+    if close < trail_stop[1]
+        trail_stop := math.min(trail_stop[1], short_stop)
+    else
+        trail_stop := trail_stop[1]
+    if close > trail_stop
+        direction  := 1
+        trail_stop := long_stop
+    else
+        direction := -1
+
+long_signal  = direction == 1  and direction[1] == -1
+short_signal = direction == -1 and direction[1] == 1
+
+// --- RSI ---
+rsi_val = ta.rsi(close, rsi_period)
+rsi_long_ok  = use_rsi_filter ? rsi_val > rsi_long_th  : true
+rsi_short_ok = use_rsi_filter ? rsi_val < rsi_short_th : true
+
+// --- EMA Slope ---
+ema_val   = ta.ema(close, ema_period)
+ema_slope = ema_val - ema_val[ema_slope_len]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ANCHORED VWAP
+// Accumulated manually rather than via ta.vwap() so that a symbol with no
+// volume data degrades to a blank plot instead of a runtime error, and so the
+// volume-weighted standard deviation is available for the bands.
+// ══════════════════════════════════════════════════════════════════════════════
+
+vwap_is_custom = vwap_anchor == "Custom Date"
+
+// Every period change is evaluated on every bar, then selected between. Calling
+// timeframe.change() inside the switch arms instead would leave those calls
+// executing conditionally, which is how history-dependent builtins get skewed.
+ch_day     = timeframe.change("D")
+ch_week    = timeframe.change("W")
+ch_month   = timeframe.change("M")
+ch_quarter = timeframe.change("3M")
+ch_year    = timeframe.change("12M")
+ch_custom  = time >= vwap_anchor_ts and (na(time[1]) or time[1] < vwap_anchor_ts)
+
+vwap_anchor_hit = switch vwap_anchor
+    "Session" => ch_day
+    "Week"    => ch_week
+    "Month"   => ch_month
+    "Quarter" => ch_quarter
+    "Year"    => ch_year
+    => ch_custom
+
+// A calendar anchor also starts on the very first bar of the dataset, so the
+// first (partial) period is measured too. A custom anchor deliberately does not.
+vwap_reset = vwap_anchor_hit or (not vwap_is_custom and bar_index == 0)
+
+var bool  vwap_live = false
+var float vw_pv     = 0.0
+var float vw_pv2    = 0.0
+var float vw_vol    = 0.0
+
+if vwap_reset
+    vwap_live := true
+    vw_pv     := 0.0
+    vw_pv2    := 0.0
+    vw_vol    := 0.0
+
+if vwap_live
+    bar_vol = nz(volume)
+    vw_pv   += vwap_src * bar_vol
+    vw_pv2  += vwap_src * vwap_src * bar_vol
+    vw_vol  += bar_vol
+
+vwap_val = vwap_live and vw_vol > 0 ? vw_pv / vw_vol : na
+vwap_var = na(vwap_val) ? na : math.max(vw_pv2 / vw_vol - vwap_val * vwap_val, 0.0)
+vwap_sd  = na(vwap_var) ? na : math.sqrt(vwap_var)
+vwap_up  = na(vwap_sd) ? na : vwap_val + vwap_band_mult * vwap_sd
+vwap_dn  = na(vwap_sd) ? na : vwap_val - vwap_band_mult * vwap_sd
+
+vwap_above    = not na(vwap_val) and close >= vwap_val
+c_vwap_active = vwap_above ? c_vwap_up : c_vwap_dn
+
+// ── VWAP ENTRY LOGIC ──────────────────────────────────────────────────────────
+// All three gates below are inert at their defaults, so the base model is
+// unchanged until one is switched on. Each fails OPEN when VWAP is unavailable
+// (no volume data), so the indicator degrades to the un-filtered model rather
+// than silently going dark.
+
+// 1. Side gate — trend entries only
+vwap_long_ok  = use_vwap_filter ? (not na(vwap_val) and close > vwap_val) : true
+vwap_short_ok = use_vwap_filter ? (not na(vwap_val) and close < vwap_val) : true
+
+// 2. Extension guard — how far price has already travelled from VWAP, in σ.
+// A trailing-stop flip that arrives 3σ from VWAP is a real flip at a bad price.
+vwap_ext_sd = na(vwap_sd) or vwap_sd <= 0 ? na : math.abs(close - vwap_val) / vwap_sd
+vwap_ext_ok = use_vwap_ext_guard ? (na(vwap_ext_sd) or vwap_ext_sd <= vwap_max_ext_sd) : true
+
+// 3. Band mean-reversion — replaces or confirms the RSI extreme in Ranging Mode
+vwap_mr_lo = na(vwap_sd) ? na : vwap_val - vwap_mr_sd * vwap_sd
+vwap_mr_hi = na(vwap_sd) ? na : vwap_val + vwap_mr_sd * vwap_sd
+
+vwap_band_long  = not na(vwap_mr_lo) and close <= vwap_mr_lo
+vwap_band_short = not na(vwap_mr_hi) and close >= vwap_mr_hi
+
+rsi_mr_long  = rsi_val < mr_rsi_oversold
+rsi_mr_short = rsi_val > mr_rsi_overbought
+
+mr_long_trigger = switch vwap_mr_mode
+    "Replace RSI" => vwap_band_long
+    "Confirm RSI" => rsi_mr_long and vwap_band_long
+    => rsi_mr_long
+
+mr_short_trigger = switch vwap_mr_mode
+    "Replace RSI" => vwap_band_short
+    "Confirm RSI" => rsi_mr_short and vwap_band_short
+    => rsi_mr_short
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VIRTUAL POSITION STATE — replaces every strategy.* state reference
+// ══════════════════════════════════════════════════════════════════════════════
+
+var int    pos            = 0      //  1 = long, -1 = short, 0 = flat
+var float  entry_price    = na
+var float  entry_qty      = na
+var float  entry_pos_val  = na
+var string trade_dir      = ""
+var bool   is_trend_trade = true
+var int    bars_held      = 0
+var float  mr_tp_price    = na
+var float  mr_sl_price    = na
+
+// State carried INTO this bar. Every condition below is evaluated against this
+// snapshot, mirroring how a strategy with process_orders_on_close = true sees
+// strategy.position_size before the bar's fills are applied.
+pos_open = pos
+
+// --- Bars Since Entry ---
+if pos_open != 0
+    bars_held += 1
+else
+    bars_held := 0
+
+ema_exit_long  = use_ema_exit and bars_held >= ema_exit_grace ? ema_slope < 0 : false
+ema_exit_short = use_ema_exit and bars_held >= ema_exit_grace ? ema_slope > 0 : false
+
+time_exit_trigger = use_time_exit ? bars_held >= max_bars_in_trade : false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// REGIME DETECTION — ADX + Efficiency Ratio with Hysteresis
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ADX calculation
+[diplus, diminus, adx_val] = ta.dmi(adx_period, adx_period)
+
+// Efficiency Ratio (Kaufman): |net move| / sum of |bar moves|
+er_net   = math.abs(close - close[er_period])
+er_gross = math.sum(math.abs(close - close[1]), er_period)
+er_val   = er_gross != 0 ? er_net / er_gross : 0.0
+
+// Hysteresis: require confirmation_bars consecutive bars before flipping
+var string cur_regime   = "ranging"
+var int trending_count  = 0
+var int ranging_count   = 0
+
+adx_ok = adx_val > adx_threshold
+er_ok  = er_val > er_threshold
+
+if adx_ok and er_ok
+    trending_count += 1
+    ranging_count  := 0
+else
+    ranging_count  += 1
+    trending_count := 0
+
+if cur_regime == "ranging" and trending_count >= confirmation_bars
+    cur_regime := "trending"
+else if cur_regime == "trending" and ranging_count >= confirmation_bars
+    cur_regime := "ranging"
+
+is_trending = use_regime_filter ? cur_regime == "trending" : true
+is_ranging  = use_regime_filter ? cur_regime == "ranging"  : false
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SIZING READ-OUT (display only — does not gate any signal)
+// ══════════════════════════════════════════════════════════════════════════════
+
+equity_val     = ref_equity
+stop_distance  = nLoss
+
+// Risk-based sizing (fallback when vol_target_pct == 0)
+risk_amount    = equity_val * (risk_pct / 100.0)
+raw_pos_value  = stop_distance > 0 ? risk_amount / (stop_distance / close) : equity_val
+risk_lev       = raw_pos_value / equity_val
+
+// Volatility-targeted sizing: target a constant per-day risk contribution.
+// ATR on a 6h chart ≈ half the daily range, so daily_vol ≈ 2*ATR/price
+daily_vol_est  = atr_val * 2.0 / close
+vol_target_lev = daily_vol_est > 0 and vol_target_pct > 0 ? (vol_target_pct / 100.0) / daily_vol_est : risk_lev
+
+// Select sizing mode
+eff_leverage   = vol_target_pct > 0 ? vol_target_lev : risk_lev
+clamped_lev    = math.max(min_leverage, math.min(max_leverage, eff_leverage))
+pos_value      = equity_val * clamped_lev
+pos_contracts  = pos_value / close
+signal_qty     = use_vol_sizing ? pos_contracts : equity_val / close
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Trend entries — trailing-stop flip, gated by regime and RSI
+enter_long_trend  = is_trending and long_signal  and rsi_long_ok  and vwap_long_ok  and vwap_ext_ok and pos_open <= 0 and in_date_range
+enter_short_trend = is_trending and short_signal and rsi_short_ok and vwap_short_ok and vwap_ext_ok and pos_open >= 0 and allow_shorts and in_date_range
+
+// Mean-reversion entries — ranging regime, mode 1 only.
+// No VWAP side gate here: an MR long is a bid below the average by design.
+mr_enter_long  = is_ranging and regime_mode == 1 and mr_long_trigger  and pos_open <= 0 and in_date_range
+mr_enter_short = is_ranging and regime_mode == 1 and mr_short_trigger and pos_open >= 0 and allow_shorts and in_date_range
+
+enter_long  = enter_long_trend  or mr_enter_long
+enter_short = enter_short_trend or mr_enter_short
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXIT CONDITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Reversal exit — trailing stop flipped against the leg (trend legs only).
+// Fires even if the current regime has since turned ranging.
+exit_long_reversal  = pos_open > 0 and is_trend_trade and short_signal
+exit_short_reversal = pos_open < 0 and is_trend_trade and long_signal
+
+// Trend exits
+exit_long_ema   = pos_open > 0 and ema_exit_long
+exit_short_ema  = pos_open < 0 and ema_exit_short
+exit_long_time  = pos_open > 0 and time_exit_trigger
+exit_short_time = pos_open < 0 and time_exit_trigger
+
+// Live take-profit level. With "MR Take-Profit at VWAP" on, the target tracks
+// VWAP each bar rather than sitting at the ATR level captured on entry; the
+// substitution only applies while an MR leg is actually open.
+mr_tp_level = not na(mr_tp_price) and vwap_mr_tp_vwap and not na(vwap_val) ? vwap_val : mr_tp_price
+
+// Mean-reversion exits (TP/SL hit or RSI crosses 50) — only when regime_mode == 1
+mr_exit_long_tp  = pos_open > 0 and is_ranging and regime_mode == 1 and not na(mr_tp_level) and high >= mr_tp_level
+mr_exit_long_sl  = pos_open > 0 and is_ranging and regime_mode == 1 and not na(mr_sl_price) and low  <= mr_sl_price
+mr_exit_long_rsi = pos_open > 0 and is_ranging and regime_mode == 1 and rsi_val > 50
+
+mr_exit_short_tp  = pos_open < 0 and is_ranging and regime_mode == 1 and not na(mr_tp_level) and low  <= mr_tp_level
+mr_exit_short_sl  = pos_open < 0 and is_ranging and regime_mode == 1 and not na(mr_sl_price) and high >= mr_sl_price
+mr_exit_short_rsi = pos_open < 0 and is_ranging and regime_mode == 1 and rsi_val < 50
+
+exit_long_extra  = exit_long_reversal  or exit_long_ema  or exit_long_time  or mr_exit_long_tp  or mr_exit_long_sl  or mr_exit_long_rsi
+exit_short_extra = exit_short_reversal or exit_short_ema or exit_short_time or mr_exit_short_tp or mr_exit_short_sl or mr_exit_short_rsi
+
+// A flat-out close: an exit that is not absorbed by an opposite entry on the
+// same bar (an opposite entry flips the virtual position directly).
+close_long  = exit_long_extra  and not enter_short
+close_short = exit_short_extra and not enter_long
+
+// A leg ends either way — closed flat, or flipped by the opposite entry.
+leg_end_long  = pos_open > 0 and (exit_long_extra  or enter_short)
+leg_end_short = pos_open < 0 and (exit_short_extra or enter_long)
+
+exit_reason_long  = exit_long_reversal ? "Reversal" : exit_long_ema ? "EMA" : exit_long_time ? "Time" : mr_exit_long_tp ? "MR TP" : mr_exit_long_sl ? "MR SL" : mr_exit_long_rsi ? "MR RSI" : "Flip"
+exit_reason_short = exit_short_reversal ? "Reversal" : exit_short_ema ? "EMA" : exit_short_time ? "Time" : mr_exit_short_tp ? "MR TP" : mr_exit_short_sl ? "MR SL" : mr_exit_short_rsi ? "MR RSI" : "Flip"
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CLOSING-LEG RESULT — captured before the state is overwritten
+// ══════════════════════════════════════════════════════════════════════════════
+
+leg_dir     = trade_dir
+leg_entry   = entry_price
+leg_qty     = entry_qty
+leg_val     = entry_pos_val
+leg_bars    = bars_held
+
+leg_end     = leg_end_long or leg_end_short
+leg_pnl     = leg_end and not na(leg_entry) ? (leg_dir == "LONG" ? (close - leg_entry) * leg_qty : (leg_entry - close) * leg_qty) : na
+leg_pnl_pct = leg_end and not na(leg_entry) and leg_val > 0 ? (leg_pnl / leg_val) * 100 : na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE TRANSITIONS — exits resolve first, then entries (an entry may flip)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if close_long or close_short
+    pos           := 0
+    entry_price   := na
+    entry_qty     := na
+    entry_pos_val := na
+    trade_dir     := ""
+    mr_tp_price   := na
+    mr_sl_price   := na
+
+if enter_long
+    pos            := 1
+    entry_price    := close
+    entry_qty      := signal_qty
+    entry_pos_val  := signal_qty * close
+    trade_dir      := "LONG"
+    bars_held      := 0
+    is_trend_trade := enter_long_trend
+    mr_tp_price    := mr_enter_long ? close + mr_tp_atr_mult * atr_val : na
+    mr_sl_price    := mr_enter_long ? close - mr_sl_atr_mult * atr_val : na
+
+if enter_short
+    pos            := -1
+    entry_price    := close
+    entry_qty      := signal_qty
+    entry_pos_val  := signal_qty * close
+    trade_dir      := "SHORT"
+    bars_held      := 0
+    is_trend_trade := enter_short_trend
+    mr_tp_price    := mr_enter_short ? close - mr_tp_atr_mult * atr_val : na
+    mr_sl_price    := mr_enter_short ? close + mr_sl_atr_mult * atr_val : na
+
+// Live read-out for the leg that is open at the end of this bar
+in_signal   = pos != 0
+open_pnl    = in_signal and not na(entry_price) ? (pos > 0 ? (close - entry_price) * entry_qty : (entry_price - close) * entry_qty) : na
+open_pnl_pct = in_signal and not na(entry_price) and entry_pos_val > 0 ? (open_pnl / entry_pos_val) * 100 : na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(enter_long,  "Long Signal",  "ATD: long signal")
+alertcondition(enter_short, "Short Signal", "ATD: short signal")
+alertcondition(close_long,  "Close Long",   "ATD: long signal ended")
+alertcondition(close_short, "Close Short",  "ATD: short signal ended")
+
+if enter_long
+    msg = use_json_alerts ? '{"action":"open_long","ticker":"' + alert_ticker + '","price":"' + str.tostring(close) + '","stop":"' + str.tostring(trail_stop) + '","leverage":"' + str.tostring(clamped_lev, '#.##') + '","regime":"' + cur_regime + '"}' : "ATD LONG " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(trail_stop, "#.##") + " | " + cur_regime
+    alert(msg, alert.freq_once_per_bar_close)
+
+if enter_short
+    msg = use_json_alerts ? '{"action":"open_short","ticker":"' + alert_ticker + '","price":"' + str.tostring(close) + '","stop":"' + str.tostring(trail_stop) + '","leverage":"' + str.tostring(clamped_lev, '#.##') + '","regime":"' + cur_regime + '"}' : "ATD SHORT " + syminfo.ticker + " @ " + str.tostring(close) + " | stop " + str.tostring(trail_stop, "#.##") + " | " + cur_regime
+    alert(msg, alert.freq_once_per_bar_close)
+
+if close_long
+    msg = use_json_alerts ? '{"action":"close_long","ticker":"' + alert_ticker + '","price":"' + str.tostring(close) + '","reason":"' + str.lower(exit_reason_long) + '"}' : "ATD CLOSE LONG " + syminfo.ticker + " @ " + str.tostring(close) + " | " + exit_reason_long
+    alert(msg, alert.freq_once_per_bar_close)
+
+if close_short
+    msg = use_json_alerts ? '{"action":"close_short","ticker":"' + alert_ticker + '","price":"' + str.tostring(close) + '","reason":"' + str.lower(exit_reason_short) + '"}' : "ATD CLOSE SHORT " + syminfo.ticker + " @ " + str.tostring(close) + " | " + exit_reason_short
+    alert(msg, alert.freq_once_per_bar_close)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DATA WINDOW SERIES
+// ══════════════════════════════════════════════════════════════════════════════
+
+plot(direction,                        "Direction (1/-1)",  color=color.new(color.white, 100), display=display.data_window)
+plot(is_trending ? 1 : 0,              "Trending (1/0)",    color=color.new(color.white, 100), display=display.data_window)
+plot(na(vwap_val) ? na : (close / vwap_val - 1) * 100, "Distance to VWAP %", color=color.new(color.white, 100), display=display.data_window)
+plot(in_signal ? entry_price : na,     "Signal Entry",      color=color.new(color.white, 100), display=display.data_window)
+plot(open_pnl,                         "Open Leg $",        color=color.new(color.white, 100), display=display.data_window)
+plot(open_pnl_pct,                     "Open Leg %",        color=color.new(color.white, 100), display=display.data_window)
+plot(in_signal ? entry_pos_val : na,   "Notional $",        color=color.new(color.white, 100), display=display.data_window)
+plot(in_signal ? clamped_lev : na,     "Leverage",          color=color.new(color.white, 100), display=display.data_window)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Invisible price anchor — the second edge for every area fill below.
+// Plotted with a fully transparent colour rather than display.none so that
+// fill() still has a usable plot id.
+p_price = plot(close, "Price Anchor", color=color.new(color.white, 100), editable=false)
+
+// Trailing stop line. Always plotted (transparent when hidden) so that turning
+// the line off does not also remove the fill anchored to it.
+ts_color = direction == 1 ? color.new(#00C853, 0) : color.new(#FF1744, 0)
+p_stop   = plot(trail_stop, "Trailing Stop", color=show_trailing_stop ? ts_color : color.new(color.white, 100), linewidth=2, style=plot.style_linebr, editable=false)
+
+// Trend area fill — gradient from solid against price to near-invisible at the
+// stop, so the band reads as depth rather than as a flat block. The band itself
+// is the distance price has travelled from its invalidation level.
+glow_base  = direction == 1 ? #00C853 : #FF1744
+glow_near  = show_trend_glow ? color.new(glow_base, glow_transp_near) : color.new(color.white, 100)
+glow_far   = show_trend_glow ? color.new(glow_base, glow_transp_far)  : color.new(color.white, 100)
+fill(p_stop, p_price,
+     top_value    = math.max(close, trail_stop),
+     bottom_value = math.min(close, trail_stop),
+     top_color    = direction == 1 ? glow_near : glow_far,
+     bottom_color = direction == 1 ? glow_far  : glow_near,
+     title        = "Trend Area")
+
+// VWAP, its price area, and optional volume-weighted StDev bands
+p_vwap = plot(vwap_val, "VWAP", color=show_vwap ? c_vwap_active : color.new(color.white, 100), linewidth=2)
+fill(p_vwap, p_price, color = show_vwap_area ? color.new(c_vwap_active, vwap_area_transp) : na, title="VWAP Area")
+
+p_vwap_up = plot(show_vwap_bands ? vwap_up : na, "VWAP +SD", color=color.new(c_vwap_active, 55), linewidth=1)
+p_vwap_dn = plot(show_vwap_bands ? vwap_dn : na, "VWAP -SD", color=color.new(c_vwap_active, 55), linewidth=1)
+fill(p_vwap_up, p_vwap_dn, color = show_vwap_bands ? color.new(c_vwap_active, 95) : na, title="VWAP Bands")
+
+// Regime background
+regime_bg = is_trending ? color.new(#00C853, 93) : color.new(#FF9100, 93)
+bgcolor(use_regime_filter ? regime_bg : na, title="Regime Background")
+
+// Entry/exit markers
+plotshape(show_entry_signals and enter_long_trend,  "Long Entry",   shape.triangleup,   location.belowbar, color.new(#00C853, 0), size=size.small)
+plotshape(show_entry_signals and enter_short_trend, "Short Entry",  shape.triangledown, location.abovebar, color.new(#FF1744, 0), size=size.small)
+plotshape(show_entry_signals and mr_enter_long,     "MR Long",      shape.circle,       location.belowbar, color.new(#2196F3, 0), size=size.small)
+plotshape(show_entry_signals and mr_enter_short,    "MR Short",     shape.circle,       location.abovebar, color.new(#FF9100, 0), size=size.small)
+plotshape(show_entry_signals and leg_end_long,      "Long Exit",    shape.xcross,       location.abovebar, color.new(#FF9100, 0), size=size.tiny)
+plotshape(show_entry_signals and leg_end_short,     "Short Exit",   shape.xcross,       location.belowbar, color.new(#FF9100, 0), size=size.tiny)
+
+// Result labels at the end of each leg
+if show_pnl_labels and leg_end and not na(leg_pnl)
+    lbl_txt = str.tostring(leg_pnl_pct, "#.##") + "%"
+    lbl_col = leg_pnl >= 0 ? color.new(#00C853, 0) : color.new(#FF1744, 0)
+    lbl_y   = leg_end_long ? high : low
+    lbl_sty = leg_end_long ? label.style_label_down : label.style_label_up
+    label.new(bar_index, lbl_y, lbl_txt, style=lbl_sty, color=color.new(color.black, 80), textcolor=lbl_col, size=size.small,
+         tooltip = leg_dir + " | " + (leg_end_long ? exit_reason_long : exit_reason_short)
+             + "\nEntry " + str.tostring(leg_entry, "#.##") + "  →  Exit " + str.tostring(close, "#.##")
+             + "\nMove " + str.tostring(leg_pnl_pct, "#.##") + "%   (" + str.tostring(leg_pnl, "#.##") + " on " + str.tostring(leg_val, "#") + " notional)"
+             + "\nBars held " + str.tostring(leg_bars))
+
+// Bar colouring while a leg is open
+barcolor(show_bar_colors ? (pos > 0 ? color.new(#00C853, 70) : pos < 0 ? color.new(#FF1744, 70) : na) : na, title="Signal Bars")
+
+// EMA
+plot(use_ema_exit ? ema_val : na, "EMA", color=color.new(#2196F3, 60), linewidth=1)
+
+// MR TP/SL levels
+plot(not na(mr_tp_price) ? mr_tp_price : na, "MR TP", color=color.new(#00C853, 50), style=plot.style_linebr, linewidth=1)
+plot(not na(mr_sl_price) ? mr_sl_price : na, "MR SL", color=color.new(#FF1744, 50), style=plot.style_linebr, linewidth=1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INFO DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════
+
+if show_info_table and barstate.islast
+    var table info = table.new(position.top_right, 2, 14, bgcolor=color.new(#1E1E1E, 10), border_width=1, border_color=color.new(#333333, 0))
+
+    header_bg = color.new(#2196F3, 20)
+    row_bg    = color.new(#1E1E1E, 10)
+    txt_col   = color.white
+
+    table.cell(info, 0, 0, "Adaptive Trend Direction", text_color=txt_col, bgcolor=header_bg, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 0, "v2.0",                     text_color=txt_col, bgcolor=header_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 1, "ATR (" + str.tostring(atr_period) + ")",  text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 1, str.tostring(atr_val, "#.##"),             text_color=txt_col,    bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 2, "Trailing Stop",         text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 2, str.tostring(trail_stop, "#.##"), text_color=ts_color, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 3, "Direction",              text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    dir_txt = direction == 1 ? "▲ BULL" : direction == -1 ? "▼ BEAR" : "— FLAT"
+    dir_col = direction == 1 ? color.new(#00C853, 0) : direction == -1 ? color.new(#FF1744, 0) : color.gray
+    table.cell(info, 1, 3, dir_txt,                  text_color=dir_col,    bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 4, "RSI (" + str.tostring(rsi_period) + ")",  text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    rsi_col = rsi_val > rsi_long_th ? color.new(#00C853, 0) : rsi_val < rsi_short_th ? color.new(#FF1744, 0) : color.gray
+    table.cell(info, 1, 4, str.tostring(rsi_val, "#.#"),              text_color=rsi_col,    bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 5, "EMA Slope",              text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    slope_col = ema_slope > 0 ? color.new(#00C853, 0) : color.new(#FF1744, 0)
+    table.cell(info, 1, 5, str.tostring(ema_slope, "#.##"), text_color=slope_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 6, "Regime",                 text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    regime_col = is_trending ? color.new(#00C853, 0) : color.new(#FF9100, 0)
+    regime_txt = is_trending ? "TRENDING" : "RANGING"
+    table.cell(info, 1, 6, regime_txt,               text_color=regime_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 7, "ADX / ER",               text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 7, str.tostring(adx_val, "#.#") + " / " + str.tostring(er_val, "#.##"), text_color=txt_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 8, "Signal State",           text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    state_txt = pos > 0 ? "LONG" : pos < 0 ? "SHORT" : "FLAT"
+    state_col = pos > 0 ? color.new(#00C853, 0) : pos < 0 ? color.new(#FF1744, 0) : color.gray
+    table.cell(info, 1, 8, state_txt + (pos != 0 ? (is_trend_trade ? " (trend)" : " (MR)") : ""), text_color=state_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 9, "Open Leg",               text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    open_col = na(open_pnl_pct) ? color.gray : open_pnl_pct >= 0 ? color.new(#00C853, 0) : color.new(#FF1744, 0)
+    table.cell(info, 1, 9, na(open_pnl_pct) ? "—" : str.tostring(open_pnl_pct, "#.##") + "%", text_color=open_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 10, "Model Size",            text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    lev_col = clamped_lev >= max_leverage ? color.new(#FF9100, 0) : txt_col
+    table.cell(info, 1, 10, str.tostring(signal_qty, "#.####") + " @ " + str.tostring(clamped_lev, "#.##") + "x", text_color=lev_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 11, "Bars in Signal",        text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    bars_col = bars_held > max_bars_in_trade * 0.8 ? color.new(#FF9100, 0) : txt_col
+    table.cell(info, 1, 11, str.tostring(bars_held) + "/" + str.tostring(max_bars_in_trade), text_color=bars_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    table.cell(info, 0, 12, "VWAP (" + vwap_anchor + ")", text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    vwap_cell_col = na(vwap_val) ? color.gray : c_vwap_active
+    vwap_cell_txt = na(vwap_val) ? "n/a" : str.tostring(vwap_val, "#.##") + (vwap_above ? "  ▲" : "  ▼")
+    table.cell(info, 1, 12, vwap_cell_txt,           text_color=vwap_cell_col, bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)
+
+    components = (use_rsi_filter ? "RSI " : "") + (use_ema_exit ? "EMA " : "") + (use_time_exit ? "TIME " : "") + (use_vol_sizing ? "VOL " : "") + (use_regime_filter ? "REG " : "") + (use_vwap_filter ? "VWAP " : "") + (allow_shorts ? "SHORT" : "")
+    table.cell(info, 0, 13, "Active",                text_color=color.gray, bgcolor=row_bg, text_size=size.small, text_halign=text.align_left)
+    table.cell(info, 1, 13, components,              text_color=color.new(#2196F3, 0), bgcolor=row_bg, text_size=size.small, text_halign=text.align_right)

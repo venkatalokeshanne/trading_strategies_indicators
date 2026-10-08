@@ -1,0 +1,260 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+strategy("LuxAlgo SMC Pro Ultimate", overlay = true, calc_on_every_tick = true, margin_long = 100, margin_short = 100, initial_capital = 10000, default_qty_type = strategy.percent_of_equity, default_qty_value = 10)
+
+// --- Groups ---
+string G_SMC    = "Market Structure (MSS/BOS/CHoCH)"
+string G_OB_FVG = "Order Blocks & FVGs"
+string G_PD     = "Premium & Discount Zones"
+string G_FILT   = "Confirmation Filters"
+string G_RANK   = "Signal Ranking & Volume"
+string G_RISK   = "Risk Management"
+string G_OPT    = "Optimization Engine (APM)"
+string G_HUD    = "HUD Customization"
+string G_STYLE  = "Visual Settings & Colors"
+
+// --- Inputs ---
+string aggLevel      = input.string("Moderate", "Signal Aggressiveness", options = ["Conservative", "Moderate", "Aggressive"], group = G_SMC)
+string structureMode = input.string("All", "Structure Mode", options = ["Internal", "Swing", "All"], group = G_SMC)
+int internalLookback = input.int(9, "Internal Lookback", minval = 2, group = G_SMC)
+int swingLookback    = input.int(50, "Swing Lookback", minval = 2, group = G_SMC)
+string tradeDirection = input.string("Both", "Trade Direction", options = ["Both", "Long Only", "Short Only"], group = G_SMC)
+
+bool useFVGConfluence = input.bool(true, "Require FVG Presence", group = G_OB_FVG)
+bool requirePDZone = input.bool(true, "Only Buy in Discount / Sell in Premium", group = G_PD)
+int pdRangeBars    = input.int(100, "Range Lookback", minval = 10, group = G_PD)
+
+bool useDivFilter = input.bool(false, "Use Reversal Divergence Filter", group = G_FILT)
+bool useBBFilter  = input.bool(false, "Use Bollinger Band Filter", group = G_FILT)
+
+float volMultInput = input.float(1.2, "Base Volume Multiplier", group = G_RANK)
+int volCandles    = input.int(3, "Volume Momentum Check", minval = 1, group = G_RANK)
+int emaLenRanking = input.int(200, "Ranking EMA Length", minval = 1, group = G_RANK)
+
+string tpMethod   = input.string("Dynamic RR", "TP Mode", options = ["Dynamic RR", "Structural"], group = G_RISK)
+float atrMultInput = input.float(1.5, "ATR Buffer Multiplier", group = G_RISK)
+float maxSLPercent = input.float(10.0, "Hard Stop Cap %", minval = 1.0, group = G_RISK)
+int atrLen        = input.int(9, "ATR Length", group = G_RISK)
+int decayRate     = input.int(2, "Signal Decay Speed", minval = 1, maxval = 10, group = G_RISK)
+
+bool useAutoOpt   = input.bool(true, "Enable Self-Optimization (APM)", group = G_OPT)
+int optLookback   = input.int(10, "Optimization Lookback (Trades)", minval = 2, maxval = 50, group = G_OPT)
+
+// HUD Toggles
+bool showHUD      = input.bool(true, "Show HUD Dashboard", group = G_HUD)
+bool showLevels   = input.bool(true, "Show Entry/SL/TP Levels", group = G_HUD)
+bool showWR       = input.bool(true, "Show Rolling Win Rate", group = G_HUD)
+bool showAPM      = input.bool(true, "Show Performance Score", group = G_HUD)
+bool showProfit   = input.bool(true, "Show Total Profit", group = G_HUD)
+
+string labelSize  = input.string(size.small, "Label Size", options = [size.tiny, size.small, size.normal, size.large, size.huge], group = G_STYLE)
+string hudPos     = input.string(position.top_right, "HUD Position", options = [position.top_right, position.bottom_right, position.top_left, position.bottom_left, position.middle_right], group = G_STYLE)
+color bullColor   = input.color(#089981, "Bullish Signals (Long)", group = G_STYLE, inline = "C1")
+color bearColor   = input.color(#f23645, "Bearish Signals (Short)", group = G_STYLE, inline = "C1")
+color slColor     = input.color(#f23645, "Stop Loss Line", group = G_STYLE, inline = "C2")
+color tpColor     = input.color(#089981, "Take Profit Line", group = G_STYLE, inline = "C2")
+color hudBgColor  = input.color(#131722, "HUD Background", group = G_STYLE)
+color hudTextColor = input.color(#ffffff, "HUD Text", group = G_STYLE)
+
+// --- Aggressiveness Multipliers ---
+float aggMod = aggLevel == "Aggressive" ? 0.7 : aggLevel == "Conservative" ? 1.4 : 1.0
+int adjInternal = math.max(2, math.round(internalLookback * aggMod))
+int adjSwing    = math.max(5, math.round(swingLookback * aggMod))
+
+// --- Performance Tracker ---
+var float[] tradeResults = array.new_float(0)
+var float performanceScore = 1.0
+
+if strategy.closedtrades > strategy.closedtrades[1]
+    float lastProfit = strategy.netprofit - strategy.netprofit[1]
+    array.push(tradeResults, lastProfit > 0 ? 1.0 : 0.0)
+    if array.size(tradeResults) > optLookback
+        array.remove(tradeResults, 0)
+    
+    float winRate = array.size(tradeResults) > 0 ? array.sum(tradeResults) / array.size(tradeResults) : 0
+    performanceScore := useAutoOpt ? math.max(0.5, math.min(1.5, winRate / 0.5)) : 1.0
+
+float adaptiveVolMult = volMultInput * (performanceScore < 0.8 ? 1.3 : performanceScore > 1.2 ? 0.9 : 1.0) * aggMod
+float adaptiveAtrMult = atrMultInput * (performanceScore < 0.8 ? 0.8 : performanceScore > 1.2 ? 1.2 : 1.0)
+
+// --- Calculations ---
+float atr = ta.rma(ta.tr(true), atrLen)
+float slBuffer = atr * adaptiveAtrMult
+float volAvg = ta.sma(volume, 20)
+float rsi = ta.rsi(close, 14)
+float emaRanking = ta.ema(close, emaLenRanking)
+[bbMid, _, _] = ta.bb(close, 20, 2.0)
+
+float pdHigh = ta.highest(high, pdRangeBars)
+float pdLow  = ta.lowest(low, pdRangeBars)
+float eq     = (pdHigh + pdLow) / 2
+bool inDisc  = close < eq
+bool inPrem  = close > eq
+
+bool bFVG = low > high[2] and close[1] > high[2]
+bool sFVG = high < low[2] and close[1] < low[2]
+
+bool volInc = true
+if volCandles > 0
+    for i = 0 to volCandles - 1
+        if volume[i] < volume[i+1]
+            volInc := false
+            break
+
+bool iSH = high[adjInternal] == ta.highest(high, adjInternal * 2 + 1)
+bool iSL = low[adjInternal] == ta.lowest(low, adjInternal * 2 + 1)
+var float lastISH = na, var float lastISL = na
+if iSH
+    lastISH := high[adjInternal]
+if iSL
+    lastISL := low[adjInternal]
+
+bool sSH = high[adjSwing] == ta.highest(high, adjSwing * 2 + 1)
+bool sSL = low[adjSwing] == ta.lowest(low, adjSwing * 2 + 1)
+var float lastSSH = na, var float lastSSL = na
+if sSH
+    lastSSH := high[adjSwing]
+if sSL
+    lastSSL := low[adjSwing]
+
+bool xoI = ta.crossover(close, lastISH), bool xuI = ta.crossunder(close, lastISL)
+bool xoS = ta.crossover(close, lastSSH), bool xuS = ta.crossunder(close, lastSSL)
+
+bool mssL = (structureMode == "Internal" and xoI) or (structureMode == "Swing" and xoS) or (structureMode == "All" and (xoI or xoS))
+bool mssS = (structureMode == "Internal" and xuI) or (structureMode == "Swing" and xuS) or (structureMode == "All" and (xuI or xuS))
+
+bool bullDiv = rsi > rsi[1] and low < low[1]
+bool bearDiv = rsi < rsi[1] and high > high[1]
+
+bool bTrigger = mssL and (not requirePDZone or inDisc) and (not useFVGConfluence or bFVG[1] or bFVG) and (not useDivFilter or bullDiv) and (not useBBFilter or close > bbMid)
+bool sTrigger = mssS and (not requirePDZone or inPrem) and (not useFVGConfluence or sFVG[1] or sFVG) and (not useDivFilter or bearDiv) and (not useBBFilter or close < bbMid)
+
+var float sl      = na
+var float initialSl = na
+var float tp1     = na
+var float tp2     = na
+var bool  tp1Hit  = false
+var bool  tp2Hit  = false
+var int entryBar  = 0
+var float entryPrice = na
+
+bool strongBase = volume > volAvg * adaptiveVolMult and volInc
+bool strongL = strongBase and close > emaRanking
+bool strongS = strongBase and close < emaRanking
+
+// --- Entry Logic ---
+if bTrigger and strategy.position_size == 0 and (tradeDirection == "Both" or tradeDirection == "Long Only")
+    // Structural SL Fix: Pivot must be below current price
+    pivot = not na(lastISL) and lastISL < close ? lastISL : ta.lowest(low, 20)
+    sl := math.max(pivot - slBuffer, close * (1 - maxSLPercent / 100))
+    // Safety Guard: SL must be below entry
+    if sl >= close
+        sl := close - (atr * 1.5)
+    
+    initialSl := sl
+    risk = close - sl
+    tp1 := close + risk
+    tp2 := (tpMethod == "Structural" and not na(lastSSH) and lastSSH > tp1) ? lastSSH : close + (risk * 2.5)
+    tp1Hit := false, tp2Hit := false, entryBar := bar_index, entryPrice := close
+    
+    string lblText = (strongL ? "STRONG " : "") + "BUY\n@ " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + "\nTP2: " + str.tostring(tp2, "#.##")
+    strategy.entry("Long", strategy.long, comment = strongL ? "STRONG BUY" : "BUY")
+    label.new(bar_index, low, lblText, color = bullColor, textcolor = color.white, style = label.style_label_up, size = labelSize)
+
+if sTrigger and strategy.position_size == 0 and (tradeDirection == "Both" or tradeDirection == "Short Only")
+    // Structural SL Fix: Pivot must be above current price
+    pivot = not na(lastISH) and lastISH > close ? lastISH : ta.highest(high, 20)
+    sl := math.min(pivot + slBuffer, close * (1 + maxSLPercent / 100))
+    // Safety Guard: SL must be above entry
+    if sl <= close
+        sl := close + (atr * 1.5)
+    
+    initialSl := sl
+    risk = sl - close
+    tp1 := close - risk
+    tp2 := (tpMethod == "Structural" and not na(lastSSL) and lastSSL < tp1) ? lastSSL : close - (risk * 2.5)
+    tp1Hit := false, tp2Hit := false, entryBar := bar_index, entryPrice := close
+    
+    string lblText = (strongS ? "STRONG " : "") + "SELL\n@ " + str.tostring(close, "#.##") + "\nSL: " + str.tostring(sl, "#.##") + "\nTP1: " + str.tostring(tp1, "#.##") + "\nTP2: " + str.tostring(tp2, "#.##")
+    strategy.entry("Short", strategy.short, comment = strongS ? "STRONG SELL" : "SELL")
+    label.new(bar_index, high, lblText, color = bearColor, textcolor = color.white, style = label.style_label_down, size = labelSize)
+
+// --- Exit & Evasive Trailing ---
+if strategy.position_size > 0
+    if not tp1Hit and high >= tp1
+        strategy.exit("TP1_L", "Long", qty_percent = 33, limit = tp1, comment = "TP1 Hit"), tp1Hit := true, sl := strategy.position_avg_price 
+    if not tp2Hit and high >= tp2
+        strategy.exit("TP2_L", "Long", qty_percent = 33, limit = tp2, comment = "TP2 Hit"), tp2Hit := true
+    
+    if high > high[1]
+        float trail = high - (atr * 3.0) 
+        if trail > sl
+            sl := trail
+    strategy.exit("Exit_L", "Long", stop = sl, comment = "Trailing SL")
+
+if strategy.position_size < 0
+    if not tp1Hit and low <= tp1
+        strategy.exit("TP1_S", "Short", qty_percent = 33, limit = tp1, comment = "TP1 Hit"), tp1Hit := true, sl := strategy.position_avg_price 
+    if not tp2Hit and low <= tp2
+        strategy.exit("TP2_S", "Short", qty_percent = 33, limit = tp2, comment = "TP2 Hit"), tp2Hit := true
+
+    if low < low[1]
+        float trail = low + (atr * 3.0)
+        if trail < sl
+            sl := trail
+    strategy.exit("Exit_S", "Short", stop = sl, comment = "Trailing SL")
+
+// --- HUD Table ---
+var table HUD = table.new(hudPos, 2, 16, bgcolor = hudBgColor, border_width = 1, border_color = hudTextColor)
+
+if barstate.islast
+    table.clear(HUD, 0, 0, 1, 15)
+    if showHUD
+        int r = 0
+        bool inTrade = strategy.position_size != 0
+        color tradeColor = inTrade ? (strategy.position_size > 0 ? bullColor : bearColor) : color.gray
+        
+        // STATUS HEADER
+        table.cell(HUD, 0, r, "TRADE STATUS", text_color = hudTextColor, text_size = size.small, bgcolor = color.new(hudBgColor, 25))
+        table.cell(HUD, 1, r, inTrade ? "ACTIVE (" + (strategy.position_size > 0 ? "LONG" : "SHORT") + ")" : "WAITING (FLAT)", text_color = inTrade ? tradeColor : color.gray, text_size = size.small, bgcolor = color.new(hudBgColor, 25))
+        r += 1
+
+        table.cell(HUD, 0, r, "Aggressiveness", text_color = hudTextColor, text_halign = text.align_left)
+        table.cell(HUD, 1, r, aggLevel, text_color = aggLevel == "Aggressive" ? bullColor : aggLevel == "Conservative" ? bearColor : hudTextColor)
+        r += 1
+
+        if showLevels
+            table.cell(HUD, 0, r, inTrade ? "Current Entry" : "Last Entry", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(entryPrice, "#.##"), text_color = hudTextColor)
+            r += 1
+            table.cell(HUD, 0, r, "Initial Stop", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(initialSl, "#.##"), text_color = color.gray)
+            r += 1
+            table.cell(HUD, 0, r, "Current Trailing SL", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(sl, "#.##"), text_color = bearColor)
+            r += 1
+            table.cell(HUD, 0, r, "Partial TP1 (1:1)", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(tp1, "#.##"), text_color = tp1Hit ? color.gray : bullColor)
+            r += 1
+            table.cell(HUD, 0, r, "Target TP2", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(tp2, "#.##"), text_color = tp2Hit ? color.gray : bullColor)
+            r += 1
+
+        if showWR
+            float wR = array.size(tradeResults) > 0 ? (array.sum(tradeResults) / array.size(tradeResults)) * 100 : 0
+            table.cell(HUD, 0, r, "Rolling Win Rate", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(wR, "#.0") + "%", text_color = wR >= 50 ? bullColor : bearColor)
+            r += 1
+
+        if showAPM
+            color mC = performanceScore > 1.1 ? bullColor : performanceScore < 0.9 ? bearColor : color.orange
+            table.cell(HUD, 0, r, "APM Perf Score", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(performanceScore, "#.##"), text_color = mC)
+            r += 1
+
+        if showProfit
+            table.cell(HUD, 0, r, "Total Net Profit", text_color = hudTextColor, text_halign = text.align_left)
+            table.cell(HUD, 1, r, str.tostring(strategy.netprofit, "###,###"), text_color = strategy.netprofit >= 0 ? bullColor : bearColor)
+
+plot(strategy.position_size != 0 ? sl : na, "SL", slColor, 2, style = plot.style_linebr)
+plot(strategy.position_size != 0 and not tp2Hit ? tp2 : na, "TP2", tpColor, 1, style = plot.style_linebr)

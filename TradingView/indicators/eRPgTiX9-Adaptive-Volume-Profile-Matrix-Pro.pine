@@ -1,0 +1,404 @@
+//@version=6
+indicator("Adaptive Volume Profile Matrix Pro [ArB Markets]", overlay=true, max_boxes_count=1500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// ADAPTIVE VOLUME PROFILE MATRIX PRO
+// Novel additions over standard Market Profile / Volume Profile tools:
+//  1. Multi-Session Profile History (stores & renders N previous profiles)
+//  2. Rotational Factor (balance vs imbalance score per profile)
+//  3. Adaptive Value Area % (volatility-scaled instead of fixed 70%)
+//  4. Profile Momentum Trail (POC drift across sessions)
+//  5. Acceptance Score Heatmap (volume x touches x delta agreement)
+//  6. Auto Single-Print / Liquidity Magnet detection
+//  7. Cross-Profile POC Confluence Zones (novel: detects when multiple
+//     historical POCs cluster near the same price -> highlights as a
+//     high-confluence support/resistance band)
+// ============================================================================
+
+// ---------------------------- INPUTS ---------------------------------------
+grp1 = "Profile Settings"
+sessionType   = input.string("Session", "Profile Anchor", options=["Session","Week","Month"], group=grp1)
+numRows       = input.int(24, "Number of Price Rows", minval=10, maxval=100, group=grp1)
+valueAreaPct  = input.float(70, "Base Value Area %", minval=50, maxval=95, group=grp1)
+adaptiveVA    = input.bool(true, "Adaptive Value Area (volatility-scaled)", group=grp1)
+
+grp2 = "Novel: Rotational Factor"
+showRotation  = input.bool(true, "Show Rotational Factor in Label", group=grp2)
+
+grp3 = "Novel: Profile Momentum"
+showMomentum  = input.bool(true, "Show POC Momentum Trail", group=grp3)
+
+grp4 = "Novel: Acceptance Heatmap"
+showHeatmap   = input.bool(true, "Enable Acceptance Heatmap Coloring", group=grp4)
+heatSensitivity = input.float(1.0, "Heatmap Sensitivity", minval=0.1, maxval=3.0, step=0.1, group=grp4)
+
+grp5 = "Previous Profiles"
+showPrevProfiles = input.bool(true, "Show Previous Profiles", group=grp5)
+numPrevProfiles  = input.int(3, "Number of Previous Profiles", minval=1, maxval=10, group=grp5)
+prevProfileTransp = input.int(55, "Previous Profile Extra Transparency", minval=0, maxval=90, group=grp5)
+prevWidthBars    = input.int(14, "Previous Profile Max Width (bars)", minval=3, maxval=40, group=grp5)
+onlyPrevPOCVA    = input.bool(false, "Previous Profiles: Show POC/VA Lines Only (no rows)", group=grp5)
+
+grp6 = "Novel: Confluence Zones"
+showConfluence   = input.bool(true, "Show POC Confluence Zones", group=grp6)
+confluenceTol    = input.float(0.15, "Confluence Tolerance (% of range)", minval=0.02, maxval=1.0, step=0.01, group=grp6)
+
+grp7 = "Visuals"
+pocColor      = input.color(color.new(color.yellow, 0), "POC Color", group=grp7)
+vahColor      = input.color(color.new(color.aqua, 40), "VAH/VAL Color", group=grp7)
+profileUp     = input.color(color.new(color.teal, 55), "Profile Bull Volume", group=grp7)
+profileDown   = input.color(color.new(color.red, 55), "Profile Bear Volume", group=grp7)
+showSinglePrints = input.bool(true, "Highlight Single Prints", group=grp7)
+maxRowWidthBars  = input.int(28, "Current Profile Max Width (bars)", minval=5, maxval=60, group=grp7)
+
+// ---------------------------- SESSION DETECTION -----------------------------
+newSession() =>
+    switch sessionType
+        "Session" => ta.change(time("D")) != 0
+        "Week"    => ta.change(time("W")) != 0
+        "Month"   => ta.change(time("M")) != 0
+        => false
+
+isNewSession = newSession()
+
+// ---------------------------- LIVE SESSION STATE -----------------------------
+var float sessHigh = na
+var float sessLow  = na
+var int   sessionStartBar = 0
+
+var float[] volAtRow   = array.new_float(0)
+var float[] buyVolRow  = array.new_float(0)
+var float[] sellVolRow = array.new_float(0)
+var int[]   touchesRow = array.new_int(0)
+
+// ---------------------------- ARCHIVE (PREVIOUS PROFILES) --------------------
+// Each completed session's full profile is snapshotted into these arrays-of-arrays
+// (Pine v6 has no native 2D arrays, so we store one array.array<float> per session
+// via array<box>/array<line> pooling instead — here we keep raw snapshots as
+// serialized flat arrays with a fixed numRows stride)
+var float[] archHigh = array.new_float(0)
+var float[] archLow  = array.new_float(0)
+var int[]   archStartBar = array.new_int(0)
+var int[]   archEndBar   = array.new_int(0)
+var float[] archPOC  = array.new_float(0)
+var float[] archVAH  = array.new_float(0)
+var float[] archVAL  = array.new_float(0)
+// flat volume storage: session i's rows live at [i*numRows .. i*numRows+numRows-1]
+var float[] archVol    = array.new_float(0)
+var float[] archBuyVol = array.new_float(0)
+var float[] archSellVol= array.new_float(0)
+
+var float[] pocHistory    = array.new_float(0)
+var int[]   pocBarHistory = array.new_int(0)
+
+var line[] profLines = array.new_line(0)
+var box[]  profBoxes = array.new_box(0)
+var box[]  confBoxes = array.new_box(0)
+
+clearAllDrawings() =>
+    if array.size(profLines) > 0
+        for i = 0 to array.size(profLines) - 1
+            line.delete(array.get(profLines, i))
+        array.clear(profLines)
+    if array.size(profBoxes) > 0
+        for i = 0 to array.size(profBoxes) - 1
+            box.delete(array.get(profBoxes, i))
+        array.clear(profBoxes)
+    if array.size(confBoxes) > 0
+        for i = 0 to array.size(confBoxes) - 1
+            box.delete(array.get(confBoxes, i))
+        array.clear(confBoxes)
+
+// ---------------------------- SESSION RESET / ARCHIVE -------------------------
+if isNewSession or barstate.isfirst
+    if array.size(volAtRow) > 0 and not na(sessHigh) and not na(sessLow) and sessHigh > sessLow
+        // compute POC/VA for the session that just ended
+        maxV = 0.0
+        maxIdx = 0
+        totalV = 0.0
+        for i = 0 to array.size(volAtRow) - 1
+            v = array.get(volAtRow, i)
+            totalV += v
+            if v > maxV
+                maxV := v
+                maxIdx := i
+        rowH = (sessHigh - sessLow) / numRows
+        targetVol = totalV * valueAreaPct / 100
+        vaUp = maxIdx
+        vaDown = maxIdx
+        accumVol = array.get(volAtRow, maxIdx)
+        while accumVol < targetVol and (vaUp < array.size(volAtRow) - 1 or vaDown > 0)
+            volUpNext = vaUp < array.size(volAtRow) - 1 ? array.get(volAtRow, vaUp + 1) : -1
+            volDownNext = vaDown > 0 ? array.get(volAtRow, vaDown - 1) : -1
+            if volUpNext >= volDownNext
+                vaUp += 1
+                accumVol += volUpNext
+            else
+                vaDown -= 1
+                accumVol += volDownNext
+        pocPriceArchive = sessLow + (maxIdx + 0.5) * rowH
+        vahArchive = sessLow + (vaUp + 1) * rowH
+        valArchive = sessLow + vaDown * rowH
+
+        array.push(archHigh, sessHigh)
+        array.push(archLow, sessLow)
+        array.push(archStartBar, sessionStartBar)
+        array.push(archEndBar, bar_index - 1)
+        array.push(archPOC, pocPriceArchive)
+        array.push(archVAH, vahArchive)
+        array.push(archVAL, valArchive)
+        for i = 0 to array.size(volAtRow) - 1
+            array.push(archVol, array.get(volAtRow, i))
+            array.push(archBuyVol, array.get(buyVolRow, i))
+            array.push(archSellVol, array.get(sellVolRow, i))
+
+        array.push(pocHistory, pocPriceArchive)
+        array.push(pocBarHistory, bar_index - 1)
+
+        // trim archive to keep only what we need (numPrevProfiles + momentum buffer)
+        maxKeep = math.max(numPrevProfiles, 20)
+        if array.size(archHigh) > maxKeep
+            array.shift(archHigh)
+            array.shift(archLow)
+            array.shift(archStartBar)
+            array.shift(archEndBar)
+            array.shift(archPOC)
+            array.shift(archVAH)
+            array.shift(archVAL)
+            for i = 0 to numRows - 1
+                array.shift(archVol)
+                array.shift(archBuyVol)
+                array.shift(archSellVol)
+        if array.size(pocHistory) > maxKeep
+            array.shift(pocHistory)
+            array.shift(pocBarHistory)
+
+    clearAllDrawings()
+    sessHigh := high
+    sessLow  := low
+    sessionStartBar := bar_index
+    array.clear(volAtRow)
+    array.clear(buyVolRow)
+    array.clear(sellVolRow)
+    array.clear(touchesRow)
+    for i = 0 to numRows - 1
+        array.push(volAtRow, 0.0)
+        array.push(buyVolRow, 0.0)
+        array.push(sellVolRow, 0.0)
+        array.push(touchesRow, 0)
+else
+    sessHigh := math.max(sessHigh, high)
+    sessLow  := math.min(sessLow, low)
+
+// ---------------------------- VOLUME DISTRIBUTION (current session) ----------
+rowHeight = (sessHigh - sessLow) / numRows
+
+distributeVolume() =>
+    if rowHeight > 0
+        barRange = high - low
+        for i = 0 to numRows - 1
+            rowLow  = sessLow + i * rowHeight
+            rowHi   = rowLow + rowHeight
+            overlap = math.min(high, rowHi) - math.max(low, rowLow)
+            if overlap > 0
+                frac = barRange > 0 ? overlap / barRange : 1.0
+                vAdd = volume * frac
+                isBull = close >= open
+                array.set(volAtRow, i, array.get(volAtRow, i) + vAdd)
+                if isBull
+                    array.set(buyVolRow, i, array.get(buyVolRow, i) + vAdd)
+                else
+                    array.set(sellVolRow, i, array.get(sellVolRow, i) + vAdd)
+                array.set(touchesRow, i, array.get(touchesRow, i) + 1)
+
+distributeVolume()
+
+// ---------------------------- ROTATIONAL FACTOR -------------------------------
+var float rotationalFactor = 0.0
+if barstate.islast
+    revisits = 0
+    total = 0
+    for i = 0 to array.size(touchesRow) - 1
+        t = array.get(touchesRow, i)
+        if t > 1
+            revisits += (t - 1)
+        total += t
+    rotationalFactor := total > 0 ? (revisits / total) * 100 : 0.0
+
+// ---------------------------- DRAW EVERYTHING (last bar only) -----------------
+if barstate.islast and rowHeight > 0
+    clearAllDrawings()
+
+    // ================= CURRENT SESSION PROFILE =================
+    maxVol = 0.0
+    totalVol = 0.0
+    for i = 0 to array.size(volAtRow) - 1
+        v = array.get(volAtRow, i)
+        totalVol += v
+        if v > maxVol
+            maxVol := v
+
+    pocIdx = 0
+    pv = 0.0
+    for i = 0 to array.size(volAtRow) - 1
+        if array.get(volAtRow, i) > pv
+            pv := array.get(volAtRow, i)
+            pocIdx := i
+
+    atr14 = ta.atr(14)
+    volRegime = (sessHigh - sessLow) > 0 ? atr14 / (sessHigh - sessLow + syminfo.mintick) : 0.5
+    dynVAPct = adaptiveVA ? math.min(90.0, math.max(55.0, valueAreaPct + (volRegime - 0.3) * 40)) : valueAreaPct
+
+    targetVol = totalVol * dynVAPct / 100
+    vaUp = pocIdx
+    vaDown = pocIdx
+    accumVol2 = array.get(volAtRow, pocIdx)
+    while accumVol2 < targetVol and (vaUp < array.size(volAtRow) - 1 or vaDown > 0)
+        volUpNext = vaUp < array.size(volAtRow) - 1 ? array.get(volAtRow, vaUp + 1) : -1
+        volDownNext = vaDown > 0 ? array.get(volAtRow, vaDown - 1) : -1
+        if volUpNext >= volDownNext
+            vaUp += 1
+            accumVol2 += volUpNext
+        else
+            vaDown -= 1
+            accumVol2 += volDownNext
+
+    vahPrice = sessLow + (vaUp + 1) * rowHeight
+    valPrice = sessLow + vaDown * rowHeight
+    pocPrice = sessLow + (pocIdx + 0.5) * rowHeight
+
+    barsBack = math.min(maxRowWidthBars, math.max(3, bar_index - sessionStartBar))
+    rightX = bar_index + 2
+
+    for i = 0 to array.size(volAtRow) - 1
+        v = array.get(volAtRow, i)
+        if v > 0
+            rowLow  = sessLow + i * rowHeight
+            rowHi   = rowLow + rowHeight
+            widthFrac = maxVol > 0 ? v / maxVol : 0
+            boxRight = rightX + math.round(widthFrac * barsBack)
+            bv = array.get(buyVolRow, i)
+            sv = array.get(sellVolRow, i)
+            deltaRatio = v > 0 ? (bv - sv) / v : 0
+            baseCol = deltaRatio >= 0 ? profileUp : profileDown
+            if showHeatmap
+                touches = array.get(touchesRow, i)
+                accScore = widthFrac * math.min(1.0, touches / 5.0) * heatSensitivity
+                transp = int(math.max(10, 85 - accScore * 75))
+                baseCol := deltaRatio >= 0 ? color.new(color.teal, transp) : color.new(color.red, transp)
+            isSinglePrint = array.get(touchesRow, i) == 1 and widthFrac < 0.15
+            bx = box.new(rightX, rowHi, boxRight, rowLow, border_color=color.new(color.gray, 70), bgcolor=showSinglePrints and isSinglePrint ? color.new(color.orange, 20) : baseCol)
+            array.push(profBoxes, bx)
+
+    pocLineCur = line.new(sessionStartBar, pocPrice, bar_index + 2, pocPrice, color=pocColor, width=2, style=line.style_solid)
+    array.push(profLines, pocLineCur)
+    vahLineCur = line.new(sessionStartBar, vahPrice, bar_index + 2, vahPrice, color=vahColor, width=1, style=line.style_dashed)
+    array.push(profLines, vahLineCur)
+    valLineCur = line.new(sessionStartBar, valPrice, bar_index + 2, valPrice, color=vahColor, width=1, style=line.style_dashed)
+    array.push(profLines, valLineCur)
+
+    // ================= PREVIOUS PROFILES (NEW) =================
+    nArchived = array.size(archHigh)
+    profilesToShow = math.min(numPrevProfiles, nArchived)
+
+    if showPrevProfiles and profilesToShow > 0
+        for s = nArchived - profilesToShow to nArchived - 1
+            pHigh  = array.get(archHigh, s)
+            pLow   = array.get(archLow, s)
+            pStart = array.get(archStartBar, s)
+            pEnd   = array.get(archEndBar, s)
+            pRowH  = (pHigh - pLow) / numRows
+            baseOffset = s * numRows
+
+            // find max vol for this archived profile (for width scaling)
+            pMaxVol = 0.0
+            for r = 0 to numRows - 1
+                vv = array.get(archVol, baseOffset + r)
+                if vv > pMaxVol
+                    pMaxVol := vv
+
+            if not onlyPrevPOCVA and pRowH > 0
+                for r = 0 to numRows - 1
+                    vv = array.get(archVol, baseOffset + r)
+                    if vv > 0
+                        rLow = pLow + r * pRowH
+                        rHi  = rLow + pRowH
+                        wFrac = pMaxVol > 0 ? vv / pMaxVol : 0
+                        bWidth = math.round(wFrac * prevWidthBars)
+                        boxL = pEnd
+                        boxR = pEnd + math.max(1, bWidth)
+                        bvv = array.get(archBuyVol, baseOffset + r)
+                        svv = array.get(archSellVol, baseOffset + r)
+                        dRatio = vv > 0 ? (bvv - svv) / vv : 0
+                        pCol = dRatio >= 0 ? color.new(color.teal, 55 + prevProfileTransp/2) : color.new(color.red, 55 + prevProfileTransp/2)
+                        pbx = box.new(boxL, rHi, boxR, rLow, border_color=color.new(color.gray, 85), bgcolor=pCol)
+                        array.push(profBoxes, pbx)
+
+            // POC / VAH / VAL lines for this previous profile, spanning its own session range
+            pPOC = array.get(archPOC, s)
+            pVAH = array.get(archVAH, s)
+            pVAL = array.get(archVAL, s)
+            plPOC = line.new(pStart, pPOC, pEnd, pPOC, color=color.new(pocColor, prevProfileTransp), width=1, style=line.style_solid)
+            array.push(profLines, plPOC)
+            plVAH = line.new(pStart, pVAH, pEnd, pVAH, color=color.new(vahColor, prevProfileTransp + 10), width=1, style=line.style_dotted)
+            array.push(profLines, plVAH)
+            plVAL = line.new(pStart, pVAL, pEnd, pVAL, color=color.new(vahColor, prevProfileTransp + 10), width=1, style=line.style_dotted)
+            array.push(profLines, plVAL)
+
+    // ================= PROFILE MOMENTUM TRAIL =================
+    if showMomentum and array.size(pocHistory) > 0
+        pts = array.size(pocHistory)
+        for i = 0 to pts - 2
+            x1 = array.get(pocBarHistory, i)
+            x2 = array.get(pocBarHistory, i + 1)
+            y1 = array.get(pocHistory, i)
+            y2 = array.get(pocHistory, i + 1)
+            ml = line.new(x1, y1, x2, y2, color=color.new(color.fuchsia, 30), width=2, style=line.style_dotted)
+            array.push(profLines, ml)
+        lastX = array.get(pocBarHistory, pts - 1)
+        lastY = array.get(pocHistory, pts - 1)
+        mlCur = line.new(lastX, lastY, bar_index, pocPrice, color=color.new(color.fuchsia, 30), width=2, style=line.style_dotted)
+        array.push(profLines, mlCur)
+
+    // ================= CONFLUENCE ZONES (NEW) =================
+    // Detect clusters where >=2 historical POCs (incl. current) sit within tolerance
+    if showConfluence and nArchived > 0
+        tolAbs = (sessHigh - sessLow) * confluenceTol / 100
+        allPOCs = array.new_float(0)
+        for i = 0 to nArchived - 1
+            array.push(allPOCs, array.get(archPOC, i))
+        array.push(allPOCs, pocPrice)
+
+        sortedPOCs = array.copy(allPOCs)
+        array.sort(sortedPOCs, order.ascending)
+
+        i = 0
+        while i < array.size(sortedPOCs)
+            clusterStart = i
+            clusterLowVal = array.get(sortedPOCs, i)
+            j = i
+            while j + 1 < array.size(sortedPOCs) and (array.get(sortedPOCs, j + 1) - array.get(sortedPOCs, clusterStart)) <= tolAbs
+                j += 1
+            clusterCount = j - clusterStart + 1
+            if clusterCount >= 2
+                zoneLow = array.get(sortedPOCs, clusterStart)
+                zoneHigh = array.get(sortedPOCs, j)
+                zoneHigh := math.max(zoneHigh, zoneLow + tolAbs * 0.3)
+                cbx = box.new(sessionStartBar - 5, zoneHigh, bar_index + 15, zoneLow, border_color=color.new(color.orange, 60), bgcolor=color.new(color.orange, 88), extend=extend.none)
+                array.push(confBoxes, cbx)
+            i := j + 1
+
+    // ================= INFO LABEL =================
+    labelTxt = "POC: " + str.tostring(pocPrice, format.mintick) +
+               "\nVAH: " + str.tostring(vahPrice, format.mintick) +
+               "\nVAL: " + str.tostring(valPrice, format.mintick) +
+               "\nAdaptive VA%: " + str.tostring(dynVAPct, "#.#") + "%" +
+               (showRotation ? "\nRotational Factor: " + str.tostring(rotationalFactor, "#.#") + "%" +
+                 (rotationalFactor > 60 ? " (Balanced)" : rotationalFactor < 30 ? " (Trending)" : " (Mixed)") : "") +
+               (showPrevProfiles ? "\nPrev Profiles Shown: " + str.tostring(profilesToShow) : "")
+
+    lbl = label.new(bar_index + 3, sessHigh, labelTxt, style=label.style_label_left, color=color.new(color.black, 20), textcolor=color.white, size=size.small)
+
+// ---------------------------- ALERTS ------------------------------------------
+alertcondition(showRotation and rotationalFactor > 70, title="High Rotational Balance", message="AVPM: High rotational balance — range-bound conditions likely.")
+alertcondition(showRotation and rotationalFactor < 20, title="Low Rotational Balance (Trend)", message="AVPM: Low rotational balance — trending conditions likely.")

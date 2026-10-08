@@ -1,0 +1,345 @@
+//@version=6
+// ============================================================================
+//  CASH ACCOUNT PORTFOLIO TREND SYSTEM  v2
+// ----------------------------------------------------------------------------
+//  Long-only trend system built for a CASH brokerage account running a
+//  MULTI-POSITION portfolio of STOCKS AND ETFs ONLY.
+//
+//  SECURITIES ONLY BY DESIGN. Crypto support was removed deliberately: it
+//  does not settle T+1, trades 365 days a year (so a bar is not a trading
+//  day), and carries several times the volatility of a large-cap. In an
+//  equal-weight portfolio that makes it the dominant risk no matter what
+//  else you hold. Spot Bitcoin ETFs (IBIT, FBTC) ARE securities and work
+//  fine here, but treat them as high-volatility holdings.
+//
+//  WHAT CHANGED FROM v1:
+//    - Position sizing now reflects your real per-slot allocation, so a
+//      single-symbol backtest no longer pretends the whole account is free.
+//    - Adds a Signal Quality Score so that when more signals fire than you
+//      have settled cash for, you have a rule for choosing.
+//
+//  TIMEFRAME: Daily. One bar must equal one trading day or the settlement
+//  logic is meaningless.
+// ============================================================================
+
+strategy("Cash Account Portfolio Trend System v2",
+     shorttitle             = "CASH_PORT",
+     overlay                = true,
+     initial_capital        = 4500,
+     default_qty_type       = strategy.fixed,   // qty computed per order, see SIZING
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.0,              // SET TO YOUR REAL COST
+     slippage               = 2,                // ticks. Never leave at 0.
+     pyramiding             = 0,
+     process_orders_on_close= false,            // fills at NEXT OPEN, as in real life
+     calc_on_every_tick     = false)
+
+// ============================================================================
+//  0. PORTFOLIO / ACCOUNT
+// ============================================================================
+
+grpAcct = "0. Portfolio & Account"
+slots        = input.int(5,    "Portfolio slots (max concurrent positions)", minval=1, maxval=20, group=grpAcct,
+     tooltip="Your capital is divided by this number. On a $4,500 account, 5 slots = ~$855 per position, which keeps per-trade risk near 2% of equity while staying large enough that whole-share rounding does not waste much cash.")
+cashBuffer   = input.float(5.0,"Cash buffer (%)", minval=0, maxval=50, step=1, group=grpAcct,
+     tooltip="Held back so a gap-up open does not cause a rejected order.")
+allowFrac    = input.bool(true, "Allow fractional shares", group=grpAcct,
+     tooltip="Turn OFF if your broker requires whole shares. With many slots and a small account, whole-share rounding can block trades on high-priced stocks.")
+
+grpAsset = "0b. Asset Class"
+assetMode = input.string("Stocks / ETFs", "Asset class", options=["Stocks / ETFs","High-volatility stock","Manual"], group=grpAsset,
+     tooltip="Use High-volatility for names that routinely move 4%+ per day (small caps, leveraged ETFs, crypto-proxy funds). It widens the stop so normal noise does not eject you.")
+
+// ============================================================================
+//  1-5. STRATEGY INPUTS
+// ============================================================================
+
+grpRegime = "1. Trend Regime Filter"
+trendLen     = input.int(200,  "Regime MA length",         minval=20,  group=grpRegime)
+trendMaType  = input.string("SMA", "Regime MA type", options=["SMA","EMA"], group=grpRegime,
+     tooltip="SMA is recommended here. EMA reacts faster, which flips the regime more often -- and every regime flip costs you an exit day plus a settlement day. Slower is cheaper in a cash account.")
+useSlope     = input.bool(true, "Require regime MA rising", group=grpRegime,
+     tooltip="Price above a FALLING long MA is usually a bear-market bounce. This skips those.")
+
+grpEntry = "2. Entry Trigger (MACD -- already EMA-based)"
+entryMode    = input.string("Breakout (MACD)", "Entry style",
+     options=["Breakout (MACD)","Pullback (RSI)","Either (more trades)"], group=grpEntry,
+     tooltip="Breakout buys momentum turning up. Pullback buys dips inside an uptrend. 'Either' roughly doubles trade count -- with only 5 slots and T+1 settlement that usually costs more than it gains. Start with Breakout.")
+srcIn        = input.source(close, "Source", group=grpEntry)
+fastLen      = input.int(12,   "MACD fast EMA",            minval=1,   group=grpEntry)
+slowLen      = input.int(26,   "MACD slow EMA",            minval=1,   group=grpEntry)
+sigLen       = input.int(9,    "MACD signal EMA",          minval=1,   group=grpEntry)
+useVolFilter = input.bool(true, "Require above-average volume", group=grpEntry)
+volLen       = input.int(20,   "Volume average length",    minval=2,   group=grpEntry)
+
+grpRsi = "2b. RSI"
+rsiLen       = input.int(14,   "RSI length",               minval=2,   group=grpRsi)
+useRsiVeto   = input.bool(true, "Veto entries when overbought", group=grpRsi,
+     tooltip="RSI's best job here. MACD tells you momentum is strong but cannot tell you when strong has become dangerous. This blocks buying the last day of a parabolic run.")
+rsiVetoLvl   = input.float(78.0,"Overbought veto level",    minval=50, maxval=95, step=1, group=grpRsi)
+rsiDipLvl    = input.float(40.0,"Pullback: dip below",      minval=10, maxval=50, step=1, group=grpRsi,
+     tooltip="Used only in Pullback or Either mode.")
+rsiRecLvl    = input.float(50.0,"Pullback: recover above",  minval=30, maxval=70, step=1, group=grpRsi)
+rsiDipBars   = input.int(10,   "Pullback: dip must be within N bars", minval=2, maxval=40, group=grpRsi)
+useRsiExit   = input.bool(false,"Exit on RSI weakness (not recommended)", group=grpRsi,
+     tooltip="RSI exits tend to fire early and cut winners short. Your ATR trailing stop already handles exits. Left off by default on purpose.")
+rsiExitLvl   = input.float(40.0,"RSI exit level",           minval=10, maxval=60, step=1, group=grpRsi)
+
+grpExit = "3. Exit Logic"
+atrLen       = input.int(22,   "ATR length",               minval=1,   group=grpExit)
+atrMult      = input.float(3.0,"Trailing stop ATR multiple (Manual mode)", minval=0.5, step=0.25, group=grpExit,
+     tooltip="THIS IS YOUR HOLD-LENGTH DIAL. 2.0 = a few weeks. 3.0 = 1-3 months. 4.5 = ride trends for many months. Only used in Manual mode; presets override it.")
+exitMaLen    = input.int(50,   "Trend-break exit MA",      minval=2,   group=grpExit)
+exitMaType   = input.string("SMA", "Trend-break MA type", options=["SMA","EMA"], group=grpExit,
+     tooltip="EMA here exits sooner. That protects gains but increases whipsaw, and each whipsaw costs you two idle days.")
+useMaExit    = input.bool(true, "Exit on close below trend-break MA", group=grpExit)
+hardStopPct  = input.float(12.0,"Catastrophic stop % (Manual mode)", minval=1.0, step=0.5, group=grpExit)
+
+grpCash = "4. Cash Account Constraints"
+minHoldBars  = input.int(1,    "Minimum holding period (bars)", minval=1, group=grpCash,
+     tooltip="1 = cannot sell the same day you bought. The no-day-trade rule.")
+settleBars   = input.int(1,    "Settlement cooldown after a sale (bars)", minval=0, group=grpCash,
+     tooltip="T+1 = 1. After a sale that slot's cash is unavailable for this many trading days. The chart shades orange while unsettled.")
+cooldownBars = input.int(0,    "Extra anti-churn cooldown (bars)", minval=0, group=grpCash)
+
+grpViz = "5. Display"
+showMAs      = input.bool(true, "Show moving averages",   group=grpViz)
+showStop     = input.bool(true, "Show trailing stop",     group=grpViz)
+showRegime   = input.bool(true, "Shade regime background",group=grpViz)
+showStats    = input.bool(true, "Show stats panel",       group=grpViz)
+
+// ============================================================================
+//  ASSET CLASS RESOLUTION
+// ============================================================================
+
+isHighVol = assetMode == "High-volatility stock"
+isManual  = assetMode == "Manual"
+
+atrMultEff     = isManual ? atrMult     : isHighVol ? 3.5  : 3.0
+hardStopPctEff = isManual ? hardStopPct : isHighVol ? 18.0 : 12.0
+settleBarsEff  = settleBars                // every instrument here settles T+1
+volFilterEff   = useVolFilter
+
+assetLabel = isHighVol ? "High-vol stock" : isManual ? "Manual" : "Stock / ETF"
+
+// Guard: this script's settlement and hold-period logic assumes one bar is
+// one TRADING day. A crypto chart has 365 bars a year and no settlement, so
+// every constraint here becomes wrong. Warn loudly rather than fail silently.
+wrongAsset = syminfo.type == "crypto"
+if wrongAsset and barstate.islast
+    label.new(bar_index, high, "WRONG ASSET TYPE\nThis strategy is for stocks and ETFs.\nCrypto does not settle T+1 and trades 365 days/yr,\nso the cash-account logic is invalid here.",
+         color=color.new(color.red, 0), textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// ============================================================================
+//  CALCULATIONS
+// ============================================================================
+
+trendMA  = trendMaType == "EMA" ? ta.ema(close, trendLen)  : ta.sma(close, trendLen)
+exitMA   = exitMaType  == "EMA" ? ta.ema(close, exitMaLen) : ta.sma(close, exitMaLen)
+
+// MACD -- note this is EMA-based, as a real MACD must be. The widely copied
+// ChartArt script used sma() for all three legs, which is why its signals do
+// not line up with the MACD indicator on your chart.
+macdLine = ta.ema(srcIn, fastLen) - ta.ema(srcIn, slowLen)
+sigLine  = ta.ema(macdLine, sigLen)
+hist     = macdLine - sigLine
+
+// RSI
+rsiVal   = ta.rsi(srcIn, rsiLen)
+
+atrVal   = ta.atr(atrLen)
+atrPct   = 100.0 * atrVal / close
+volOk    = not volFilterEff or volume > ta.sma(volume, volLen)
+
+regimeOk = close > trendMA and (not useSlope or ta.change(trendMA) > 0)
+
+// ============================================================================
+//  SIGNAL QUALITY SCORE
+// ----------------------------------------------------------------------------
+//  With 5 slots and settled-cash limits, you will regularly see more buy
+//  signals than you can fund. Rather than taking whichever you noticed first,
+//  compare this score across your watchlist and take the highest.
+//
+//  Momentum (3-month return) rewarded; extension above the 200 MA penalized,
+//  because buying something already stretched far above trend is where
+//  trend-following goes to die.
+// ============================================================================
+
+mom63     = 100.0 * (close - close[63]) / close[63]
+extension = 100.0 * (close - trendMA) / trendMA
+qScore    = mom63 - (extension * 0.5)
+
+// ============================================================================
+//  CASH ACCOUNT STATE MACHINE
+// ============================================================================
+
+inTrade  = strategy.position_size > 0
+justSold = strategy.position_size == 0 and strategy.position_size[1] > 0
+
+var int lastSellBar = na
+if justSold
+    lastSellBar := bar_index
+
+barsSinceSell = na(lastSellBar) ? 999999 : bar_index - lastSellBar
+fundsSettled  = barsSinceSell >= settleBarsEff
+cooldownOver  = barsSinceSell >= (settleBarsEff + cooldownBars)
+
+barsHeld = inTrade ? bar_index - strategy.opentrades.entry_bar_index(0) : na
+holdMet  = inTrade and barsHeld >= minHoldBars
+
+// ============================================================================
+//  TRAILING STOP
+// ============================================================================
+
+var float peakSinceEntry = na
+var float hardStopLvl    = na
+
+if inTrade
+    peakSinceEntry := na(peakSinceEntry) ? high : math.max(peakSinceEntry, high)
+    if na(hardStopLvl)
+        hardStopLvl := strategy.opentrades.entry_price(0) * (1.0 - hardStopPctEff / 100.0)
+else
+    peakSinceEntry := na
+    hardStopLvl    := na
+
+trailStop = inTrade ? peakSinceEntry - atrMultEff * atrVal : na
+
+// ============================================================================
+//  POSITION SIZING
+// ----------------------------------------------------------------------------
+//  Each position gets equity / slots, minus a cash buffer. This is the single
+//  most important correction for a multi-position portfolio: without it every
+//  symbol you test silently assumes 100% of the account was available to it.
+// ============================================================================
+
+perSlotCapital = strategy.equity * (1.0 - cashBuffer / 100.0) / slots
+rawQty         = perSlotCapital / close
+orderQty       = allowFrac ? rawQty : math.floor(rawQty)
+qtyOk          = orderQty > 0
+
+// ============================================================================
+//  SIGNALS & ORDERS
+// ============================================================================
+
+// --- Breakout: MACD momentum turning up while already positive -------------
+breakoutTrig = ta.crossover(hist, 0) and macdLine > 0
+
+// --- Pullback: RSI dipped recently, now recovering, trend still intact -----
+// A different job from MACD: this buys weakness inside strength, where the
+// breakout trigger buys strength itself. They fire in different conditions.
+dippedRecently = ta.barssince(rsiVal < rsiDipLvl) <= rsiDipBars
+pullbackTrig   = dippedRecently and ta.crossover(rsiVal, rsiRecLvl) and close > exitMA
+
+entryTrigger = entryMode == "Breakout (MACD)" ? breakoutTrig :
+               entryMode == "Pullback (RSI)"  ? pullbackTrig :
+               (breakoutTrig or pullbackTrig)
+
+// --- RSI veto: never buy a blow-off top ------------------------------------
+rsiVetoOk = not useRsiVeto or rsiVal < rsiVetoLvl
+
+longSignal = not inTrade and regimeOk and entryTrigger and volOk and rsiVetoOk and fundsSettled and cooldownOver and qtyOk
+
+exitTrail  = inTrade and close < trailStop
+exitMaBrk  = inTrade and useMaExit and close < exitMA
+exitHard   = inTrade and close < hardStopLvl
+exitRegime = inTrade and close < trendMA
+exitRsi    = inTrade and useRsiExit and ta.crossunder(rsiVal, rsiExitLvl)
+
+exitSignal = holdMet and (exitTrail or exitMaBrk or exitHard or exitRegime or exitRsi)
+
+exitReason = exitHard   ? "Catastrophic stop" :
+             exitTrail  ? "Trailing stop"     :
+             exitRegime ? "Regime break"      :
+             exitMaBrk  ? "Trend break"       :
+             exitRsi    ? "RSI weakness"      : "Exit"
+
+if longSignal
+    strategy.entry("Long", strategy.long, qty=orderQty, comment="BUY")
+
+if exitSignal
+    strategy.close("Long", comment=exitReason)
+
+// ============================================================================
+//  TRACKING
+// ============================================================================
+
+var int barsTotal    = 0
+var int barsInMarket = 0
+barsTotal += 1
+if inTrade
+    barsInMarket += 1
+
+pctInMarket = barsTotal > 0 ? 100.0 * barsInMarket / barsTotal : 0.0
+avgHold     = strategy.closedtrades > 0 ? barsInMarket / strategy.closedtrades : 0.0
+
+// ============================================================================
+//  PLOTS
+// ============================================================================
+
+plot(showMAs  ? trendMA   : na, "Regime MA",  color=ta.change(trendMA) > 0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=3)
+plot(showMAs  ? exitMA    : na, "Exit MA",    color=color.new(color.orange, 0), linewidth=1)
+plot(showStop ? trailStop : na, "Trail Stop", color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=2)
+
+bgcolor(showRegime and regimeOk ? color.new(color.green, 92) : na, title="Regime OK")
+bgcolor(showRegime and not fundsSettled ? color.new(color.orange, 85) : na, title="Unsettled Cash")
+
+plotshape(longSignal, "Buy signal",  shape.triangleup,   location.belowbar, color.new(color.green, 0), size=size.tiny)
+plotshape(exitSignal, "Exit signal", shape.triangledown, location.abovebar, color.new(color.red, 0),   size=size.tiny)
+
+// ============================================================================
+//  STATS PANEL
+// ============================================================================
+
+if showStats and barstate.islast
+    var table t = table.new(position.top_right, 2, 10, border_width=1)
+    hdr = color.new(color.gray, 80)
+    table.cell(t, 0, 0, "Asset class",     bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 0, assetLabel,        text_size=size.small)
+    table.cell(t, 0, 8, "RSI (" + str.tostring(rsiLen) + ")", bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 8, str.tostring(rsiVal, "#.#") + (useRsiVeto and rsiVal >= rsiVetoLvl ? "  VETO" : ""),
+         text_size=size.small,
+         text_color = rsiVal >= rsiVetoLvl ? color.red : rsiVal < rsiDipLvl ? color.orange : color.gray)
+    table.cell(t, 0, 9, "Entry style",     bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 9, entryMode,         text_size=size.small)
+    table.cell(t, 0, 1, "Signal score",    bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 1, str.tostring(qScore, "#.#"), text_size=size.small,
+         text_color = qScore > 0 ? color.green : color.red)
+    table.cell(t, 0, 2, "Stop width",      bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 2, str.tostring(atrMultEff, "#.#") + "x ATR (" + str.tostring(atrPct * atrMultEff, "#.#") + "%)", text_size=size.small)
+    table.cell(t, 0, 3, "Per-slot capital",bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 3, str.tostring(perSlotCapital, "#") + " (" + str.tostring(100.0 / slots, "#.#") + "%)", text_size=size.small)
+    table.cell(t, 0, 4, "Time in market",  bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 4, str.tostring(pctInMarket, "#.#") + "%", text_size=size.small)
+    table.cell(t, 0, 5, "Closed trades",   bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 5, str.tostring(strategy.closedtrades), text_size=size.small,
+         text_color = strategy.closedtrades < 30 ? color.orange : color.gray)
+    table.cell(t, 0, 6, "Avg hold (bars)", bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 6, str.tostring(avgHold, "#.#"), text_size=size.small)
+    table.cell(t, 0, 7, "Status",          bgcolor=hdr, text_size=size.small)
+    table.cell(t, 1, 7, inTrade ? "LONG (" + str.tostring(barsHeld) + "d)" : fundsSettled ? "CASH - ready" : "CASH - unsettled",
+         text_size=size.small, text_color = inTrade ? color.green : fundsSettled ? color.blue : color.orange)
+
+// ============================================================================
+//  ALERTS
+// ============================================================================
+
+alertcondition(longSignal, "BUY next open",  "CASH_PORT: BUY signal. Fills next open. Check signal score before funding.")
+alertcondition(exitSignal, "SELL next open", "CASH_PORT: SELL signal. Fills next open.")
+
+// ============================================================================
+//  KNOWN LIMITS OF THIS BACKTEST -- READ BEFORE TRUSTING ANY NUMBER
+// ----------------------------------------------------------------------------
+//  1. Pine tests ONE symbol. It cannot model a shared settled-cash pool across
+//     5 positions. Real results will be worse than the sum of the parts,
+//     because in real life some signals will be unfundable.
+//  2. It cannot model correlation. Five semiconductor stocks is one position
+//     wearing five hats. Spread across unrelated sectors or the slot count
+//     is an illusion and all five will stop out in the same week.
+//  3. Set commission and slippage to your real costs. Zero-cost backtests
+//     are fiction.
+//  4. Fewer than ~30 closed trades proves nothing. Test each symbol across at
+//     least one full bear market (include 2022, and 2018 if data allows).
+//  5. If a 10% parameter change collapses returns, you found noise, not edge.
+//  6. Compare every result against buy-and-hold on the same symbol. If the
+//     strategy loses, the honest conclusion is to hold the index.
+// ============================================================================

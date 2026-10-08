@@ -1,0 +1,2082 @@
+//@version=6
+indicator("Surge Zone & Risk Manager v2.0B.1", overlay=true, max_lines_count=100, max_boxes_count=20, max_labels_count=50)
+
+//======================================================================
+// SURGE ZONE & RISK MANAGER v2.0B.1
+//
+// CLEAN MASTER BUILD
+//
+// AUTO features:
+//   • RBD / DBD / DBR / RBR candidate detection
+//   • Automatic proximal / distal placement
+//   • Multiple Supply and Demand zones remembered
+//   • Automatic Time score
+//   • Automatic Freshness score
+//   • Zone penetration tracking
+//   • Invalid zone retirement
+//   • Fallback to another remembered valid zone
+//
+// MANUAL mode:
+//   • Preserves manual proximal/distal workflow
+//   • Manual Time and Freshness available
+//
+// Existing risk engine preserved:
+//   • Daily ATR
+//   • Surge stop buffer
+//   • Futures tick risk
+//   • Position sizing
+//   • R multiples
+//   • Profit Zone
+//   • Curve / Trend
+//   • Decision Matrix
+//   • Odds Enhancer score
+//   • Compact / Detailed dashboards
+//   • Alerts
+//
+// IMPORTANT:
+// AUTO candle classification and zone-ranking logic are implementation
+// rules for this Pine tool, not official SurgeU definitions.
+//======================================================================
+
+
+//======================================================================
+// 1. HELPER FUNCTIONS
+//======================================================================
+
+f_bodyRatio(float o, float h, float l, float c) =>
+    float candleRange = math.max(h - l, syminfo.mintick)
+    float candleBody = math.abs(c - o)
+    float ratio = candleBody / candleRange
+    ratio
+
+
+f_lowerBody(float o, float c) =>
+    float value = math.min(o, c)
+    value
+
+
+f_upperBody(float o, float c) =>
+    float value = math.max(o, c)
+    value
+
+
+f_roundUpToTick(float value) =>
+    float rounded = math.ceil(value / syminfo.mintick) * syminfo.mintick
+    rounded
+
+
+// Official Surge Time scoring:
+// 1–3 base candles = 1
+// 4–6 base candles = 0.5
+// >6 base candles = 0
+f_timeScore(int baseCount) =>
+    float score = 0.0
+
+    if baseCount <= 0
+        score := 0.0
+    else if baseCount <= 3
+        score := 1.0
+    else if baseCount <= 6
+        score := 0.5
+    else
+        score := 0.0
+
+    score
+
+
+// Official Surge Freshness scoring:
+// Untested / Fresh = 2
+// Tested <=50% = 1
+// Tested >50% toward distal = 0
+f_freshScore(bool touched, float penetration) =>
+    float score = 0.0
+
+    if not touched
+        score := 2.0
+    else if penetration <= 0.50
+        score := 1.0
+    else
+        score := 0.0
+
+    score
+
+
+//======================================================================
+// 2. ZONE / TRADE INPUTS
+//======================================================================
+
+groupTrade = "1. Zone & Trade Setup"
+
+zoneMode = input.string(
+     "AUTO",
+     "Zone Mode",
+     options=["AUTO", "MANUAL"],
+     group=groupTrade)
+
+zoneType = input.string(
+     "SUPPLY",
+     "Trade Zone Type",
+     options=["SUPPLY", "DEMAND"],
+     group=groupTrade)
+
+tradePurpose = input.string(
+     "Weekly Income",
+     "Trading Purpose",
+     options=["Hourly Income", "Daily Income", "Weekly Income", "Monthly Income"],
+     group=groupTrade)
+
+manualProximal = input.float(
+     82.900,
+     "MANUAL Proximal",
+     step=0.001,
+     group=groupTrade)
+
+manualDistal = input.float(
+     83.475,
+     "MANUAL Distal",
+     step=0.001,
+     group=groupTrade)
+
+bool isSupply = zoneType == "SUPPLY"
+bool isDemand = zoneType == "DEMAND"
+
+string tradeDirection = isSupply ? "SHORT" : "LONG"
+
+
+//======================================================================
+// 3. AUTO DETECTION SETTINGS
+//
+// Implementation rules:
+// Base candle body <= selected % of total range.
+// Rally / Drop body >= selected % of total range.
+//======================================================================
+
+groupAuto = "2. AUTO Zone Detection"
+
+baseBodyMaxPct = input.float(
+     0.50,
+     "Maximum Base Body / Range",
+     minval=0.05,
+     maxval=0.95,
+     step=0.05,
+     group=groupAuto)
+
+impulseBodyMinPct = input.float(
+     0.50,
+     "Minimum Rally/Drop Body / Range",
+     minval=0.05,
+     maxval=0.95,
+     step=0.05,
+     group=groupAuto)
+
+maxBaseCandles = input.int(
+     6,
+     "Maximum Base Candles",
+     minval=1,
+     maxval=12,
+     group=groupAuto)
+
+requireBaseBreak = input.bool(
+     true,
+     "Require Move-Out Close Beyond Base",
+     group=groupAuto)
+
+memoryDepth = input.int(
+     8,
+     "Remember Zones Per Side",
+     minval=1,
+     maxval=20,
+     group=groupAuto)
+
+showDetectionLabel = input.bool(
+     true,
+     "Show Active AUTO Label",
+     group=groupAuto)
+
+
+//======================================================================
+// 4. SUPPLY MEMORY ARRAYS
+//======================================================================
+
+var array<float> supplyProx = array.new_float()
+var array<float> supplyDist = array.new_float()
+var array<string> supplyForm = array.new_string()
+var array<int> supplyBase = array.new_int()
+var array<int> supplyDetected = array.new_int()
+var array<int> supplyStart = array.new_int()
+var array<float> supplyPen = array.new_float()
+var array<bool> supplyTouched = array.new_bool()
+var array<bool> supplyValid = array.new_bool()
+
+
+//======================================================================
+// 5. DEMAND MEMORY ARRAYS
+//======================================================================
+
+var array<float> demandProx = array.new_float()
+var array<float> demandDist = array.new_float()
+var array<string> demandForm = array.new_string()
+var array<int> demandBase = array.new_int()
+var array<int> demandDetected = array.new_int()
+var array<int> demandStart = array.new_int()
+var array<float> demandPen = array.new_float()
+var array<bool> demandTouched = array.new_bool()
+var array<bool> demandValid = array.new_bool()
+
+
+//======================================================================
+// 6. UPDATE REMEMBERED SUPPLY ZONES
+//
+// Implementation retirement rule:
+// high > distal => remembered Supply candidate becomes invalid.
+//======================================================================
+
+int supplySize = array.size(supplyProx)
+
+if supplySize > 0
+
+    for j = 0 to supplySize - 1
+
+        bool validJ = array.get(supplyValid, j)
+        int detectedJ = array.get(supplyDetected, j)
+
+        if validJ and bar_index > detectedJ
+
+            float proxJ = array.get(supplyProx, j)
+            float distJ = array.get(supplyDist, j)
+            bool touchedJ = array.get(supplyTouched, j)
+            float penJ = array.get(supplyPen, j)
+
+            float widthJ = math.max(distJ - proxJ, syminfo.mintick)
+
+            if high >= proxJ
+
+                touchedJ := true
+
+                float currentPen = (high - proxJ) / widthJ
+
+                if currentPen < 0.0
+                    currentPen := 0.0
+
+                if currentPen > 1.0
+                    currentPen := 1.0
+
+                if currentPen > penJ
+                    penJ := currentPen
+
+                array.set(supplyTouched, j, touchedJ)
+                array.set(supplyPen, j, penJ)
+
+            if high > distJ
+                array.set(supplyValid, j, false)
+
+
+//======================================================================
+// 7. UPDATE REMEMBERED DEMAND ZONES
+//
+// Implementation retirement rule:
+// low < distal => remembered Demand candidate becomes invalid.
+//======================================================================
+
+int demandSize = array.size(demandProx)
+
+if demandSize > 0
+
+    for j = 0 to demandSize - 1
+
+        bool validJ = array.get(demandValid, j)
+        int detectedJ = array.get(demandDetected, j)
+
+        if validJ and bar_index > detectedJ
+
+            float proxJ = array.get(demandProx, j)
+            float distJ = array.get(demandDist, j)
+            bool touchedJ = array.get(demandTouched, j)
+            float penJ = array.get(demandPen, j)
+
+            float widthJ = math.max(proxJ - distJ, syminfo.mintick)
+
+            if low <= proxJ
+
+                touchedJ := true
+
+                float currentPen = (proxJ - low) / widthJ
+
+                if currentPen < 0.0
+                    currentPen := 0.0
+
+                if currentPen > 1.0
+                    currentPen := 1.0
+
+                if currentPen > penJ
+                    penJ := currentPen
+
+                array.set(demandTouched, j, touchedJ)
+                array.set(demandPen, j, penJ)
+
+            if low < distJ
+                array.set(demandValid, j, false)
+
+
+//======================================================================
+// 8. DETECT NEW AUTO FORMATION
+//
+// Same basic detector as v2.0A.
+//
+// Current confirmed candle = move-out.
+// Earlier candle(s)       = base.
+// Candle before base      = move-in.
+//======================================================================
+
+bool autoCandidateDetectedThisBar = false
+
+string newSide = "NONE"
+string newFormation = "NONE"
+
+float newProximal = na
+float newDistal = na
+
+int newBaseCount = 0
+int newStartBar = na
+
+if (barstate.isconfirmed and bar_index > maxBaseCandles + 2)
+
+    float outBodyRatio = f_bodyRatio(open, high, low, close)
+
+    bool outRally = close > open and outBodyRatio >= impulseBodyMinPct
+    bool outDrop = close < open and outBodyRatio >= impulseBodyMinPct
+
+    bool candidateFound = false
+
+    for n = 1 to maxBaseCandles
+
+        if not candidateFound
+
+            bool allBase = true
+
+            float baseLowestBody = na
+            float baseHighestBody = na
+            float baseHighestHigh = na
+            float baseLowestLow = na
+
+            //----------------------------------------------------------
+            // Evaluate base candles
+            //----------------------------------------------------------
+
+            for i = 1 to n
+
+                float ratioI = f_bodyRatio(open[i], high[i], low[i], close[i])
+
+                bool baseCandle = ratioI <= baseBodyMaxPct
+
+                if not baseCandle
+                    allBase := false
+
+                float lowerBodyI = f_lowerBody(open[i], close[i])
+                float upperBodyI = f_upperBody(open[i], close[i])
+
+                if na(baseLowestBody)
+                    baseLowestBody := lowerBodyI
+                else
+                    baseLowestBody := math.min(baseLowestBody, lowerBodyI)
+
+                if na(baseHighestBody)
+                    baseHighestBody := upperBodyI
+                else
+                    baseHighestBody := math.max(baseHighestBody, upperBodyI)
+
+                if na(baseHighestHigh)
+                    baseHighestHigh := high[i]
+                else
+                    baseHighestHigh := math.max(baseHighestHigh, high[i])
+
+                if na(baseLowestLow)
+                    baseLowestLow := low[i]
+                else
+                    baseLowestLow := math.min(baseLowestLow, low[i])
+
+            //----------------------------------------------------------
+            // Move-in candle
+            //----------------------------------------------------------
+
+            int moveInIndex = n + 1
+
+            float inBodyRatio = f_bodyRatio(
+                 open[moveInIndex],
+                 high[moveInIndex],
+                 low[moveInIndex],
+                 close[moveInIndex])
+
+            bool inRally = close[moveInIndex] > open[moveInIndex] and inBodyRatio >= impulseBodyMinPct
+            bool inDrop = close[moveInIndex] < open[moveInIndex] and inBodyRatio >= impulseBodyMinPct
+
+            //----------------------------------------------------------
+            // Break filter
+            //----------------------------------------------------------
+
+            bool supplyBreak = true
+            bool demandBreak = true
+
+            if requireBaseBreak
+                supplyBreak := close < baseLowestLow
+                demandBreak := close > baseHighestHigh
+
+            //----------------------------------------------------------
+            // SUPPLY — RBD / DBD
+            //----------------------------------------------------------
+
+            if allBase and outDrop and supplyBreak
+
+                // RBD
+                if inRally
+
+                    float rbdDistal = math.max(baseHighestHigh, high)
+                    rbdDistal := math.max(rbdDistal, high[moveInIndex])
+
+                    if rbdDistal > baseLowestBody
+
+                        newSide := "SUPPLY"
+                        newFormation := "RBD"
+                        newProximal := baseLowestBody
+                        newDistal := rbdDistal
+                        newBaseCount := n
+                        newStartBar := bar_index - moveInIndex
+
+                        candidateFound := true
+
+                // DBD
+                else if inDrop
+
+                    float dbdDistal = math.max(baseHighestHigh, high)
+
+                    if dbdDistal > baseLowestBody
+
+                        newSide := "SUPPLY"
+                        newFormation := "DBD"
+                        newProximal := baseLowestBody
+                        newDistal := dbdDistal
+                        newBaseCount := n
+                        newStartBar := bar_index - moveInIndex
+
+                        candidateFound := true
+
+            //----------------------------------------------------------
+            // DEMAND — DBR / RBR
+            //----------------------------------------------------------
+
+            if not candidateFound and allBase and outRally and demandBreak
+
+                // DBR
+                if inDrop
+
+                    float dbrDistal = math.min(baseLowestLow, low)
+                    dbrDistal := math.min(dbrDistal, low[moveInIndex])
+
+                    if dbrDistal < baseHighestBody
+
+                        newSide := "DEMAND"
+                        newFormation := "DBR"
+                        newProximal := baseHighestBody
+                        newDistal := dbrDistal
+                        newBaseCount := n
+                        newStartBar := bar_index - moveInIndex
+
+                        candidateFound := true
+
+                // RBR
+                else if inRally
+
+                    float rbrDistal = math.min(baseLowestLow, low)
+
+                    if rbrDistal < baseHighestBody
+
+                        newSide := "DEMAND"
+                        newFormation := "RBR"
+                        newProximal := baseHighestBody
+                        newDistal := rbrDistal
+                        newBaseCount := n
+                        newStartBar := bar_index - moveInIndex
+
+                        candidateFound := true
+
+    //------------------------------------------------------------------
+    // Store candidate
+    //------------------------------------------------------------------
+
+    if candidateFound
+
+        autoCandidateDetectedThisBar := true
+
+        if newSide == "SUPPLY"
+
+            array.unshift(supplyProx, newProximal)
+            array.unshift(supplyDist, newDistal)
+            array.unshift(supplyForm, newFormation)
+            array.unshift(supplyBase, newBaseCount)
+            array.unshift(supplyDetected, bar_index)
+            array.unshift(supplyStart, newStartBar)
+            array.unshift(supplyPen, 0.0)
+            array.unshift(supplyTouched, false)
+            array.unshift(supplyValid, true)
+
+            if array.size(supplyProx) > memoryDepth
+
+                array.pop(supplyProx)
+                array.pop(supplyDist)
+                array.pop(supplyForm)
+                array.pop(supplyBase)
+                array.pop(supplyDetected)
+                array.pop(supplyStart)
+                array.pop(supplyPen)
+                array.pop(supplyTouched)
+                array.pop(supplyValid)
+
+        if newSide == "DEMAND"
+
+            array.unshift(demandProx, newProximal)
+            array.unshift(demandDist, newDistal)
+            array.unshift(demandForm, newFormation)
+            array.unshift(demandBase, newBaseCount)
+            array.unshift(demandDetected, bar_index)
+            array.unshift(demandStart, newStartBar)
+            array.unshift(demandPen, 0.0)
+            array.unshift(demandTouched, false)
+            array.unshift(demandValid, true)
+
+            if array.size(demandProx) > memoryDepth
+
+                array.pop(demandProx)
+                array.pop(demandDist)
+                array.pop(demandForm)
+                array.pop(demandBase)
+                array.pop(demandDetected)
+                array.pop(demandStart)
+                array.pop(demandPen)
+                array.pop(demandTouched)
+                array.pop(demandValid)
+
+
+//======================================================================
+// 9. COUNT VALID REMEMBERED ZONES
+//======================================================================
+
+int validSupplyCount = 0
+int supplyValidSize = array.size(supplyValid)
+
+if supplyValidSize > 0
+
+    for j = 0 to supplyValidSize - 1
+
+        if array.get(supplyValid, j)
+            validSupplyCount += 1
+
+
+int validDemandCount = 0
+int demandValidSize = array.size(demandValid)
+
+if demandValidSize > 0
+
+    for j = 0 to demandValidSize - 1
+
+        if array.get(demandValid, j)
+            validDemandCount += 1
+
+
+//======================================================================
+// 10. SELECT BEST REMEMBERED SUPPLY
+//
+// Ranking implementation:
+//   1. Highest Freshness score
+//   2. Nearest proximal to current price
+//======================================================================
+
+int bestSupplyIndex = -1
+float bestSupplyFresh = -1.0
+float bestSupplyDistance = 1000000000000.0
+
+int supplySearchSize = array.size(supplyProx)
+
+if supplySearchSize > 0
+
+    for j = 0 to supplySearchSize - 1
+
+        bool validJ = array.get(supplyValid, j)
+
+        if validJ
+
+            bool touchedJ = array.get(supplyTouched, j)
+            float penJ = array.get(supplyPen, j)
+            float freshJ = f_freshScore(touchedJ, penJ)
+
+            float proxJ = array.get(supplyProx, j)
+            float distanceJ = math.abs(proxJ - close)
+
+            bool chooseJ = false
+
+            if freshJ > bestSupplyFresh
+                chooseJ := true
+            else if freshJ == bestSupplyFresh and distanceJ < bestSupplyDistance
+                chooseJ := true
+
+            if chooseJ
+
+                bestSupplyIndex := j
+                bestSupplyFresh := freshJ
+                bestSupplyDistance := distanceJ
+
+
+//======================================================================
+// 11. SELECT BEST REMEMBERED DEMAND
+//======================================================================
+
+int bestDemandIndex = -1
+float bestDemandFresh = -1.0
+float bestDemandDistance = 1000000000000.0
+
+int demandSearchSize = array.size(demandProx)
+
+if demandSearchSize > 0
+
+    for j = 0 to demandSearchSize - 1
+
+        bool validJ = array.get(demandValid, j)
+
+        if validJ
+
+            bool touchedJ = array.get(demandTouched, j)
+            float penJ = array.get(demandPen, j)
+            float freshJ = f_freshScore(touchedJ, penJ)
+
+            float proxJ = array.get(demandProx, j)
+            float distanceJ = math.abs(proxJ - close)
+
+            bool chooseJ = false
+
+            if freshJ > bestDemandFresh
+                chooseJ := true
+            else if freshJ == bestDemandFresh and distanceJ < bestDemandDistance
+                chooseJ := true
+
+            if chooseJ
+
+                bestDemandIndex := j
+                bestDemandFresh := freshJ
+                bestDemandDistance := distanceJ
+
+
+//======================================================================
+// 12. ACTIVE AUTO ZONE
+//======================================================================
+
+int activeIndex = -1
+
+if isSupply
+    activeIndex := bestSupplyIndex
+else
+    activeIndex := bestDemandIndex
+
+bool autoZoneReady = activeIndex >= 0
+
+float autoProximal = na
+float autoDistal = na
+
+string autoFormation = "NONE"
+
+int autoBaseCount = 0
+int autoDetectedBar = na
+int autoStartBar = na
+
+float autoPenetration = 0.0
+bool autoTouched = false
+
+if autoZoneReady
+
+    if isSupply
+
+        autoProximal := array.get(supplyProx, activeIndex)
+        autoDistal := array.get(supplyDist, activeIndex)
+        autoFormation := array.get(supplyForm, activeIndex)
+        autoBaseCount := array.get(supplyBase, activeIndex)
+        autoDetectedBar := array.get(supplyDetected, activeIndex)
+        autoStartBar := array.get(supplyStart, activeIndex)
+        autoPenetration := array.get(supplyPen, activeIndex)
+        autoTouched := array.get(supplyTouched, activeIndex)
+
+    else
+
+        autoProximal := array.get(demandProx, activeIndex)
+        autoDistal := array.get(demandDist, activeIndex)
+        autoFormation := array.get(demandForm, activeIndex)
+        autoBaseCount := array.get(demandBase, activeIndex)
+        autoDetectedBar := array.get(demandDetected, activeIndex)
+        autoStartBar := array.get(demandStart, activeIndex)
+        autoPenetration := array.get(demandPen, activeIndex)
+        autoTouched := array.get(demandTouched, activeIndex)
+
+
+//======================================================================
+// 13. ACTIVE AUTO / MANUAL ZONE
+//======================================================================
+
+bool zoneReady = false
+
+if zoneMode == "MANUAL"
+    zoneReady := true
+else
+    zoneReady := autoZoneReady
+
+
+float proximal = na
+float distal = na
+
+if zoneMode == "AUTO"
+    proximal := autoProximal
+    distal := autoDistal
+else
+    proximal := manualProximal
+    distal := manualDistal
+
+
+string activeFormation = "MANUAL"
+
+if zoneMode == "AUTO"
+    activeFormation := autoFormation
+
+
+int activeBaseCount = 0
+
+if zoneMode == "AUTO"
+    activeBaseCount := autoBaseCount
+
+
+float entryPrice = proximal
+
+
+int autoAgeBars = 0
+
+if zoneMode == "AUTO" and autoZoneReady
+    autoAgeBars := bar_index - autoDetectedBar
+
+
+//======================================================================
+// 14. CURVE & TREND INPUTS
+//======================================================================
+
+groupContext = "3. Curve & Trend"
+
+curveLocation = input.string(
+     "Low",
+     "HTF Curve",
+     options=["High", "Middle", "Low"],
+     group=groupContext)
+
+trendState = input.string(
+     "Downtrend",
+     "ITF Trend",
+     options=["Downtrend", "Sideways", "Uptrend"],
+     group=groupContext)
+
+
+//======================================================================
+// 15. ODDS ENHANCERS
+//
+// Strength remains manual.
+// AUTO mode calculates Time and Freshness.
+// MANUAL mode uses manual inputs.
+//======================================================================
+
+groupScore = "4. Odds Enhancers"
+
+strengthScore = input.float(
+     2.0,
+     "Strength",
+     options=[0.0, 1.0, 2.0],
+     group=groupScore)
+
+manualTimeScore = input.float(
+     1.0,
+     "MANUAL Time",
+     options=[0.0, 0.5, 1.0],
+     group=groupScore)
+
+manualFreshnessScore = input.float(
+     2.0,
+     "MANUAL Freshness",
+     options=[0.0, 1.0, 2.0],
+     group=groupScore)
+
+
+float autoTimeScore = 0.0
+
+if autoZoneReady
+    autoTimeScore := f_timeScore(autoBaseCount)
+
+
+float autoFreshnessScore = 0.0
+
+if autoZoneReady
+    autoFreshnessScore := f_freshScore(autoTouched, autoPenetration)
+
+
+float timeScore = manualTimeScore
+float freshnessScore = manualFreshnessScore
+
+if zoneMode == "AUTO"
+    timeScore := autoTimeScore
+    freshnessScore := autoFreshnessScore
+
+
+//======================================================================
+// 16. DAILY ATR & STOP
+//======================================================================
+
+groupATR = "5. ATR & Stop"
+
+atrLength = input.int(
+     14,
+     "Daily ATR Length",
+     minval=1,
+     group=groupATR)
+
+dailyATR = request.security(
+     syminfo.tickerid,
+     "D",
+     ta.atr(atrLength),
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_off)
+
+
+bool usesTenPctBuffer = tradePurpose == "Weekly Income" or tradePurpose == "Monthly Income"
+
+float bufferPct = 0.02
+
+if usesTenPctBuffer
+    bufferPct := 0.10
+
+
+float rawBuffer = dailyATR * bufferPct
+float stopBuffer = f_roundUpToTick(rawBuffer)
+
+
+float stopPrice = na
+
+if zoneReady
+
+    if isSupply
+        stopPrice := distal + stopBuffer
+    else
+        stopPrice := distal - stopBuffer
+
+
+float riskPoints = na
+
+if zoneReady
+    riskPoints := math.abs(stopPrice - entryPrice)
+
+
+//======================================================================
+// 17. FUTURES RISK / POSITION SIZE
+//======================================================================
+
+groupRisk = "6. Futures Risk & Position Size"
+
+useChartTickSize = input.bool(
+     true,
+     "Use Chart Minimum Tick",
+     group=groupRisk)
+
+manualTickSize = input.float(
+     0.025,
+     "Manual Tick Size",
+     minval=0.000001,
+     step=0.001,
+     group=groupRisk)
+
+dollarPerTick = input.float(
+     10.00,
+     "Dollar Value Per Tick / Contract",
+     minval=0.01,
+     step=0.01,
+     group=groupRisk)
+
+maxTradeRisk = input.float(
+     1000.00,
+     "Maximum Trade Risk ($)",
+     minval=0,
+     step=50,
+     group=groupRisk)
+
+useAutoPositionSize = input.bool(
+     true,
+     "Automatically Size Contracts",
+     group=groupRisk)
+
+manualContracts = input.int(
+     1,
+     "Manual Contracts",
+     minval=1,
+     group=groupRisk)
+
+
+float tickSize = manualTickSize
+
+if useChartTickSize
+    tickSize := syminfo.mintick
+
+
+float riskTicks = na
+
+if zoneReady and tickSize > 0
+    riskTicks := riskPoints / tickSize
+
+
+float riskPerContract = na
+
+if not na(riskTicks)
+    riskPerContract := riskTicks * dollarPerTick
+
+
+int maxContracts = 0
+
+if not na(riskPerContract) and riskPerContract > 0
+    maxContracts := int(math.floor(maxTradeRisk / riskPerContract))
+
+
+int plannedContracts = manualContracts
+
+if useAutoPositionSize
+    plannedContracts := maxContracts
+
+
+float plannedDollarRisk = na
+
+if not na(riskPerContract)
+    plannedDollarRisk := plannedContracts * riskPerContract
+
+
+float riskCapacityUsed = na
+
+if maxTradeRisk > 0 and not na(plannedDollarRisk)
+    riskCapacityUsed := plannedDollarRisk / maxTradeRisk * 100.0
+
+
+//======================================================================
+// 18. R MULTIPLES
+//======================================================================
+
+float oneR = na
+float twoR = na
+float threeR = na
+float fiveR = na
+
+if zoneReady
+
+    if isSupply
+
+        oneR := entryPrice - riskPoints
+        twoR := entryPrice - riskPoints * 2.0
+        threeR := entryPrice - riskPoints * 3.0
+        fiveR := entryPrice - riskPoints * 5.0
+
+    else
+
+        oneR := entryPrice + riskPoints
+        twoR := entryPrice + riskPoints * 2.0
+        threeR := entryPrice + riskPoints * 3.0
+        fiveR := entryPrice + riskPoints * 5.0
+
+
+//======================================================================
+// 19. PROFIT ZONE
+//
+// Still manual in v2.0B.1.
+//======================================================================
+
+groupProfit = "7. Profit Zone"
+
+useOpposingZone = input.bool(
+     true,
+     "Use Opposing Fresh Zone",
+     group=groupProfit)
+
+opposingZone = input.float(
+     80.500,
+     "Opposing Fresh Zone Proximal",
+     step=0.001,
+     group=groupProfit)
+
+
+float rewardPoints = na
+
+if zoneReady
+
+    if isSupply
+        rewardPoints := entryPrice - opposingZone
+    else
+        rewardPoints := opposingZone - entryPrice
+
+
+bool opposingZoneValid = false
+
+if zoneReady and useOpposingZone and not na(rewardPoints)
+    opposingZoneValid := rewardPoints > 0
+
+
+float actualRR = na
+
+if opposingZoneValid and riskPoints > 0
+    actualRR := rewardPoints / riskPoints
+
+
+float profitZoneScore = 0.0
+
+if opposingZoneValid
+
+    if actualRR >= 3.0
+        profitZoneScore := 2.0
+    else if actualRR >= 2.0
+        profitZoneScore := 1.0
+    else
+        profitZoneScore := 0.0
+
+
+//======================================================================
+// 20. TREND SCORE
+//======================================================================
+
+float trendScore = 0.0
+
+if isSupply
+
+    if trendState == "Downtrend"
+        trendScore := 2.0
+    else if trendState == "Sideways"
+        trendScore := 1.0
+    else
+        trendScore := 0.0
+
+else
+
+    if trendState == "Uptrend"
+        trendScore := 2.0
+    else if trendState == "Sideways"
+        trendScore := 1.0
+    else
+        trendScore := 0.0
+
+
+//======================================================================
+// 21. CURVE SCORE
+//======================================================================
+
+float curveScore = 0.0
+
+if isSupply
+
+    if curveLocation == "High"
+        curveScore := 1.0
+    else if curveLocation == "Middle"
+        curveScore := 0.5
+    else
+        curveScore := 0.0
+
+else
+
+    if curveLocation == "Low"
+        curveScore := 1.0
+    else if curveLocation == "Middle"
+        curveScore := 0.5
+    else
+        curveScore := 0.0
+
+
+//======================================================================
+// 22. OFFICIAL SURGE DECISION MATRIX
+//======================================================================
+
+string matrixAction = "NO ACTION"
+
+if isSupply
+
+    if curveLocation == "High"
+
+        if trendState == "Downtrend"
+            matrixAction := "SHORT"
+        else if trendState == "Sideways"
+            matrixAction := "SHORT"
+        else
+            matrixAction := "SHORT - ADVANCED"
+
+    else if curveLocation == "Middle"
+
+        if trendState == "Downtrend"
+            matrixAction := "SHORT"
+        else if trendState == "Sideways"
+            matrixAction := "SHORT"
+        else
+            matrixAction := "NO ACTION"
+
+    else
+
+        if trendState == "Downtrend"
+
+            if opposingZoneValid
+
+                if actualRR >= 5.0
+                    matrixAction := "SHORT - ADVANCED"
+                else
+                    matrixAction := "NO ACTION (<5:1)"
+
+            else
+
+                matrixAction := "CHECK 5:1"
+
+        else
+
+            matrixAction := "NO ACTION"
+
+else
+
+    if curveLocation == "High"
+
+        if trendState == "Uptrend"
+            matrixAction := "LONG - ADVANCED"
+        else
+            matrixAction := "NO ACTION"
+
+    else if curveLocation == "Middle"
+
+        if trendState == "Downtrend"
+            matrixAction := "NO ACTION"
+        else
+            matrixAction := "LONG"
+
+    else
+
+        if trendState == "Downtrend"
+            matrixAction := "LONG - ADVANCED"
+        else
+            matrixAction := "LONG"
+
+
+//======================================================================
+// 23. TOTAL SCORE
+//======================================================================
+
+float surgeScore = strengthScore + timeScore + freshnessScore + trendScore + curveScore + profitZoneScore
+
+
+string scoreResult = "NO TRADE"
+
+if surgeScore >= 8.5
+    scoreResult := "PROXIMAL"
+else if surgeScore >= 7.0
+    scoreResult := "CONFIRMATION"
+else
+    scoreResult := "NO TRADE"
+
+
+bool matrixPermitted = true
+
+if matrixAction == "NO ACTION"
+    matrixPermitted := false
+
+if matrixAction == "NO ACTION (<5:1)"
+    matrixPermitted := false
+
+if matrixAction == "CHECK 5:1"
+    matrixPermitted := false
+
+
+bool scorePermitted = surgeScore >= 7.0
+
+
+//======================================================================
+// 24. TRADE GATE
+//======================================================================
+
+string tradeGate = "BLOCKED"
+
+if not zoneReady
+
+    tradeGate := "WAITING FOR AUTO ZONE"
+
+else if not matrixPermitted
+
+    tradeGate := "BLOCKED BY MATRIX"
+
+else if not scorePermitted
+
+    tradeGate := "BLOCKED BY SCORE"
+
+else if plannedContracts < 1
+
+    tradeGate := "RISK TOO LARGE"
+
+else if str.contains(matrixAction, "ADVANCED")
+
+    if surgeScore >= 8.5
+        tradeGate := "ADVANCED / PROXIMAL"
+    else
+        tradeGate := "ADVANCED / CONFIRMATION"
+
+else
+
+    if surgeScore >= 8.5
+        tradeGate := "QUALIFIED / PROXIMAL"
+    else
+        tradeGate := "QUALIFIED / CONFIRMATION"
+
+
+//======================================================================
+// 25. ACTIVE ZONE STATE
+//======================================================================
+
+bool zoneOrientationValid = false
+
+if zoneReady
+
+    if isSupply
+        zoneOrientationValid := distal > proximal
+    else
+        zoneOrientationValid := distal < proximal
+
+
+float zoneHigh = na
+float zoneLow = na
+
+if zoneReady
+    zoneHigh := math.max(proximal, distal)
+    zoneLow := math.min(proximal, distal)
+
+
+bool barTouchedZone = false
+
+if zoneOrientationValid
+    barTouchedZone := high >= zoneLow and low <= zoneHigh
+
+
+bool closeInsideZone = false
+
+if zoneOrientationValid
+    closeInsideZone := close >= zoneLow and close <= zoneHigh
+
+
+bool enteredZone = false
+
+if barTouchedZone and not barTouchedZone[1]
+    enteredZone := true
+
+
+bool beyondStop = false
+
+if zoneReady
+
+    if isSupply
+        beyondStop := close >= stopPrice
+    else
+        beyondStop := close <= stopPrice
+
+
+bool stopTouched = false
+
+if zoneReady
+
+    if isSupply
+        stopTouched := high >= stopPrice
+    else
+        stopTouched := low <= stopPrice
+
+
+bool threeRReached = false
+
+if zoneReady
+
+    if isSupply
+        threeRReached := low <= threeR
+    else
+        threeRReached := high >= threeR
+
+
+//======================================================================
+// 26. LIVE STATUS
+//======================================================================
+
+string tradeStatus = "MONITOR"
+
+if not zoneReady
+
+    tradeStatus := "WAITING FOR AUTO ZONE"
+
+else if not zoneOrientationValid
+
+    tradeStatus := "CHECK ZONE LINES"
+
+else if beyondStop
+
+    tradeStatus := "INVALIDATED"
+
+else if not matrixPermitted
+
+    tradeStatus := "NO TRADE - MATRIX"
+
+else if surgeScore < 7.0
+
+    tradeStatus := "NO TRADE - SCORE"
+
+else if plannedContracts < 1
+
+    tradeStatus := "RISK EXCEEDS LIMIT"
+
+else if closeInsideZone and surgeScore >= 8.5
+
+    tradeStatus := "CURRENTLY IN ZONE"
+
+else if closeInsideZone and surgeScore >= 7.0
+
+    tradeStatus := "IN ZONE - CONFIRM"
+
+else if barTouchedZone
+
+    tradeStatus := "TOUCHED ZONE THIS BAR"
+
+else if isSupply and close < proximal
+
+    tradeStatus := "WAIT FOR RALLY"
+
+else if isDemand and close > proximal
+
+    tradeStatus := "WAIT FOR DROP"
+
+else
+
+    tradeStatus := "MONITOR"
+
+
+//======================================================================
+// 27. DISPLAY INPUTS
+//======================================================================
+
+groupDisplay = "8. Display"
+
+dashboardMode = input.string(
+     "Compact",
+     "Dashboard",
+     options=["Compact", "Detailed", "Off"],
+     group=groupDisplay)
+
+showZone = input.bool(
+     true,
+     "Show Active Zone",
+     group=groupDisplay)
+
+showR1 = input.bool(
+     false,
+     "Show 1R",
+     group=groupDisplay)
+
+showR2 = input.bool(
+     false,
+     "Show 2R",
+     group=groupDisplay)
+
+showR3 = input.bool(
+     true,
+     "Show 3R",
+     group=groupDisplay)
+
+showR5 = input.bool(
+     false,
+     "Show 5R",
+     group=groupDisplay)
+
+showOpposing = input.bool(
+     true,
+     "Show Opposing Zone",
+     group=groupDisplay)
+
+lineLookback = input.int(
+     25,
+     "MANUAL Line Start Bars Back",
+     minval=1,
+     group=groupDisplay)
+
+
+//======================================================================
+// 28. COLORS
+//======================================================================
+
+color zoneFill = color.new(color.red, 86)
+color zoneBorder = color.red
+
+if isDemand
+    zoneFill := color.new(color.green, 86)
+    zoneBorder := color.green
+
+
+//======================================================================
+// 29. DRAWING START BAR
+//======================================================================
+
+int drawingStartBar = bar_index - lineLookback
+
+if zoneMode == "AUTO" and autoZoneReady
+    drawingStartBar := autoStartBar
+
+
+//======================================================================
+// 30. ZONE BOX
+//======================================================================
+
+var box zoneBox = na
+
+if barstate.islast
+
+    if not na(zoneBox)
+        box.delete(zoneBox)
+
+    if showZone and zoneOrientationValid
+
+        zoneBox := box.new(
+             left=drawingStartBar,
+             top=zoneHigh,
+             right=bar_index,
+             bottom=zoneLow,
+             xloc=xloc.bar_index,
+             extend=extend.right,
+             border_color=zoneBorder,
+             bgcolor=zoneFill)
+
+
+//======================================================================
+// 31. AUTO LABEL
+//======================================================================
+
+var label formationLabel = na
+
+if barstate.islast
+
+    if not na(formationLabel)
+        label.delete(formationLabel)
+
+    if zoneMode == "AUTO" and autoZoneReady and showDetectionLabel
+
+        string freshnessDescription = "Fresh"
+
+        if autoFreshnessScore == 1.0
+            freshnessDescription := "<=50% Tested"
+
+        if autoFreshnessScore == 0.0
+            freshnessDescription := ">50% Tested"
+
+        string formationText = "AUTO " + autoFormation
+        formationText := formationText + "\nBase: " + str.tostring(autoBaseCount)
+        formationText := formationText + " | Time " + str.tostring(autoTimeScore, "#.0")
+        formationText := formationText + "\nFresh " + str.tostring(autoFreshnessScore, "#.0")
+        formationText := formationText + " | " + freshnessDescription
+
+        if isSupply
+
+            formationLabel := label.new(
+                 x=autoDetectedBar,
+                 y=autoDistal,
+                 text=formationText,
+                 xloc=xloc.bar_index,
+                 style=label.style_label_down,
+                 color=color.red,
+                 textcolor=color.white)
+
+        else
+
+            formationLabel := label.new(
+                 x=autoDetectedBar,
+                 y=autoProximal,
+                 text=formationText,
+                 xloc=xloc.bar_index,
+                 style=label.style_label_up,
+                 color=color.green,
+                 textcolor=color.white)
+
+
+//======================================================================
+// 32. PRICE LINES
+//======================================================================
+
+var line proximalLine = na
+var line distalLine = na
+var line stopLine = na
+var line r1Line = na
+var line r2Line = na
+var line r3Line = na
+var line r5Line = na
+var line opposingLine = na
+
+if barstate.islast
+
+    if not na(proximalLine)
+        line.delete(proximalLine)
+
+    if not na(distalLine)
+        line.delete(distalLine)
+
+    if not na(stopLine)
+        line.delete(stopLine)
+
+    if not na(r1Line)
+        line.delete(r1Line)
+
+    if not na(r2Line)
+        line.delete(r2Line)
+
+    if not na(r3Line)
+        line.delete(r3Line)
+
+    if not na(r5Line)
+        line.delete(r5Line)
+
+    if not na(opposingLine)
+        line.delete(opposingLine)
+
+
+    if zoneOrientationValid
+
+        proximalLine := line.new(
+             drawingStartBar,
+             proximal,
+             bar_index,
+             proximal,
+             extend=extend.right,
+             color=color.blue,
+             width=2)
+
+        distalLine := line.new(
+             drawingStartBar,
+             distal,
+             bar_index,
+             distal,
+             extend=extend.right,
+             color=color.purple,
+             width=2)
+
+        stopLine := line.new(
+             drawingStartBar,
+             stopPrice,
+             bar_index,
+             stopPrice,
+             extend=extend.right,
+             color=color.orange,
+             width=2)
+
+
+        if showR1
+
+            r1Line := line.new(
+                 drawingStartBar,
+                 oneR,
+                 bar_index,
+                 oneR,
+                 extend=extend.right,
+                 color=color.gray)
+
+
+        if showR2
+
+            r2Line := line.new(
+                 drawingStartBar,
+                 twoR,
+                 bar_index,
+                 twoR,
+                 extend=extend.right,
+                 color=color.green)
+
+
+        if showR3
+
+            r3Line := line.new(
+                 drawingStartBar,
+                 threeR,
+                 bar_index,
+                 threeR,
+                 extend=extend.right,
+                 color=color.green,
+                 width=2)
+
+
+        if showR5
+
+            r5Line := line.new(
+                 drawingStartBar,
+                 fiveR,
+                 bar_index,
+                 fiveR,
+                 extend=extend.right,
+                 color=color.teal,
+                 width=2)
+
+
+        if showOpposing and opposingZoneValid
+
+            opposingLine := line.new(
+                 drawingStartBar,
+                 opposingZone,
+                 bar_index,
+                 opposingZone,
+                 extend=extend.right,
+                 color=color.fuchsia,
+                 width=2)
+
+
+//======================================================================
+// 33. DASHBOARD COLORS
+//======================================================================
+
+color scoreColor = color.red
+
+if surgeScore >= 8.5
+    scoreColor := color.green
+else if surgeScore >= 7.0
+    scoreColor := color.orange
+
+
+color matrixColor = color.red
+
+if matrixPermitted
+    matrixColor := color.green
+
+
+bool gatePassed = zoneReady and matrixPermitted and scorePermitted and plannedContracts >= 1
+
+color gateColor = color.red
+
+if gatePassed
+    gateColor := color.green
+
+
+color statusColor = color.gray
+
+if str.contains(tradeStatus, "CURRENTLY")
+    statusColor := color.green
+else if str.contains(tradeStatus, "CONFIRM")
+    statusColor := color.orange
+else if str.contains(tradeStatus, "TOUCHED")
+    statusColor := color.orange
+else if str.contains(tradeStatus, "WAIT")
+    statusColor := color.blue
+else if str.contains(tradeStatus, "NO TRADE")
+    statusColor := color.red
+else if str.contains(tradeStatus, "INVALIDATED")
+    statusColor := color.red
+else if str.contains(tradeStatus, "RISK")
+    statusColor := color.red
+
+
+//======================================================================
+// 34. DASHBOARD TEXT
+//======================================================================
+
+string rrText = "Not Set"
+
+if not na(actualRR)
+    rrText := str.tostring(actualRR, "#.##") + "R"
+
+
+string riskTicksText = "N/A"
+
+if not na(riskTicks)
+    riskTicksText := str.tostring(riskTicks, "#.##")
+
+
+string riskDollarText = "N/A"
+
+if not na(riskPerContract)
+    riskDollarText := "$" + str.tostring(riskPerContract, "#,###.00")
+
+
+string plannedRiskText = "N/A"
+
+if not na(plannedDollarRisk)
+    plannedRiskText := "$" + str.tostring(plannedDollarRisk, "#,###.00")
+
+
+string zoneText = "Waiting..."
+
+if zoneReady
+    zoneText := str.tostring(proximal, format.mintick)
+    zoneText := zoneText + " - "
+    zoneText := zoneText + str.tostring(distal, format.mintick)
+
+
+string contextText = zoneType + " | " + curveLocation + " | " + trendState
+
+
+string formationDisplay = "MANUAL"
+
+if zoneMode == "AUTO"
+    formationDisplay := activeFormation + " | Base " + str.tostring(activeBaseCount)
+
+
+string freshText = str.tostring(freshnessScore, "#.0") + "/2"
+
+if zoneMode == "AUTO"
+    freshText := freshText + " | "
+    freshText := freshText + str.tostring(autoPenetration * 100.0, "#.0")
+    freshText := freshText + "%"
+
+
+string memoryText = "S " + str.tostring(validSupplyCount)
+memoryText := memoryText + " | D " + str.tostring(validDemandCount)
+
+
+//======================================================================
+// 35. DASHBOARD
+//======================================================================
+
+var table dash = table.new(position.top_right, 3, 30, border_width=1)
+
+if barstate.islast
+
+    for row = 0 to 29
+
+        table.cell(dash, 0, row, "")
+        table.cell(dash, 1, row, "")
+        table.cell(dash, 2, row, "")
+
+
+    //------------------------------------------------------------------
+    // COMPACT DASHBOARD
+    //------------------------------------------------------------------
+
+    if dashboardMode == "Compact"
+
+        table.cell(dash, 0, 0, "SURGE", bgcolor=color.blue, text_color=color.white)
+        table.cell(dash, 1, 0, syminfo.ticker + " | " + tradePurpose, bgcolor=color.blue, text_color=color.white)
+        table.cell(dash, 2, 0, "v2.0B.1", bgcolor=color.blue, text_color=color.white)
+
+
+        table.cell(dash, 0, 1, "ZONE MODE")
+        table.cell(dash, 1, 1, zoneMode)
+        table.cell(dash, 2, 1, formationDisplay)
+
+
+        table.cell(dash, 0, 2, "MEMORY")
+        table.cell(dash, 1, 2, memoryText)
+
+        if autoZoneReady
+            table.cell(dash, 2, 2, "Slot " + str.tostring(activeIndex + 1))
+        else
+            table.cell(dash, 2, 2, "None")
+
+
+        table.cell(dash, 0, 3, "TIME / FRESH")
+        table.cell(dash, 1, 3, str.tostring(timeScore, "#.0") + " / " + freshText)
+
+        if zoneMode == "AUTO"
+            table.cell(dash, 2, 3, "AUTO")
+        else
+            table.cell(dash, 2, 3, "MANUAL")
+
+
+        table.cell(dash, 0, 4, "CONTEXT")
+        table.cell(dash, 1, 4, contextText)
+        table.cell(dash, 2, 4, tradeDirection)
+
+
+        table.cell(dash, 0, 5, "MATRIX")
+        table.cell(dash, 1, 5, matrixAction, bgcolor=matrixColor, text_color=color.white)
+
+        if matrixPermitted
+            table.cell(dash, 2, 5, "PASS", bgcolor=matrixColor, text_color=color.white)
+        else
+            table.cell(dash, 2, 5, "BLOCK", bgcolor=matrixColor, text_color=color.white)
+
+
+        table.cell(dash, 0, 6, "SCORE")
+        table.cell(dash, 1, 6, str.tostring(surgeScore, "#.0") + " / 10", bgcolor=scoreColor, text_color=color.white)
+        table.cell(dash, 2, 6, scoreResult, bgcolor=scoreColor, text_color=color.white)
+
+
+        table.cell(dash, 0, 7, "ZONE")
+        table.cell(dash, 1, 7, zoneText)
+        table.cell(dash, 2, 7, formationDisplay)
+
+
+        table.cell(dash, 0, 8, "STOP")
+
+        if zoneReady
+            table.cell(dash, 1, 8, str.tostring(stopPrice, format.mintick))
+        else
+            table.cell(dash, 1, 8, "N/A")
+
+        table.cell(dash, 2, 8, str.tostring(bufferPct * 100.0, "#") + "% ATR")
+
+
+        table.cell(dash, 0, 9, "RISK")
+        table.cell(dash, 1, 9, riskTicksText + " ticks")
+        table.cell(dash, 2, 9, riskDollarText)
+
+
+        table.cell(dash, 0, 10, "POSITION")
+        table.cell(dash, 1, 10, str.tostring(plannedContracts) + " contract(s)")
+        table.cell(dash, 2, 10, plannedRiskText)
+
+
+        table.cell(dash, 0, 11, "PROFIT ZONE")
+        table.cell(dash, 1, 11, rrText)
+
+        if opposingZoneValid
+            table.cell(dash, 2, 11, str.tostring(opposingZone, format.mintick))
+        else
+            table.cell(dash, 2, 11, "Not Set")
+
+
+        table.cell(dash, 0, 12, "3R")
+
+        if zoneReady
+            table.cell(dash, 1, 12, str.tostring(threeR, format.mintick))
+            table.cell(dash, 2, 12, "5R " + str.tostring(fiveR, format.mintick))
+        else
+            table.cell(dash, 1, 12, "N/A")
+            table.cell(dash, 2, 12, "N/A")
+
+
+        table.cell(dash, 0, 13, tradeGate, bgcolor=gateColor, text_color=color.white)
+        table.cell(dash, 1, 13, tradeStatus, bgcolor=statusColor, text_color=color.white)
+
+        if gatePassed
+            table.cell(dash, 2, 13, "READY", bgcolor=gateColor, text_color=color.white)
+        else
+            table.cell(dash, 2, 13, "BLOCKED", bgcolor=gateColor, text_color=color.white)
+
+
+    //------------------------------------------------------------------
+    // DETAILED DASHBOARD
+    //------------------------------------------------------------------
+
+    else if dashboardMode == "Detailed"
+
+        table.cell(dash, 0, 0, "SURGE", bgcolor=color.blue, text_color=color.white)
+        table.cell(dash, 1, 0, "ZONE & RISK", bgcolor=color.blue, text_color=color.white)
+        table.cell(dash, 2, 0, "v2.0B.1", bgcolor=color.blue, text_color=color.white)
+
+
+        table.cell(dash, 0, 1, "Symbol")
+        table.cell(dash, 1, 1, syminfo.ticker)
+        table.cell(dash, 2, 1, tradeDirection)
+
+
+        table.cell(dash, 0, 2, "Zone Mode")
+        table.cell(dash, 1, 2, zoneMode)
+        table.cell(dash, 2, 2, formationDisplay)
+
+
+        table.cell(dash, 0, 3, "Memory")
+        table.cell(dash, 1, 3, memoryText)
+
+        if autoZoneReady
+            table.cell(dash, 2, 3, "Slot " + str.tostring(activeIndex + 1))
+        else
+            table.cell(dash, 2, 3, "None")
+
+
+        table.cell(dash, 0, 4, "AUTO Age")
+
+        if zoneMode == "AUTO" and autoZoneReady
+            table.cell(dash, 1, 4, str.tostring(autoAgeBars) + " bars")
+            table.cell(dash, 2, 4, str.tostring(activeBaseCount) + " base")
+        else
+            table.cell(dash, 1, 4, "N/A")
+
+
+        table.cell(dash, 0, 5, "Auto Time")
+        table.cell(dash, 1, 5, str.tostring(autoTimeScore, "#.0"))
+        table.cell(dash, 2, 5, "/ 1")
+
+
+        table.cell(dash, 0, 6, "Auto Freshness")
+        table.cell(dash, 1, 6, str.tostring(autoFreshnessScore, "#.0"))
+        table.cell(dash, 2, 6, str.tostring(autoPenetration * 100.0, "#.0") + "%")
+
+
+        table.cell(dash, 0, 7, "Curve")
+        table.cell(dash, 1, 7, curveLocation)
+        table.cell(dash, 2, 7, str.tostring(curveScore, "#.0"))
+
+
+        table.cell(dash, 0, 8, "Trend")
+        table.cell(dash, 1, 8, trendState)
+        table.cell(dash, 2, 8, str.tostring(trendScore, "#.0"))
+
+
+        table.cell(dash, 0, 9, "MATRIX")
+        table.cell(dash, 1, 9, matrixAction, bgcolor=matrixColor, text_color=color.white)
+
+        if matrixPermitted
+            table.cell(dash, 2, 9, "PASS", bgcolor=matrixColor, text_color=color.white)
+        else
+            table.cell(dash, 2, 9, "BLOCK", bgcolor=matrixColor, text_color=color.white)
+
+
+        table.cell(dash, 0, 10, "Formation")
+        table.cell(dash, 1, 10, formationDisplay)
+        table.cell(dash, 2, 10, zoneMode)
+
+
+        table.cell(dash, 0, 11, "Entry")
+
+        if zoneReady
+            table.cell(dash, 1, 11, str.tostring(entryPrice, format.mintick))
+        else
+            table.cell(dash, 1, 11, "Waiting")
+
+        table.cell(dash, 2, 11, "Proximal")
+
+
+        table.cell(dash, 0, 12, "Distal")
+
+        if zoneReady
+            table.cell(dash, 1, 12, str.tostring(distal, format.mintick))
+        else
+            table.cell(dash, 1, 12, "Waiting")
+
+
+        table.cell(dash, 0, 13, "Daily ATR")
+        table.cell(dash, 1, 13, str.tostring(dailyATR, format.mintick))
+        table.cell(dash, 2, 13, str.tostring(bufferPct * 100.0, "#") + "%")
+
+
+        table.cell(dash, 0, 14, "Stop")
+
+        if zoneReady
+            table.cell(dash, 1, 14, str.tostring(stopPrice, format.mintick))
+        else
+            table.cell(dash, 1, 14, "N/A")
+
+
+        table.cell(dash, 0, 15, "Risk Ticks")
+        table.cell(dash, 1, 15, riskTicksText)
+
+
+        table.cell(dash, 0, 16, "Risk / Contract")
+        table.cell(dash, 1, 16, riskDollarText)
+
+
+        table.cell(dash, 0, 17, "Max Risk")
+        table.cell(dash, 1, 17, "$" + str.tostring(maxTradeRisk, "#,###.00"))
+
+
+        table.cell(dash, 0, 18, "Contracts")
+        table.cell(dash, 1, 18, str.tostring(plannedContracts))
+        table.cell(dash, 2, 18, plannedRiskText)
+
+
+        table.cell(dash, 0, 19, "Opposing Zone")
+
+        if opposingZoneValid
+            table.cell(dash, 1, 19, str.tostring(opposingZone, format.mintick))
+        else
+            table.cell(dash, 1, 19, "Not Set")
+
+        table.cell(dash, 2, 19, rrText)
+
+
+        table.cell(dash, 0, 20, "Strength")
+        table.cell(dash, 1, 20, str.tostring(strengthScore, "#.0"))
+        table.cell(dash, 2, 20, "/ 2")
+
+
+        table.cell(dash, 0, 21, "Time")
+        table.cell(dash, 1, 21, str.tostring(timeScore, "#.0"))
+
+        if zoneMode == "AUTO"
+            table.cell(dash, 2, 21, "AUTO /1")
+        else
+            table.cell(dash, 2, 21, "MANUAL /1")
+
+
+        table.cell(dash, 0, 22, "Freshness")
+        table.cell(dash, 1, 22, str.tostring(freshnessScore, "#.0"))
+
+        if zoneMode == "AUTO"
+            table.cell(dash, 2, 22, "AUTO /2")
+        else
+            table.cell(dash, 2, 22, "MANUAL /2")
+
+
+        table.cell(dash, 0, 23, "Trend")
+        table.cell(dash, 1, 23, str.tostring(trendScore, "#.0"))
+        table.cell(dash, 2, 23, "/ 2")
+
+
+        table.cell(dash, 0, 24, "Curve")
+        table.cell(dash, 1, 24, str.tostring(curveScore, "#.0"))
+        table.cell(dash, 2, 24, "/ 1")
+
+
+        table.cell(dash, 0, 25, "Profit Zone")
+        table.cell(dash, 1, 25, str.tostring(profitZoneScore, "#.0"))
+        table.cell(dash, 2, 25, "/ 2")
+
+
+        table.cell(dash, 0, 26, "Score")
+        table.cell(dash, 1, 26, str.tostring(surgeScore, "#.0") + " / 10", bgcolor=scoreColor, text_color=color.white)
+        table.cell(dash, 2, 26, scoreResult, bgcolor=scoreColor, text_color=color.white)
+
+
+        table.cell(dash, 0, 27, "3R / 5R")
+
+        if zoneReady
+            table.cell(dash, 1, 27, str.tostring(threeR, format.mintick))
+            table.cell(dash, 2, 27, str.tostring(fiveR, format.mintick))
+        else
+            table.cell(dash, 1, 27, "N/A")
+            table.cell(dash, 2, 27, "N/A")
+
+
+        table.cell(dash, 0, 28, tradeGate, bgcolor=gateColor, text_color=color.white)
+        table.cell(dash, 1, 28, tradeStatus, bgcolor=statusColor, text_color=color.white)
+
+        if gatePassed
+            table.cell(dash, 2, 28, "READY", bgcolor=gateColor, text_color=color.white)
+        else
+            table.cell(dash, 2, 28, "BLOCKED", bgcolor=gateColor, text_color=color.white)
+
+
+//======================================================================
+// 36. ALERTS
+//======================================================================
+
+alertcondition(
+     autoCandidateDetectedThisBar,
+     title="Surge AUTO Zone Candidate",
+     message="A new automatic Surge zone candidate was detected on {{ticker}}.")
+
+
+bool qualifiedZoneEntry = enteredZone and matrixPermitted and scorePermitted and plannedContracts >= 1
+
+bool proximalEntryAlert = qualifiedZoneEntry and surgeScore >= 8.5
+
+bool confirmationEntryAlert = qualifiedZoneEntry and surgeScore >= 7.0 and surgeScore < 8.5
+
+
+alertcondition(
+     proximalEntryAlert,
+     title="Surge Proximal Zone Entry",
+     message="Price entered a qualified Surge Proximal zone on {{ticker}}.")
+
+
+alertcondition(
+     confirmationEntryAlert,
+     title="Surge Confirmation Zone",
+     message="Price entered a Surge zone requiring confirmation on {{ticker}}.")
+
+
+alertcondition(
+     stopTouched,
+     title="Surge Stop Reached",
+     message="Price reached the Surge stop on {{ticker}}.")
+
+
+alertcondition(
+     threeRReached,
+     title="Surge 3R Reached",
+     message="Price reached the Surge 3R level on {{ticker}}.")

@@ -1,0 +1,2269 @@
+//@version=6
+// Market Compass Combo
+// Version: v1.0.0-rc2
+// Date: 08.08.2026
+// Change: full English release candidate after audit fixes.
+// - deterministic closed-bar initialization with barstate.islastconfirmedhistory
+// - confirmed-bar compact redraws by default
+// - optional intrabar compact redraws
+// - table cells initialized once and updated with setters
+// - strings created only when the dashboard or an alert needs them
+// - global max_bars_back removed
+// - live alert events throttled independently with varip flags
+// - selectable geometric or linear compact-panel scaling
+// Snapshot: v1.0.0-rc1.
+
+indicator(
+    "Paul Crow Market Compass Combo v1.0.0",
+    shorttitle = "Paul Crow MC Combo",
+    overlay = true,
+    behind_chart = false,
+    explicit_plot_zorder = true,
+    calc_bars_count = 6000,
+    max_lines_count = 300,
+    max_labels_count = 250,
+    max_polylines_count = 10)
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
+const string GROUP_GENERAL = "01. General"
+const string GROUP_EMA = "02. EMA module"
+const string GROUP_RSI = "03. RSI module"
+const string GROUP_MACD = "04. MACD module"
+const string GROUP_DMI = "05. ADX / DMI module"
+const string GROUP_ATR = "06. ATR / Volatility module"
+const string GROUP_VOLUME = "07. Volume module"
+const string GROUP_ALERTS = "08. Stability and alerts"
+const string GROUP_DEBUG = "09. Diagnostics"
+
+const color BULL_COLOR = #089981
+const color BEAR_COLOR = #F23645
+const color NEUTRAL_COLOR = #5F6368
+const color INFO_COLOR = #2962FF
+const color WARNING_COLOR = #8A5A00
+const color HEADER_COLOR = #1F2937
+const color RSI_NEUTRAL_COLOR = #7E57C2
+const color MACD_LINE_COLOR = #2962FF
+const color MACD_SIGNAL_COLOR = #FF9800
+const color ADX_DEFAULT_COLOR = #FDD835
+const color ATR_LOW_COLOR = #2962FF
+const color ATR_NORMAL_COLOR = #5F6368
+const color ATR_HIGH_COLOR = #FF9800
+const color ATR_EXTREME_COLOR = #F23645
+const color VOLUME_LOW_COLOR = #2962FF
+const color VOLUME_NORMAL_COLOR = #5F6368
+const color VOLUME_HIGH_COLOR = #FF9800
+const color VOLUME_EXTREME_COLOR = #F23645
+
+const int COMPACT_POINTS_LIGHT = 240
+const int COMPACT_POINTS_BALANCED = 420
+const int COMPACT_POINTS_PRECISE = 700
+const int RSI_SEGMENTS_LIGHT = 40
+const int RSI_SEGMENTS_BALANCED = 65
+const int RSI_SEGMENTS_PRECISE = 90
+const int MACD_HISTOGRAM_LIGHT = 50
+const int MACD_HISTOGRAM_BALANCED = 80
+const int MACD_HISTOGRAM_PRECISE = 120
+
+// ============================================================================
+// INPUTS - GENERAL
+// ============================================================================
+
+showDashboardInput = input.bool(
+    true,
+    "Show market dashboard",
+    group = GROUP_GENERAL,
+    tooltip = "Shows a combined summary of all enabled modules. This is market context, not a buy or sell signal.")
+
+dashboardModeInput = input.string(
+    "Simple",
+    "Dashboard mode",
+    options = ["Simple", "Pro"],
+    group = GROUP_GENERAL,
+    inline = "dashboard")
+
+dashboardTextSizeInput = input.int(
+    10,
+    "Text size",
+    minval = 8,
+    maxval = 14,
+    group = GROUP_GENERAL,
+    inline = "dashboard",
+    tooltip = "Simple shows six categories and the final market view. Pro shows all technical details.")
+
+compactQualityInput = input.string(
+    "Balanced",
+    "Compact-panel quality",
+    options = ["Light", "Balanced", "Precise"],
+    group = GROUP_GENERAL,
+    tooltip = "Light uses fewer points and drawings. Balanced is the default. Precise uses more detail and more resources.")
+
+evaluationModeInput = input.string(
+    "Closed bar",
+    "Dashboard and alert data",
+    options = ["Closed bar", "Live"],
+    group = GROUP_GENERAL,
+    tooltip = "Closed bar keeps the dashboard and alerts on confirmed data. Live allows them to change during the open bar.")
+
+compactIntrabarRefreshInput = input.bool(
+    false,
+    "Refresh compact panels intrabar",
+    group = GROUP_GENERAL,
+    tooltip = "Advanced. When Live mode is selected, this refreshes RSI, MACD and optional DMI drawings on every realtime update. Keep disabled for better performance.")
+
+compactScaleModeInput = input.string(
+    "Geometric",
+    "Compact-panel vertical scaling",
+    options = ["Geometric", "Linear"],
+    group = GROUP_GENERAL,
+    tooltip = "Geometric is recommended for logarithmic charts and long price histories. Linear preserves exact proportions on a linear chart. Pine cannot detect the chart scale automatically.")
+
+warnNonStandardChartInput = input.bool(
+    true,
+    "Warn on synthetic chart types",
+    group = GROUP_GENERAL,
+    tooltip = "Heikin Ashi, Renko, Kagi, Line Break, Point & Figure and Range charts may use synthetic prices. The Timeframe row will show a warning.")
+
+compactBottomMarginInput = input.float(
+    3.0,
+    "Bottom panel margin - % of visible price range",
+    minval = 0.0,
+    maxval = 12.0,
+    step = 1.0,
+    group = GROUP_GENERAL,
+    tooltip = "Distance between the first compact panel and the lowest visible price. Visual only.")
+
+compactPanelGapInput = input.float(
+    2.0,
+    "Gap between compact panels - % of visible price range",
+    minval = 0.0,
+    maxval = 8.0,
+    step = 1.0,
+    group = GROUP_GENERAL,
+    tooltip = "Gap between enabled RSI, MACD and optional ADX/DMI panels.")
+
+// ============================================================================
+// INPUTS - EMA MODULE
+// ============================================================================
+
+emaModuleEnabledInput = input.bool(
+    true,
+    "Enable EMA module - lines and evaluation",
+    group = GROUP_EMA,
+    tooltip = "Disabling the module hides the EMA lines and removes EMA from the combined trend evaluation.")
+
+emaSourceInput = input.source(
+    close,
+    "EMA source",
+    group = GROUP_EMA,
+    tooltip = "Source used by all three EMAs.")
+
+emaFastLengthInput = input.int(20, "Fast EMA", minval = 1, maxval = 1000, group = GROUP_EMA, inline = "emaFast")
+emaFastColorInput = input.color(color.aqua, "Color", group = GROUP_EMA, inline = "emaFast")
+
+emaMediumLengthInput = input.int(50, "Medium EMA", minval = 2, maxval = 1000, group = GROUP_EMA, inline = "emaMedium")
+emaMediumColorInput = input.color(color.orange, "Color", group = GROUP_EMA, inline = "emaMedium")
+
+emaSlowLengthInput = input.int(200, "Slow EMA", minval = 3, maxval = 2000, group = GROUP_EMA, inline = "emaSlow")
+emaSlowColorInput = input.color(color.fuchsia, "Color", group = GROUP_EMA, inline = "emaSlow")
+
+emaLineWidthInput = input.int(2, "EMA line width", minval = 1, maxval = 4, group = GROUP_EMA)
+
+emaSlopeLookbackInput = input.int(
+    3,
+    "EMA slope lookback - bars",
+    minval = 1,
+    maxval = 20,
+    group = GROUP_EMA,
+    tooltip = "Example: 3 compares each EMA with its value three bars ago.")
+
+// ============================================================================
+// INPUTS - RSI MODULE
+// ============================================================================
+
+rsiModuleEnabledInput = input.bool(
+    true,
+    "Enable RSI module - compact panel and evaluation",
+    group = GROUP_RSI,
+    tooltip = "Draws RSI inside the lower part of the visible price range. It does not use the price scale and does not compress candles.")
+
+rsiSourceInput = input.source(close, "RSI source", group = GROUP_RSI)
+rsiLengthInput = input.int(14, "RSI length", minval = 2, maxval = 100, group = GROUP_RSI)
+
+rsiOverboughtInput = input.float(70.0, "Overbought level", minval = 51.0, maxval = 99.0, step = 1.0, group = GROUP_RSI, inline = "rsiExtreme")
+rsiOversoldInput = input.float(30.0, "Oversold level", minval = 1.0, maxval = 49.0, step = 1.0, group = GROUP_RSI, inline = "rsiExtreme")
+
+rsiBullThresholdInput = input.float(55.0, "Bullish bias from", minval = 50.1, maxval = 90.0, step = 1.0, group = GROUP_RSI, inline = "rsiBias")
+rsiBearThresholdInput = input.float(45.0, "Bearish bias to", minval = 10.0, maxval = 49.9, step = 1.0, group = GROUP_RSI, inline = "rsiBias")
+
+rsiLineWidthInput = input.int(2, "RSI line width", minval = 1, maxval = 4, group = GROUP_RSI)
+rsiBullColorInput = input.color(BULL_COLOR, "Bullish", group = GROUP_RSI, inline = "rsiColors")
+rsiNeutralColorInput = input.color(RSI_NEUTRAL_COLOR, "Neutral", group = GROUP_RSI, inline = "rsiColors")
+rsiBearColorInput = input.color(BEAR_COLOR, "Bearish", group = GROUP_RSI, inline = "rsiColors")
+
+rsiCompactHeightInput = input.float(
+    18.0,
+    "RSI panel height - % of visible price range",
+    minval = 10.0,
+    maxval = 30.0,
+    step = 1.0,
+    group = GROUP_RSI,
+    tooltip = "Visual height only. Default: 18% of the visible price range.")
+
+// ============================================================================
+// INPUTS - MACD MODULE
+// ============================================================================
+
+macdModuleEnabledInput = input.bool(
+    true,
+    "Enable MACD module - compact panel and evaluation",
+    group = GROUP_MACD,
+    tooltip = "Draws MACD in a compact panel and adds its state to the dashboard. The panel does not compress candles.")
+
+macdSourceInput = input.source(close, "MACD source", group = GROUP_MACD)
+macdFastLengthInput = input.int(12, "Fast MACD EMA", minval = 1, maxval = 200, group = GROUP_MACD, inline = "macdLengths")
+macdSlowLengthInput = input.int(26, "Slow MACD EMA", minval = 2, maxval = 400, group = GROUP_MACD, inline = "macdLengths")
+macdSignalLengthInput = input.int(9, "Signal length", minval = 1, maxval = 100, group = GROUP_MACD)
+
+macdShowHistogramInput = input.bool(
+    true,
+    "Show MACD histogram",
+    group = GROUP_MACD,
+    tooltip = "Draws positive and negative histogram bars in the compact panel.")
+
+macdLineWidthInput = input.int(2, "MACD and signal line width", minval = 1, maxval = 4, group = GROUP_MACD)
+macdHistogramWidthInput = input.int(2, "MACD histogram width", minval = 1, maxval = 4, group = GROUP_MACD)
+
+macdCompactHeightInput = input.float(
+    15.0,
+    "MACD panel height - % of visible price range",
+    minval = 10.0,
+    maxval = 30.0,
+    step = 1.0,
+    group = GROUP_MACD,
+    tooltip = "Visual height only. Default: 15% of the visible price range.")
+
+// ============================================================================
+// INPUTS - ADX / DMI MODULE
+// ============================================================================
+
+dmiModuleEnabledInput = input.bool(
+    true,
+    "Enable ADX/DMI module - trend strength and direction",
+    group = GROUP_DMI,
+    tooltip = "ADX measures trend strength. +DI and -DI describe directional dominance. The module contributes one directional vote.")
+
+dmiLengthInput = input.int(14, "DI length", minval = 2, maxval = 100, group = GROUP_DMI, inline = "dmiLengths")
+adxSmoothingInput = input.int(14, "ADX smoothing", minval = 2, maxval = 100, group = GROUP_DMI, inline = "dmiLengths")
+
+adxTrendThresholdInput = input.float(20.0, "Trend from ADX", minval = 5.0, maxval = 60.0, step = 1.0, group = GROUP_DMI, inline = "adxThresholds")
+adxStrongThresholdInput = input.float(25.0, "Strong trend from ADX", minval = 6.0, maxval = 80.0, step = 1.0, group = GROUP_DMI, inline = "adxThresholds")
+
+dmiMinSeparationInput = input.float(
+    3.0,
+    "Minimum +DI / -DI separation",
+    minval = 0.0,
+    maxval = 30.0,
+    step = 0.5,
+    group = GROUP_DMI,
+    tooltip = "Reduces noisy direction changes when +DI and -DI are close together.")
+
+dmiShowCompactPanelInput = input.bool(
+    false,
+    "Show compact +DI / -DI / ADX panel",
+    group = GROUP_DMI,
+    tooltip = "Disabled by default to keep the chart clean. Dashboard evaluation works even when the panel is hidden.")
+
+dmiPanelMaximumInput = input.float(
+    60.0,
+    "Visual panel maximum",
+    minval = 40.0,
+    maxval = 100.0,
+    step = 5.0,
+    group = GROUP_DMI,
+    tooltip = "Values above this level are clipped visually only. Dashboard values remain unchanged.")
+
+dmiLineWidthInput = input.int(2, "+DI / -DI / ADX line width", minval = 1, maxval = 4, group = GROUP_DMI)
+dmiPlusColorInput = input.color(BULL_COLOR, "+DI", group = GROUP_DMI, inline = "dmiColors")
+dmiMinusColorInput = input.color(BEAR_COLOR, "-DI", group = GROUP_DMI, inline = "dmiColors")
+adxColorInput = input.color(ADX_DEFAULT_COLOR, "ADX", group = GROUP_DMI, inline = "dmiColors")
+
+dmiCompactHeightInput = input.float(
+    14.0,
+    "ADX/DMI panel height - % of visible price range",
+    minval = 10.0,
+    maxval = 25.0,
+    step = 1.0,
+    group = GROUP_DMI,
+    tooltip = "The optional panel is placed above enabled RSI and MACD panels.")
+
+// ============================================================================
+// INPUTS - ATR / VOLATILITY MODULE
+// ============================================================================
+
+atrModuleEnabledInput = input.bool(
+    true,
+    "Enable ATR module - volatility regime",
+    group = GROUP_ATR,
+    tooltip = "ATR describes volatility, not price direction. It does not cast a bullish or bearish vote.")
+
+atrLengthInput = input.int(14, "ATR length", minval = 2, maxval = 100, group = GROUP_ATR, inline = "atrLengths")
+atrRegimeLookbackInput = input.int(
+    100,
+    "Comparison window",
+    minval = 20,
+    maxval = 500,
+    group = GROUP_ATR,
+    inline = "atrLengths",
+    tooltip = "Current ATR as a percentage of price is ranked against its own history in this window.")
+
+atrSlopeLookbackInput = input.int(3, "ATR change lookback - bars", minval = 1, maxval = 20, group = GROUP_ATR, inline = "atrSlope")
+atrChangeThresholdInput = input.float(
+    5.0,
+    "Minimum ATR change - %",
+    minval = 0.0,
+    maxval = 50.0,
+    step = 0.5,
+    group = GROUP_ATR,
+    inline = "atrSlope",
+    tooltip = "A smaller change is classified as stable volatility.")
+
+atrLowRankInput = input.float(25.0, "Low below rank", minval = 1.0, maxval = 60.0, step = 1.0, group = GROUP_ATR, inline = "atrRanks1")
+atrHighRankInput = input.float(75.0, "High from rank", minval = 40.0, maxval = 95.0, step = 1.0, group = GROUP_ATR, inline = "atrRanks1")
+atrExtremeRankInput = input.float(
+    90.0,
+    "Extreme from rank",
+    minval = 50.0,
+    maxval = 99.0,
+    step = 1.0,
+    group = GROUP_ATR,
+    tooltip = "Percent rank 0-100 shows where current ATR% sits relative to the selected historical window.")
+
+// ============================================================================
+// INPUTS - VOLUME MODULE
+// ============================================================================
+
+volumeModuleEnabledInput = input.bool(
+    true,
+    "Enable volume module - RVOL, OBV and confirmation",
+    group = GROUP_VOLUME,
+    tooltip = "Compares current volume with its average, evaluates OBV direction and checks whether activity confirms price direction. Symbols without usable volume data are excluded from the final confirmation.")
+
+volumeAverageLengthInput = input.int(20, "Volume average - previous bars", minval = 2, maxval = 200, group = GROUP_VOLUME, inline = "volumeLengths")
+volumeObvEmaLengthInput = input.int(20, "OBV EMA", minval = 2, maxval = 200, group = GROUP_VOLUME, inline = "volumeLengths")
+
+volumeObvSlopeLookbackInput = input.int(
+    3,
+    "OBV EMA slope lookback - bars",
+    minval = 1,
+    maxval = 20,
+    group = GROUP_VOLUME,
+    tooltip = "Compares the OBV EMA with its value a selected number of bars ago.")
+
+volumeLowRvolInput = input.float(0.75, "Low RVOL below", minval = 0.05, maxval = 1.50, step = 0.05, group = GROUP_VOLUME, inline = "volumeRvol1")
+volumeConfirmRvolInput = input.float(1.00, "Movement confirmation from", minval = 0.10, maxval = 3.00, step = 0.05, group = GROUP_VOLUME, inline = "volumeRvol1")
+volumeHighRvolInput = input.float(1.50, "High RVOL from", minval = 0.20, maxval = 5.00, step = 0.05, group = GROUP_VOLUME, inline = "volumeRvol2")
+volumeExtremeRvolInput = input.float(
+    2.00,
+    "Extreme RVOL from",
+    minval = 0.30,
+    maxval = 10.00,
+    step = 0.05,
+    group = GROUP_VOLUME,
+    inline = "volumeRvol2",
+    tooltip = "RVOL = current volume / average previous volume. Example: 1.50 means 150% of average volume.")
+
+// ============================================================================
+// INPUTS - STABILITY AND ALERTS
+// ============================================================================
+
+alertsEnabledInput = input.bool(
+    false,
+    "Enable descriptive alerts",
+    group = GROUP_ALERTS,
+    tooltip = "After enabling, create a TradingView alert using: Any alert() function call. The script cannot create the UI alert automatically.")
+
+alertMarketChangeInput = input.bool(
+    true,
+    "Alert: Market View direction change",
+    group = GROUP_ALERTS,
+    tooltip = "Notifies when the final directional state changes to bullish or bearish.")
+
+alertFullAgreementInput = input.bool(
+    true,
+    "Alert: Trend and Momentum agreement",
+    group = GROUP_ALERTS,
+    tooltip = "Notifies when Trend and Momentum begin pointing in the same direction.")
+
+alertVolatilityInput = input.bool(
+    true,
+    "Alert: entry into high volatility",
+    group = GROUP_ALERTS,
+    tooltip = "Notifies when the ATR regime changes to High or Extreme.")
+
+alertVolumeConfirmationInput = input.bool(
+    true,
+    "Alert: volume begins confirming",
+    group = GROUP_ALERTS,
+    tooltip = "Notifies when RVOL and OBV begin confirming the current Market View direction.")
+
+alertsOnlyTargetTimeframesInput = input.bool(
+    true,
+    "Alerts only on Daily and Weekly",
+    group = GROUP_ALERTS,
+    tooltip = "Blocks alerts on other timeframes by default.")
+
+allowAlertsOnNonStandardChartInput = input.bool(
+    false,
+    "Allow alerts on synthetic charts",
+    group = GROUP_ALERTS,
+    tooltip = "Disabled by default because synthetic OHLC values may not match tradable market prices.")
+
+// ============================================================================
+// INPUTS - DIAGNOSTICS
+// ============================================================================
+
+debugModeInput = input.bool(
+    false,
+    "Diagnostic mode",
+    group = GROUP_DEBUG,
+    tooltip = "Shows one-time event markers for EMA, RSI, MACD, ADX/DMI, ATR and volume. Markers are committed only on confirmed bars.")
+// ============================================================================
+// GENERIC HELPERS
+// ============================================================================
+
+// Direction color:
+// positive = bullish, negative = bearish, zero = neutral.
+stateColor(int state) =>
+    state > 0 ? BULL_COLOR : state < 0 ? BEAR_COLOR : NEUTRAL_COLOR
+
+// ATR regime color:
+// -1 = low, 1 = normal, 2 = high, 3 = extreme.
+atrRegimeColor(int state) =>
+    state == -1 ? ATR_LOW_COLOR : state == 2 ? ATR_HIGH_COLOR : state == 3 ? ATR_EXTREME_COLOR : ATR_NORMAL_COLOR
+
+// Relative-volume regime color:
+// -1 = low, 1 = normal, 2 = high, 3 = extreme.
+relativeVolumeColor(int state) =>
+    state == -1 ? VOLUME_LOW_COLOR : state == 2 ? VOLUME_HIGH_COLOR : state == 3 ? VOLUME_EXTREME_COLOR : VOLUME_NORMAL_COLOR
+
+// Adds one reason on a new line to a dynamic alert message.
+appendAlertReason(string currentText, string newReason) =>
+    str.length(currentText) == 0 ? newReason : currentText + "\n" + newReason
+
+// Returns a point between a visible low and high.
+// Geometric mapping is suitable for logarithmic charts.
+// Linear mapping preserves exact proportions on linear charts.
+scaleVisibleRange(float lowValue, float highValue, float fraction) =>
+    float clippedFraction = math.max(0.0, math.min(1.0, fraction))
+    bool useGeometricScale = compactScaleModeInput == "Geometric" and lowValue > 0.0 and highValue > lowValue
+    (
+        useGeometricScale
+            ? math.exp(math.log(lowValue) + (math.log(highValue) - math.log(lowValue)) * clippedFraction)
+            : lowValue + (highValue - lowValue) * clippedFraction
+    )
+
+// Maps a true RSI value from 0-100 into a compact price band.
+// Only the drawing position changes. RSI calculations remain unchanged.
+mapRsiToCompactBand(float rsiSourceValue, float bandBottom, float bandTop) =>
+    float clippedRsi = math.max(0.0, math.min(100.0, rsiSourceValue))
+    scaleVisibleRange(bandBottom, bandTop, clippedRsi / 100.0)
+
+// Maps a bounded value into a compact price band.
+mapBoundedToCompactBand(float sourceValue, float sourceMinimum, float sourceMaximum, float bandBottom, float bandTop) =>
+    float safeSourceRange = math.max(sourceMaximum - sourceMinimum, 0.0000000001)
+    float clippedValue = math.max(sourceMinimum, math.min(sourceMaximum, sourceValue))
+    scaleVisibleRange(bandBottom, bandTop, (clippedValue - sourceMinimum) / safeSourceRange)
+
+// Selects the three-state RSI line color.
+rsiVisualColor(float sourceValue, float bullThreshold, float bearThreshold, color bullColor, color neutralColor, color bearColor) =>
+    sourceValue >= bullThreshold ? bullColor : sourceValue <= bearThreshold ? bearColor : neutralColor
+
+// Maps a signed oscillator around zero into a compact price band.
+// The visible maximum absolute MACD value defines the dynamic range.
+mapSignedToCompactBand(float sourceValue, float maxAbsValue, float bandBottom, float bandTop) =>
+    float safeMaxAbs = math.max(maxAbsValue, 0.0000000001)
+    float clippedValue = math.max(-safeMaxAbs, math.min(safeMaxAbs, sourceValue))
+    float normalizedFraction = (clippedValue / safeMaxAbs + 1.0) / 2.0
+    scaleVisibleRange(bandBottom, bandTop, normalizedFraction)
+
+// Creates or updates one horizontal compact-panel level.
+updateCompactLevel(line currentLine, int leftTime, int rightTime, float yValue, color lineColor, string lineStyle) =>
+    line resultLine = currentLine
+    if na(resultLine)
+        resultLine := line.new(
+            x1 = leftTime,
+            y1 = yValue,
+            x2 = rightTime,
+            y2 = yValue,
+            xloc = xloc.bar_time,
+            extend = extend.none,
+            color = lineColor,
+            style = lineStyle,
+            width = 1,
+            force_overlay = true)
+    else
+        line.set_xy1(resultLine, leftTime, yValue)
+        line.set_xy2(resultLine, rightTime, yValue)
+        line.set_color(resultLine, lineColor)
+        line.set_style(resultLine, lineStyle)
+    resultLine
+
+// Creates or updates one colored segment of the compact RSI line.
+updateCompactSegment(line currentLine, int startTime, float startValue, int endTime, float endValue, color segmentColor, int segmentWidth) =>
+    line resultLine = currentLine
+    if na(resultLine)
+        resultLine := line.new(
+            x1 = startTime,
+            y1 = startValue,
+            x2 = endTime,
+            y2 = endValue,
+            xloc = xloc.bar_time,
+            extend = extend.none,
+            color = segmentColor,
+            style = line.style_solid,
+            width = segmentWidth,
+            force_overlay = true)
+    else
+        line.set_xy1(resultLine, startTime, startValue)
+        line.set_xy2(resultLine, endTime, endValue)
+        line.set_color(resultLine, segmentColor)
+        line.set_width(resultLine, segmentWidth)
+    resultLine
+
+// Initializes a dashboard row once.
+// Later updates use table.cell_set_*() setters.
+initializeDashboardRow(table panel, int rowIndex, string labelText, int textSize, string tooltipText = "") =>
+    table.cell(
+        panel,
+        0,
+        rowIndex,
+        labelText,
+        text_color = chart.fg_color,
+        bgcolor = chart.bg_color,
+        text_halign = text.align_left,
+        text_size = textSize,
+        tooltip = tooltipText)
+    table.cell(
+        panel,
+        1,
+        rowIndex,
+        "",
+        text_color = color.white,
+        bgcolor = NEUTRAL_COLOR,
+        text_halign = text.align_center,
+        text_size = textSize,
+        tooltip = tooltipText)
+
+// Updates only the dynamic properties of a dashboard row.
+updateDashboardRow(table panel, int rowIndex, string valueText, color valueBgColor) =>
+    table.cell_set_text(panel, 1, rowIndex, valueText)
+    table.cell_set_bgcolor(panel, 1, rowIndex, valueBgColor)
+// ============================================================================
+// INPUT VALIDATION
+// ============================================================================
+
+if barstate.isfirst and emaModuleEnabledInput and not (emaFastLengthInput < emaMediumLengthInput and emaMediumLengthInput < emaSlowLengthInput)
+    runtime.error("EMA module: lengths must satisfy fast < medium < slow.")
+
+if barstate.isfirst and rsiModuleEnabledInput and not (rsiOversoldInput < rsiBearThresholdInput and rsiBearThresholdInput < 50.0 and 50.0 < rsiBullThresholdInput and rsiBullThresholdInput < rsiOverboughtInput)
+    runtime.error("RSI module: required threshold order is oversold < bearish bias < 50 < bullish bias < overbought.")
+
+if barstate.isfirst and macdModuleEnabledInput and macdFastLengthInput >= macdSlowLengthInput
+    runtime.error("MACD module: the fast EMA length must be smaller than the slow EMA length.")
+
+if barstate.isfirst and dmiModuleEnabledInput and adxTrendThresholdInput >= adxStrongThresholdInput
+    runtime.error("ADX/DMI module: the trend threshold must be smaller than the strong-trend threshold.")
+
+if barstate.isfirst and dmiModuleEnabledInput and dmiShowCompactPanelInput and dmiPanelMaximumInput <= adxStrongThresholdInput
+    runtime.error("ADX/DMI module: the panel maximum must be greater than the strong ADX threshold.")
+
+if barstate.isfirst and atrModuleEnabledInput and not (atrLowRankInput < atrHighRankInput and atrHighRankInput < atrExtremeRankInput)
+    runtime.error("ATR module: required threshold order is low rank < high rank < extreme rank.")
+
+if barstate.isfirst and volumeModuleEnabledInput and not (volumeLowRvolInput < volumeConfirmRvolInput and volumeConfirmRvolInput < volumeHighRvolInput and volumeHighRvolInput < volumeExtremeRvolInput)
+    runtime.error("Volume module: thresholds must satisfy low RVOL < confirmation < high RVOL < extreme RVOL.")
+
+// ============================================================================
+// EXECUTION MODE
+// ============================================================================
+
+bool useClosedBarMode = evaluationModeInput == "Closed bar"
+bool useLiveDashboard = not useClosedBarMode
+bool useLiveCompactRefresh = useLiveDashboard and compactIntrabarRefreshInput
+
+// ============================================================================
+// EMA MODULE
+// ============================================================================
+
+float emaFast = ta.ema(emaSourceInput, emaFastLengthInput)
+float emaMedium = ta.ema(emaSourceInput, emaMediumLengthInput)
+float emaSlow = ta.ema(emaSourceInput, emaSlowLengthInput)
+
+float emaFastPast = emaFast[emaSlopeLookbackInput]
+float emaMediumPast = emaMedium[emaSlopeLookbackInput]
+float emaSlowPast = emaSlow[emaSlopeLookbackInput]
+
+bool emaValuesReady = not na(emaFast) and not na(emaMedium) and not na(emaSlow)
+bool emaSlopeReady = emaValuesReady and not na(emaFastPast) and not na(emaMediumPast) and not na(emaSlowPast)
+bool emaDataReady = emaValuesReady and emaSlopeReady
+
+int priceAboveCount = (
+    (close > emaFast ? 1 : 0) +
+    (close > emaMedium ? 1 : 0) +
+    (close > emaSlow ? 1 : 0))
+
+int pricePositionState = (
+    emaModuleEnabledInput and emaValuesReady
+         ? priceAboveCount == 3 ? 1 : priceAboveCount == 0 ? -1 : 0
+         : 0)
+
+bool emaBullOrder = emaValuesReady and emaFast > emaMedium and emaMedium > emaSlow
+bool emaBearOrder = emaValuesReady and emaFast < emaMedium and emaMedium < emaSlow
+
+int emaOrderState = (
+    emaModuleEnabledInput and emaValuesReady
+         ? emaBullOrder ? 1 : emaBearOrder ? -1 : 0
+         : 0)
+
+bool emaFastRising = emaSlopeReady and emaFast > emaFastPast
+bool emaMediumRising = emaSlopeReady and emaMedium > emaMediumPast
+bool emaSlowRising = emaSlopeReady and emaSlow > emaSlowPast
+
+bool emaFastFalling = emaSlopeReady and emaFast < emaFastPast
+bool emaMediumFalling = emaSlopeReady and emaMedium < emaMediumPast
+bool emaSlowFalling = emaSlopeReady and emaSlow < emaSlowPast
+
+int emaRisingCount = (
+    (emaFastRising ? 1 : 0) +
+    (emaMediumRising ? 1 : 0) +
+    (emaSlowRising ? 1 : 0))
+
+int emaFallingCount = (
+    (emaFastFalling ? 1 : 0) +
+    (emaMediumFalling ? 1 : 0) +
+    (emaSlowFalling ? 1 : 0))
+
+int emaSlopeState = (
+    emaModuleEnabledInput and emaSlopeReady
+         ? emaRisingCount == 3 ? 1 : emaFallingCount == 3 ? -1 : 0
+         : 0)
+
+bool strongBullTrend = emaDataReady and emaBullOrder and priceAboveCount == 3 and emaRisingCount == 3
+bool strongBearTrend = emaDataReady and emaBearOrder and priceAboveCount == 0 and emaFallingCount == 3
+bool bullTrend = emaDataReady and not strongBullTrend and emaBullOrder and priceAboveCount >= 2 and emaRisingCount >= 2
+bool bearTrend = emaDataReady and not strongBearTrend and emaBearOrder and priceAboveCount <= 1 and emaFallingCount >= 2
+
+int emaTrendStateRaw = (
+    strongBullTrend ? 2 :
+    strongBearTrend ? -2 :
+    bullTrend ? 1 :
+    bearTrend ? -1 :
+    0)
+
+int emaTrendState = emaModuleEnabledInput ? emaTrendStateRaw : 0
+
+// ============================================================================
+// RSI MODULE
+// ============================================================================
+
+float rsiValue = ta.rsi(rsiSourceInput, rsiLengthInput)
+bool rsiReady = not na(rsiValue)
+bool rsiRising = rsiReady and rsiValue > rsiValue[1]
+bool rsiFalling = rsiReady and rsiValue < rsiValue[1]
+
+bool rsiCrossUpBull = ta.crossover(rsiValue, rsiBullThresholdInput)
+bool rsiCrossDownBear = ta.crossunder(rsiValue, rsiBearThresholdInput)
+
+int rsiStateRaw = (
+    not rsiReady ? 0 :
+    rsiValue >= rsiOverboughtInput ? 2 :
+    rsiValue >= rsiBullThresholdInput ? 1 :
+    rsiValue <= rsiOversoldInput ? -2 :
+    rsiValue <= rsiBearThresholdInput ? -1 :
+    0)
+
+int rsiState = rsiModuleEnabledInput ? rsiStateRaw : 0
+
+int rsiDirectionState = (
+    rsiModuleEnabledInput and rsiReady
+         ? rsiRising ? 1 : rsiFalling ? -1 : 0
+         : 0)
+
+color rsiLineColor = rsiVisualColor(
+    rsiValue,
+    rsiBullThresholdInput,
+    rsiBearThresholdInput,
+    rsiBullColorInput,
+    rsiNeutralColorInput,
+    rsiBearColorInput)
+
+// ============================================================================
+// MACD MODULE
+// ============================================================================
+
+[macdLineValue, macdSignalValue, macdHistogramValue] = ta.macd(macdSourceInput, macdFastLengthInput, macdSlowLengthInput, macdSignalLengthInput)
+
+bool macdReady = not na(macdLineValue) and not na(macdSignalValue) and not na(macdHistogramValue)
+bool macdAboveSignal = macdReady and macdLineValue > macdSignalValue
+bool macdBelowSignal = macdReady and macdLineValue < macdSignalValue
+bool macdAboveZero = macdReady and macdLineValue > 0.0
+bool macdBelowZero = macdReady and macdLineValue < 0.0
+bool macdHistogramRising = macdReady and macdHistogramValue > macdHistogramValue[1]
+bool macdHistogramFalling = macdReady and macdHistogramValue < macdHistogramValue[1]
+
+bool macdBullCross = ta.crossover(macdLineValue, macdSignalValue)
+bool macdBearCross = ta.crossunder(macdLineValue, macdSignalValue)
+
+int macdStateRaw = (
+    not macdReady ? 0 :
+    macdAboveSignal and macdAboveZero ? 2 :
+    macdAboveSignal ? 1 :
+    macdBelowSignal and macdBelowZero ? -2 :
+    macdBelowSignal ? -1 :
+    0)
+
+int macdState = macdModuleEnabledInput ? macdStateRaw : 0
+
+int macdHistogramState = (
+    not macdModuleEnabledInput or not macdReady ? 0 :
+    macdHistogramValue > 0.0 and macdHistogramRising ? 1 :
+    macdHistogramValue < 0.0 and macdHistogramFalling ? -1 :
+    0)
+
+// ============================================================================
+// ADX / DMI MODULE
+// ============================================================================
+
+[dmiPlusValue, dmiMinusValue, adxValue] = ta.dmi(dmiLengthInput, adxSmoothingInput)
+
+bool dmiReady = not na(dmiPlusValue) and not na(dmiMinusValue) and not na(adxValue)
+bool adxRising = dmiReady and adxValue > adxValue[1]
+bool adxFalling = dmiReady and adxValue < adxValue[1]
+bool adxTrendPresent = dmiReady and adxValue >= adxTrendThresholdInput
+bool adxStrongTrend = dmiReady and adxValue >= adxStrongThresholdInput
+
+float dmiDirectionalDifference = dmiReady ? dmiPlusValue - dmiMinusValue : 0.0
+bool dmiBullDominant = dmiReady and dmiPlusValue > dmiMinusValue and dmiDirectionalDifference >= dmiMinSeparationInput
+bool dmiBearDominant = dmiReady and dmiMinusValue > dmiPlusValue and dmiDirectionalDifference <= -dmiMinSeparationInput
+
+bool dmiBullCross = ta.crossover(dmiPlusValue, dmiMinusValue)
+bool dmiBearCross = ta.crossunder(dmiPlusValue, dmiMinusValue)
+bool adxCrossTrendThreshold = ta.crossover(adxValue, adxTrendThresholdInput)
+
+int dmiStateRaw = (
+    not dmiReady or not adxTrendPresent ? 0 :
+    dmiBullDominant ? (adxStrongTrend ? 2 : 1) :
+    dmiBearDominant ? (adxStrongTrend ? -2 : -1) :
+    0)
+
+int dmiState = dmiModuleEnabledInput ? dmiStateRaw : 0
+
+color adxStrengthColor = (
+    not dmiModuleEnabledInput or not dmiReady ? NEUTRAL_COLOR :
+    adxStrongTrend ? INFO_COLOR :
+    adxTrendPresent ? WARNING_COLOR :
+    NEUTRAL_COLOR)
+
+// ============================================================================
+// ATR / VOLATILITY MODULE
+// ============================================================================
+
+float atrValue = ta.atr(atrLengthInput)
+float atrPriceDenominator = math.max(math.abs(close), math.max(syminfo.mintick, 0.0000000001))
+float atrPercentValue = atrValue / atrPriceDenominator * 100.0
+float atrPercentRank = ta.percentrank(atrPercentValue, atrRegimeLookbackInput)
+float atrPercentPast = atrPercentValue[atrSlopeLookbackInput]
+
+bool atrReady = not na(atrValue) and not na(atrPercentValue) and not na(atrPercentRank)
+bool atrDirectionReady = atrReady and not na(atrPercentPast) and math.abs(atrPercentPast) > 0.0000000001
+float atrPercentChange = atrDirectionReady ? (atrPercentValue / atrPercentPast - 1.0) * 100.0 : na
+
+bool atrRising = atrDirectionReady and atrPercentChange >= atrChangeThresholdInput
+bool atrFalling = atrDirectionReady and atrPercentChange <= -atrChangeThresholdInput
+
+int atrRegimeStateRaw = (
+    not atrReady ? 0 :
+    atrPercentRank >= atrExtremeRankInput ? 3 :
+    atrPercentRank >= atrHighRankInput ? 2 :
+    atrPercentRank < atrLowRankInput ? -1 :
+    1)
+
+int atrRegimeState = atrModuleEnabledInput ? atrRegimeStateRaw : 0
+
+int atrDirectionState = (
+    atrModuleEnabledInput and atrDirectionReady
+         ? atrRising ? 1 : atrFalling ? -1 : 0
+         : 0)
+
+color atrRegimeTableColor = (
+    not atrModuleEnabledInput or not atrReady
+         ? NEUTRAL_COLOR
+         : atrRegimeColor(atrRegimeState))
+
+color atrDirectionTableColor = (
+    not atrModuleEnabledInput or not atrDirectionReady
+         ? NEUTRAL_COLOR
+         : atrRising ? ATR_HIGH_COLOR : atrFalling ? ATR_LOW_COLOR : ATR_NORMAL_COLOR)
+
+bool atrEnteredHighVolatility = ta.crossover(atrPercentRank, atrHighRankInput)
+bool atrExitedHighVolatility = ta.crossunder(atrPercentRank, atrHighRankInput)
+
+// ============================================================================
+// VOLUME MODULE
+// ============================================================================
+
+// The RVOL baseline uses only previous bars.
+// The current bar does not increase its own comparison average.
+float volumeAverageValue = ta.sma(volume, volumeAverageLengthInput)[1]
+bool volumeSeriesAvailable = not na(volume) and not na(volumeAverageValue) and volumeAverageValue > 0.0
+float relativeVolumeValue = volumeSeriesAvailable ? volume / volumeAverageValue : na
+
+// Explicit OBV implementation for transparent testing.
+float obvSignedVolume = (
+    na(close[1]) ? 0.0 :
+    close > close[1] ? nz(volume, 0.0) :
+    close < close[1] ? -nz(volume, 0.0) :
+    0.0)
+
+float obvValue = ta.cum(obvSignedVolume)
+float obvEmaValue = ta.ema(obvValue, volumeObvEmaLengthInput)
+float obvEmaPast = obvEmaValue[volumeObvSlopeLookbackInput]
+
+bool volumeReady = volumeSeriesAvailable and not na(relativeVolumeValue) and not na(obvEmaValue) and not na(obvEmaPast)
+bool obvAboveEma = volumeReady and obvValue > obvEmaValue
+bool obvBelowEma = volumeReady and obvValue < obvEmaValue
+bool obvEmaRising = volumeReady and obvEmaValue > obvEmaPast
+bool obvEmaFalling = volumeReady and obvEmaValue < obvEmaPast
+
+bool obvBullCross = ta.crossover(obvValue, obvEmaValue)
+bool obvBearCross = ta.crossunder(obvValue, obvEmaValue)
+bool relativeVolumeCrossHigh = ta.crossover(relativeVolumeValue, volumeHighRvolInput)
+
+int relativeVolumeStateRaw = (
+    not volumeSeriesAvailable ? 0 :
+    relativeVolumeValue >= volumeExtremeRvolInput ? 3 :
+    relativeVolumeValue >= volumeHighRvolInput ? 2 :
+    relativeVolumeValue < volumeLowRvolInput ? -1 :
+    1)
+
+int relativeVolumeState = volumeModuleEnabledInput ? relativeVolumeStateRaw : 0
+
+int obvDirectionStateRaw = (
+    not volumeReady ? 0 :
+    obvAboveEma and obvEmaRising ? 2 :
+    obvAboveEma ? 1 :
+    obvBelowEma and obvEmaFalling ? -2 :
+    obvBelowEma ? -1 :
+    0)
+
+int obvDirectionState = volumeModuleEnabledInput ? obvDirectionStateRaw : 0
+
+int priceChangeDirection = (
+    na(close[1]) ? 0 :
+    close > close[1] ? 1 :
+    close < close[1] ? -1 :
+    0)
+
+bool volumeActivityEnough = volumeReady and relativeVolumeValue >= volumeConfirmRvolInput
+
+// Conservative confirmation requires sufficient RVOL, candle direction
+// and matching OBV direction.
+int volumeConfirmationStateRaw = (
+    not volumeReady or not volumeActivityEnough ? 0 :
+    priceChangeDirection > 0 and obvDirectionStateRaw > 0 ? 1 :
+    priceChangeDirection < 0 and obvDirectionStateRaw < 0 ? -1 :
+    0)
+
+int volumeConfirmationState = volumeModuleEnabledInput ? volumeConfirmationStateRaw : 0
+
+color relativeVolumeTableColor = (
+    not volumeModuleEnabledInput or not volumeSeriesAvailable
+         ? NEUTRAL_COLOR
+         : relativeVolumeColor(relativeVolumeState))
+
+color volumeConfirmationTableColor = (
+    not volumeModuleEnabledInput or not volumeReady ? NEUTRAL_COLOR :
+    volumeConfirmationState != 0 ? stateColor(volumeConfirmationState) :
+    volumeActivityEnough and priceChangeDirection != 0 ? WARNING_COLOR :
+    NEUTRAL_COLOR)
+
+// ============================================================================
+// COMPACT-PANEL PERFORMANCE PRESETS
+// ============================================================================
+
+int compactPointLimit = (
+    compactQualityInput == "Light" ? COMPACT_POINTS_LIGHT :
+    compactQualityInput == "Precise" ? COMPACT_POINTS_PRECISE :
+    COMPACT_POINTS_BALANCED)
+
+int compactRsiSegmentLimit = (
+    compactQualityInput == "Light" ? RSI_SEGMENTS_LIGHT :
+    compactQualityInput == "Precise" ? RSI_SEGMENTS_PRECISE :
+    RSI_SEGMENTS_BALANCED)
+
+int compactMacdHistogramLimit = (
+    compactQualityInput == "Light" ? MACD_HISTOGRAM_LIGHT :
+    compactQualityInput == "Precise" ? MACD_HISTOGRAM_PRECISE :
+    MACD_HISTOGRAM_BALANCED)
+
+// ============================================================================
+// VISIBLE-RANGE DATA FOR COMPACT PANELS
+// ============================================================================
+
+var array<int> visibleBarTimes = array.new<int>()
+var array<float> visibleRsiValues = array.new<float>()
+var array<float> visibleMacdValues = array.new<float>()
+var array<float> visibleMacdSignalValues = array.new<float>()
+var array<float> visibleMacdHistogramValues = array.new<float>()
+var array<float> visibleDmiPlusValues = array.new<float>()
+var array<float> visibleDmiMinusValues = array.new<float>()
+var array<float> visibleAdxValues = array.new<float>()
+
+var float visiblePriceHigh = na
+var float visiblePriceLow = na
+var float visibleMacdMaxAbs = na
+
+bool compactDmiPanelEnabled = dmiModuleEnabledInput and dmiShowCompactPanelInput
+bool compactModulesEnabled = rsiModuleEnabledInput or macdModuleEnabledInput or compactDmiPanelEnabled
+bool isVisibleChartBar = time >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+
+if compactModulesEnabled and isVisibleChartBar
+    int visibleArraySize = array.size(visibleBarTimes)
+    bool updateLastVisibleBar = visibleArraySize > 0 and array.get(visibleBarTimes, visibleArraySize - 1) == time
+
+    if updateLastVisibleBar
+        int lastVisibleArrayIndex = visibleArraySize - 1
+
+        if rsiModuleEnabledInput
+            array.set(visibleRsiValues, lastVisibleArrayIndex, rsiValue)
+
+        if macdModuleEnabledInput
+            array.set(visibleMacdValues, lastVisibleArrayIndex, macdLineValue)
+            array.set(visibleMacdSignalValues, lastVisibleArrayIndex, macdSignalValue)
+            array.set(visibleMacdHistogramValues, lastVisibleArrayIndex, macdHistogramValue)
+
+        if compactDmiPanelEnabled
+            array.set(visibleDmiPlusValues, lastVisibleArrayIndex, dmiPlusValue)
+            array.set(visibleDmiMinusValues, lastVisibleArrayIndex, dmiMinusValue)
+            array.set(visibleAdxValues, lastVisibleArrayIndex, adxValue)
+    else
+        array.push(visibleBarTimes, time)
+
+        if rsiModuleEnabledInput
+            array.push(visibleRsiValues, rsiValue)
+
+        if macdModuleEnabledInput
+            array.push(visibleMacdValues, macdLineValue)
+            array.push(visibleMacdSignalValues, macdSignalValue)
+            array.push(visibleMacdHistogramValues, macdHistogramValue)
+
+        if compactDmiPanelEnabled
+            array.push(visibleDmiPlusValues, dmiPlusValue)
+            array.push(visibleDmiMinusValues, dmiMinusValue)
+            array.push(visibleAdxValues, adxValue)
+
+    visiblePriceHigh := na(visiblePriceHigh) ? high : math.max(visiblePriceHigh, high)
+    visiblePriceLow := na(visiblePriceLow) ? low : math.min(visiblePriceLow, low)
+
+    if macdModuleEnabledInput
+        float currentMacdMaxAbs = 0.0
+        currentMacdMaxAbs := not na(macdLineValue) ? math.max(currentMacdMaxAbs, math.abs(macdLineValue)) : currentMacdMaxAbs
+        currentMacdMaxAbs := not na(macdSignalValue) ? math.max(currentMacdMaxAbs, math.abs(macdSignalValue)) : currentMacdMaxAbs
+        currentMacdMaxAbs := not na(macdHistogramValue) ? math.max(currentMacdMaxAbs, math.abs(macdHistogramValue)) : currentMacdMaxAbs
+
+        if currentMacdMaxAbs > 0.0
+            visibleMacdMaxAbs := na(visibleMacdMaxAbs) ? currentMacdMaxAbs : math.max(visibleMacdMaxAbs, currentMacdMaxAbs)
+
+// ============================================================================
+// DASHBOARD CATEGORY STATES
+// ============================================================================
+
+int emaDirectionSign = emaTrendState > 0 ? 1 : emaTrendState < 0 ? -1 : 0
+int dmiDirectionSign = dmiState > 0 ? 1 : dmiState < 0 ? -1 : 0
+int rsiDirectionSign = rsiState > 0 ? 1 : rsiState < 0 ? -1 : 0
+int macdDirectionSign = macdState > 0 ? 1 : macdState < 0 ? -1 : 0
+
+bool trendEmaAvailable = emaModuleEnabledInput and emaDataReady
+bool trendDmiAvailable = dmiModuleEnabledInput and dmiReady
+bool trendCategoryConfigured = emaModuleEnabledInput or dmiModuleEnabledInput
+bool trendCategoryAvailable = trendEmaAvailable or trendDmiAvailable
+
+int trendCategoryState = (
+    not trendCategoryAvailable ? 0 :
+    trendEmaAvailable and not trendDmiAvailable ? emaDirectionSign :
+    not trendEmaAvailable and trendDmiAvailable ? dmiDirectionSign :
+    emaDirectionSign == dmiDirectionSign ? emaDirectionSign :
+    emaDirectionSign == 0 ? dmiDirectionSign :
+    dmiDirectionSign == 0 ? emaDirectionSign :
+    0)
+
+bool momentumRsiAvailable = rsiModuleEnabledInput and rsiReady
+bool momentumMacdAvailable = macdModuleEnabledInput and macdReady
+bool momentumCategoryConfigured = rsiModuleEnabledInput or macdModuleEnabledInput
+bool momentumCategoryAvailable = momentumRsiAvailable or momentumMacdAvailable
+
+int momentumCategoryState = (
+    not momentumCategoryAvailable ? 0 :
+    momentumRsiAvailable and not momentumMacdAvailable ? rsiDirectionSign :
+    not momentumRsiAvailable and momentumMacdAvailable ? macdDirectionSign :
+    rsiDirectionSign == macdDirectionSign ? rsiDirectionSign :
+    rsiDirectionSign == 0 ? macdDirectionSign :
+    macdDirectionSign == 0 ? rsiDirectionSign :
+    0)
+
+int activeDirectionalCategoryCount = (
+    (trendCategoryAvailable ? 1 : 0) +
+    (momentumCategoryAvailable ? 1 : 0))
+
+int marketState = (
+    activeDirectionalCategoryCount == 0 ? 0 :
+    activeDirectionalCategoryCount == 1
+         ? (trendCategoryAvailable ? trendCategoryState : momentumCategoryState)
+         : trendCategoryState != 0 and trendCategoryState == momentumCategoryState
+             ? trendCategoryState
+             : 0)
+
+bool volumeConfirmsMarket = (
+    volumeModuleEnabledInput and
+    volumeReady and
+    marketState != 0 and
+    volumeConfirmationState == marketState)
+
+bool volumeOpposesMarket = (
+    volumeModuleEnabledInput and
+    volumeReady and
+    volumeActivityEnough and
+    marketState != 0 and
+    volumeConfirmationState == -marketState)
+
+bool volumeDivergesMarket = (
+    volumeModuleEnabledInput and
+    volumeReady and
+    volumeActivityEnough and
+    marketState != 0 and
+    volumeConfirmationState == 0)
+
+bool volumeWarnsMarket = volumeOpposesMarket or volumeDivergesMarket
+color marketStateTableColor = marketState == 0 ? NEUTRAL_COLOR : volumeWarnsMarket ? WARNING_COLOR : stateColor(marketState)
+
+// ============================================================================
+// CHART CONTEXT
+// ============================================================================
+
+bool isTargetTimeframe = timeframe.isdaily or timeframe.isweekly
+bool isStandardChart = chart.is_standard
+color timeframeColor = (
+    warnNonStandardChartInput and not isStandardChart ? BEAR_COLOR :
+    isTargetTimeframe ? INFO_COLOR :
+    WARNING_COLOR)
+// ============================================================================
+// ON-DEMAND TEXT FORMATTERS
+// ============================================================================
+
+// These functions are called only when the dashboard updates or an alert fires.
+// This avoids constructing dozens of dynamic strings on every historical bar.
+
+formatNumber(float value, int decimals) =>
+    na(value) ? "N/A" : str.tostring(math.round(value, decimals))
+
+formatSignedPercent(float value, int decimals) =>
+    na(value) ? "N/A" : (value > 0.0 ? "+" : "") + str.tostring(math.round(value, decimals)) + "%"
+
+pricePositionText() =>
+    (
+        not emaModuleEnabledInput ? "Disabled" :
+        not emaValuesReady ? "Insufficient data" :
+        priceAboveCount == 3 ? "Above all 3 EMAs" :
+        priceAboveCount == 0 ? "Below all 3 EMAs" :
+        "Above " + str.tostring(priceAboveCount) + "/3 EMAs"
+    )
+
+emaOrderText() =>
+    (
+        not emaModuleEnabledInput ? "Disabled" :
+        not emaValuesReady ? "Insufficient data" :
+        emaBullOrder ? "Bullish" :
+        emaBearOrder ? "Bearish" :
+        "Mixed"
+    )
+
+emaSlopeText() =>
+    (
+        not emaModuleEnabledInput ? "Disabled" :
+        not emaSlopeReady ? "Insufficient data" :
+        emaRisingCount == 3 ? "3/3 rising" :
+        emaFallingCount == 3 ? "3/3 falling" :
+        str.tostring(emaRisingCount) + " rising, " + str.tostring(emaFallingCount) + " falling"
+    )
+
+emaTrendText() =>
+    (
+        not emaModuleEnabledInput ? "Disabled" :
+        not emaDataReady ? "Insufficient data" :
+        emaTrendState == 2 ? "Strong uptrend" :
+        emaTrendState == 1 ? "Uptrend" :
+        emaTrendState == -2 ? "Strong downtrend" :
+        emaTrendState == -1 ? "Downtrend" :
+        "Neutral / transitional"
+    )
+
+rsiStateText() =>
+    string valueText = formatNumber(rsiValue, 1)
+    (
+        not rsiModuleEnabledInput ? "Disabled" :
+        not rsiReady ? "Insufficient data" :
+        rsiState == 2 ? "Overbought | " + valueText :
+        rsiState == 1 ? "Bullish bias | " + valueText :
+        rsiState == -2 ? "Oversold | " + valueText :
+        rsiState == -1 ? "Bearish bias | " + valueText :
+        "Neutral | " + valueText
+    )
+
+rsiDirectionText() =>
+    (
+        not rsiModuleEnabledInput ? "Disabled" :
+        not rsiReady ? "Insufficient data" :
+        rsiRising ? "Rising" :
+        rsiFalling ? "Falling" :
+        "Flat"
+    )
+
+macdStateText() =>
+    (
+        not macdModuleEnabledInput ? "Disabled" :
+        not macdReady ? "Insufficient data" :
+        macdState == 2 ? "Bullish | above zero" :
+        macdState == 1 ? "Recovery | below zero" :
+        macdState == -2 ? "Bearish | below zero" :
+        macdState == -1 ? "Weakening | above zero" :
+        "Neutral"
+    )
+
+macdHistogramText() =>
+    (
+        not macdModuleEnabledInput ? "Disabled" :
+        not macdReady ? "Insufficient data" :
+        macdHistogramValue > 0.0 and macdHistogramRising ? "Positive | rising" :
+        macdHistogramValue > 0.0 and macdHistogramFalling ? "Positive | weakening" :
+        macdHistogramValue < 0.0 and macdHistogramFalling ? "Negative | deepening" :
+        macdHistogramValue < 0.0 and macdHistogramRising ? "Negative | recovering" :
+        "Near zero"
+    )
+
+adxStrengthText() =>
+    string valueText = formatNumber(adxValue, 1)
+    string slopeText = adxRising ? "rising" : adxFalling ? "falling" : "flat"
+    (
+        not dmiModuleEnabledInput ? "Disabled" :
+        not dmiReady ? "Insufficient data" :
+        adxStrongTrend ? "Strong | " + valueText + " | " + slopeText :
+        adxTrendPresent ? "Developing | " + valueText + " | " + slopeText :
+        "Weak | " + valueText + " | " + slopeText
+    )
+
+dmiDirectionText() =>
+    string plusText = formatNumber(dmiPlusValue, 1)
+    string minusText = formatNumber(dmiMinusValue, 1)
+    (
+        not dmiModuleEnabledInput ? "Disabled" :
+        not dmiReady ? "Insufficient data" :
+        not adxTrendPresent ? "No trend | +DI " + plusText + " / -DI " + minusText :
+        dmiBullDominant ? "+DI dominant | " + plusText + " > " + minusText :
+        dmiBearDominant ? "-DI dominant | " + minusText + " > " + plusText :
+        "No DI dominance | gap < " + formatNumber(dmiMinSeparationInput, 1)
+    )
+
+atrRegimeText() =>
+    string atrPercentText = formatNumber(atrPercentValue, 2) + "%"
+    string rankText = formatNumber(atrPercentRank, 0)
+    (
+        not atrModuleEnabledInput ? "Disabled" :
+        not atrReady ? "Insufficient data" :
+        atrRegimeState == 3 ? "Extreme | " + atrPercentText + " | rank " + rankText + "/100" :
+        atrRegimeState == 2 ? "High | " + atrPercentText + " | rank " + rankText + "/100" :
+        atrRegimeState == -1 ? "Low | " + atrPercentText + " | rank " + rankText + "/100" :
+        "Normal | " + atrPercentText + " | rank " + rankText + "/100"
+    )
+
+atrDirectionText() =>
+    string changeText = formatSignedPercent(atrPercentChange, 1)
+    (
+        not atrModuleEnabledInput ? "Disabled" :
+        not atrDirectionReady ? "Insufficient data" :
+        atrRising ? "Rising | " + changeText :
+        atrFalling ? "Falling | " + changeText :
+        "Stable | " + changeText
+    )
+
+relativeVolumeText() =>
+    string valueText = formatNumber(relativeVolumeValue, 2) + "x"
+    (
+        not volumeModuleEnabledInput ? "Disabled" :
+        not volumeSeriesAvailable ? "No usable volume data" :
+        relativeVolumeState == 3 ? "Extreme | " + valueText :
+        relativeVolumeState == 2 ? "High | " + valueText :
+        relativeVolumeState == -1 ? "Low | " + valueText :
+        "Normal | " + valueText
+    )
+
+obvDirectionText() =>
+    (
+        not volumeModuleEnabledInput ? "Disabled" :
+        not volumeReady ? "No usable volume data" :
+        obvDirectionState == 2 ? "Bullish | OBV above EMA, EMA rising" :
+        obvDirectionState == 1 ? "Bullish | OBV above EMA" :
+        obvDirectionState == -2 ? "Bearish | OBV below EMA, EMA falling" :
+        obvDirectionState == -1 ? "Bearish | OBV below EMA" :
+        "Neutral"
+    )
+
+volumeConfirmationText() =>
+    string rvolText = formatNumber(relativeVolumeValue, 2) + "x"
+    (
+        not volumeModuleEnabledInput ? "Disabled" :
+        not volumeReady ? "No usable volume data | excluded" :
+        not volumeActivityEnough ? "No confirmation | RVOL " + rvolText :
+        priceChangeDirection == 0 ? "Price direction flat | RVOL " + rvolText :
+        volumeConfirmationState == 1 ? "Confirms bullish move | RVOL " + rvolText :
+        volumeConfirmationState == -1 ? "Confirms bearish move | RVOL " + rvolText :
+        "Price / OBV divergence | RVOL " + rvolText
+    )
+
+trendCategoryText() =>
+    (
+        not trendCategoryConfigured ? "Disabled" :
+        not trendCategoryAvailable ? "Insufficient data" :
+        trendEmaAvailable and not trendDmiAvailable ? "EMA | " + emaTrendText() :
+        not trendEmaAvailable and trendDmiAvailable ? "DMI | " + dmiDirectionText() :
+        emaDirectionSign > 0 and dmiDirectionSign > 0 ? "Bullish | EMA + DMI" :
+        emaDirectionSign < 0 and dmiDirectionSign < 0 ? "Bearish | EMA + DMI" :
+        emaDirectionSign > 0 and dmiDirectionSign == 0 ? "Bullish | DMI not dominant" :
+        emaDirectionSign < 0 and dmiDirectionSign == 0 ? "Bearish | DMI not dominant" :
+        emaDirectionSign == 0 and dmiDirectionSign > 0 ? "Developing bullish | DMI" :
+        emaDirectionSign == 0 and dmiDirectionSign < 0 ? "Developing bearish | DMI" :
+        emaDirectionSign != dmiDirectionSign ? "Mixed | EMA vs DMI" :
+        "Neutral / transitional"
+    )
+
+momentumCategoryText() =>
+    (
+        not momentumCategoryConfigured ? "Disabled" :
+        not momentumCategoryAvailable ? "Insufficient data" :
+        momentumRsiAvailable and not momentumMacdAvailable ? "RSI | " + rsiStateText() :
+        not momentumRsiAvailable and momentumMacdAvailable ? "MACD | " + macdStateText() :
+        rsiDirectionSign > 0 and macdDirectionSign > 0 ? "Positive | RSI + MACD" :
+        rsiDirectionSign < 0 and macdDirectionSign < 0 ? "Negative | RSI + MACD" :
+        rsiDirectionSign > 0 and macdDirectionSign == 0 ? "Positive | RSI only" :
+        rsiDirectionSign < 0 and macdDirectionSign == 0 ? "Negative | RSI only" :
+        rsiDirectionSign == 0 and macdDirectionSign > 0 ? "Positive | MACD only" :
+        rsiDirectionSign == 0 and macdDirectionSign < 0 ? "Negative | MACD only" :
+        rsiDirectionSign != macdDirectionSign ? "Mixed | RSI vs MACD" :
+        "Neutral / transitional"
+    )
+
+volatilityCategoryText() =>
+    string directionText = atrRising ? "rising" : atrFalling ? "falling" : "stable"
+    string atrPercentText = formatNumber(atrPercentValue, 2) + "%"
+    (
+        not atrModuleEnabledInput ? "Disabled" :
+        not atrReady ? "Insufficient data" :
+        atrRegimeState == 3 ? "Extreme | " + directionText + " | " + atrPercentText :
+        atrRegimeState == 2 ? "High | " + directionText + " | " + atrPercentText :
+        atrRegimeState == -1 ? "Low | " + directionText + " | " + atrPercentText :
+        "Normal | " + directionText + " | " + atrPercentText
+    )
+
+marketStateText() =>
+    (
+        activeDirectionalCategoryCount == 0 ? "No active directional categories" :
+        activeDirectionalCategoryCount == 1 and marketState > 0
+             ? "Bullish | " + (trendCategoryAvailable ? "trend only" : "momentum only") :
+        activeDirectionalCategoryCount == 1 and marketState < 0
+             ? "Bearish | " + (trendCategoryAvailable ? "trend only" : "momentum only") :
+        trendCategoryState > 0 and momentumCategoryState > 0
+             ? volumeConfirmsMarket ? "Bullish | volume confirms" :
+               volumeWarnsMarket ? "Bullish | volume does not confirm" :
+               "Bullish | trend + momentum" :
+        trendCategoryState < 0 and momentumCategoryState < 0
+             ? volumeConfirmsMarket ? "Bearish | volume confirms" :
+               volumeWarnsMarket ? "Bearish | volume does not confirm" :
+               "Bearish | trend + momentum" :
+        trendCategoryState != 0 and momentumCategoryState != 0 and trendCategoryState != momentumCategoryState
+             ? "Mixed | trend vs momentum" :
+        trendCategoryState > 0 or momentumCategoryState > 0
+             ? "Partial bullish bias" :
+        trendCategoryState < 0 or momentumCategoryState < 0
+             ? "Partial bearish bias" :
+        "Neutral / transitional"
+    )
+
+timeframeText() =>
+    string modeText = useClosedBarMode ? "CLOSED" : "LIVE"
+    string targetText = isTargetTimeframe ? "Daily/Weekly target" : "outside Daily/Weekly"
+    string syntheticText = warnNonStandardChartInput and not isStandardChart ? " | synthetic chart" : ""
+    timeframe.period + " | " + targetText + " | " + modeText + syntheticText
+
+activeConfigurationText() =>
+    string emaText = emaModuleEnabledInput ? "E" + str.tostring(emaFastLengthInput) + "/" + str.tostring(emaMediumLengthInput) + "/" + str.tostring(emaSlowLengthInput) : "E-"
+    string rsiText = rsiModuleEnabledInput ? "R" + str.tostring(rsiLengthInput) : "R-"
+    string macdText = macdModuleEnabledInput ? "M" + str.tostring(macdFastLengthInput) + "/" + str.tostring(macdSlowLengthInput) + "/" + str.tostring(macdSignalLengthInput) : "M-"
+    string dmiText = dmiModuleEnabledInput ? "D" + str.tostring(dmiLengthInput) + "/" + str.tostring(adxSmoothingInput) : "D-"
+    string atrText = atrModuleEnabledInput ? "A" + str.tostring(atrLengthInput) : "A-"
+    string volumeText = volumeModuleEnabledInput ? "V" + str.tostring(volumeAverageLengthInput) + "/" + str.tostring(volumeObvEmaLengthInput) : "V-"
+    emaText + " | " + rsiText + " | " + macdText + " | " + dmiText + " | " + atrText + " | " + volumeText
+// ============================================================================
+// PLOTS - EMA MODULE ON MAIN CHART
+// ============================================================================
+
+plot(emaModuleEnabledInput ? emaFast : na, title = "Fast EMA", color = emaFastColorInput, linewidth = emaLineWidthInput, force_overlay = true)
+plot(emaModuleEnabledInput ? emaMedium : na, title = "Medium EMA", color = emaMediumColorInput, linewidth = emaLineWidthInput, force_overlay = true)
+plot(emaModuleEnabledInput ? emaSlow : na, title = "Slow EMA", color = emaSlowColorInput, linewidth = emaLineWidthInput, force_overlay = true)
+
+// ============================================================================
+// VISUALS - COMPACT OSCILLATORS WITHOUT PRICE-SCALE IMPACT
+// ============================================================================
+
+// True oscillator values remain available in the status line and Data Window.
+// These hidden plots do not draw in the chart pane and do not affect the price scale.
+plot(rsiModuleEnabledInput ? rsiValue : na, title = "RSI | value", color = rsiLineColor, linewidth = 1, display = display.status_line + display.data_window, format = format.price, precision = 1)
+plot(macdModuleEnabledInput ? macdLineValue : na, title = "MACD | line", color = MACD_LINE_COLOR, linewidth = 1, display = display.status_line + display.data_window)
+plot(macdModuleEnabledInput ? macdSignalValue : na, title = "MACD | signal", color = MACD_SIGNAL_COLOR, linewidth = 1, display = display.status_line + display.data_window)
+plot(macdModuleEnabledInput ? macdHistogramValue : na, title = "MACD | histogram", color = NEUTRAL_COLOR, linewidth = 1, display = display.status_line + display.data_window)
+plot(dmiModuleEnabledInput ? dmiPlusValue : na, title = "DMI | +DI", color = dmiPlusColorInput, linewidth = 1, display = display.status_line + display.data_window, precision = 1)
+plot(dmiModuleEnabledInput ? dmiMinusValue : na, title = "DMI | -DI", color = dmiMinusColorInput, linewidth = 1, display = display.status_line + display.data_window, precision = 1)
+plot(dmiModuleEnabledInput ? adxValue : na, title = "ADX | value", color = adxColorInput, linewidth = 1, display = display.status_line + display.data_window, precision = 1)
+plot(atrModuleEnabledInput ? atrValue : na, title = "ATR | value", color = ATR_NORMAL_COLOR, linewidth = 1, display = display.data_window)
+plot(atrModuleEnabledInput ? atrPercentValue : na, title = "ATR | percent of price", color = ATR_HIGH_COLOR, linewidth = 1, display = display.data_window, precision = 2)
+plot(atrModuleEnabledInput ? atrPercentRank : na, title = "ATR | percent rank", color = ATR_LOW_COLOR, linewidth = 1, display = display.data_window, precision = 0)
+plot(volumeModuleEnabledInput and volumeSeriesAvailable ? relativeVolumeValue : na, title = "Volume | RVOL", color = relativeVolumeTableColor, linewidth = 1, display = display.status_line + display.data_window, precision = 2)
+plot(volumeModuleEnabledInput and volumeReady ? obvValue : na, title = "Volume | OBV", color = INFO_COLOR, linewidth = 1, display = display.data_window)
+plot(volumeModuleEnabledInput and volumeReady ? obvEmaValue : na, title = "Volume | OBV EMA", color = VOLUME_HIGH_COLOR, linewidth = 1, display = display.data_window)
+
+// Automatic dashboard header color for light and dark themes.
+float chartBackgroundBrightness = (color.r(chart.bg_color) * 299.0 + color.g(chart.bg_color) * 587.0 + color.b(chart.bg_color) * 114.0) / 1000.0
+color dashboardHeaderColor = chartBackgroundBrightness >= 145.0 ? #334155 : HEADER_COLOR
+
+// RSI drawings. Colored line segments replace a single-color polyline.
+var array<line> rsiSegmentLines = array.new<line>()
+var line rsiBandTopLine = na
+var line rsiOverboughtLine = na
+var line rsiBullThresholdLine = na
+var line rsiCenterLine = na
+var line rsiBearThresholdLine = na
+var line rsiOversoldLine = na
+var line rsiBandBottomLine = na
+
+// MACD drawings.
+var polyline macdCompactPolyline = na
+var polyline macdSignalCompactPolyline = na
+var line macdBandTopLine = na
+var line macdZeroLine = na
+var line macdBandBottomLine = na
+var array<line> macdHistogramLines = array.new<line>()
+
+// ADX/DMI drawings.
+var polyline dmiPlusCompactPolyline = na
+var polyline dmiMinusCompactPolyline = na
+var polyline adxCompactPolyline = na
+var line dmiBandTopLine = na
+var line dmiStrongThresholdLine = na
+var line dmiTrendThresholdLine = na
+var line dmiBandBottomLine = na
+
+// Closed-bar mode initializes on the last confirmed historical bar and then
+// redraws only when the realtime bar confirms. Live intrabar redraws require
+// the explicit advanced checkbox.
+bool shouldRefreshCompactVisuals = (
+    compactModulesEnabled and
+    (
+        barstate.islastconfirmedhistory or
+        (barstate.islast and barstate.isconfirmed) or
+        (useLiveCompactRefresh and barstate.islast)
+    ))
+
+if shouldRefreshCompactVisuals
+    // Polylines have no setters, so they must be deleted and recreated
+    // only on the selected refresh events after the visible range is known.
+    if not na(macdCompactPolyline)
+        polyline.delete(macdCompactPolyline)
+        macdCompactPolyline := na
+
+    if not na(macdSignalCompactPolyline)
+        polyline.delete(macdSignalCompactPolyline)
+        macdSignalCompactPolyline := na
+
+    if not na(dmiPlusCompactPolyline)
+        polyline.delete(dmiPlusCompactPolyline)
+        dmiPlusCompactPolyline := na
+
+    if not na(dmiMinusCompactPolyline)
+        polyline.delete(dmiMinusCompactPolyline)
+        dmiMinusCompactPolyline := na
+
+    if not na(adxCompactPolyline)
+        polyline.delete(adxCompactPolyline)
+        adxCompactPolyline := na
+
+    int visibleBarCount = array.size(visibleBarTimes)
+    bool compactRangeReady = visibleBarCount >= 2 and not na(visiblePriceHigh) and not na(visiblePriceLow)
+
+    if compactRangeReady
+        float safeVisibleHigh = visiblePriceHigh > visiblePriceLow ? visiblePriceHigh : visiblePriceLow + math.max(syminfo.mintick, 0.0000001)
+        float compactBaseBottomFraction = compactBottomMarginInput / 100.0
+        int compactPanelCount = (rsiModuleEnabledInput ? 1 : 0) + (macdModuleEnabledInput ? 1 : 0) + (compactDmiPanelEnabled ? 1 : 0)
+        float requestedPanelHeights = (rsiModuleEnabledInput ? rsiCompactHeightInput / 100.0 : 0.0) + (macdModuleEnabledInput ? macdCompactHeightInput / 100.0 : 0.0) + (compactDmiPanelEnabled ? dmiCompactHeightInput / 100.0 : 0.0)
+        float requestedPanelGaps = math.max(compactPanelCount - 1, 0) * compactPanelGapInput / 100.0
+        float availablePanelSpace = math.max(0.05, 0.95 - compactBaseBottomFraction)
+        float requestedLayoutSpace = requestedPanelHeights + requestedPanelGaps
+        float compactLayoutScale = requestedLayoutSpace > availablePanelSpace and requestedLayoutSpace > 0.0 ? availablePanelSpace / requestedLayoutSpace : 1.0
+        float scaledPanelGap = compactPanelGapInput / 100.0 * compactLayoutScale
+        float nextPanelBottomFraction = compactBaseBottomFraction
+
+        float rsiBandBottomFraction = nextPanelBottomFraction
+        float rsiBandTopFraction = math.min(0.95, rsiBandBottomFraction + (rsiModuleEnabledInput ? rsiCompactHeightInput / 100.0 * compactLayoutScale : 0.0))
+        if rsiModuleEnabledInput
+            nextPanelBottomFraction := math.min(0.95, rsiBandTopFraction + scaledPanelGap)
+
+        float macdBandBottomFraction = nextPanelBottomFraction
+        float macdBandTopFraction = math.min(0.95, macdBandBottomFraction + (macdModuleEnabledInput ? macdCompactHeightInput / 100.0 * compactLayoutScale : 0.0))
+        if macdModuleEnabledInput
+            nextPanelBottomFraction := math.min(0.95, macdBandTopFraction + scaledPanelGap)
+
+        float dmiBandBottomFraction = nextPanelBottomFraction
+        float dmiBandTopFraction = math.min(0.95, dmiBandBottomFraction + (compactDmiPanelEnabled ? dmiCompactHeightInput / 100.0 * compactLayoutScale : 0.0))
+
+        int firstVisibleTime = array.get(visibleBarTimes, 0)
+        int lastVisibleTime = array.get(visibleBarTimes, visibleBarCount - 1)
+        int pointStep = visibleBarCount > compactPointLimit ? int(math.ceil(visibleBarCount / float(compactPointLimit))) : 1
+        int lastVisibleIndex = visibleBarCount - 1
+
+        // --------------------------------------------------------------------
+        // COMPACT RSI
+        // --------------------------------------------------------------------
+
+        bool compactRsiReady = rsiModuleEnabledInput
+
+        if compactRsiReady
+            float compactRsiBandBottom = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, rsiBandBottomFraction)
+            float compactRsiBandTop = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, rsiBandTopFraction)
+
+            float compactOverbought = mapRsiToCompactBand(rsiOverboughtInput, compactRsiBandBottom, compactRsiBandTop)
+            float compactBullThreshold = mapRsiToCompactBand(rsiBullThresholdInput, compactRsiBandBottom, compactRsiBandTop)
+            float compactCenter = mapRsiToCompactBand(50.0, compactRsiBandBottom, compactRsiBandTop)
+            float compactBearThreshold = mapRsiToCompactBand(rsiBearThresholdInput, compactRsiBandBottom, compactRsiBandTop)
+            float compactOversold = mapRsiToCompactBand(rsiOversoldInput, compactRsiBandBottom, compactRsiBandTop)
+
+            int usedRsiSegmentCount = 0
+            int rsiSegmentStep = visibleBarCount > compactRsiSegmentLimit + 1 ? int(math.ceil((visibleBarCount - 1) / float(compactRsiSegmentLimit))) : 1
+            int rsiSegmentStartIndex = 0
+            int rsiSegmentEndIndex = math.min(rsiSegmentStep, lastVisibleIndex)
+
+            while rsiSegmentStartIndex < lastVisibleIndex
+                float segmentStartRsi = array.get(visibleRsiValues, rsiSegmentStartIndex)
+                float segmentEndRsi = array.get(visibleRsiValues, rsiSegmentEndIndex)
+
+                if not na(segmentStartRsi) and not na(segmentEndRsi)
+                    int segmentStartTime = array.get(visibleBarTimes, rsiSegmentStartIndex)
+                    int segmentEndTime = array.get(visibleBarTimes, rsiSegmentEndIndex)
+                    float segmentStartY = mapRsiToCompactBand(segmentStartRsi, compactRsiBandBottom, compactRsiBandTop)
+                    float segmentEndY = mapRsiToCompactBand(segmentEndRsi, compactRsiBandBottom, compactRsiBandTop)
+                    float segmentReferenceRsi = (segmentStartRsi + segmentEndRsi) / 2.0
+                    color segmentRsiColor = rsiVisualColor(segmentReferenceRsi, rsiBullThresholdInput, rsiBearThresholdInput, rsiBullColorInput, rsiNeutralColorInput, rsiBearColorInput)
+                    line currentRsiSegment = na
+                    if usedRsiSegmentCount < array.size(rsiSegmentLines)
+                        currentRsiSegment := array.get(rsiSegmentLines, usedRsiSegmentCount)
+                    line updatedRsiSegment = updateCompactSegment(currentRsiSegment, segmentStartTime, segmentStartY, segmentEndTime, segmentEndY, segmentRsiColor, rsiLineWidthInput)
+
+                    if usedRsiSegmentCount >= array.size(rsiSegmentLines)
+                        array.push(rsiSegmentLines, updatedRsiSegment)
+
+                    usedRsiSegmentCount += 1
+
+                rsiSegmentStartIndex := rsiSegmentEndIndex
+                rsiSegmentEndIndex := math.min(rsiSegmentEndIndex + rsiSegmentStep, lastVisibleIndex)
+
+            while array.size(rsiSegmentLines) > usedRsiSegmentCount
+                line unusedRsiSegment = array.pop(rsiSegmentLines)
+                line.delete(unusedRsiSegment)
+
+            rsiBandTopLine := updateCompactLevel(rsiBandTopLine, firstVisibleTime, lastVisibleTime, compactRsiBandTop, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+            rsiOverboughtLine := updateCompactLevel(rsiOverboughtLine, firstVisibleTime, lastVisibleTime, compactOverbought, color.new(BEAR_COLOR, 35), line.style_dashed)
+            rsiBullThresholdLine := updateCompactLevel(rsiBullThresholdLine, firstVisibleTime, lastVisibleTime, compactBullThreshold, color.new(BULL_COLOR, 72), line.style_dotted)
+            rsiCenterLine := updateCompactLevel(rsiCenterLine, firstVisibleTime, lastVisibleTime, compactCenter, color.new(NEUTRAL_COLOR, 55), line.style_solid)
+            rsiBearThresholdLine := updateCompactLevel(rsiBearThresholdLine, firstVisibleTime, lastVisibleTime, compactBearThreshold, color.new(BEAR_COLOR, 72), line.style_dotted)
+            rsiOversoldLine := updateCompactLevel(rsiOversoldLine, firstVisibleTime, lastVisibleTime, compactOversold, color.new(BULL_COLOR, 35), line.style_dashed)
+            rsiBandBottomLine := updateCompactLevel(rsiBandBottomLine, firstVisibleTime, lastVisibleTime, compactRsiBandBottom, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+        else
+            while array.size(rsiSegmentLines) > 0
+                line unusedRsiSegment = array.pop(rsiSegmentLines)
+                line.delete(unusedRsiSegment)
+
+            if not na(rsiBandTopLine)
+                line.delete(rsiBandTopLine)
+                rsiBandTopLine := na
+            if not na(rsiOverboughtLine)
+                line.delete(rsiOverboughtLine)
+                rsiOverboughtLine := na
+            if not na(rsiBullThresholdLine)
+                line.delete(rsiBullThresholdLine)
+                rsiBullThresholdLine := na
+            if not na(rsiCenterLine)
+                line.delete(rsiCenterLine)
+                rsiCenterLine := na
+            if not na(rsiBearThresholdLine)
+                line.delete(rsiBearThresholdLine)
+                rsiBearThresholdLine := na
+            if not na(rsiOversoldLine)
+                line.delete(rsiOversoldLine)
+                rsiOversoldLine := na
+            if not na(rsiBandBottomLine)
+                line.delete(rsiBandBottomLine)
+                rsiBandBottomLine := na
+
+        // --------------------------------------------------------------------
+        // COMPACT MACD
+        // --------------------------------------------------------------------
+
+        bool compactMacdReady = macdModuleEnabledInput and not na(visibleMacdMaxAbs) and visibleMacdMaxAbs > 0.0
+
+        if compactMacdReady
+            float compactMacdBandBottom = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, macdBandBottomFraction)
+            float compactMacdBandTop = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, macdBandTopFraction)
+            float compactMacdZero = mapSignedToCompactBand(0.0, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+
+            array<chart.point> compactMacdPoints = array.new<chart.point>()
+            array<chart.point> compactMacdSignalPoints = array.new<chart.point>()
+
+            int macdPointIndex = 0
+            while macdPointIndex <= lastVisibleIndex
+                float sampledMacd = array.get(visibleMacdValues, macdPointIndex)
+                float sampledSignal = array.get(visibleMacdSignalValues, macdPointIndex)
+                int sampledTime = array.get(visibleBarTimes, macdPointIndex)
+
+                if not na(sampledMacd)
+                    float sampledMacdY = mapSignedToCompactBand(sampledMacd, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                    array.push(compactMacdPoints, chart.point.from_time(sampledTime, sampledMacdY))
+
+                if not na(sampledSignal)
+                    float sampledSignalY = mapSignedToCompactBand(sampledSignal, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                    array.push(compactMacdSignalPoints, chart.point.from_time(sampledTime, sampledSignalY))
+
+                macdPointIndex += pointStep
+
+            if lastVisibleIndex % pointStep != 0
+                float finalMacd = array.get(visibleMacdValues, lastVisibleIndex)
+                float finalSignal = array.get(visibleMacdSignalValues, lastVisibleIndex)
+                int finalTime = array.get(visibleBarTimes, lastVisibleIndex)
+
+                if not na(finalMacd)
+                    float finalMacdY = mapSignedToCompactBand(finalMacd, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                    array.push(compactMacdPoints, chart.point.from_time(finalTime, finalMacdY))
+
+                if not na(finalSignal)
+                    float finalSignalY = mapSignedToCompactBand(finalSignal, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                    array.push(compactMacdSignalPoints, chart.point.from_time(finalTime, finalSignalY))
+
+            int usedHistogramLineCount = 0
+
+            if macdShowHistogramInput
+                int histogramStep = visibleBarCount > compactMacdHistogramLimit ? int(math.ceil(visibleBarCount / float(compactMacdHistogramLimit))) : 1
+                int histogramIndex = 0
+
+                while histogramIndex <= lastVisibleIndex
+                    float sampledHistogram = array.get(visibleMacdHistogramValues, histogramIndex)
+
+                    if not na(sampledHistogram) and math.abs(sampledHistogram) > 0.0000000001
+                        int sampledHistogramTime = array.get(visibleBarTimes, histogramIndex)
+                        float sampledHistogramY = mapSignedToCompactBand(sampledHistogram, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                        color sampledHistogramColor = sampledHistogram >= 0.0 ? color.new(BULL_COLOR, 35) : color.new(BEAR_COLOR, 35)
+                        line histogramLine = usedHistogramLineCount < array.size(macdHistogramLines) ? array.get(macdHistogramLines, usedHistogramLineCount) : line.new(x1 = sampledHistogramTime, y1 = compactMacdZero, x2 = sampledHistogramTime, y2 = sampledHistogramY, xloc = xloc.bar_time, extend = extend.none, color = sampledHistogramColor, style = line.style_solid, width = macdHistogramWidthInput, force_overlay = true)
+
+                        if usedHistogramLineCount >= array.size(macdHistogramLines)
+                            array.push(macdHistogramLines, histogramLine)
+                        else
+                            line.set_xy1(histogramLine, sampledHistogramTime, compactMacdZero)
+                            line.set_xy2(histogramLine, sampledHistogramTime, sampledHistogramY)
+                            line.set_color(histogramLine, sampledHistogramColor)
+                            line.set_width(histogramLine, macdHistogramWidthInput)
+
+                        usedHistogramLineCount += 1
+
+                    histogramIndex += histogramStep
+
+                if lastVisibleIndex % histogramStep != 0
+                    float finalHistogram = array.get(visibleMacdHistogramValues, lastVisibleIndex)
+
+                    if not na(finalHistogram) and math.abs(finalHistogram) > 0.0000000001
+                        int finalHistogramTime = array.get(visibleBarTimes, lastVisibleIndex)
+                        float finalHistogramY = mapSignedToCompactBand(finalHistogram, visibleMacdMaxAbs, compactMacdBandBottom, compactMacdBandTop)
+                        color finalHistogramColor = finalHistogram >= 0.0 ? color.new(BULL_COLOR, 35) : color.new(BEAR_COLOR, 35)
+                        line finalHistogramLine = usedHistogramLineCount < array.size(macdHistogramLines) ? array.get(macdHistogramLines, usedHistogramLineCount) : line.new(x1 = finalHistogramTime, y1 = compactMacdZero, x2 = finalHistogramTime, y2 = finalHistogramY, xloc = xloc.bar_time, extend = extend.none, color = finalHistogramColor, style = line.style_solid, width = macdHistogramWidthInput, force_overlay = true)
+
+                        if usedHistogramLineCount >= array.size(macdHistogramLines)
+                            array.push(macdHistogramLines, finalHistogramLine)
+                        else
+                            line.set_xy1(finalHistogramLine, finalHistogramTime, compactMacdZero)
+                            line.set_xy2(finalHistogramLine, finalHistogramTime, finalHistogramY)
+                            line.set_color(finalHistogramLine, finalHistogramColor)
+                            line.set_width(finalHistogramLine, macdHistogramWidthInput)
+
+                        usedHistogramLineCount += 1
+
+            while array.size(macdHistogramLines) > usedHistogramLineCount
+                line unusedHistogramLine = array.pop(macdHistogramLines)
+                line.delete(unusedHistogramLine)
+
+            // MACD lines are created after the histogram so they remain visible on top.
+            if array.size(compactMacdPoints) >= 2
+                macdCompactPolyline := polyline.new(compactMacdPoints, curved = false, closed = false, xloc = xloc.bar_time, line_color = MACD_LINE_COLOR, line_style = line.style_solid, line_width = macdLineWidthInput, force_overlay = true)
+
+            if array.size(compactMacdSignalPoints) >= 2
+                macdSignalCompactPolyline := polyline.new(compactMacdSignalPoints, curved = false, closed = false, xloc = xloc.bar_time, line_color = MACD_SIGNAL_COLOR, line_style = line.style_solid, line_width = macdLineWidthInput, force_overlay = true)
+
+            macdBandTopLine := updateCompactLevel(macdBandTopLine, firstVisibleTime, lastVisibleTime, compactMacdBandTop, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+            macdZeroLine := updateCompactLevel(macdZeroLine, firstVisibleTime, lastVisibleTime, compactMacdZero, color.new(NEUTRAL_COLOR, 42), line.style_dashed)
+            macdBandBottomLine := updateCompactLevel(macdBandBottomLine, firstVisibleTime, lastVisibleTime, compactMacdBandBottom, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+        else
+            while array.size(macdHistogramLines) > 0
+                line unusedHistogramLine = array.pop(macdHistogramLines)
+                line.delete(unusedHistogramLine)
+
+            if not na(macdBandTopLine)
+                line.delete(macdBandTopLine)
+                macdBandTopLine := na
+            if not na(macdZeroLine)
+                line.delete(macdZeroLine)
+                macdZeroLine := na
+            if not na(macdBandBottomLine)
+                line.delete(macdBandBottomLine)
+                macdBandBottomLine := na
+
+        // --------------------------------------------------------------------
+        // COMPACT ADX / DMI - OPTIONAL
+        // --------------------------------------------------------------------
+
+        bool compactDmiReady = compactDmiPanelEnabled
+
+        if compactDmiReady
+            float compactDmiBandBottom = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, dmiBandBottomFraction)
+            float compactDmiBandTop = scaleVisibleRange(visiblePriceLow, safeVisibleHigh, dmiBandTopFraction)
+            float compactDmiTrendThreshold = mapBoundedToCompactBand(adxTrendThresholdInput, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)
+            float compactDmiStrongThreshold = mapBoundedToCompactBand(adxStrongThresholdInput, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)
+
+            array<chart.point> compactDmiPlusPoints = array.new<chart.point>()
+            array<chart.point> compactDmiMinusPoints = array.new<chart.point>()
+            array<chart.point> compactAdxPoints = array.new<chart.point>()
+
+            int dmiPointIndex = 0
+            while dmiPointIndex <= lastVisibleIndex
+                int sampledDmiTime = array.get(visibleBarTimes, dmiPointIndex)
+                float sampledDmiPlus = array.get(visibleDmiPlusValues, dmiPointIndex)
+                float sampledDmiMinus = array.get(visibleDmiMinusValues, dmiPointIndex)
+                float sampledAdx = array.get(visibleAdxValues, dmiPointIndex)
+
+                if not na(sampledDmiPlus)
+                    float sampledDmiPlusY = mapBoundedToCompactBand(sampledDmiPlus, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)
+                    array.push(compactDmiPlusPoints, chart.point.from_time(sampledDmiTime, sampledDmiPlusY))
+
+                if not na(sampledDmiMinus)
+                    float sampledDmiMinusY = mapBoundedToCompactBand(sampledDmiMinus, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)
+                    array.push(compactDmiMinusPoints, chart.point.from_time(sampledDmiTime, sampledDmiMinusY))
+
+                if not na(sampledAdx)
+                    float sampledAdxY = mapBoundedToCompactBand(sampledAdx, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)
+                    array.push(compactAdxPoints, chart.point.from_time(sampledDmiTime, sampledAdxY))
+
+                dmiPointIndex += pointStep
+
+            if lastVisibleIndex % pointStep != 0
+                int finalDmiTime = array.get(visibleBarTimes, lastVisibleIndex)
+                float finalDmiPlus = array.get(visibleDmiPlusValues, lastVisibleIndex)
+                float finalDmiMinus = array.get(visibleDmiMinusValues, lastVisibleIndex)
+                float finalAdx = array.get(visibleAdxValues, lastVisibleIndex)
+
+                if not na(finalDmiPlus)
+                    array.push(compactDmiPlusPoints, chart.point.from_time(finalDmiTime, mapBoundedToCompactBand(finalDmiPlus, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)))
+
+                if not na(finalDmiMinus)
+                    array.push(compactDmiMinusPoints, chart.point.from_time(finalDmiTime, mapBoundedToCompactBand(finalDmiMinus, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)))
+
+                if not na(finalAdx)
+                    array.push(compactAdxPoints, chart.point.from_time(finalDmiTime, mapBoundedToCompactBand(finalAdx, 0.0, dmiPanelMaximumInput, compactDmiBandBottom, compactDmiBandTop)))
+
+            if array.size(compactDmiPlusPoints) >= 2
+                dmiPlusCompactPolyline := polyline.new(compactDmiPlusPoints, curved = false, closed = false, xloc = xloc.bar_time, line_color = dmiPlusColorInput, line_style = line.style_solid, line_width = dmiLineWidthInput, force_overlay = true)
+
+            if array.size(compactDmiMinusPoints) >= 2
+                dmiMinusCompactPolyline := polyline.new(compactDmiMinusPoints, curved = false, closed = false, xloc = xloc.bar_time, line_color = dmiMinusColorInput, line_style = line.style_solid, line_width = dmiLineWidthInput, force_overlay = true)
+
+            if array.size(compactAdxPoints) >= 2
+                adxCompactPolyline := polyline.new(compactAdxPoints, curved = false, closed = false, xloc = xloc.bar_time, line_color = adxColorInput, line_style = line.style_solid, line_width = dmiLineWidthInput, force_overlay = true)
+
+            dmiBandTopLine := updateCompactLevel(dmiBandTopLine, firstVisibleTime, lastVisibleTime, compactDmiBandTop, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+            dmiStrongThresholdLine := updateCompactLevel(dmiStrongThresholdLine, firstVisibleTime, lastVisibleTime, compactDmiStrongThreshold, color.new(adxColorInput, 30), line.style_dashed)
+            dmiTrendThresholdLine := updateCompactLevel(dmiTrendThresholdLine, firstVisibleTime, lastVisibleTime, compactDmiTrendThreshold, color.new(adxColorInput, 65), line.style_dotted)
+            dmiBandBottomLine := updateCompactLevel(dmiBandBottomLine, firstVisibleTime, lastVisibleTime, compactDmiBandBottom, color.new(NEUTRAL_COLOR, 78), line.style_solid)
+        else
+            if not na(dmiBandTopLine)
+                line.delete(dmiBandTopLine)
+                dmiBandTopLine := na
+            if not na(dmiStrongThresholdLine)
+                line.delete(dmiStrongThresholdLine)
+                dmiStrongThresholdLine := na
+            if not na(dmiTrendThresholdLine)
+                line.delete(dmiTrendThresholdLine)
+                dmiTrendThresholdLine := na
+            if not na(dmiBandBottomLine)
+                line.delete(dmiBandBottomLine)
+                dmiBandBottomLine := na
+    else
+        // The visible range is not ready, so remove all compact levels.
+        while array.size(rsiSegmentLines) > 0
+            line unusedRsiSegment = array.pop(rsiSegmentLines)
+            line.delete(unusedRsiSegment)
+
+        if not na(rsiBandTopLine)
+            line.delete(rsiBandTopLine)
+            rsiBandTopLine := na
+        if not na(rsiOverboughtLine)
+            line.delete(rsiOverboughtLine)
+            rsiOverboughtLine := na
+        if not na(rsiBullThresholdLine)
+            line.delete(rsiBullThresholdLine)
+            rsiBullThresholdLine := na
+        if not na(rsiCenterLine)
+            line.delete(rsiCenterLine)
+            rsiCenterLine := na
+        if not na(rsiBearThresholdLine)
+            line.delete(rsiBearThresholdLine)
+            rsiBearThresholdLine := na
+        if not na(rsiOversoldLine)
+            line.delete(rsiOversoldLine)
+            rsiOversoldLine := na
+        if not na(rsiBandBottomLine)
+            line.delete(rsiBandBottomLine)
+            rsiBandBottomLine := na
+        while array.size(macdHistogramLines) > 0
+            line unusedHistogramLine = array.pop(macdHistogramLines)
+            line.delete(unusedHistogramLine)
+
+        if not na(macdBandTopLine)
+            line.delete(macdBandTopLine)
+            macdBandTopLine := na
+        if not na(macdZeroLine)
+            line.delete(macdZeroLine)
+            macdZeroLine := na
+        if not na(macdBandBottomLine)
+            line.delete(macdBandBottomLine)
+            macdBandBottomLine := na
+        if not na(dmiBandTopLine)
+            line.delete(dmiBandTopLine)
+            dmiBandTopLine := na
+        if not na(dmiStrongThresholdLine)
+            line.delete(dmiStrongThresholdLine)
+            dmiStrongThresholdLine := na
+        if not na(dmiTrendThresholdLine)
+            line.delete(dmiTrendThresholdLine)
+            dmiTrendThresholdLine := na
+        if not na(dmiBandBottomLine)
+            line.delete(dmiBandBottomLine)
+            dmiBandBottomLine := na
+// ============================================================================
+// DIAGNOSTICS - LABELS INSTEAD OF EXTRA PLOTS
+// ============================================================================
+
+// Diagnostic labels are committed only on confirmed bars.
+// This prevents intrabar rollback churn and keeps plot-count usage low.
+bool emaEnteredStrongBull = emaModuleEnabledInput and emaTrendState == 2 and nz(emaTrendState[1], 0) != 2
+bool emaEnteredStrongBear = emaModuleEnabledInput and emaTrendState == -2 and nz(emaTrendState[1], 0) != -2
+
+if debugModeInput and barstate.isconfirmed
+    if emaEnteredStrongBull
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "E+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = BULL_COLOR,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if emaEnteredStrongBear
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "E-",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = BEAR_COLOR,
+            style = label.style_label_down,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if rsiModuleEnabledInput and rsiCrossUpBull
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "R+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = BULL_COLOR,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if rsiModuleEnabledInput and rsiCrossDownBear
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "R-",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = BEAR_COLOR,
+            style = label.style_label_down,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if macdModuleEnabledInput and macdBullCross
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "M+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = BULL_COLOR,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if macdModuleEnabledInput and macdBearCross
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "M-",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = BEAR_COLOR,
+            style = label.style_label_down,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if dmiModuleEnabledInput and dmiBullCross
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "D+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = dmiPlusColorInput,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if dmiModuleEnabledInput and dmiBearCross
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "D-",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = dmiMinusColorInput,
+            style = label.style_label_down,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if dmiModuleEnabledInput and adxCrossTrendThreshold
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "A+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = adxColorInput,
+            style = label.style_label_up,
+            textcolor = color.black,
+            size = size.tiny,
+            force_overlay = true)
+
+    if atrModuleEnabledInput and atrEnteredHighVolatility
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "V+",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = ATR_HIGH_COLOR,
+            style = label.style_label_down,
+            textcolor = color.black,
+            size = size.tiny,
+            force_overlay = true)
+
+    if atrModuleEnabledInput and atrExitedHighVolatility
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "V-",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = ATR_LOW_COLOR,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if volumeModuleEnabledInput and relativeVolumeCrossHigh
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "RV",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = VOLUME_HIGH_COLOR,
+            style = label.style_label_down,
+            textcolor = color.black,
+            size = size.tiny,
+            force_overlay = true)
+
+    if volumeModuleEnabledInput and obvBullCross
+        label.new(
+            x = bar_index,
+            y = low,
+            text = "O+",
+            xloc = xloc.bar_index,
+            yloc = yloc.belowbar,
+            color = BULL_COLOR,
+            style = label.style_label_up,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+    if volumeModuleEnabledInput and obvBearCross
+        label.new(
+            x = bar_index,
+            y = high,
+            text = "O-",
+            xloc = xloc.bar_index,
+            yloc = yloc.abovebar,
+            color = BEAR_COLOR,
+            style = label.style_label_down,
+            textcolor = color.white,
+            size = size.tiny,
+            force_overlay = true)
+
+// ============================================================================
+// DASHBOARD 2.0
+// ============================================================================
+
+const string TT_TIMEFRAME = "CLOSED uses confirmed data. LIVE can change until the bar closes. Synthetic-chart warnings identify chart types whose OHLC may not represent tradable market prices."
+const string TT_TREND = "Trend combines EMA structure with DMI direction. Opposing EMA and DMI states produce a mixed result."
+const string TT_MOMENTUM = "Momentum combines RSI and MACD. They are grouped instead of counted as two fully independent votes."
+const string TT_STRENGTH = "ADX measures trend strength, not direction. A low ADX means no clear directional trend."
+const string TT_VOLATILITY = "ATR measures the typical price range. ATR 5% means the typical bar range is approximately 5% of price. It does not predict direction."
+const string TT_VOLUME = "RVOL compares current volume with its previous-bar average. 1.50x means 150% of average volume. OBV checks whether activity confirms direction."
+const string TT_MARKET = "The final Market View requires agreement between Trend and Momentum. Volume can confirm or warn, but cannot reverse the direction by itself."
+const string TT_ATR_REGIME = "ATR% is ATR divided by price. Percent rank shows where current volatility sits within the selected historical window."
+const string TT_ATR_CHANGE = "Shows whether ATR% is rising, falling or stable relative to the selected lookback."
+const string TT_RVOL = "RVOL 1.50x means current volume is 150% of the previous-bar average."
+const string TT_OBV = "OBV accumulates signed volume and compares it with an OBV EMA."
+const string TT_VOLUME_CONFIRMATION = "Confirmation requires sufficient RVOL, candle direction and matching OBV direction."
+
+int dashboardRowCount = dashboardModeInput == "Simple" ? 8 : 18
+
+var table dashboardTable = table.new(
+    position.top_right,
+    2,
+    dashboardRowCount,
+    bgcolor = chart.bg_color,
+    frame_color = color.new(chart.fg_color, 60),
+    frame_width = 1,
+    border_color = color.new(chart.fg_color, 80),
+    border_width = 1,
+    force_overlay = true)
+
+var bool dashboardReady = false
+
+if showDashboardInput and barstate.islastconfirmedhistory
+    bool simpleDashboard = dashboardModeInput == "Simple"
+    string dashboardHeaderRight = (
+        simpleDashboard
+             ? (useClosedBarMode ? "CLOSED | SIMPLE" : "LIVE | SIMPLE")
+             : (useClosedBarMode ? "CLOSED | " : "LIVE | ") + activeConfigurationText())
+
+    table.cell(
+        dashboardTable,
+        0,
+        0,
+        "MARKET COMPASS",
+        text_color = color.white,
+        bgcolor = dashboardHeaderColor,
+        text_halign = text.align_left,
+        text_size = dashboardTextSizeInput,
+        text_formatting = text.format_bold)
+
+    table.cell(
+        dashboardTable,
+        1,
+        0,
+        dashboardHeaderRight,
+        text_color = color.white,
+        bgcolor = dashboardHeaderColor,
+        text_halign = text.align_center,
+        text_size = dashboardTextSizeInput)
+
+    if simpleDashboard
+        initializeDashboardRow(dashboardTable, 1, "Timeframe", dashboardTextSizeInput, TT_TIMEFRAME)
+        initializeDashboardRow(dashboardTable, 2, "Trend", dashboardTextSizeInput, TT_TREND)
+        initializeDashboardRow(dashboardTable, 3, "Momentum", dashboardTextSizeInput, TT_MOMENTUM)
+        initializeDashboardRow(dashboardTable, 4, "Trend strength", dashboardTextSizeInput, TT_STRENGTH)
+        initializeDashboardRow(dashboardTable, 5, "Volatility", dashboardTextSizeInput, TT_VOLATILITY)
+        initializeDashboardRow(dashboardTable, 6, "Volume", dashboardTextSizeInput, TT_VOLUME)
+        initializeDashboardRow(dashboardTable, 7, "Market View", dashboardTextSizeInput, TT_MARKET)
+    else
+        initializeDashboardRow(dashboardTable, 1, "Timeframe", dashboardTextSizeInput, TT_TIMEFRAME)
+        initializeDashboardRow(dashboardTable, 2, "EMA trend", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 3, "Price vs EMA", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 4, "EMA order", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 5, "EMA slope", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 6, "RSI", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 7, "RSI direction", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 8, "MACD", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 9, "MACD histogram", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 10, "ADX strength", dashboardTextSizeInput, TT_STRENGTH)
+        initializeDashboardRow(dashboardTable, 11, "DMI direction", dashboardTextSizeInput)
+        initializeDashboardRow(dashboardTable, 12, "ATR regime", dashboardTextSizeInput, TT_ATR_REGIME)
+        initializeDashboardRow(dashboardTable, 13, "ATR change", dashboardTextSizeInput, TT_ATR_CHANGE)
+        initializeDashboardRow(dashboardTable, 14, "RVOL", dashboardTextSizeInput, TT_RVOL)
+        initializeDashboardRow(dashboardTable, 15, "OBV direction", dashboardTextSizeInput, TT_OBV)
+        initializeDashboardRow(dashboardTable, 16, "Volume confirmation", dashboardTextSizeInput, TT_VOLUME_CONFIRMATION)
+        initializeDashboardRow(dashboardTable, 17, "Market View", dashboardTextSizeInput, TT_MARKET)
+
+    dashboardReady := true
+
+bool shouldUpdateDashboard = (
+    showDashboardInput and
+    dashboardReady and
+    (
+        barstate.islastconfirmedhistory or
+        (useLiveDashboard and barstate.islast) or
+        (useClosedBarMode and barstate.islast and barstate.isconfirmed)
+    ))
+
+if shouldUpdateDashboard
+    bool simpleDashboard = dashboardModeInput == "Simple"
+
+    if simpleDashboard
+        updateDashboardRow(dashboardTable, 1, timeframeText(), timeframeColor)
+        updateDashboardRow(dashboardTable, 2, trendCategoryText(), stateColor(trendCategoryState))
+        updateDashboardRow(dashboardTable, 3, momentumCategoryText(), stateColor(momentumCategoryState))
+        updateDashboardRow(dashboardTable, 4, adxStrengthText(), adxStrengthColor)
+        updateDashboardRow(dashboardTable, 5, volatilityCategoryText(), atrRegimeTableColor)
+        updateDashboardRow(dashboardTable, 6, volumeConfirmationText(), volumeConfirmationTableColor)
+        updateDashboardRow(dashboardTable, 7, marketStateText(), marketStateTableColor)
+    else
+        updateDashboardRow(dashboardTable, 1, timeframeText(), timeframeColor)
+        updateDashboardRow(dashboardTable, 2, emaTrendText(), stateColor(emaTrendState))
+        updateDashboardRow(dashboardTable, 3, pricePositionText(), stateColor(pricePositionState))
+        updateDashboardRow(dashboardTable, 4, emaOrderText(), stateColor(emaOrderState))
+        updateDashboardRow(dashboardTable, 5, emaSlopeText(), stateColor(emaSlopeState))
+        updateDashboardRow(dashboardTable, 6, rsiStateText(), stateColor(rsiState))
+        updateDashboardRow(dashboardTable, 7, rsiDirectionText(), stateColor(rsiDirectionState))
+        updateDashboardRow(dashboardTable, 8, macdStateText(), stateColor(macdState))
+        updateDashboardRow(dashboardTable, 9, macdHistogramText(), stateColor(macdHistogramState))
+        updateDashboardRow(dashboardTable, 10, adxStrengthText(), adxStrengthColor)
+        updateDashboardRow(dashboardTable, 11, dmiDirectionText(), stateColor(dmiState))
+        updateDashboardRow(dashboardTable, 12, atrRegimeText(), atrRegimeTableColor)
+        updateDashboardRow(dashboardTable, 13, atrDirectionText(), atrDirectionTableColor)
+        updateDashboardRow(dashboardTable, 14, relativeVolumeText(), relativeVolumeTableColor)
+        updateDashboardRow(dashboardTable, 15, obvDirectionText(), stateColor(obvDirectionState))
+        updateDashboardRow(dashboardTable, 16, volumeConfirmationText(), volumeConfirmationTableColor)
+        updateDashboardRow(dashboardTable, 17, marketStateText(), marketStateTableColor)
+
+// ============================================================================
+// DESCRIPTIVE ALERTS
+// ============================================================================
+
+bool alertsTimeframeAllowed = not alertsOnlyTargetTimeframesInput or isTargetTimeframe
+bool alertsChartAllowed = isStandardChart or allowAlertsOnNonStandardChartInput
+bool alertsTimingAllowed = barstate.isrealtime and (useLiveDashboard or barstate.isconfirmed)
+
+bool marketDirectionChangedEvent = marketState != 0 and marketState != marketState[1]
+bool fullAgreementNow = trendCategoryState != 0 and trendCategoryState == momentumCategoryState
+bool fullAgreementBefore = trendCategoryState[1] != 0 and trendCategoryState[1] == momentumCategoryState[1]
+bool fullAgreementStartedEvent = fullAgreementNow and not fullAgreementBefore
+bool highVolatilityStartedEvent = atrModuleEnabledInput and atrRegimeState >= 2 and atrRegimeState[1] < 2
+bool volumeConfirmsNow = volumeModuleEnabledInput and volumeReady and marketState != 0 and volumeConfirmationState == marketState
+bool volumeConfirmedBefore = volumeModuleEnabledInput and volumeReady[1] and marketState[1] != 0 and volumeConfirmationState[1] == marketState[1]
+bool volumeConfirmationStartedEvent = volumeConfirmsNow and not volumeConfirmedBefore
+
+// Independent intrabar flags allow different event types to alert later in
+// the same bar without repeating the same event on every tick.
+varip bool marketAlertSentThisBar = false
+varip bool agreementAlertSentThisBar = false
+varip bool volatilityAlertSentThisBar = false
+varip bool volumeAlertSentThisBar = false
+
+if barstate.isnew
+    marketAlertSentThisBar := false
+    agreementAlertSentThisBar := false
+    volatilityAlertSentThisBar := false
+    volumeAlertSentThisBar := false
+
+if alertsEnabledInput and alertsTimeframeAllowed and alertsChartAllowed and alertsTimingAllowed
+    bool sendMarketAlert = (
+        alertMarketChangeInput and
+        marketDirectionChangedEvent and
+        not marketAlertSentThisBar)
+
+    bool sendAgreementAlert = (
+        alertFullAgreementInput and
+        fullAgreementStartedEvent and
+        not agreementAlertSentThisBar)
+
+    bool sendVolatilityAlert = (
+        alertVolatilityInput and
+        highVolatilityStartedEvent and
+        not volatilityAlertSentThisBar)
+
+    bool sendVolumeAlert = (
+        alertVolumeConfirmationInput and
+        volumeConfirmationStartedEvent and
+        not volumeAlertSentThisBar)
+
+    string alertReasons = ""
+
+    if sendMarketAlert
+        alertReasons := appendAlertReason(alertReasons, "Market View changed: " + marketStateText())
+
+    if sendAgreementAlert
+        alertReasons := appendAlertReason(alertReasons, "Trend and Momentum agree: " + marketStateText())
+
+    if sendVolatilityAlert
+        alertReasons := appendAlertReason(alertReasons, "Volatility entered a high regime: " + atrRegimeText())
+
+    if sendVolumeAlert
+        alertReasons := appendAlertReason(alertReasons, "Volume began confirming direction: " + volumeConfirmationText())
+
+    if str.length(alertReasons) > 0
+        string timingText = useClosedBarMode ? "bar close" : "live"
+        string alertMessage = (
+            "Market Compass | " +
+            syminfo.tickerid +
+            " | " +
+            timeframe.period +
+            " | " +
+            timingText +
+            "\n" +
+            alertReasons)
+
+        if useClosedBarMode
+            alert(alertMessage, alert.freq_once_per_bar_close)
+        else
+            alert(alertMessage, alert.freq_all)
+
+        if sendMarketAlert
+            marketAlertSentThisBar := true
+
+        if sendAgreementAlert
+            agreementAlertSentThisBar := true
+
+        if sendVolatilityAlert
+            volatilityAlertSentThisBar := true
+
+        if sendVolumeAlert
+            volumeAlertSentThisBar := true
+
+// ============================================================================
+// VERSION DOCUMENTATION
+// ============================================================================
+
+// Market Compass Combo v1.0.0-rc2
+//
+// PURPOSE
+// A modular market-context indicator designed primarily for Daily and Weekly
+// charts. It combines EMA, RSI, MACD, ADX/DMI, ATR and volume in one script.
+// It does not place trades and does not issue buy or sell commands.
+//
+// MODULES
+// 1. EMA: trend structure and direction.
+// 2. RSI: momentum level and direction.
+// 3. MACD: momentum direction and rate-of-change context.
+// 4. ADX/DMI: trend strength and directional dominance.
+// 5. ATR: volatility regime and volatility change.
+// 6. RVOL/OBV: activity and volume confirmation.
+//
+// CATEGORY MODEL
+// - Trend = EMA + DMI.
+// - Momentum = RSI + MACD.
+// - Strength = ADX.
+// - Volatility = ATR.
+// - Confirmation = RVOL + OBV.
+// This avoids counting correlated indicators as fully independent evidence.
+//
+// CLOSED-BAR CONTRACT
+// - Closed bar is the default mode.
+// - The dashboard is initialized on barstate.islastconfirmedhistory.
+// - During an open realtime bar, the closed-bar dashboard remains unchanged.
+// - It updates when the realtime bar confirms.
+// - Live mode updates the dashboard intrabar.
+// - Compact panels remain confirmed-bar visuals unless the advanced intrabar
+//   refresh checkbox is explicitly enabled.
+//
+// PERFORMANCE CHANGES IN RC2
+// - Removed the global max_bars_back = 2500 declaration.
+// - Built-in TA functions remain in global scope for deterministic series.
+// - Expensive compact drawings are gated by confirmed refresh events.
+// - Disabled compact modules do not collect their visible-range arrays.
+// - Dynamic dashboard strings are created only on dashboard updates.
+// - Alert strings are created only when an alert event occurs.
+// - Table cells are initialized once and updated with table.cell_set_* setters.
+// - Diagnostic drawings are confirmed-bar labels, not additional plot outputs.
+// - Live alerts use independent varip flags and alert.freq_all so separate event
+//   types can fire later in the same bar without repeated spam.
+//
+// COMPACT PANEL SCALING
+// - Geometric: recommended for logarithmic charts and long price histories.
+// - Linear: exact proportional placement on a linear chart.
+// Pine does not expose the current chart scale mode, so the user selects it.
+//
+// ATR AND VOLUME DISPLAY
+// ATR and volume are intentionally dashboard-first modules. ATR describes the
+// size of price movement, not direction. RVOL/OBV provide confirmation context.
+// Raw ATR, ATR%, ATR rank, RVOL, OBV and OBV EMA remain in Data Window.
+//
+// ALERTS
+// Available descriptive events:
+// - Market View direction change.
+// - Trend and Momentum begin agreeing.
+// - ATR enters High or Extreme volatility.
+// - Volume begins confirming direction.
+// The user must create an alert using "Any alert() function call".
+// Existing alerts must be recreated after code or input changes.
+//
+// SAFETY
+// - Alerts are limited to Daily and Weekly by default.
+// - Alerts are blocked on synthetic chart types by default.
+// - The Timeframe row warns about non-standard chart types.
+// - Missing or zero volume data is reported as "No usable volume data" and is
+//   excluded from confirmation.
+//
+// LIMITATIONS
+// - Evaluation uses the chart timeframe only. There are no MTF requests.
+// - Live values can change until the bar closes.
+// - ATR does not predict direction.
+// - Volume quality depends on the market and data provider.
+// - calc_bars_count = 6000 limits calculation history.
+// - The indicator cannot guarantee profit and does not replace risk management.
+//

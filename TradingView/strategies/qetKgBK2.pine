@@ -1,0 +1,310 @@
+//@version=5
+strategy("MTF MA Matrix - Clean Base", overlay=true, pyramiding=0, initial_capital=100000, commission_type=strategy.commission.percent, commission_value=0.04)
+
+//==================================================
+// INPUTS
+//==================================================
+group_general = "General"
+maType = input.string("EMA", "MA Type", options=["SMA", "EMA", "WMA", "RMA", "VWMA", "HMA"], group=group_general)
+src = input.source(close, "Source", group=group_general)
+
+group_ma = "MA Lengths"
+use_100 = input.bool(true, "MA 100", group=group_ma)
+use_250 = input.bool(true, "MA 250", group=group_ma)
+use_500 = input.bool(true, "MA 500", group=group_ma)
+use_1000 = input.bool(true, "MA 1000", group=group_ma)
+
+group_tf = "MTF Monitor"
+show_1h = input.bool(true, "1H", group=group_tf)
+show_2h = input.bool(true, "2H", group=group_tf)
+show_4h = input.bool(true, "4H", group=group_tf)
+show_8h = input.bool(true, "8H", group=group_tf)
+show_12h = input.bool(true, "12H", group=group_tf)
+show_1d = input.bool(true, "1D", group=group_tf)
+
+group_logic = "Logic"
+slopeLen = input.int(10, "Slope Lookback", minval=1, group=group_logic)
+atrLen = input.int(14, "ATR Length", minval=1, group=group_logic)
+slopeThreshold = input.float(0.15, "Slope Threshold", step=0.01, group=group_logic)
+angleThreshold = input.float(0.0015, "Angle Threshold", step=0.0001, group=group_logic)
+distanceThreshold = input.float(0.20, "Distance Threshold", step=0.01, group=group_logic)
+alignmentMin = input.int(3, "Min Alignment Count", minval=1, maxval=6, group=group_logic)
+
+group_risk = "Risk"
+useAtrStop = input.bool(false, "Use ATR Stop", group=group_risk)
+atrStopMult = input.float(2.0, "ATR Stop Multiplier", step=0.1, group=group_risk)
+useTrailing = input.bool(true, "Use Trailing Stop", group=group_risk)
+atrTrailMult = input.float(2.5, "ATR Trailing Multiplier", step=0.1, group=group_risk)
+
+group_display = "Display"
+showTable = input.bool(true, "Show MTF Table", group=group_display)
+showMAs = input.bool(true, "Show Main MAs", group=group_display)
+showCloud = input.bool(true, "Show 250-500 Cloud", group=group_display)
+
+//==================================================
+// FUNCTIONS
+//==================================================
+f_ma(_src, _len, _type) =>
+    float result = na
+    if _type == "SMA"
+        result := ta.sma(_src, _len)
+    else if _type == "EMA"
+        result := ta.ema(_src, _len)
+    else if _type == "WMA"
+        result := ta.wma(_src, _len)
+    else if _type == "RMA"
+        result := ta.rma(_src, _len)
+    else if _type == "VWMA"
+        result := ta.vwma(_src, _len)
+    else if _type == "HMA"
+        result := ta.hma(_src, _len)
+    result
+
+f_norm_slope(_ma, _atr, _lookback) =>
+    _atr == 0.0 or na(_atr) or na(_ma[_lookback]) ? na : (_ma - _ma[_lookback]) / _atr
+
+f_angle_proxy(_ma, _lookback) =>
+    na(_ma[_lookback]) or _ma == 0.0 ? na : (_ma - _ma[_lookback]) / _ma
+
+f_dist_norm(_a, _b, _atr) =>
+    _atr == 0.0 or na(_a) or na(_b) or na(_atr) ? na : math.abs(_a - _b) / _atr
+
+f_state_text(_state) =>
+    _state == 1 ? "LONG" : _state == -1 ? "SHORT" : "NO TRADE"
+
+f_fmt_price(_x) =>
+    na(_x) ? "-" : str.tostring(_x, format.mintick)
+
+f_fmt_pct(_x) =>
+    na(_x) ? "-" : str.tostring(_x, "#.##") + "%"
+
+f_state_bg(_state) =>
+    _state == 1 ? color.new(color.green, 78) : _state == -1 ? color.new(color.red, 78) : color.new(color.gray, 85)
+
+//==================================================
+// PACKED TF FUNCTION
+// Returns: [state, entry, pnl]
+//==================================================
+f_tf_pack() =>
+    ma100_local = use_100 ? f_ma(src, 100, maType) : na
+    ma250_local = use_250 ? f_ma(src, 250, maType) : na
+    ma500_local = use_500 ? f_ma(src, 500, maType) : na
+    ma1000_local = use_1000 ? f_ma(src, 1000, maType) : na
+    atr_local = ta.atr(atrLen)
+
+    slope_local = f_norm_slope(ma1000_local, atr_local, slopeLen)
+    angle_local = f_angle_proxy(ma1000_local, slopeLen)
+
+    dist1_local = f_dist_norm(ma100_local, ma250_local, atr_local)
+    dist2_local = f_dist_norm(ma250_local, ma500_local, atr_local)
+    dist3_local = f_dist_norm(ma500_local, ma1000_local, atr_local)
+    distanceScore_local = 0.25 * nz(dist1_local) + 0.45 * nz(dist2_local) + 0.30 * nz(dist3_local)
+
+    bull_local = ma250_local > ma500_local and ma500_local > ma1000_local
+    bear_local = ma250_local < ma500_local and ma500_local < ma1000_local
+    priceAbove_local = close > ma100_local
+    priceBelow_local = close < ma100_local
+
+    longCond_local = bull_local and priceAbove_local and slope_local > slopeThreshold and angle_local > angleThreshold and distanceScore_local > distanceThreshold
+    shortCond_local = bear_local and priceBelow_local and slope_local < -slopeThreshold and angle_local < -angleThreshold and distanceScore_local > distanceThreshold
+
+    newLong_local = longCond_local and not longCond_local[1]
+    newShort_local = shortCond_local and not shortCond_local[1]
+
+    longEntry_local = ta.valuewhen(newLong_local, close, 0)
+    shortEntry_local = ta.valuewhen(newShort_local, close, 0)
+
+    longPnl_local = not na(longEntry_local) ? ((close / longEntry_local) - 1.0) * 100.0 : na
+    shortPnl_local = not na(shortEntry_local) ? ((shortEntry_local / close) - 1.0) * 100.0 : na
+
+    state_local = longCond_local ? 1 : shortCond_local ? -1 : 0
+    entry_local = longCond_local ? longEntry_local : shortCond_local ? shortEntry_local : na
+    pnl_local = longCond_local ? longPnl_local : shortCond_local ? shortPnl_local : na
+
+    [state_local, entry_local, pnl_local]
+
+//==================================================
+// MAIN TF MA
+//==================================================
+ma100 = use_100 ? f_ma(src, 100, maType) : na
+ma250 = use_250 ? f_ma(src, 250, maType) : na
+ma500 = use_500 ? f_ma(src, 500, maType) : na
+ma1000 = use_1000 ? f_ma(src, 1000, maType) : na
+atrNow = ta.atr(atrLen)
+
+//==================================================
+// MTF ALIGNMENT FOR MAIN LOGIC
+//==================================================
+ma1h_1000 = request.security(syminfo.tickerid, "60", f_ma(src, 1000, maType))
+ma2h_1000 = request.security(syminfo.tickerid, "120", f_ma(src, 1000, maType))
+ma4h_1000 = request.security(syminfo.tickerid, "240", f_ma(src, 1000, maType))
+ma8h_1000 = request.security(syminfo.tickerid, "480", f_ma(src, 1000, maType))
+ma12h_1000 = request.security(syminfo.tickerid, "720", f_ma(src, 1000, maType))
+ma1d_1000 = request.security(syminfo.tickerid, "D", f_ma(src, 1000, maType))
+
+atr1h = request.security(syminfo.tickerid, "60", ta.atr(atrLen))
+atr2h = request.security(syminfo.tickerid, "120", ta.atr(atrLen))
+atr4h = request.security(syminfo.tickerid, "240", ta.atr(atrLen))
+atr8h = request.security(syminfo.tickerid, "480", ta.atr(atrLen))
+atr12h = request.security(syminfo.tickerid, "720", ta.atr(atrLen))
+atr1d = request.security(syminfo.tickerid, "D", ta.atr(atrLen))
+
+s1h = f_norm_slope(ma1h_1000, atr1h, slopeLen)
+s2h = f_norm_slope(ma2h_1000, atr2h, slopeLen)
+s4h = f_norm_slope(ma4h_1000, atr4h, slopeLen)
+s8h = f_norm_slope(ma8h_1000, atr8h, slopeLen)
+s12h = f_norm_slope(ma12h_1000, atr12h, slopeLen)
+s1d = f_norm_slope(ma1d_1000, atr1d, slopeLen)
+
+long1 = show_1h and nz(s1h) > slopeThreshold ? 1 : 0
+long2 = show_2h and nz(s2h) > slopeThreshold ? 1 : 0
+long3 = show_4h and nz(s4h) > slopeThreshold ? 1 : 0
+long4 = show_8h and nz(s8h) > slopeThreshold ? 1 : 0
+long5 = show_12h and nz(s12h) > slopeThreshold ? 1 : 0
+long6 = show_1d and nz(s1d) > slopeThreshold ? 1 : 0
+
+short1 = show_1h and nz(s1h) < -slopeThreshold ? 1 : 0
+short2 = show_2h and nz(s2h) < -slopeThreshold ? 1 : 0
+short3 = show_4h and nz(s4h) < -slopeThreshold ? 1 : 0
+short4 = show_8h and nz(s8h) < -slopeThreshold ? 1 : 0
+short5 = show_12h and nz(s12h) < -slopeThreshold ? 1 : 0
+short6 = show_1d and nz(s1d) < -slopeThreshold ? 1 : 0
+
+alignLongCount = long1 + long2 + long3 + long4 + long5 + long6
+alignShortCount = short1 + short2 + short3 + short4 + short5 + short6
+
+//==================================================
+// MAIN TF LOGIC
+//==================================================
+slope1000 = f_norm_slope(ma1000, atrNow, slopeLen)
+angle1000 = f_angle_proxy(ma1000, slopeLen)
+
+dist100_250 = f_dist_norm(ma100, ma250, atrNow)
+dist250_500 = f_dist_norm(ma250, ma500, atrNow)
+dist500_1000 = f_dist_norm(ma500, ma1000, atrNow)
+distanceScore = 0.25 * nz(dist100_250) + 0.45 * nz(dist250_500) + 0.30 * nz(dist500_1000)
+
+bullStack = ma250 > ma500 and ma500 > ma1000
+bearStack = ma250 < ma500 and ma500 < ma1000
+priceAboveEntry = close > ma100
+priceBelowEntry = close < ma100
+slopeBull = slope1000 > slopeThreshold
+slopeBear = slope1000 < -slopeThreshold
+angleBull = angle1000 > angleThreshold
+angleBear = angle1000 < -angleThreshold
+distanceBull = distanceScore > distanceThreshold
+distanceBear = distanceScore > distanceThreshold
+
+longState = bullStack and priceAboveEntry and slopeBull and angleBull and distanceBull and alignLongCount >= alignmentMin
+shortState = bearStack and priceBelowEntry and slopeBear and angleBear and distanceBear and alignShortCount >= alignmentMin
+
+newLongSignal = longState and not longState[1]
+newShortSignal = shortState and not shortState[1]
+
+//==================================================
+// STRATEGY EXECUTION
+//==================================================
+if newLongSignal
+    strategy.close("Short")
+    strategy.entry("Long", strategy.long)
+
+if newShortSignal
+    strategy.close("Long")
+    strategy.entry("Short", strategy.short)
+
+longStopPrice = strategy.position_avg_price - atrNow * atrStopMult
+shortStopPrice = strategy.position_avg_price + atrNow * atrStopMult
+trailTicks = int(math.max(1, math.round((atrNow * atrTrailMult) / syminfo.mintick)))
+
+if strategy.position_size > 0
+    if useAtrStop and useTrailing
+        strategy.exit("Long Exit", from_entry="Long", stop=longStopPrice, trail_points=trailTicks, trail_offset=trailTicks)
+    else if useAtrStop and not useTrailing
+        strategy.exit("Long Exit", from_entry="Long", stop=longStopPrice)
+    else if not useAtrStop and useTrailing
+        strategy.exit("Long Exit", from_entry="Long", trail_points=trailTicks, trail_offset=trailTicks)
+
+if strategy.position_size < 0
+    if useAtrStop and useTrailing
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStopPrice, trail_points=trailTicks, trail_offset=trailTicks)
+    else if useAtrStop and not useTrailing
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStopPrice)
+    else if not useAtrStop and useTrailing
+        strategy.exit("Short Exit", from_entry="Short", trail_points=trailTicks, trail_offset=trailTicks)
+
+//==================================================
+// VIRTUAL MTF TABLE DATA
+//==================================================
+[tf1hState, tf1hEntry, tf1hPnl] = request.security(syminfo.tickerid, "60", f_tf_pack())
+[tf2hState, tf2hEntry, tf2hPnl] = request.security(syminfo.tickerid, "120", f_tf_pack())
+[tf4hState, tf4hEntry, tf4hPnl] = request.security(syminfo.tickerid, "240", f_tf_pack())
+[tf8hState, tf8hEntry, tf8hPnl] = request.security(syminfo.tickerid, "480", f_tf_pack())
+[tf12hState, tf12hEntry, tf12hPnl] = request.security(syminfo.tickerid, "720", f_tf_pack())
+[tf1dState, tf1dEntry, tf1dPnl] = request.security(syminfo.tickerid, "D", f_tf_pack())
+
+mainEntry = strategy.position_size != 0 ? strategy.position_avg_price : na
+mainPnl = strategy.position_size > 0 ? ((close / strategy.position_avg_price) - 1.0) * 100.0 : strategy.position_size < 0 ? ((strategy.position_avg_price / close) - 1.0) * 100.0 : na
+
+//==================================================
+// PLOTS
+//==================================================
+p100 = plot(showMAs ? ma100 : na, title="MA100", color=color.new(color.aqua, 0), linewidth=1)
+p250 = plot(showMAs ? ma250 : na, title="MA250", color=color.new(color.red, 0), linewidth=2)
+p500 = plot(showMAs ? ma500 : na, title="MA500", color=color.new(color.green, 0), linewidth=3)
+p1000 = plot(showMAs ? ma1000 : na, title="MA1000", color=color.new(color.white, 0), linewidth=4)
+
+cloudColor = ma250 >= ma500 ? color.new(color.green, 85) : color.new(color.red, 85)
+fill(p250, p500, color=showCloud ? cloudColor : na, title="EMA250-500 Cloud")
+
+//==================================================
+// TABLE
+//==================================================
+var table t = table.new(position.top_left, 4, 8, border_width=1)
+
+tableBg = color.new(color.black, 20)
+headerBg = color.new(color.black, 0)
+
+if showTable
+    table.clear(t, 0, 0, 3, 7)
+
+    table.cell(t, 0, 0, "TF", text_color=color.white, bgcolor=headerBg)
+    table.cell(t, 1, 0, "State", text_color=color.white, bgcolor=headerBg)
+    table.cell(t, 2, 0, "Entry", text_color=color.white, bgcolor=headerBg)
+    table.cell(t, 3, 0, "PnL %", text_color=color.white, bgcolor=headerBg)
+
+    table.cell(t, 0, 1, "1H", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 1, show_1h ? f_state_text(tf1hState) : "OFF", text_color=color.white, bgcolor=show_1h ? f_state_bg(tf1hState) : color.new(color.gray, 80))
+    table.cell(t, 2, 1, show_1h ? f_fmt_price(tf1hEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 1, show_1h ? f_fmt_pct(tf1hPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    table.cell(t, 0, 2, "2H", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 2, show_2h ? f_state_text(tf2hState) : "OFF", text_color=color.white, bgcolor=show_2h ? f_state_bg(tf2hState) : color.new(color.gray, 80))
+    table.cell(t, 2, 2, show_2h ? f_fmt_price(tf2hEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 2, show_2h ? f_fmt_pct(tf2hPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    table.cell(t, 0, 3, "4H", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 3, show_4h ? f_state_text(tf4hState) : "OFF", text_color=color.white, bgcolor=show_4h ? f_state_bg(tf4hState) : color.new(color.gray, 80))
+    table.cell(t, 2, 3, show_4h ? f_fmt_price(tf4hEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 3, show_4h ? f_fmt_pct(tf4hPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    table.cell(t, 0, 4, "8H", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 4, show_8h ? f_state_text(tf8hState) : "OFF", text_color=color.white, bgcolor=show_8h ? f_state_bg(tf8hState) : color.new(color.gray, 80))
+    table.cell(t, 2, 4, show_8h ? f_fmt_price(tf8hEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 4, show_8h ? f_fmt_pct(tf8hPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    table.cell(t, 0, 5, "12H", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 5, show_12h ? f_state_text(tf12hState) : "OFF", text_color=color.white, bgcolor=show_12h ? f_state_bg(tf12hState) : color.new(color.gray, 80))
+    table.cell(t, 2, 5, show_12h ? f_fmt_price(tf12hEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 5, show_12h ? f_fmt_pct(tf12hPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    table.cell(t, 0, 6, "1D", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 1, 6, show_1d ? f_state_text(tf1dState) : "OFF", text_color=color.white, bgcolor=show_1d ? f_state_bg(tf1dState) : color.new(color.gray, 80))
+    table.cell(t, 2, 6, show_1d ? f_fmt_price(tf1dEntry) : "-", text_color=color.white, bgcolor=tableBg)
+    table.cell(t, 3, 6, show_1d ? f_fmt_pct(tf1dPnl) : "-", text_color=color.white, bgcolor=tableBg)
+
+    mainStateText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    mainStateVal = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+    table.cell(t, 0, 7, "MAIN", text_color=color.white, bgcolor=headerBg)
+    table.cell(t, 1, 7, mainStateText, text_color=color.white, bgcolor=f_state_bg(mainStateVal))
+    table.cell(t, 2, 7, f_fmt_price(mainEntry), text_color=color.white, bgcolor=headerBg)
+    table.cell(t, 3, 7, f_fmt_pct(mainPnl), text_color=color.white, bgcolor=headerBg)

@@ -1,0 +1,852 @@
+//@version=6
+strategy("SVT Big Swing Capture Early Catch", overlay=true, pyramiding=0, process_orders_on_close=true, initial_capital=100000, max_labels_count=500)
+
+// ============================================================================
+// SVT BIG SWING CAPTURE v9
+//
+// PURPOSE
+// -------
+// Designed for SPY / QQQ swing options, typically entered with ~2-3 weeks DTE.
+// Goal: catch the EARLY part of large 30M EMA20/EMA50 regime changes, avoid
+// rapid whipsaw crosses, and HOLD the large move instead of trading every wiggle.
+//
+// CORE 30M DIRECTION
+// ------------------
+// EMA20 > EMA50 = BULL
+// EMA20 < EMA50 = BEAR
+//
+// MACD > 0 = BULL
+// MACD < 0 = BEAR
+//
+// RSI > 50 = BULL
+// RSI < 50 = BEAR
+//
+// KEY CHANGE FROM v8
+// ------------------
+// v8 could enter too late because it required too much confirmation after a
+// reversal. v9 does NOT require EMA50 to already slope in the new direction.
+// EMA50 is naturally slow and can remain pointed the old way near major bottoms
+// and tops.
+//
+// v9 instead requires:
+// 1. A real EMA20/EMA50 crossover.
+// 2. The PRIOR EMA regime existed long enough to reduce rapid whipsaws.
+// 3. The new cross persists for a few bars.
+// 4. MACD and RSI confirm the new direction.
+// 5. EMA20 is moving strongly in the new direction.
+// 6. EMA spread is expanding.
+// 7. 2H must not be completely opposite.
+// 8. Daily is context, NOT a hard entry veto.
+// 9. One primary trade per EMA crossover regime.
+//
+// EXIT
+// ----
+// Hold primarily until the EMA20/EMA50 regime reverses.
+// Once a trade has substantial profit, a confirmed 30M momentum/EMA20 breakdown
+// can protect gains before the very slow opposite EMA crossover.
+//
+// IMPORTANT
+// ---------
+// Dashboard can display on any chart timeframe.
+// For accurate historical 30M strategy testing, use the 30-minute chart.
+// ============================================================================
+
+// =====================
+// Timeframes
+// =====================
+dailyTF = input.timeframe("D", "Daily Context")
+confirmTF = input.timeframe("120", "2H Context")
+entryTF = input.timeframe("30", "30M Swing")
+
+// =====================
+// Core indicators
+// =====================
+emaFastLen = input.int(20, "EMA Fast", minval=1)
+emaSlowLen = input.int(50, "EMA Slow", minval=1)
+emaLongLen = input.int(200, "EMA Long", minval=1)
+
+rsiLen = input.int(14, "RSI Length", minval=1)
+rsiCenter = input.float(50.0, "RSI Center", step=0.5)
+
+macdFast = input.int(12, "MACD Fast", minval=1)
+macdSlow = input.int(26, "MACD Slow", minval=1)
+macdSignalLen = input.int(9, "MACD Signal", minval=1)
+macdCenter = input.float(0.0, "MACD Center", step=0.05)
+
+adxLen = input.int(14, "DMI Length", minval=1)
+adxSmooth = input.int(14, "ADX Smoothing", minval=1)
+
+// =====================
+// Crossover quality
+// =====================
+confirmWindowBars = input.int(18, "Bars Allowed To Confirm After EMA Cross", minval=3)
+crossPersistenceBars = input.int(2, "New EMA Regime Persistence Bars", minval=1, maxval=6)
+minPriorRegimeBars = input.int(8, "Minimum Prior EMA Regime Bars", minval=1)
+
+emaSlopeLookback = input.int(2, "EMA20 Slope Lookback", minval=1)
+minEma20SlopeAtr = input.float(0.04, "Minimum EMA20 Slope / ATR", step=0.01)
+
+separationLookback = input.int(2, "EMA Spread Expansion Lookback", minval=1)
+minSeparationAtr = input.float(0.04, "Minimum EMA20/50 Separation / ATR", step=0.01)
+
+// =====================
+// Trend evidence / scoring
+// =====================
+breakoutLookback = input.int(8, "Breakout Lookback", minval=3)
+impulseAtr = input.float(0.55, "Impulse Candle Body / ATR", step=0.05)
+
+volLen = input.int(20, "Relative Volume Length", minval=2)
+volPressureLen = input.int(5, "Volume Pressure EMA", minval=1)
+minRelativeVolume = input.float(0.85, "Relative Volume Threshold", step=0.05)
+
+adxTrendMin = input.float(17.0, "ADX Trend Threshold", step=0.5)
+
+minSwingScore = input.int(6, "Legacy Context Score Display", minval=4, maxval=9)
+
+minCoreScore = input.int(4, "Minimum 30M Core Score", minval=3, maxval=6)
+freshCrossBars = input.int(6, "Fresh EMA Cross Bars", minval=1, maxval=12)
+freshCrossMaxExtensionAtr = input.float(3.0, "Fresh Cross Max Extension / ATR", step=0.1)
+normalMaxExtensionAtr = input.float(2.0, "Normal Entry Max Extension / ATR", step=0.1)
+
+allowLateRegimeCatch = input.bool(true, "Allow Late Big-Run Catch In Same EMA Regime")
+lateCatchMaxAge = input.int(78, "Late Catch Maximum Cross Age - 30M Bars", minval=10)
+lateCatchMinCoreScore = input.int(4, "Late Catch Minimum Core Score", minval=3, maxval=6)
+
+blockOnlyIfDailyAnd2HStrongOpposite = input.bool(true, "Only Hard-Block When Daily AND 2H Are 3/3 Opposite")
+
+// =====================
+// HTF behavior
+// =====================
+blockIf2HCompletelyOpposite = input.bool(true, "Block If 2H Is 3/3 Opposite")
+dailyContextBonus = input.bool(true, "Use Daily As Score Bonus")
+
+// =====================
+// Chop
+// =====================
+useChopFilter = input.bool(true, "Use Chop Filter")
+chopLookback = input.int(24, "Chop Lookback", minval=5)
+chopAdx = input.float(14.0, "Chop ADX Threshold", step=0.5)
+chopCompressionAtr = input.float(0.18, "Chop EMA Compression / ATR", step=0.02)
+
+// =====================
+// Entry location
+// =====================
+maxEntryExtensionAtr = input.float(1.75, "Max Entry Extension From EMA20 / ATR", step=0.05)
+
+// =====================
+// Risk / hold
+// =====================
+atrLen = input.int(14, "ATR Length", minval=1)
+emergencyStopAtr = input.float(4.0, "Maximum Initial Risk ATR", step=0.1)
+
+swingStopLookback = input.int(10, "Structural Stop Swing Lookback", minval=3)
+structureStopBufferAtr = input.float(0.35, "Structural Stop Buffer ATR", step=0.05)
+
+allowOneReentry = input.bool(true, "Allow One Re-entry In Same EMA Regime")
+reentryCooldownBars = input.int(6, "Re-entry Cooldown - 30M Bars", minval=1)
+reentryBreakLookback = input.int(5, "Re-entry Breakout Lookback", minval=2)
+
+minHoldBars = input.int(8, "Minimum Hold - 30M Bars", minval=1)
+maxHoldBars = input.int(156, "Maximum Hold - 30M Bars", minval=1)
+
+profitProtectStartAtr = input.float(2.5, "Profit Protection Starts After ATR Gain", step=0.1)
+profitWeakBars = input.int(3, "Profit Weakness Confirmation Bars", minval=1, maxval=6)
+
+useWideTrail = input.bool(false, "Use Wide ATR Trail")
+wideTrailStartAtr = input.float(4.5, "Wide Trail Starts After ATR Gain", step=0.1)
+wideTrailAtr = input.float(5.5, "Wide Trail ATR Distance", step=0.1)
+
+useThetaProtection = input.bool(true, "Use Theta / No-Progress Exit")
+thetaCheckBars = input.int(39, "No-Progress Check - 30M Bars", minval=1)
+minProgressAtr = input.float(0.75, "Minimum ATR Progress", step=0.05)
+
+cooldownBars = input.int(4, "Cooldown After Exit - Chart Bars", minval=0)
+
+// =====================
+// Display
+// =====================
+showEma20 = input.bool(true, "Show EMA20")
+showEma50 = input.bool(true, "Show EMA50")
+showEma200 = input.bool(false, "Show EMA200")
+showStop = input.bool(true, "Show Active Stop")
+showSignals = input.bool(true, "Show CALL / PUT / EXIT")
+showCrossCandidates = input.bool(false, "Show EMA Cross Candidate")
+showTable = input.bool(true, "Show Dashboard")
+shadeSwing = input.bool(false, "Shade Confirmed Swing")
+
+// ============================================================================
+// HELPERS
+// ============================================================================
+
+f_volumePressure(_len) =>
+    rng = high - low
+    clv = rng != 0.0 ? ((close - low) - (high - close)) / rng : 0.0
+    ta.ema(volume * clv, _len)
+
+f_htfConfirmed() =>
+    e20 = ta.ema(close, emaFastLen)
+    e50 = ta.ema(close, emaSlowLen)
+    e200 = ta.ema(close, emaLongLen)
+    r = ta.rsi(close, rsiLen)
+    [m, s, h] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+    [pdiVal, mdiVal, ax] = ta.dmi(adxLen, adxSmooth)
+    [close[1], e20[1], e50[1], e200[1], r[1], m[1], s[1], h[1], pdiVal[1], mdiVal[1], ax[1]]
+
+f_30mData() =>
+    e20 = ta.ema(close, emaFastLen)
+    e50 = ta.ema(close, emaSlowLen)
+    e200 = ta.ema(close, emaLongLen)
+
+    r = ta.rsi(close, rsiLen)
+    [m, s, h] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+    [pdiVal, mdiVal, ax] = ta.dmi(adxLen, adxSmooth)
+
+    atrVal = ta.atr(atrLen)
+
+    volAvg = ta.sma(volume, volLen)
+    relVol = volAvg != 0.0 ? volume / volAvg : 0.0
+    vPressure = f_volumePressure(volPressureLen)
+
+    obv = ta.cum(close > close[1] ? volume : close < close[1] ? -volume : 0.0)
+    obvSlope = obv - obv[3]
+
+    emaBull = e20 > e50
+    emaBear = e20 < e50
+    macdBull = m > macdCenter
+    macdBear = m < macdCenter
+    rsiBull = r > rsiCenter
+    rsiBear = r < rsiCenter
+
+    bullVotes = (emaBull ? 1 : 0) + (macdBull ? 1 : 0) + (rsiBull ? 1 : 0)
+    bearVotes = (emaBear ? 1 : 0) + (macdBear ? 1 : 0) + (rsiBear ? 1 : 0)
+
+    crossUp = ta.crossover(e20, e50)
+    crossDown = ta.crossunder(e20, e50)
+
+    bullCrossAge = ta.barssince(crossUp)
+    bearCrossAge = ta.barssince(crossDown)
+
+    bullCrossTime = ta.valuewhen(crossUp, time, 0)
+    bearCrossTime = ta.valuewhen(crossDown, time, 0)
+
+    priorBearBarsAtBullCross = ta.valuewhen(crossUp, ta.barssince(crossDown), 0)
+    priorBullBarsAtBearCross = ta.valuewhen(crossDown, ta.barssince(crossUp), 0)
+
+    priorBearRegimeOk = na(priorBearBarsAtBullCross) or priorBearBarsAtBullCross >= minPriorRegimeBars
+    priorBullRegimeOk = na(priorBullBarsAtBearCross) or priorBullBarsAtBearCross >= minPriorRegimeBars
+
+    bullPersistCount = math.sum(emaBull ? 1.0 : 0.0, crossPersistenceBars)
+    bearPersistCount = math.sum(emaBear ? 1.0 : 0.0, crossPersistenceBars)
+
+    bullPersistent = bullPersistCount >= crossPersistenceBars
+    bearPersistent = bearPersistCount >= crossPersistenceBars
+
+    e20Slope = e20 - e20[emaSlopeLookback]
+    e20SlopeAtr = atrVal != 0.0 ? e20Slope / atrVal : 0.0
+
+    bullSep = e20 - e50
+    bearSep = e50 - e20
+
+    bullSepAtr = atrVal != 0.0 ? bullSep / atrVal : 0.0
+    bearSepAtr = atrVal != 0.0 ? bearSep / atrVal : 0.0
+
+    bullSepExpanding = bullSep > bullSep[separationLookback]
+    bearSepExpanding = bearSep > bearSep[separationLookback]
+
+    // EARLY REVERSAL STRUCTURE:
+    // EMA50 is NOT required to already slope upward/downward.
+    // That would be too late near a major turning point.
+    bullStructure = emaBull and e20SlopeAtr >= minEma20SlopeAtr and bullSepAtr >= minSeparationAtr and bullSepExpanding
+    bearStructure = emaBear and e20SlopeAtr <= -minEma20SlopeAtr and bearSepAtr >= minSeparationAtr and bearSepExpanding
+
+    priorHigh = ta.highest(high[1], breakoutLookback)
+    priorLow = ta.lowest(low[1], breakoutLookback)
+
+    bullBreakout = close > priorHigh
+    bearBreakout = close < priorLow
+
+    body = close - open
+    bullImpulse = body > atrVal * impulseAtr
+    bearImpulse = -body > atrVal * impulseAtr
+
+    bullParticipation = (relVol >= minRelativeVolume and vPressure > 0) or obvSlope > 0
+    bearParticipation = (relVol >= minRelativeVolume and vPressure < 0) or obvSlope < 0
+
+    bullAdx = ax >= adxTrendMin and pdiVal > mdiVal
+    bearAdx = ax >= adxTrendMin and mdiVal > pdiVal
+
+    rangeHigh = ta.highest(high, chopLookback)
+    rangeLow = ta.lowest(low, chopLookback)
+    rangeSize = rangeHigh - rangeLow
+
+    emaCompressed = math.abs(e20 - e50) < atrVal * chopCompressionAtr
+    weakAdx = ax < chopAdx
+    tightRange = rangeSize < atrVal * 1.8
+    insideRange = close < rangeHigh and close > rangeLow
+
+    chop = useChopFilter and weakAdx and emaCompressed and tightRange and insideRange
+
+    belowEma20Count = math.sum(close < e20 ? 1.0 : 0.0, profitWeakBars)
+    aboveEma20Count = math.sum(close > e20 ? 1.0 : 0.0, profitWeakBars)
+
+    swingLow = ta.lowest(low, swingStopLookback)
+    swingHigh = ta.highest(high, swingStopLookback)
+    reentryHigh = ta.highest(high[1], reentryBreakLookback)
+    reentryLow = ta.lowest(low[1], reentryBreakLookback)
+
+    [time, close, open, high, low, e20, e50, e200, r, m, s, h, pdiVal, mdiVal, ax, atrVal, relVol, vPressure, obvSlope, bullVotes, bearVotes, crossUp, crossDown, bullCrossAge, bearCrossAge, bullCrossTime, bearCrossTime, priorBearRegimeOk, priorBullRegimeOk, bullPersistent, bearPersistent, e20SlopeAtr, bullSepAtr, bearSepAtr, bullSepExpanding, bearSepExpanding, bullStructure, bearStructure, bullBreakout, bearBreakout, bullImpulse, bearImpulse, bullParticipation, bearParticipation, bullAdx, bearAdx, chop, belowEma20Count, aboveEma20Count, swingLow, swingHigh, reentryHigh, reentryLow]
+
+// ============================================================================
+// MTF DATA
+// ============================================================================
+
+[dClose, dEma20, dEma50, dEma200, dRsi, dMacd, dSignal, dHist, dPdi, dMdi, dAdx] = request.security(syminfo.tickerid, dailyTF, f_htfConfirmed(), lookahead=barmerge.lookahead_on)
+[hClose, hEma20, hEma50, hEma200, hRsi, hMacd, hSignal, hHist, hPdi, hMdi, hAdx] = request.security(syminfo.tickerid, confirmTF, f_htfConfirmed(), lookahead=barmerge.lookahead_on)
+[mTime, mClose, mOpen, mHigh, mLow, ema20, ema50, ema200, rsi, macdLine, signalLine, hist, pdi, mdi, adx, atr, relVol, vPressure, obvSlope, mBullVotes, mBearVotes, mCrossUp, mCrossDown, mBullCrossAge, mBearCrossAge, mBullCrossTime, mBearCrossTime, priorBearRegimeOk, priorBullRegimeOk, bullPersistent, bearPersistent, ema20SlopeAtr, bullSepAtr, bearSepAtr, bullSepExpanding, bearSepExpanding, bullStructure, bearStructure, bullBreakout, bearBreakout, bullImpulse, bearImpulse, bullParticipation, bearParticipation, bullAdx, bearAdx, chopZone, belowEma20Count, aboveEma20Count, swingLow30, swingHigh30, reentryHigh30, reentryLow30] = request.security(syminfo.tickerid, entryTF, f_30mData(), lookahead=barmerge.lookahead_off)
+
+// ============================================================================
+// DAILY CONTEXT - SCORE, NOT HARD GATE
+// ============================================================================
+
+dEmaBull = dEma20 > dEma50
+dEmaBear = dEma20 < dEma50
+dMacdBull = dMacd > macdCenter
+dMacdBear = dMacd < macdCenter
+dRsiBull = dRsi > rsiCenter
+dRsiBear = dRsi < rsiCenter
+
+dailyBullVotes = (dEmaBull ? 1 : 0) + (dMacdBull ? 1 : 0) + (dRsiBull ? 1 : 0)
+dailyBearVotes = (dEmaBear ? 1 : 0) + (dMacdBear ? 1 : 0) + (dRsiBear ? 1 : 0)
+
+dailyBull = dailyBullVotes >= 2
+dailyBear = dailyBearVotes >= 2
+dailyStrongBull = dailyBullVotes == 3
+dailyStrongBear = dailyBearVotes == 3
+
+// ============================================================================
+// 2H CONTEXT
+// ============================================================================
+
+hEmaBull = hEma20 > hEma50
+hEmaBear = hEma20 < hEma50
+hMacdBull = hMacd > macdCenter
+hMacdBear = hMacd < macdCenter
+hRsiBull = hRsi > rsiCenter
+hRsiBear = hRsi < rsiCenter
+
+twoHourBullVotes = (hEmaBull ? 1 : 0) + (hMacdBull ? 1 : 0) + (hRsiBull ? 1 : 0)
+twoHourBearVotes = (hEmaBear ? 1 : 0) + (hMacdBear ? 1 : 0) + (hRsiBear ? 1 : 0)
+
+twoHourBull = twoHourBullVotes >= 2
+twoHourBear = twoHourBearVotes >= 2
+twoHourStrongBull = twoHourBullVotes == 3
+twoHourStrongBear = twoHourBearVotes == 3
+
+// ============================================================================
+// 30M CORE
+// ============================================================================
+
+emaBull = ema20 > ema50
+emaBear = ema20 < ema50
+
+macdBull = macdLine > macdCenter
+macdBear = macdLine < macdCenter
+
+rsiBull = rsi > rsiCenter
+rsiBear = rsi < rsiCenter
+
+thirtyStrongBull = mBullVotes == 3
+thirtyStrongBear = mBearVotes == 3
+
+// ============================================================================
+// CANDIDATE WINDOW
+// ============================================================================
+
+bullWindow = not na(mBullCrossAge) and mBullCrossAge <= confirmWindowBars and emaBull
+bearWindow = not na(mBearCrossAge) and mBearCrossAge <= confirmWindowBars and emaBear
+
+bullFreshWindow = bullWindow and mBullCrossAge <= freshCrossBars
+bearFreshWindow = bearWindow and mBearCrossAge <= freshCrossBars
+
+bullLateCatchWindow = allowLateRegimeCatch and not na(mBullCrossAge) and mBullCrossAge > confirmWindowBars and mBullCrossAge <= lateCatchMaxAge and emaBull
+bearLateCatchWindow = allowLateRegimeCatch and not na(mBearCrossAge) and mBearCrossAge > confirmWindowBars and mBearCrossAge <= lateCatchMaxAge and emaBear
+
+// ============================================================================
+// SEPARATE 30M CORE FROM HIGHER-TIMEFRAME CONTEXT
+// ============================================================================
+//
+// The prior v10 score mixed 30M evidence with Daily/2H evidence.
+// At a major reversal, Daily and 2H are naturally late. That could leave the
+// total score below threshold until price was already too extended.
+//
+// v12 uses:
+//   CORE SCORE    = what the 30M move itself is doing.
+//   CONTEXT SCORE = Daily / 2H confidence only.
+//
+// CORE has 6 possible points:
+// 1 prior regime was meaningful
+// 2 new EMA regime persisted
+// 3 EMA20/50 structure expanding
+// 4 breakout or impulse
+// 5 directional participation
+// 6 ADX + DI trend strength
+//
+// EMA20/50 + MACD zero + RSI50 are still mandatory for a CALL/PUT.
+
+bullCoreScore = 0
+bullCoreScore += priorBearRegimeOk ? 1 : 0
+bullCoreScore += bullPersistent ? 1 : 0
+bullCoreScore += bullStructure ? 1 : 0
+bullCoreScore += (bullBreakout or bullImpulse) ? 1 : 0
+bullCoreScore += bullParticipation ? 1 : 0
+bullCoreScore += bullAdx ? 1 : 0
+
+bearCoreScore = 0
+bearCoreScore += priorBullRegimeOk ? 1 : 0
+bearCoreScore += bearPersistent ? 1 : 0
+bearCoreScore += bearStructure ? 1 : 0
+bearCoreScore += (bearBreakout or bearImpulse) ? 1 : 0
+bearCoreScore += bearParticipation ? 1 : 0
+bearCoreScore += bearAdx ? 1 : 0
+
+bullContextScore = 0
+bullContextScore += twoHourBull ? 1 : 0
+bullContextScore += dailyBull ? 1 : 0
+bullContextScore += twoHourStrongBull ? 1 : 0
+
+bearContextScore = 0
+bearContextScore += twoHourBear ? 1 : 0
+bearContextScore += dailyBear ? 1 : 0
+bearContextScore += twoHourStrongBear ? 1 : 0
+
+// Kept only for dashboard compatibility.
+bullSwingScore = bullCoreScore + bullContextScore
+bearSwingScore = bearCoreScore + bearContextScore
+
+// Only the strongest possible opposite context can hard-block a trade.
+// A normal early reversal is allowed to lead the higher timeframes.
+bullHardOpposite = blockOnlyIfDailyAnd2HStrongOpposite and dailyStrongBear and twoHourStrongBear
+bearHardOpposite = blockOnlyIfDailyAnd2HStrongOpposite and dailyStrongBull and twoHourStrongBull
+
+// ============================================================================
+// ENTRY PATH A - FRESH CROSS: CATCH THE MOVE EARLY
+// ============================================================================
+//
+// Fresh cross gets more extension room because large reversals can move fast.
+// We still require:
+// - EMA20 > EMA50 / < EMA50
+// - MACD > 0 / < 0
+// - RSI > 50 / < 50
+// - prior regime
+// - persistence
+// - expanding EMA structure
+// - enough 30M core evidence
+//
+// Daily/2H are NOT required unless BOTH are strongly opposite.
+
+freshCallNotExtended = mClose <= ema20 + atr * freshCrossMaxExtensionAtr
+freshPutNotExtended = mClose >= ema20 - atr * freshCrossMaxExtensionAtr
+
+freshCallSetup = bullFreshWindow and priorBearRegimeOk and bullPersistent and thirtyStrongBull and bullStructure and bullCoreScore >= minCoreScore and not chopZone and freshCallNotExtended and not bullHardOpposite
+
+freshPutSetup = bearFreshWindow and priorBullRegimeOk and bearPersistent and thirtyStrongBear and bearStructure and bearCoreScore >= minCoreScore and not chopZone and freshPutNotExtended and not bearHardOpposite
+
+// If BOTH Daily and 2H are strongly opposite, an exceptional 30M reversal may
+// still enter only with very strong local evidence.
+exceptionalCallOverride = bullFreshWindow and bullHardOpposite and priorBearRegimeOk and bullPersistent and thirtyStrongBull and bullStructure and bullCoreScore >= 5 and (bullBreakout or bullImpulse) and bullParticipation and bullAdx and not chopZone and freshCallNotExtended
+
+exceptionalPutOverride = bearFreshWindow and bearHardOpposite and priorBullRegimeOk and bearPersistent and thirtyStrongBear and bearStructure and bearCoreScore >= 5 and (bearBreakout or bearImpulse) and bearParticipation and bearAdx and not chopZone and freshPutNotExtended
+
+// ============================================================================
+// ENTRY PATH B - NORMAL CROSS WINDOW
+// ============================================================================
+
+normalCallNotExtended = mClose <= ema20 + atr * normalMaxExtensionAtr
+normalPutNotExtended = mClose >= ema20 - atr * normalMaxExtensionAtr
+
+normalCallSetup = bullWindow and not bullFreshWindow and priorBearRegimeOk and bullPersistent and thirtyStrongBull and bullStructure and bullCoreScore >= minCoreScore and not chopZone and normalCallNotExtended and not bullHardOpposite
+
+normalPutSetup = bearWindow and not bearFreshWindow and priorBullRegimeOk and bearPersistent and thirtyStrongBear and bearStructure and bearCoreScore >= minCoreScore and not chopZone and normalPutNotExtended and not bearHardOpposite
+
+// ============================================================================
+// ENTRY PATH C - LATE BIG-RUN CATCH
+// ============================================================================
+//
+// This directly addresses the latest move in the screenshot.
+// If the original crossover window was missed, do NOT throw away the entire
+// EMA regime. A first entry is still allowed later when:
+//
+// - EMA20/50 regime remains intact
+// - MACD and RSI are still fully aligned
+// - 2H has caught up to the direction
+// - price produces a fresh breakout / impulse
+// - local core evidence remains strong
+//
+// Late catch is for the FIRST trade in the EMA regime only.
+// The separate v10 re-entry logic remains for a prior stopped trade.
+
+lateCallSetup = bullLateCatchWindow and thirtyStrongBull and emaBull and twoHourBull and bullCoreScore >= lateCatchMinCoreScore and (bullBreakout or bullImpulse) and bullParticipation and not chopZone and mClose > ema20
+
+latePutSetup = bearLateCatchWindow and thirtyStrongBear and emaBear and twoHourBear and bearCoreScore >= lateCatchMinCoreScore and (bearBreakout or bearImpulse) and bearParticipation and not chopZone and mClose < ema20
+
+callSetup = freshCallSetup or exceptionalCallOverride or normalCallSetup or lateCallSetup
+putSetup = freshPutSetup or exceptionalPutOverride or normalPutSetup or latePutSetup
+
+entryPathText = freshCallSetup ? "Fresh CALL" : exceptionalCallOverride ? "Override CALL" : normalCallSetup ? "Normal CALL" : lateCallSetup ? "Late CALL" : freshPutSetup ? "Fresh PUT" : exceptionalPutOverride ? "Override PUT" : normalPutSetup ? "Normal PUT" : latePutSetup ? "Late PUT" : "None"
+
+// Diagnostic text: if no setup, show the main blocker.
+callBlockerText = not bullWindow and not bullLateCatchWindow ? "No Bull Cross Window" : not thirtyStrongBull ? "Need EMA+MACD+RSI Bull" : not priorBearRegimeOk ? "Prior Regime Too Short" : not bullPersistent ? "Cross Not Persistent" : not bullStructure ? "EMA Not Expanding" : bullCoreScore < minCoreScore ? "Core Score Too Low" : chopZone ? "Chop" : bullHardOpposite ? "Daily+2H Strong Bear" : "Waiting Breakout"
+
+putBlockerText = not bearWindow and not bearLateCatchWindow ? "No Bear Cross Window" : not thirtyStrongBear ? "Need EMA+MACD+RSI Bear" : not priorBullRegimeOk ? "Prior Regime Too Short" : not bearPersistent ? "Cross Not Persistent" : not bearStructure ? "EMA Not Expanding" : bearCoreScore < minCoreScore ? "Core Score Too Low" : chopZone ? "Chop" : bearHardOpposite ? "Daily+2H Strong Bull" : "Waiting Breakdown"
+
+// ============================================================================
+// PRIMARY ENTRY + ONE CONTROLLED RE-ENTRY PER EMA REGIME
+// ============================================================================
+//
+// v9 permanently locked an EMA regime after the first entry. If the initial
+// protective stop was hit during a healthy retest, the strategy could not
+// participate in the rest of the large trend.
+//
+// v10 permits at most TWO entries per EMA regime:
+//   Entry #1 = original crossover confirmation.
+//   Entry #2 = only after a cooldown and a fresh 3/3 continuation breakout.
+// ============================================================================
+
+var int activeBullCrossTime = na
+var int activeBearCrossTime = na
+var int bullEntriesThisRegime = 0
+var int bearEntriesThisRegime = 0
+var int lastProcessed30mTime = na
+var int lastExitBar = na
+var int lastTradeExitBar = na
+
+new30mState = na(lastProcessed30mTime) or mTime != lastProcessed30mTime
+exitCooldownOk = na(lastExitBar) or bar_index - lastExitBar > cooldownBars
+reentryCooldownOk = na(lastTradeExitBar) or bar_index - lastTradeExitBar > reentryCooldownBars
+
+// Reset counts whenever a genuinely new EMA crossover regime begins.
+if not na(mBullCrossTime) and (na(activeBullCrossTime) or mBullCrossTime != activeBullCrossTime)
+    activeBullCrossTime := mBullCrossTime
+    bullEntriesThisRegime := 0
+
+if not na(mBearCrossTime) and (na(activeBearCrossTime) or mBearCrossTime != activeBearCrossTime)
+    activeBearCrossTime := mBearCrossTime
+    bearEntriesThisRegime := 0
+
+primaryCallAvailable = bullEntriesThisRegime == 0
+primaryPutAvailable = bearEntriesThisRegime == 0
+
+// Re-entry is intentionally stricter than the first entry.
+// The original EMA regime must still be intact and all 3 core votes must be
+// bullish/bearish again. Price must also break a recent 30M continuation level.
+callReentrySetup = allowOneReentry and bullEntriesThisRegime == 1 and emaBull and thirtyStrongBull and bullStructure and not bullHardOpposite and not chopZone and mClose > reentryHigh30 and mClose > ema20 and reentryCooldownOk
+putReentrySetup = allowOneReentry and bearEntriesThisRegime == 1 and emaBear and thirtyStrongBear and bearStructure and not bearHardOpposite and not chopZone and mClose < reentryLow30 and mClose < ema20 and reentryCooldownOk
+
+callEntry = barstate.isconfirmed and new30mState and strategy.position_size <= 0 and exitCooldownOk and ((callSetup and primaryCallAvailable) or callReentrySetup)
+putEntry = barstate.isconfirmed and new30mState and strategy.position_size >= 0 and exitCooldownOk and ((putSetup and primaryPutAvailable) or putReentrySetup)
+
+if new30mState
+    lastProcessed30mTime := mTime
+
+if callEntry
+    bullEntriesThisRegime += 1
+
+if putEntry
+    bearEntriesThisRegime += 1
+
+// ============================================================================
+// ORDERS / TRACKING
+// ============================================================================
+
+var int entryBar = na
+var float entryAtr = na
+var float highSinceEntry = na
+var float lowSinceEntry = na
+var float activeStop = na
+var float pendingStructureStop = na
+var float initialStructureStop = na
+var string lastExitReason = "None"
+
+if callEntry
+    // Stop must sit below BOTH EMA50 support and the recent swing low.
+    pendingStructureStop := math.min(ema50 - atr * structureStopBufferAtr, swingLow30 - atr * structureStopBufferAtr)
+    if strategy.position_size < 0
+        strategy.close("PUT")
+    strategy.entry("CALL", strategy.long)
+
+if putEntry
+    // Stop must sit above BOTH EMA50 resistance and the recent swing high.
+    pendingStructureStop := math.max(ema50 + atr * structureStopBufferAtr, swingHigh30 + atr * structureStopBufferAtr)
+    if strategy.position_size > 0
+        strategy.close("CALL")
+    strategy.entry("PUT", strategy.short)
+
+newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0
+newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if newLong or newShort
+    entryBar := bar_index
+    entryAtr := atr
+    highSinceEntry := mHigh
+    lowSinceEntry := mLow
+
+if newLong
+    maxRiskStop = strategy.position_avg_price - entryAtr * emergencyStopAtr
+    initialStructureStop := math.max(pendingStructureStop, maxRiskStop)
+
+if newShort
+    maxRiskStop = strategy.position_avg_price + entryAtr * emergencyStopAtr
+    initialStructureStop := math.min(pendingStructureStop, maxRiskStop)
+
+if strategy.position_size > 0
+    highSinceEntry := na(highSinceEntry) ? mHigh : math.max(highSinceEntry, mHigh)
+    lowSinceEntry := na(lowSinceEntry) ? mLow : math.min(lowSinceEntry, mLow)
+
+if strategy.position_size < 0
+    highSinceEntry := na(highSinceEntry) ? mHigh : math.max(highSinceEntry, mHigh)
+    lowSinceEntry := na(lowSinceEntry) ? mLow : math.min(lowSinceEntry, mLow)
+
+barsInTrade = strategy.position_size != 0 and not na(entryBar) ? bar_index - entryBar : 0
+activeAtr = na(entryAtr) ? atr : entryAtr
+
+// ============================================================================
+// STRUCTURAL INITIAL STOP + OPTIONAL WIDE TRAIL
+// ============================================================================
+//
+// The v9 chart showed "CALL Stop" during the normal post-reversal retest.
+// A fixed ATR stop was too insensitive to market structure.
+//
+// CALL initial stop:
+//   below EMA50 AND below the recent 30M swing low,
+//   but never farther than Maximum Initial Risk ATR.
+//
+// PUT is the reverse.
+//
+// Position size should be adjusted to the wider structural risk.
+// ============================================================================
+
+longWideTrailActive = useWideTrail and strategy.position_size > 0 and highSinceEntry >= strategy.position_avg_price + activeAtr * wideTrailStartAtr
+shortWideTrailActive = useWideTrail and strategy.position_size < 0 and lowSinceEntry <= strategy.position_avg_price - activeAtr * wideTrailStartAtr
+
+longWideTrail = highSinceEntry - activeAtr * wideTrailAtr
+shortWideTrail = lowSinceEntry + activeAtr * wideTrailAtr
+
+if strategy.position_size > 0
+    activeStop := longWideTrailActive ? math.max(strategy.position_avg_price, longWideTrail) : initialStructureStop
+
+if strategy.position_size < 0
+    activeStop := shortWideTrailActive ? math.min(strategy.position_avg_price, shortWideTrail) : initialStructureStop
+
+if strategy.position_size > 0 and not na(activeStop)
+    strategy.exit("CALL Structure Stop", from_entry="CALL", stop=activeStop)
+
+if strategy.position_size < 0 and not na(activeStop)
+    strategy.exit("PUT Structure Stop", from_entry="PUT", stop=activeStop)
+
+// ============================================================================
+// EXIT - DESIGNED TO HOLD THE LARGE RUN
+// ============================================================================
+
+// Primary exit: EMA20/EMA50 fully reverses.
+callEmaExit = strategy.position_size > 0 and barsInTrade >= minHoldBars and emaBear
+putEmaExit = strategy.position_size < 0 and barsInTrade >= minHoldBars and emaBull
+
+// Profit protection:
+// Only after a substantial move.
+// Instead of waiting all the way for EMA20/50 to cross, protect a winning option
+// if price stays on the wrong side of EMA20 for several bars AND MACD/RSI both
+// move to the wrong side of their centerlines AND EMA20 slope has reversed.
+longHasProfitMove = strategy.position_size > 0 and highSinceEntry >= strategy.position_avg_price + activeAtr * profitProtectStartAtr
+shortHasProfitMove = strategy.position_size < 0 and lowSinceEntry <= strategy.position_avg_price - activeAtr * profitProtectStartAtr
+
+callProfitFailure = strategy.position_size > 0 and barsInTrade >= minHoldBars and longHasProfitMove and belowEma20Count >= profitWeakBars and macdBear and rsiBear and ema20SlopeAtr < 0
+putProfitFailure = strategy.position_size < 0 and barsInTrade >= minHoldBars and shortHasProfitMove and aboveEma20Count >= profitWeakBars and macdBull and rsiBull and ema20SlopeAtr > 0
+
+// Strong HTF failure only when 30M also loses two of its three core votes.
+callHtfFailure = strategy.position_size > 0 and barsInTrade >= minHoldBars and twoHourStrongBear and mBullVotes <= 1
+putHtfFailure = strategy.position_size < 0 and barsInTrade >= minHoldBars and twoHourStrongBull and mBearVotes <= 1
+
+// Options theta protection: if nothing meaningful happened after ~3 sessions
+// and 2H does not support the trade, leave.
+longNoProgress = useThetaProtection and strategy.position_size > 0 and barsInTrade >= thetaCheckBars and highSinceEntry < strategy.position_avg_price + activeAtr * minProgressAtr and not twoHourBull
+shortNoProgress = useThetaProtection and strategy.position_size < 0 and barsInTrade >= thetaCheckBars and lowSinceEntry > strategy.position_avg_price - activeAtr * minProgressAtr and not twoHourBear
+
+timeExit = strategy.position_size != 0 and barsInTrade >= maxHoldBars
+
+if callEmaExit
+    lastExitReason := "CALL: EMA20<EMA50"
+    strategy.close("CALL", comment="EMA Regime Exit")
+else if callProfitFailure
+    lastExitReason := "CALL: Profit Failure"
+    strategy.close("CALL", comment="Profit Protection")
+else if callHtfFailure
+    lastExitReason := "CALL: 2H + 30M Failure"
+    strategy.close("CALL", comment="HTF Failure")
+else if longNoProgress
+    lastExitReason := "CALL: No Progress"
+    strategy.close("CALL", comment="Theta / No Progress")
+else if timeExit and strategy.position_size > 0
+    lastExitReason := "CALL: Time Exit"
+    strategy.close("CALL", comment="Time Exit")
+
+if putEmaExit
+    lastExitReason := "PUT: EMA20>EMA50"
+    strategy.close("PUT", comment="EMA Regime Exit")
+else if putProfitFailure
+    lastExitReason := "PUT: Profit Failure"
+    strategy.close("PUT", comment="Profit Protection")
+else if putHtfFailure
+    lastExitReason := "PUT: 2H + 30M Failure"
+    strategy.close("PUT", comment="HTF Failure")
+else if shortNoProgress
+    lastExitReason := "PUT: No Progress"
+    strategy.close("PUT", comment="Theta / No Progress")
+else if timeExit and strategy.position_size < 0
+    lastExitReason := "PUT: Time Exit"
+    strategy.close("PUT", comment="Time Exit")
+
+callClosed = strategy.position_size[1] > 0 and strategy.position_size == 0
+putClosed = strategy.position_size[1] < 0 and strategy.position_size == 0
+
+if callClosed or putClosed
+    lastExitBar := bar_index
+    lastTradeExitBar := bar_index
+
+    // If no rule-based reason was assigned on this bar, the protective
+    // strategy.exit order is the likely cause.
+    if callClosed and not (callEmaExit or callProfitFailure or callHtfFailure or longNoProgress or timeExit)
+        lastExitReason := "CALL: Structure Stop"
+    if putClosed and not (putEmaExit or putProfitFailure or putHtfFailure or shortNoProgress or timeExit)
+        lastExitReason := "PUT: Structure Stop"
+
+if strategy.position_size == 0
+    entryBar := na
+    entryAtr := na
+    highSinceEntry := na
+    lowSinceEntry := na
+    activeStop := na
+    initialStructureStop := na
+    pendingStructureStop := na
+
+// ============================================================================
+// DISPLAY
+// ============================================================================
+
+plot(showEma20 ? ema20 : na, "30M EMA20", color=color.yellow, linewidth=1)
+plot(showEma50 ? ema50 : na, "30M EMA50", color=color.orange, linewidth=2)
+plot(showEma200 ? ema200 : na, "30M EMA200", color=color.blue, linewidth=2)
+
+plot(showStop and strategy.position_size != 0 ? activeStop : na, "Active Stop", color=color.white, linewidth=2, style=plot.style_linebr)
+
+bgcolor(shadeSwing ? (strategy.position_size > 0 ? color.new(color.green, 93) : strategy.position_size < 0 ? color.new(color.red, 93) : na) : na)
+
+plotshape(showCrossCandidates and mCrossUp, title="Bull EMA Cross", text="EMA+", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+plotshape(showCrossCandidates and mCrossDown, title="Bear EMA Cross", text="EMA-", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+
+plotshape(showSignals and callEntry, title="CALL Entry", text="CALL", style=shape.labelup, location=location.belowbar, color=color.lime, textcolor=color.black, size=size.normal)
+plotshape(showSignals and putEntry, title="PUT Entry", text="PUT", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.normal)
+
+plotshape(showSignals and callClosed, title="CALL Exit", text="EXIT", style=shape.labeldown, location=location.abovebar, color=color.yellow, textcolor=color.black, size=size.small)
+plotshape(showSignals and putClosed, title="PUT Exit", text="EXIT", style=shape.labelup, location=location.belowbar, color=color.yellow, textcolor=color.black, size=size.small)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+var table t = table.new(position.top_right, 2, 17, border_width=1)
+
+if barstate.islast and showTable
+    dailyText = dailyStrongBull ? "Bull 3/3" : dailyBull ? "Bull 2/3" : dailyStrongBear ? "Bear 3/3" : dailyBear ? "Bear 2/3" : "Mixed"
+    twoHourText = twoHourStrongBull ? "Bull 3/3" : twoHourBull ? "Bull 2/3" : twoHourStrongBear ? "Bear 3/3" : twoHourBear ? "Bear 2/3" : "Mixed"
+    thirtyText = thirtyStrongBull ? "Bull 3/3" : thirtyStrongBear ? "Bear 3/3" : str.tostring(mBullVotes) + "/3 Bull"
+
+    emaText = emaBull ? "Bull 20>50" : emaBear ? "Bear 20<50" : "Flat"
+    macdText = macdBull ? "Bull > 0" : macdBear ? "Bear < 0" : "Zero"
+    rsiText = rsiBull ? "Bull > 50 (" + str.tostring(rsi, "#.0") + ")" : rsiBear ? "Bear < 50 (" + str.tostring(rsi, "#.0") + ")" : "50"
+
+    priorText = bullWindow ? (priorBearRegimeOk ? "Bull Cross Valid" : "Bull Whipsaw Risk") : bearWindow ? (priorBullRegimeOk ? "Bear Cross Valid" : "Bear Whipsaw Risk") : "No New Cross"
+
+    persistenceText = bullPersistent and emaBull ? "Bull Holds" : bearPersistent and emaBear ? "Bear Holds" : "Waiting"
+
+    expansionText = bullStructure ? "Bull Expanding" : bearStructure ? "Bear Expanding" : "Weak / Flat"
+
+    evidenceText = bullBreakout ? "Bull Breakout" : bearBreakout ? "Bear Breakout" : bullImpulse ? "Bull Impulse" : bearImpulse ? "Bear Impulse" : bullParticipation ? "Bull Participation" : bearParticipation ? "Bear Participation" : "Mixed"
+
+    crossText = bullWindow ? "CALL Window " + str.tostring(mBullCrossAge) : bearWindow ? "PUT Window " + str.tostring(mBearCrossAge) : bullLateCatchWindow ? "Late CALL " + str.tostring(mBullCrossAge) : bearLateCatchWindow ? "Late PUT " + str.tostring(mBearCrossAge) : emaBull ? "Bull Regime" : emaBear ? "Bear Regime" : "None"
+
+    scoreText = emaBull ? "Core " + str.tostring(bullCoreScore) + "/6 | HTF " + str.tostring(bullContextScore) + "/3" : emaBear ? "Core " + str.tostring(bearCoreScore) + "/6 | HTF " + str.tostring(bearContextScore) + "/3" : "Mixed"
+
+    posText = strategy.position_size > 0 ? "CALL" : strategy.position_size < 0 ? "PUT" : "Flat"
+
+    actionText = strategy.position_size > 0 ? (emaBull ? "HOLD BIG CALL" : "EXIT CALL") : strategy.position_size < 0 ? (emaBear ? "HOLD BIG PUT" : "EXIT PUT") : callSetup and primaryCallAvailable ? "ENTER CALL" : putSetup and primaryPutAvailable ? "ENTER PUT" : callReentrySetup ? "RE-ENTER CALL" : putReentrySetup ? "RE-ENTER PUT" : bullWindow or bullLateCatchWindow ? "WATCH CALL" : bearWindow or bearLateCatchWindow ? "WATCH PUT" : "WAIT"
+
+    table.cell(t, 0, 0, "Daily", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 0, dailyText, text_color=color.white, bgcolor=dailyBull ? color.green : dailyBear ? color.red : color.gray)
+
+    table.cell(t, 0, 1, "2H", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 1, twoHourText, text_color=color.white, bgcolor=twoHourBull ? color.green : twoHourBear ? color.red : color.gray)
+
+    table.cell(t, 0, 2, "30M Core", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 2, thirtyText, text_color=color.white, bgcolor=thirtyStrongBull ? color.green : thirtyStrongBear ? color.red : color.gray)
+
+    table.cell(t, 0, 3, "EMA20/50", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 3, emaText, text_color=color.white, bgcolor=emaBull ? color.green : emaBear ? color.red : color.gray)
+
+    table.cell(t, 0, 4, "MACD Zero", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 4, macdText, text_color=color.white, bgcolor=macdBull ? color.green : macdBear ? color.red : color.gray)
+
+    table.cell(t, 0, 5, "RSI 50", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 5, rsiText, text_color=color.white, bgcolor=rsiBull ? color.green : rsiBear ? color.red : color.gray)
+
+    table.cell(t, 0, 6, "Prior Regime", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 6, priorText, text_color=color.white, bgcolor=str.contains(priorText, "Valid") ? (bullWindow ? color.green : color.red) : color.gray)
+
+    table.cell(t, 0, 7, "Persistence", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 7, persistenceText, text_color=color.white, bgcolor=str.contains(persistenceText, "Bull") ? color.green : str.contains(persistenceText, "Bear") ? color.red : color.gray)
+
+    table.cell(t, 0, 8, "EMA Expansion", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 8, expansionText, text_color=color.white, bgcolor=bullStructure ? color.green : bearStructure ? color.red : color.gray)
+
+    table.cell(t, 0, 9, "Trend Evidence", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 9, evidenceText, text_color=color.white, bgcolor=str.contains(evidenceText, "Bull") ? color.green : str.contains(evidenceText, "Bear") ? color.red : color.gray)
+
+    table.cell(t, 0, 10, "Swing Score", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 10, scoreText, text_color=color.white, bgcolor=bullWindow ? color.green : bearWindow ? color.red : color.gray)
+
+    blockerText = emaBull ? callBlockerText : emaBear ? putBlockerText : "No EMA Regime"
+
+    table.cell(t, 0, 11, "Entry Path", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 11, entryPathText, text_color=color.white, bgcolor=str.contains(entryPathText, "CALL") ? color.green : str.contains(entryPathText, "PUT") ? color.red : color.gray)
+
+    table.cell(t, 0, 12, "Entry Blocker", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 12, blockerText, text_color=color.white, bgcolor=color.gray)
+
+    table.cell(t, 0, 13, "Position", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 13, posText, text_color=color.white, bgcolor=strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray)
+
+    table.cell(t, 0, 14, "Action", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 14, actionText, text_color=color.white, bgcolor=str.contains(actionText, "CALL") ? color.green : str.contains(actionText, "PUT") ? color.red : color.gray)
+
+    entryCountText = emaBull ? str.tostring(bullEntriesThisRegime) + "/2 CALL" : emaBear ? str.tostring(bearEntriesThisRegime) + "/2 PUT" : "0"
+
+    table.cell(t, 0, 15, "Regime Entries", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 15, entryCountText, text_color=color.white, bgcolor=emaBull ? color.green : emaBear ? color.red : color.gray)
+
+    table.cell(t, 0, 16, "Last Exit", text_color=color.white, bgcolor=color.black)
+    table.cell(t, 1, 16, lastExitReason, text_color=color.white, bgcolor=str.contains(lastExitReason, "CALL") ? color.green : str.contains(lastExitReason, "PUT") ? color.red : color.gray)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+if callEntry
+    alert("SVT v12 CALL | " + syminfo.ticker + " | Core " + str.tostring(bullCoreScore) + "/6 | HTF " + str.tostring(bullContextScore) + "/3 | Price " + str.tostring(mClose), alert.freq_once_per_bar_close)
+
+if putEntry
+    alert("SVT v12 PUT | " + syminfo.ticker + " | Core " + str.tostring(bearCoreScore) + "/6 | HTF " + str.tostring(bearContextScore) + "/3 | Price " + str.tostring(mClose), alert.freq_once_per_bar_close)
+
+if callClosed
+    alert("SVT BIG SWING v9 CALL EXIT | " + syminfo.ticker + " | Price " + str.tostring(mClose), alert.freq_once_per_bar_close)
+
+if putClosed
+    alert("SVT BIG SWING v9 PUT EXIT | " + syminfo.ticker + " | Price " + str.tostring(mClose), alert.freq_once_per_bar_close)

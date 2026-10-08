@@ -1,0 +1,155 @@
+//@version=6
+indicator("Volatility Regime Breakout [Squeeze + ATR + Trend + PreAlert]", overlay=true, max_bars_back=500)
+
+// ============================================================================
+// INPUTS - Parámetros configurables por el usuario
+// ============================================================================
+
+grpSqueeze = "Squeeze de Volatilidad (BB vs KC)"
+bbLength   = input.int(20, "Longitud Bollinger", minval=5, group=grpSqueeze)
+bbMultSD   = input.float(2.0, "Multiplicador Desv. Estándar (BB)", minval=0.5, step=0.1, group=grpSqueeze)
+kcLength   = input.int(20, "Longitud Keltner", minval=5, group=grpSqueeze)
+kcMultATR  = input.float(1.5, "Multiplicador ATR (KC)", minval=0.5, step=0.1, group=grpSqueeze)
+
+grpATR = "Confirmación de Expansión (ATR Ratio)"
+atrLen        = input.int(14, "Longitud ATR", minval=5, group=grpATR)
+atrSmoothLen  = input.int(50, "Longitud Media del ATR (baseline)", minval=10, group=grpATR)
+atrRatioMin   = input.float(1.15, "Ratio mínimo ATR/ATR_media para confirmar expansión", minval=1.0, step=0.05, group=grpATR)
+
+grpTrend = "Dirección de Tendencia"
+emaLen        = input.int(50, "Longitud EMA de tendencia", minval=10, group=grpTrend)
+slopeLookback = input.int(5, "Velas atrás para medir pendiente EMA", minval=1, group=grpTrend)
+
+grpRisk = "Gestión de Riesgo"
+atrSLMult = input.float(1.5, "Multiplicador ATR para Stop Loss sugerido", minval=0.5, step=0.1, group=grpRisk)
+atrTPMult = input.float(3.0, "Multiplicador ATR para Take Profit sugerido (R:R)", minval=0.5, step=0.1, group=grpRisk)
+
+grpPreAlert = "Pre-Alerta (anticipación)"
+minSqueezeBars   = input.int(6, "Mínimo de velas en squeeze antes de considerar pre-alerta", minval=1, group=grpPreAlert)
+bbwLookback      = input.int(10, "Velas atrás para medir contracción de ancho BB", minval=3, group=grpPreAlert)
+bbwContractPct   = input.float(5.0, "% mínimo de contracción del ancho BB para pre-alerta", minval=0.5, step=0.5, group=grpPreAlert)
+
+grpVisual = "Visualización"
+showBg     = input.bool(true, "Mostrar fondo de zona de Squeeze", group=grpVisual)
+showLevels = input.bool(true, "Mostrar líneas de SL/TP sugeridas en señal", group=grpVisual)
+
+// ============================================================================
+// CÁLCULOS - Squeeze (Bollinger dentro de Keltner)
+// ============================================================================
+
+basisBB = ta.sma(close, bbLength)
+devBB   = bbMultSD * ta.stdev(close, bbLength)
+upperBB = basisBB + devBB
+lowerBB = basisBB - devBB
+bbWidth = upperBB - lowerBB  // Ancho absoluto de la banda, usado para medir contracción
+
+basisKC = ta.ema(close, kcLength)
+rangeKC = ta.atr(kcLength) * kcMultATR
+upperKC = basisKC + rangeKC
+lowerKC = basisKC - rangeKC
+
+squeezeOn  = (lowerBB > lowerKC) and (upperBB < upperKC)
+squeezeOff = not squeezeOn
+squeezeRelease = squeezeOn[1] and squeezeOff
+
+// ============================================================================
+// CÁLCULOS - Contador de velas en squeeze (para exigir "madurez" antes de pre-alertar)
+// ============================================================================
+
+var int barsInSqueeze = 0
+barsInSqueeze := squeezeOn ? barsInSqueeze + 1 : 0
+
+// ============================================================================
+// CÁLCULOS - Contracción acelerada del ancho de banda (anticipación real)
+// ============================================================================
+
+// Comparamos el ancho actual contra el de N velas atrás dentro del mismo squeeze.
+// Si se está contrayendo más de X%, es señal de que la "compresión" se está
+// apretando más, lo cual suele preceder al release en pocas velas.
+bbWidthPast = bbWidth[bbwLookback]
+bbwContraction = bbWidthPast > 0 ? ((bbWidthPast - bbWidth) / bbWidthPast) * 100 : 0.0
+
+preAlertCondition = squeezeOn and barsInSqueeze >= minSqueezeBars and bbwContraction >= bbwContractPct
+
+// Evitar que la pre-alerta se dispare en cada vela mientras dura la condición:
+// solo en el momento en que se activa (transición false -> true)
+preAlertTrigger = preAlertCondition and not preAlertCondition[1]
+
+// ============================================================================
+// CÁLCULOS - Ratio de ATR relativo (confirmación de expansión real)
+// ============================================================================
+
+atrCurrent  = ta.atr(atrLen)
+atrBaseline = ta.sma(atrCurrent, atrSmoothLen)
+atrRatio    = atrCurrent / atrBaseline
+
+volumeExpansionConfirmed = atrRatio >= atrRatioMin
+
+// ============================================================================
+// CÁLCULOS - Dirección de tendencia (EMA + pendiente)
+// ============================================================================
+
+emaTrend = ta.ema(close, emaLen)
+emaSlope = emaTrend - emaTrend[slopeLookback]
+
+trendUp   = close > emaTrend and emaSlope > 0
+trendDown = close < emaTrend and emaSlope < 0
+
+// ============================================================================
+// SEÑALES - Solo se disparan en vela cerrada (evita repintado)
+// ============================================================================
+
+volatilityBreakout = squeezeRelease and volumeExpansionConfirmed
+
+buySignal  = volatilityBreakout and trendUp
+sellSignal = volatilityBreakout and trendDown
+
+// ============================================================================
+// VISUALIZACIÓN
+// ============================================================================
+
+// Fondo normal de squeeze
+bgcolor(showBg and squeezeOn and not preAlertCondition ? color.new(color.yellow, 85) : na, title="Zona de Squeeze")
+// Fondo de PRE-ALERTA: compresión madura y acelerándose (distinto color = anticipación)
+bgcolor(showBg and preAlertCondition ? color.new(color.purple, 65) : na, title="Pre-Alerta: Compresión Acelerada")
+// Fondo de breakout confirmado
+bgcolor(showBg and volatilityBreakout ? color.new(color.orange, 70) : na, title="Alerta de Volatilidad Confirmada")
+
+plot(emaTrend, "EMA Tendencia", color=trendUp ? color.new(color.teal, 0) : trendDown ? color.new(color.red, 0) : color.gray, linewidth=2)
+
+// Marcador de pre-alerta: icono discreto arriba de la vela (no es señal de entrada, es aviso)
+plotshape(preAlertTrigger, title="Pre-Alerta", location=location.abovebar, style=shape.diamond, size=size.tiny, color=color.new(color.purple, 0), text="⚠")
+
+plotshape(buySignal, title="Señal Compra", location=location.belowbar, style=shape.triangleup, size=size.small, color=color.green, text="BUY")
+plotshape(sellSignal, title="Señal Venta", location=location.abovebar, style=shape.triangledown, size=size.small, color=color.red, text="SELL")
+
+// ============================================================================
+// GESTIÓN DE RIESGO - Niveles sugeridos de SL/TP dibujados en la señal
+// ============================================================================
+
+var line slLine = na
+var line tpLine = na
+
+if buySignal and showLevels
+    slPrice = close - (atrCurrent * atrSLMult)
+    tpPrice = close + (atrCurrent * atrTPMult)
+    slLine := line.new(bar_index, slPrice, bar_index + 20, slPrice, color=color.red, style=line.style_dashed, width=1)
+    tpLine := line.new(bar_index, tpPrice, bar_index + 20, tpPrice, color=color.green, style=line.style_dashed, width=1)
+
+if sellSignal and showLevels
+    slPrice = close + (atrCurrent * atrSLMult)
+    tpPrice = close - (atrCurrent * atrTPMult)
+    slLine := line.new(bar_index, slPrice, bar_index + 20, slPrice, color=color.red, style=line.style_dashed, width=1)
+    tpLine := line.new(bar_index, tpPrice, bar_index + 20, tpPrice, color=color.green, style=line.style_dashed, width=1)
+
+// ============================================================================
+// ALERTAS - Configurables desde el panel de alertas de TradingView
+// Nota: el sonido se elige al crear la alerta en la UI de TradingView, no en el código.
+// Cada alertcondition aparece como una opción separada al configurar la alerta,
+// así puedes asignar un sonido distinto a la pre-alerta vs. la entrada confirmada.
+// ============================================================================
+
+alertcondition(preAlertTrigger, title="🔶 Pre-Alerta: Posible entrada gestándose", message="BTC: Compresión de volatilidad acelerándose. Prepárate, breakout posible en las próximas velas.")
+alertcondition(buySignal, title="✅ Breakout Alcista Confirmado", message="BTC: Breakout de volatilidad + tendencia alcista detectado. Revisar entrada.")
+alertcondition(sellSignal, title="✅ Breakout Bajista Confirmado", message="BTC: Breakout de volatilidad + tendencia bajista detectado. Revisar entrada.")
+alertcondition(squeezeOn and not squeezeOn[1], title="Inicio de Squeeze", message="BTC: Mercado entrando en compresión de volatilidad.")

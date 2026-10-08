@@ -1,0 +1,383 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Dots3Red
+// TradingView: https://www.tradingview.com/u/Dots3Red/
+
+//@version=6
+indicator("Auto Trendlines - Touch-Graded [Dots3Red]",
+          shorttitle = "ATL Graded [D3R]",
+          overlay    = true,
+          max_lines_count  = 500,
+          max_labels_count = 500)
+
+
+
+
+// COLORS
+C_BULL    = color.new(#00f0ff, 0)
+C_BEAR    = color.new(#ff00aa, 0)
+C_GREEN   = color.new(#00c896, 0)
+C_RED     = color.new(#ff4466, 0)
+C_AMBER   = color.new(#ffb700, 0)
+C_NEUTRAL = color.new(#64748b, 0)
+C_BG      = color.new(#131722, 5)
+C_TXT     = color.new(#f8fafc, 0)
+C_DIM     = color.new(#94a3b8, 0)
+C_BORD    = color.new(#334155, 0)
+
+
+// INPUTS
+GRP_DET = "📐 Detection"
+GRP_TCH = "🎯 Touch Grading"
+GRP_VIS = "🎨 Visualization"
+GRP_HUD = "🖥️ Dashboard"
+
+pivot_leg   = input.int(5, "Pivot Leg (bars each side)", minval=2, maxval=20, group=GRP_DET,
+              tooltip="Bars required on each side to confirm a pivot. Larger = fewer, more significant pivots.")
+min_slope_ok = input.bool(true, "Require Meaningful Slope", group=GRP_DET,
+              tooltip="Reject near-horizontal lines (those are levels, not trendlines).")
+min_slope_atr = input.float(0.02, "Min Slope (×ATR per bar)", minval=0.0, maxval=0.5, step=0.01, group=GRP_DET)
+max_line_age = input.int(300, "Max Line Age (bars)", minval=50, maxval=1000, group=GRP_DET,
+              tooltip="Lines older than this are retired from active tracking.")
+
+touch_tol   = input.float(0.25, "Touch Tolerance (×ATR)", minval=0.05, maxval=1.0, step=0.05, group=GRP_TCH,
+              tooltip="How close price must come to the line to count as a touch.")
+break_buf   = input.float(0.3, "Break Buffer (×ATR)", minval=0.05, maxval=1.5, step=0.05, group=GRP_TCH,
+              tooltip="Close must clear the line by this margin to count as a break.")
+bounce_atr  = input.float(1.0, "Bounce Distance (×ATR)", minval=0.3, maxval=5.0, step=0.1, group=GRP_TCH,
+              tooltip="After a touch, price must move away at least this far (without breaking) for the touch to grade as a bounce.")
+outcome_bars = input.int(10, "Outcome Window (bars)", minval=3, maxval=50, group=GRP_TCH,
+              tooltip="Bars after a touch to decide bounce vs break.")
+
+show_labels = input.bool(true, "Line Stat Labels", group=GRP_VIS)
+show_touch_marks = input.bool(false, "Touch Markers", group=GRP_VIS)
+show_broken_lines = input.bool(false, "Show Broken Lines", group=GRP_VIS,
+              tooltip="ON: retired lines stay on the chart, dotted. OFF: retired lines are deleted immediately, decluttering the chart.")
+show_glow   = input.bool(true, "Trendline Glow", group=GRP_VIS,
+              tooltip="Soft fade extending away from each active trendline. Not a channel fill — each line fades independently.")
+glow_fade_atr = input.float(1.5, "Glow Fade Distance (×ATR)", minval=0.3, maxval=5.0, step=0.1, group=GRP_VIS,
+              tooltip="How far the glow extends before fully fading to transparent.")
+
+show_hud = input.bool(true, "Show Dashboard", group=GRP_HUD)
+hud_pos  = input.string("Top Right", "Position",
+           options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=GRP_HUD)
+
+
+// CONTEXT
+atr_raw = ta.atr(14)
+
+// PIVOTS
+ph = ta.pivothigh(high, pivot_leg, pivot_leg)
+pl = ta.pivotlow(low,  pivot_leg, pivot_leg)
+
+
+// TREND LINE STATE:  one active resistance (through pivot highs, sloping)
+// and one active support (through pivot lows)
+type TLine
+    int   x1
+    float y1
+    float slope
+    int   touches
+    int   bounces
+    int   breaks
+    bool  active
+    line  ln
+    label lbl
+
+var TLine res_tl = na
+var TLine sup_tl = na
+
+// Recent pivots storage
+var int[]   ph_bars   = array.new<int>()
+var float[] ph_prices = array.new<float>()
+var int[]   pl_bars   = array.new<int>()
+var float[] pl_prices = array.new<float>()
+
+var int   res_pend_bar   = na
+var float res_pend_price = na
+var int   sup_pend_bar   = na
+var float sup_pend_price = na
+
+var int g_touches = 0
+var int g_bounces = 0
+var int g_breaks  = 0
+
+f_line_val(TLine tl, int b) =>
+    tl.y1 + tl.slope * float(b - tl.x1)
+
+f_update_label(TLine tl, bool is_res) =>
+    if not na(tl.lbl)
+        label.delete(tl.lbl)
+    string s = (is_res ? "RES  " : "SUP  ") + str.tostring(tl.touches) + " touches · " +
+               str.tostring(tl.bounces) + " bounced"
+    tl.lbl := label.new(bar_index + 3, f_line_val(tl, bar_index + 3), s,
+                        style=is_res ? label.style_label_lower_left : label.style_label_upper_left,
+                        color=color.new(#000000, 100),
+                        textcolor=is_res ? C_BEAR : C_BULL,
+                        size=size.small)
+    tl
+
+f_extend(TLine tl) =>
+    if not na(tl.ln)
+        line.set_x2(tl.ln, bar_index + 3)
+        line.set_y2(tl.ln, f_line_val(tl, bar_index + 3))
+    tl
+
+f_retire(TLine tl) =>
+    if show_broken_lines
+        if not na(tl.ln)
+            line.set_style(tl.ln, line.style_dashed)
+    else
+        if not na(tl.ln)
+            line.delete(tl.ln)
+        if not na(tl.lbl)
+            label.delete(tl.lbl)
+        tl.ln  := na
+        tl.lbl := na
+    tl
+
+
+if barstate.isconfirmed
+
+    // ── COLLECT PIVOTS 
+    if not na(ph)
+        array.push(ph_bars,   bar_index - pivot_leg)
+        array.push(ph_prices, ph)
+        if array.size(ph_bars) > 10
+            array.shift(ph_bars)
+            array.shift(ph_prices)
+
+        // Try to build/replace resistance line from the two most recent pivot highs
+        if array.size(ph_bars) >= 2
+            int   b2 = array.get(ph_bars,   array.size(ph_bars) - 1)
+            float p2 = array.get(ph_prices, array.size(ph_prices) - 1)
+            int   b1 = array.get(ph_bars,   array.size(ph_bars) - 2)
+            float p1 = array.get(ph_prices, array.size(ph_prices) - 2)
+            float slp = (p2 - p1) / float(b2 - b1)
+            bool slope_ok = not min_slope_ok or math.abs(slp) >= min_slope_atr * atr_raw
+            if slope_ok
+                // Retire old line drawing
+                if not na(res_tl) and not na(res_tl.ln)
+                    line.set_x2(res_tl.ln, bar_index)
+                    line.set_y2(res_tl.ln, f_line_val(res_tl, bar_index))
+                if not na(res_tl) and not na(res_tl.lbl)
+                    label.delete(res_tl.lbl)
+                TLine ntl = TLine.new(b1, p1, slp, 0, 0, 0, true, na, na)
+                ntl.ln := line.new(b1, p1, bar_index + 3, f_line_val(ntl, bar_index + 3),
+                                   color=color.new(C_BEAR, 30), width=1)
+                res_tl := ntl
+                res_pend_bar := na
+
+    if not na(pl)
+        array.push(pl_bars,   bar_index - pivot_leg)
+        array.push(pl_prices, pl)
+        if array.size(pl_bars) > 10
+            array.shift(pl_bars)
+            array.shift(pl_prices)
+
+        if array.size(pl_bars) >= 2
+            int   b2l = array.get(pl_bars,   array.size(pl_bars) - 1)
+            float p2l = array.get(pl_prices, array.size(pl_prices) - 1)
+            int   b1l = array.get(pl_bars,   array.size(pl_bars) - 2)
+            float p1l = array.get(pl_prices, array.size(pl_prices) - 2)
+            float slpl = (p2l - p1l) / float(b2l - b1l)
+            bool slope_ok_l = not min_slope_ok or math.abs(slpl) >= min_slope_atr * atr_raw
+            if slope_ok_l
+                if not na(sup_tl) and not na(sup_tl.ln)
+                    line.set_x2(sup_tl.ln, bar_index)
+                    line.set_y2(sup_tl.ln, f_line_val(sup_tl, bar_index))
+                if not na(sup_tl) and not na(sup_tl.lbl)
+                    label.delete(sup_tl.lbl)
+                TLine ntl2 = TLine.new(b1l, p1l, slpl, 0, 0, 0, true, na, na)
+                ntl2.ln := line.new(b1l, p1l, bar_index + 3, f_line_val(ntl2, bar_index + 3),
+                                    color=color.new(C_BULL, 30), width=1)
+                sup_tl := ntl2
+                sup_pend_bar := na
+
+    // RESISTANCE: touch detection + pending outcome grading 
+    if not na(res_tl) and res_tl.active
+        float rv = f_line_val(res_tl, bar_index)
+        bool too_old_r = (bar_index - res_tl.x1) > max_line_age
+
+        // Grade pending touch
+        if not na(res_pend_bar)
+            float touch_lv = res_pend_price
+            bool broke   = close > touch_lv + break_buf * atr_raw
+            bool bounced = (touch_lv - close) >= bounce_atr * atr_raw
+            bool timed_out = (bar_index - res_pend_bar) >= outcome_bars
+            if broke
+                res_tl.breaks += 1
+                g_breaks += 1
+                g_touches += 1
+                res_tl.active := false
+                res_tl := f_retire(res_tl)
+                res_pend_bar := na
+            else if bounced
+                res_tl.bounces += 1
+                g_bounces += 1
+                g_touches += 1
+                res_pend_bar := na
+                res_tl := f_update_label(res_tl, true)
+            else if timed_out
+                g_touches += 1
+                res_pend_bar := na
+
+        // New touch: high reaches the line, close stays below
+        if res_tl.active and na(res_pend_bar)
+            if high >= rv - touch_tol * atr_raw and close < rv
+                res_tl.touches += 1
+                res_pend_bar   := bar_index
+                res_pend_price := rv
+                res_tl := f_update_label(res_tl, true)
+                if show_touch_marks
+                    label.new(bar_index, high + atr_raw * 0.3, "◦",
+                              style=label.style_label_down,
+                              color=color.new(#000000, 100), textcolor=C_BEAR, size=size.tiny)
+
+        // Immediate hard break without prior touch pending
+        if res_tl.active and close > rv + break_buf * atr_raw
+            res_tl.active := false
+            res_tl := f_retire(res_tl)
+
+        if too_old_r
+            res_tl.active := false
+            res_tl := f_retire(res_tl)
+
+        if res_tl.active
+            res_tl := f_extend(res_tl)
+
+    // SUPPORT: mirrored 
+    if not na(sup_tl) and sup_tl.active
+        float sv = f_line_val(sup_tl, bar_index)
+        bool too_old_s = (bar_index - sup_tl.x1) > max_line_age
+
+        if not na(sup_pend_bar)
+            float touch_lv_s = sup_pend_price
+            bool broke_s   = close < touch_lv_s - break_buf * atr_raw
+            bool bounced_s = (close - touch_lv_s) >= bounce_atr * atr_raw
+            bool timed_out_s = (bar_index - sup_pend_bar) >= outcome_bars
+            if broke_s
+                sup_tl.breaks += 1
+                g_breaks += 1
+                g_touches += 1
+                sup_tl.active := false
+                sup_tl := f_retire(sup_tl)
+                sup_pend_bar := na
+            else if bounced_s
+                sup_tl.bounces += 1
+                g_bounces += 1
+                g_touches += 1
+                sup_pend_bar := na
+                sup_tl := f_update_label(sup_tl, false)
+            else if timed_out_s
+                g_touches += 1
+                sup_pend_bar := na
+
+        if sup_tl.active and na(sup_pend_bar)
+            if low <= sv + touch_tol * atr_raw and close > sv
+                sup_tl.touches += 1
+                sup_pend_bar   := bar_index
+                sup_pend_price := sv
+                sup_tl := f_update_label(sup_tl, false)
+                if show_touch_marks
+                    label.new(bar_index, low - atr_raw * 0.3, "◦",
+                              style=label.style_label_up,
+                              color=color.new(#000000, 100), textcolor=C_BULL, size=size.tiny)
+
+        if sup_tl.active and close < sv - break_buf * atr_raw
+            sup_tl.active := false
+            sup_tl := f_retire(sup_tl)
+
+        if too_old_s
+            sup_tl.active := false
+            sup_tl := f_retire(sup_tl)
+
+        if sup_tl.active
+            sup_tl := f_extend(sup_tl)
+
+
+// TRENDLINE GLOW:each line fades independently away from itself.
+float res_plot_val  = (not na(res_tl) and res_tl.active) ? f_line_val(res_tl, bar_index) : na
+float res_plot_fade = na(res_plot_val) ? na : res_plot_val - glow_fade_atr * atr_raw
+float sup_plot_val  = (not na(sup_tl) and sup_tl.active) ? f_line_val(sup_tl, bar_index) : na
+float sup_plot_fade = na(sup_plot_val) ? na : sup_plot_val + glow_fade_atr * atr_raw
+
+p_res_a = plot(show_glow ? res_plot_val  : na, display=display.none)
+p_res_b = plot(show_glow ? res_plot_fade : na, display=display.none)
+fill(p_res_a, p_res_b,
+     top_color=color.new(C_BEAR, 45), bottom_color=color.new(C_BEAR, 100),
+     top_value=res_plot_val, bottom_value=res_plot_fade,
+     title="Resistance Glow")
+
+p_sup_a = plot(show_glow ? sup_plot_val  : na, display=display.none)
+p_sup_b = plot(show_glow ? sup_plot_fade : na, display=display.none)
+fill(p_sup_a, p_sup_b,
+     top_color=color.new(C_BULL, 100), bottom_color=color.new(C_BULL, 45),
+     top_value=sup_plot_fade, bottom_value=sup_plot_val,
+     title="Support Glow")
+
+
+// DASHBOARD
+f_hud_pos(string s) =>
+    switch s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        =>                position.bottom_left
+
+var table hud = table.new(f_hud_pos(hud_pos), 2, 8,
+                           bgcolor=C_BG, border_color=C_BORD,
+                           border_width=1, frame_color=C_BORD, frame_width=2)
+
+if show_hud and barstate.islast
+    table.cell(hud, 0, 0, "AUTO TRENDLINES [D3R]", text_color=C_TXT,
+               bgcolor=color.new(#1e293b, 0), text_size=size.small, text_halign=text.align_center)
+    table.merge_cells(hud, 0, 0, 1, 0)
+
+    string res_s = na(res_tl) ? "—" : res_tl.active ? str.tostring(res_tl.touches) + "t · " + str.tostring(res_tl.bounces) + "b" : "broken"
+    table.cell(hud, 0, 1, "Resistance", text_color=C_DIM, bgcolor=color.new(#1e293b, 40), text_size=size.small)
+    table.cell(hud, 1, 1, res_s,
+               text_color=na(res_tl) or not res_tl.active ? C_DIM : C_BEAR,
+               bgcolor=color.new(#1e293b, 40), text_size=size.small, text_halign=text.align_center)
+
+    string sup_s = na(sup_tl) ? "—" : sup_tl.active ? str.tostring(sup_tl.touches) + "t · " + str.tostring(sup_tl.bounces) + "b" : "broken"
+    table.cell(hud, 0, 2, "Support", text_color=C_DIM, bgcolor=color.new(#0f172a, 40), text_size=size.small)
+    table.cell(hud, 1, 2, sup_s,
+               text_color=na(sup_tl) or not sup_tl.active ? C_DIM : C_BULL,
+               bgcolor=color.new(#0f172a, 40), text_size=size.small, text_halign=text.align_center)
+
+    float bounce_rate = g_touches > 0 ? float(g_bounces) / float(g_touches) * 100.0 : na
+    table.cell(hud, 0, 3, "Bounce Rate", text_color=C_DIM, bgcolor=color.new(#1e293b, 40), text_size=size.small)
+    table.cell(hud, 1, 3, na(bounce_rate) ? "—" : str.tostring(math.round(bounce_rate)) + "%  (n=" + str.tostring(g_touches) + ")",
+               text_color=na(bounce_rate) ? C_DIM : bounce_rate >= 50 ? C_GREEN : C_AMBER,
+               bgcolor=color.new(#1e293b, 40), text_size=size.small, text_halign=text.align_center)
+
+    table.cell(hud, 0, 4, "Breaks", text_color=C_DIM, bgcolor=color.new(#0f172a, 40), text_size=size.tiny)
+    table.cell(hud, 1, 4, str.tostring(g_breaks),
+               text_color=C_DIM, bgcolor=color.new(#0f172a, 40),
+               text_size=size.tiny, text_halign=text.align_center)
+
+    table.cell(hud, 0, 5, "Pivot Leg", text_color=C_DIM, bgcolor=color.new(#1e293b, 40), text_size=size.tiny)
+    table.cell(hud, 1, 5, str.tostring(pivot_leg) + " bars",
+               text_color=C_DIM, bgcolor=color.new(#1e293b, 40),
+               text_size=size.tiny, text_halign=text.align_center)
+
+
+// ALERTS
+bool res_touch_now = not na(res_tl) and res_tl.active and not na(res_pend_bar) and res_pend_bar == bar_index
+bool sup_touch_now = not na(sup_tl) and sup_tl.active and not na(sup_pend_bar) and sup_pend_bar == bar_index
+bool res_active_now = not na(res_tl) and res_tl.active
+bool sup_active_now = not na(sup_tl) and sup_tl.active
+
+var bool res_was_active = false
+var bool sup_was_active = false
+
+bool res_broken_now = res_was_active and not res_active_now
+bool sup_broken_now = sup_was_active and not sup_active_now
+
+res_was_active := res_active_now
+sup_was_active := sup_active_now
+
+alertcondition(res_touch_now,  "Resistance Touch", "D3R ATL: price touched the resistance trendline")
+alertcondition(sup_touch_now,  "Support Touch",    "D3R ATL: price touched the support trendline")
+alertcondition(res_broken_now, "Resistance Break", "D3R ATL: resistance trendline broken")
+alertcondition(sup_broken_now, "Support Break",    "D3R ATL: support trendline broken")

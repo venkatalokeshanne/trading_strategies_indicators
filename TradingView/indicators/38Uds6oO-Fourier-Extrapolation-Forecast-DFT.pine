@@ -1,0 +1,88 @@
+//@version=6
+
+indicator("DFT", overlay=true, max_lines_count=500, max_bars_back=1000)
+
+// Settings
+length = input.int(128, minval=8, title="DFT Length")
+forecast_length = input.int(14, minval=1, title="Forecast Length")
+num_harmonics = input.int(8, minval=1, title="Harmonics Used")
+anchor_to_close = input.bool(true, title="Anchor Forecast to Last Close")
+
+src = close
+
+// Truncated inverse DFT of the detrended residual, evaluated at time index t_.
+// t_ may point beyond the sampled window (t_ >= n_) for extrapolation.
+// Uses real/imag parts directly instead of magnitude/phase, so no quadrant
+// ambiguity from atan().
+recon(re_, im_, n_, m_, t_) =>
+    total = array.get(re_, 0) / n_
+    for k = 1 to m_
+        angle = 2 * math.pi * k * t_ / n_
+        total += 2.0 / n_ * (array.get(re_, k) * math.cos(angle) - array.get(im_, k) * math.sin(angle))
+    total
+
+var forecast_lines = array.new_line()
+
+if barstate.islast
+    // Redraw from scratch on every update of the last bar
+    while array.size(forecast_lines) > 0
+        line.delete(array.pop(forecast_lines))
+
+    n = length
+
+    // Rebuild the window in chronological order: s[0] = oldest, s[n-1] = current bar.
+    // src[j] counts backwards in time, so it must be flipped before the DFT,
+    // otherwise the extrapolation runs in the wrong time direction.
+    s = array.new_float(n, 0.0)
+    for t = 0 to n - 1
+        array.set(s, t, src[n - 1 - t])
+
+    // Least-squares linear trend over the window. The DFT only models the
+    // residual: a DFT extrapolation is periodic, so without detrending the
+    // forecast snaps back toward the oldest prices in the window.
+    sum_x = 0.0
+    sum_y = 0.0
+    sum_xy = 0.0
+    sum_x2 = 0.0
+    for t = 0 to n - 1
+        y = array.get(s, t)
+        sum_x += t
+        sum_y += y
+        sum_xy += t * y
+        sum_x2 += t * t
+    slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x)
+    intercept = (sum_y - slope * sum_x) / n
+
+    resid = array.new_float(n, 0.0)
+    for t = 0 to n - 1
+        array.set(resid, t, array.get(s, t) - (intercept + slope * t))
+
+    // DFT coefficients for the low harmonics only; the high ones mostly fit noise
+    m = math.min(num_harmonics, n / 2 - 1)
+    re = array.new_float(m + 1, 0.0)
+    im = array.new_float(m + 1, 0.0)
+    for k = 0 to m
+        re_sum = 0.0
+        im_sum = 0.0
+        for t = 0 to n - 1
+            angle = 2 * math.pi * k * t / n
+            re_sum += array.get(resid, t) * math.cos(angle)
+            im_sum -= array.get(resid, t) * math.sin(angle)
+        array.set(re, k, re_sum)
+        array.set(im, k, im_sum)
+
+    // Shift the whole forecast so it starts exactly at the last close
+    model_now = intercept + slope * (n - 1) + recon(re, im, n, m, n - 1)
+    offset = anchor_to_close ? src - model_now : 0.0
+
+    // First forecast point is the NEXT bar (h = 1). The segment drawn from the
+    // current bar only connects the last close to that first forecast point.
+    prev_y = model_now + offset
+    for h = 1 to forecast_length
+        t = n - 1 + h
+        y = intercept + slope * t + recon(re, im, n, m, t) + offset
+        array.push(forecast_lines, line.new(x1=bar_index + h - 1, y1=prev_y, x2=bar_index + h, y2=y, color=color.red, width=2))
+        prev_y := y
+
+// Plot the original price for reference
+plot(src, color=color.blue, linewidth=1, title="Price")

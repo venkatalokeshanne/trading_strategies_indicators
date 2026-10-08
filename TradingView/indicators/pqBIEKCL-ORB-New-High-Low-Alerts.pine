@@ -1,0 +1,145 @@
+//@version=6
+indicator("ORB + New High Alerts", overlay=true)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+or_min     = input.int(15, "Opening range (minutes)", options=[5, 15, 30])
+orb_mode   = input.string("close", "ORB trigger", options=["close", "touch"],
+             tooltip="close = a candle must CLOSE beyond the range (filters wick fakeouts); touch = any wick through fires immediately")
+confirm_tf = input.string("5", "ORB confirm timeframe (min)", options=["chart", "5", "15"],
+             tooltip="Which candle close confirms the ORB break in close mode. '5' waits for the 5-minute close even on a 1m chart. Falls back to the chart's own close if the chart timeframe is coarser than this.")
+confirm_bars = input.int(2, "Confirm bars past OR before alert (close mode only)", minval=1, maxval=5,
+             tooltip="Consecutive confirm-timeframe closes beyond the range required before the ORB alert fires. 1 = fire on the breakout bar itself (early — this is the chasing entry). 2 = wait for one bar of hold-through past the break before alerting.")
+do_orb_hi  = input.bool(true,  "Alert: ORB high break")
+do_orb_lo  = input.bool(true,  "Alert: ORB low break")
+do_hi5     = input.bool(true,  "Alert: new 5-min high")
+do_hi15    = input.bool(true,  "Alert: new 15-min high")
+pause_min  = input.int(10, "New-high pause filter (min)", minval=0,
+             tooltip="A new-high alert only fires if the stock had NOT made a new high for at least this many minutes — otherwise a steady trend fires on every bar.")
+do_ema_exit = input.bool(true, "Alert: EMA trail exit (after ORB↑ fires)")
+ema_len     = input.int(5, "Trail EMA length (confirm-tf closes)", minval=1)
+
+// ── Day / session tracking (same reset pattern as the ATR box) ──────────────
+new_day = ta.change(time("D")) != 0
+
+var int   rth_t0    = na
+var float or_h      = na
+var float or_l      = na
+var bool  broke_hi  = false
+var bool  broke_lo  = false
+var int   hi_streak = 0
+var int   lo_streak = 0
+var bool  exited_hi = false
+var bool  exited_lo = false
+var float ema_val   = na
+
+if new_day
+    rth_t0    := na
+    or_h      := na
+    or_l      := na
+    broke_hi  := false
+    broke_lo  := false
+    hi_streak := 0
+    lo_streak := 0
+    exited_hi := false
+    exited_lo := false
+    ema_val   := na
+
+rth_start = session.ismarket and (not session.ismarket[1] or new_day)
+if rth_start
+    rth_t0 := time
+
+in_or   = session.ismarket and not na(rth_t0) and time <  rth_t0 + or_min * 60000
+or_done = session.ismarket and not na(rth_t0) and time >= rth_t0 + or_min * 60000
+
+if in_or
+    or_h := na(or_h) ? high : math.max(or_h, high)
+    or_l := na(or_l) ? low  : math.min(or_l,  low)
+
+// ── ORB breaks (once per day each) ──────────────────────────────────────────
+// "close" mode: the alert fires only when a candle on the CONFIRM timeframe
+// finishes beyond the range — a wick through (GOOGL 2026-07-27: multiple
+// pokes above ORH before the 9:55/10:07 5m closes) stays silent.
+// Higher-TF confirm trick: ta.change(time(tf)) fires on the first chart bar
+// of a new tf-period, at which point close[1] IS the just-completed tf close
+// (chart bars subdivide the confirm bar evenly). If the chart is coarser
+// than the confirm TF, fall back to the chart's own close.
+use_chart_close = confirm_tf == "chart" or timeframe.in_seconds() >= timeframe.in_seconds(confirm_tf)
+conf_boundary   = use_chart_close ? barstate.isconfirmed : ta.change(time(confirm_tf)) != 0
+conf_close      = use_chart_close ? close : close[1]
+
+// "touch" mode fires immediately on any wick through — no hold-through concept,
+// so confirm_bars is ignored there. "close" mode requires `confirm_bars`
+// CONSECUTIVE confirm-tf closes beyond the range before alerting: a break that
+// closes beyond the level once and then fails back inside resets the streak to
+// zero (SPCX 2026-08-07: 9:50/9:55 5m candles never closed above the 15m OR,
+// so the streak stayed at 0 until the 10:00 close, then confirmed on 10:05).
+if or_done and not na(or_h)
+    if orb_mode == "touch"
+        if do_orb_hi and not broke_hi and high > or_h
+            broke_hi := true
+            alert(syminfo.ticker + " ORB↑ — broke " + str.tostring(or_min) + "m opening-range high "
+                  + str.tostring(or_h, format.mintick), alert.freq_once_per_bar)
+        if do_orb_lo and not broke_lo and low < or_l
+            broke_lo := true
+            alert(syminfo.ticker + " ORB↓ — broke " + str.tostring(or_min) + "m opening-range low "
+                  + str.tostring(or_l, format.mintick), alert.freq_once_per_bar)
+    else if conf_boundary
+        hi_streak := conf_close > or_h ? hi_streak + 1 : 0
+        lo_streak := conf_close < or_l ? lo_streak + 1 : 0
+
+        if do_orb_hi and not broke_hi and hi_streak >= confirm_bars
+            broke_hi := true
+            alert(syminfo.ticker + " ORB↑ — held " + str.tostring(confirm_bars) + " confirm-bar close(s) above "
+                  + str.tostring(or_min) + "m opening-range high " + str.tostring(or_h, format.mintick),
+                  alert.freq_once_per_bar)
+        if do_orb_lo and not broke_lo and lo_streak >= confirm_bars
+            broke_lo := true
+            alert(syminfo.ticker + " ORB↓ — held " + str.tostring(confirm_bars) + " confirm-bar close(s) below "
+                  + str.tostring(or_min) + "m opening-range low " + str.tostring(or_l, format.mintick),
+                  alert.freq_once_per_bar)
+
+// ── EMA trail exit — fires once, only after that side's ORB alert has fired ──
+prev_ema = ema_val
+if conf_boundary
+    ema_val := na(ema_val) ? conf_close : conf_close * (2.0 / (ema_len + 1)) + ema_val * (1 - 2.0 / (ema_len + 1))
+
+    if do_ema_exit and broke_hi and not exited_hi and not na(prev_ema) and conf_close < prev_ema
+        exited_hi := true
+        alert(syminfo.ticker + " trail exit — closed below " + str.tostring(ema_len) + "-bar EMA "
+              + str.tostring(prev_ema, format.mintick), alert.freq_once_per_bar)
+    if do_ema_exit and broke_lo and not exited_lo and not na(prev_ema) and conf_close > prev_ema
+        exited_lo := true
+        alert(syminfo.ticker + " trail exit — closed above " + str.tostring(ema_len) + "-bar EMA "
+              + str.tostring(prev_ema, format.mintick), alert.freq_once_per_bar)
+
+// ── Rolling new highs (5m / 15m), pause-filtered ────────────────────────────
+// Windows are defined in MINUTES and converted to bars for whatever timeframe
+// the chart is on, so "new 5m high" means the same thing on a 1m or 5m chart.
+_bars(mins) => math.max(1, math.round(mins * 60.0 / timeframe.in_seconds()))
+b5  = _bars(5)
+b15 = _bars(15)
+
+var int last_hi_bar = na
+hh5  = ta.highest(high, b5)[1]
+hh15 = ta.highest(high, b15)[1]
+
+paused = na(last_hi_bar) or (bar_index - last_hi_bar) >= _bars(pause_min)
+
+if session.ismarket and or_done
+    if do_hi15 and high > hh15 and paused
+        alert(syminfo.ticker + " new 15m high " + str.tostring(high, format.mintick),
+              alert.freq_once_per_bar)
+        last_hi_bar := bar_index
+    else if do_hi5 and high > hh5 and paused
+        alert(syminfo.ticker + " new 5m high " + str.tostring(high, format.mintick),
+              alert.freq_once_per_bar)
+        last_hi_bar := bar_index
+    else if high > hh5
+        last_hi_bar := bar_index   // still making highs — keep the pause clock at zero
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+plot(or_done ? or_h : na, "OR High", color=color.new(#00e5ff, 0), style=plot.style_linebr, linewidth=2)
+plot(or_done ? or_l : na, "OR Low",  color=color.new(#e040fb, 0), style=plot.style_linebr, linewidth=2)
+plot((broke_hi or broke_lo) and not na(ema_val) ? ema_val : na, "Trail EMA",
+     color=color.new(#ffb300, 0), style=plot.style_line, linewidth=1)
+bgcolor(in_or ? color.new(#00e5ff, 92) : na)

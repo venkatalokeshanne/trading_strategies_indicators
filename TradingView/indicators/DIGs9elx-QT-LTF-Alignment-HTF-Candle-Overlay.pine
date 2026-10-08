@@ -1,0 +1,163 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © RichBvwy
+
+//@version=6
+indicator("QT: LTF Alignment HTF Candle Overlay ", overlay=true, max_boxes_count=500, max_lines_count=500, max_bars_back=2000)
+
+var string GRP = "Display"
+bullColor   = input.color(color.new(color.blue, 70), "Bullish Candle Color", group=GRP)
+bearColor   = input.color(color.new(color.red,  70), "Bearish Candle Color", group=GRP)
+dojiColor   = input.color(color.new(color.gray, 70), "Doji / Neutral Color", group=GRP)
+wickWidth   = input.int(1, "Wick Width",  minval=1, maxval=3, group=GRP)
+bodyWidth   = input.int(2, "Body Width",  minval=1, maxval=4, group=GRP)
+showCurrent = input.bool(true, "Show Current (Forming) Candle", group=GRP)
+maxCandles  = input.int(50, "Max Candles Displayed", minval=5, maxval=200, group=GRP)
+
+bool is_1m  = timeframe.period == "1"
+bool is_5m  = timeframe.period == "5"
+bool is_15m = timeframe.period == "15"
+bool is_1h  = timeframe.period == "60"
+bool is_4h  = timeframe.period == "240"
+bool is_D   = timeframe.period == "D" or timeframe.period == "1D"
+bool is_W   = timeframe.period == "W" or timeframe.period == "1W"
+bool isSupported = is_1m or is_5m or is_15m or is_1h or is_4h or is_D or is_W
+
+string htfTF    = is_1m ? "15" : is_5m ? "60" : is_15m ? "240" : is_1h ? "D" : is_4h ? "W" : is_D ? "M" : "12M"
+string htfLabel = is_1m ? "15M" : is_5m ? "1H" : is_15m ? "4H" : is_1h ? "Daily" : is_4h ? "Weekly" : is_D ? "Monthly" : "Yearly"
+
+// Whether this HTF uses our own NY 18:00-anchored day/week/month grouping
+bool useSelfAgg = htfTF == "D" or htfTF == "W" or htfTF == "M"
+
+// ── NY-pinned custom trading day (new day begins 18:00 New York time, DST-aware) ──
+int nyHour   = hour(time, "America/New_York")
+int nyMinute = minute(time, "America/New_York")
+int nyDayNum = dayofmonth(time, "America/New_York")
+int nyMonNum = month(time, "America/New_York")
+int nyYrNum  = year(time, "America/New_York")
+
+bool rollForward   = (nyHour * 60 + nyMinute) >= 18 * 60
+int  baseMidnightNY = timestamp("America/New_York", nyYrNum, nyMonNum, nyDayNum, 0, 0)
+int  tradingMs      = baseMidnightNY + (rollForward ? 86400000 : 0)
+
+int tYear  = year(tradingMs, "America/New_York")
+int tMonth = month(tradingMs, "America/New_York")
+
+int nyDayIndex = int(tradingMs / 86400000)
+int weekIndex  = int(math.floor((nyDayIndex - 3) / 7.0))   // increments each Sunday (NY, 18:00-shifted)
+int monthIndex = tYear * 12 + (tMonth - 1)
+
+bool newTradingDay   = ta.change(nyDayIndex) != 0
+bool newTradingWeek  = ta.change(weekIndex)  != 0
+bool newTradingMonth = ta.change(monthIndex) != 0
+
+// ── FIX: 15M/1H/4H boundaries now come from timeframe.change(), not request.security() ──
+// request.security() + ta.change(htf_t) under lookahead_off only fires AFTER the HTF bar
+// closes and the security feed catches up, so box boundaries chased the real HTF open
+// instead of sitting on it — worse on symbols with session gaps (e.g. DXY). That's what was
+// producing the warped, unevenly-sized boxes. timeframe.change() reads the chart's own bar
+// time directly, so it lines up exactly with the real boundary every time, with zero repaint lag.
+bool isNewHTFBar = isSupported and (useSelfAgg ? (htfTF == "D" ? newTradingDay : htfTF == "W" ? newTradingWeek : newTradingMonth) : timeframe.change(htfTF))
+
+var int[]   htfBarOpen = array.new_int()
+var float[] htfO       = array.new_float()
+var float[] htfH       = array.new_float()
+var float[] htfL       = array.new_float()
+var float[] htfC       = array.new_float()
+
+if isNewHTFBar
+    array.push(htfBarOpen, bar_index)
+    array.push(htfO, open)
+    array.push(htfH, high)
+    array.push(htfL, low)
+    array.push(htfC, close)
+
+    while array.size(htfBarOpen) > maxCandles + 1
+        array.shift(htfBarOpen)
+        array.shift(htfO)
+        array.shift(htfH)
+        array.shift(htfL)
+        array.shift(htfC)
+
+// Update the latest stored candle in real-time so the forming bar tracks live price
+if isSupported and not isNewHTFBar and array.size(htfBarOpen) > 0
+    int lastIdx = array.size(htfBarOpen) - 1
+    array.set(htfH, lastIdx, math.max(array.get(htfH, lastIdx), high))
+    array.set(htfL, lastIdx, math.min(array.get(htfL, lastIdx), low))
+    array.set(htfC, lastIdx, close)
+
+var box[]  bodyBoxes = array.new_box()
+var line[] wickLines = array.new_line()
+
+f_clearDrawings() =>
+    for b in bodyBoxes
+        box.delete(b)
+    for l in wickLines
+        line.delete(l)
+    array.clear(bodyBoxes)
+    array.clear(wickLines)
+
+if barstate.islast and isSupported
+    f_clearDrawings()
+    int n = array.size(htfBarOpen)
+
+    if n > 0
+        for i = 0 to n - 1
+            int   x1 = array.get(htfBarOpen, i)
+            int   x2 = i < n - 1 ? array.get(htfBarOpen, i + 1) - 1 : bar_index
+            if x2 <= x1
+                x2 := x1 + 1
+
+            float o = array.get(htfO, i)
+            float h = array.get(htfH, i)
+            float l = array.get(htfL, i)
+            float c = array.get(htfC, i)
+
+            bool  isDoji    = math.abs(o - c) <= syminfo.mintick * 2
+            bool  bull      = c >= o
+            color cndlColor = isDoji ? dojiColor : bull ? bullColor : bearColor
+
+            float bodyTop = math.max(o, c)
+            float bodyBot = math.min(o, c)
+            if isDoji
+                bodyTop := bodyTop + syminfo.mintick
+                bodyBot := bodyBot - syminfo.mintick
+
+            bool isLast = (i == n - 1)
+            if isLast and not showCurrent
+                continue
+
+            box b = box.new(left=x1, top=bodyTop, right=x2, bottom=bodyBot, border_color=cndlColor, border_width=bodyWidth, bgcolor=color.new(cndlColor, 100))
+            array.push(bodyBoxes, b)
+
+            int midX = x1 + math.round((x2 - x1) / 2)
+
+            if h > bodyTop
+                array.push(wickLines, line.new(x1=midX, y1=bodyTop, x2=midX, y2=h, color=cndlColor, width=wickWidth, style=line.style_solid))
+            if l < bodyBot
+                array.push(wickLines, line.new(x1=midX, y1=bodyBot, x2=midX, y2=l, color=cndlColor, width=wickWidth, style=line.style_solid))
+
+if not isSupported and barstate.islastconfirmedhistory
+    label.new(bar_index, high, "HTF Candle Overlay: Unsupported TF\nSupported: 1M 5M 15M 1H 4H Daily Weekly", color=color.orange, textcolor=color.white, size=size.normal, style=label.style_label_left)
+
+var table tbl = table.new(position.top_right, 2, 2, bgcolor=color.new(color.white, 70), border_color=color.gray, border_width=1, frame_color=color.gray, frame_width=1)
+
+if barstate.islast and isSupported
+    table.cell(tbl, 0, 0, "Chart TF",    text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 0, timeframe.period, text_color=color.green, text_size=size.small)
+    table.cell(tbl, 0, 1, "HTF Candles", text_color=color.silver, text_size=size.small)
+    table.cell(tbl, 1, 1, htfLabel,      text_color=color.red, text_size=size.small)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Signature
+// ─────────────────────────────────────────────────────────────────────────────
+var table sigTable = table.new(
+     position.bottom_center, 1, 1,
+     bgcolor      = color.new(color.black, 100),
+     border_color = color.new(color.black, 100),
+     border_width = 0,
+     frame_color  = color.new(color.black, 100),
+     frame_width  = 0)
+table.cell(sigTable, 0, 0, "ᵣᵢCₕ BᵥWY",
+     text_color  = color.new(color.gray, 85),
+     text_size   = size.small,
+     text_halign = text.align_center,
+     text_valign = text.align_center)

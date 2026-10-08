@@ -1,0 +1,740 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// ©SG_Group
+
+//@version=6
+
+// Attribution and correction notice:
+// A prior version included an optional ATR-normalized MACD display. Following
+// feedback from Alex Spiroglou, originator of "MACD-V: Volatility Normalised
+// Momentum" (2022), that option has been removed in full to avoid ambiguity or
+// reliance on the MACD-V concept. This script does not implement MACD/ATR
+// normalization, MACD-V ranges, trend-regime filters, the Momentum Lifecycle
+// RoadMap, or associated MACD-V techniques. MACD is attributed to Gerald Appel.
+
+indicator(
+     "MACD Momentum Phase & Acceleration Observatory",
+     overlay = false,
+     format = format.inherit,
+     precision = 4)
+
+//------------------------------------------------------------------------------
+// Constants and reusable helpers
+//------------------------------------------------------------------------------
+const float EPSILON = 1e-10
+
+f_clamp(float value, float lowerBound, float upperBound) =>
+    math.max(lowerBound, math.min(upperBound, value))
+
+f_safe_div(float numerator, float denominator) =>
+    not na(numerator) and not na(denominator) and math.abs(denominator) > EPSILON ? numerator / denominator : na
+
+f_scale_divisor(simple string mode, float slowValue) =>
+    switch mode
+        "Percent of Slow Average" => math.abs(slowValue) * 0.01
+        => 1.0
+
+const string GROUP_CORE      = "1. MACD Engine"
+const string GROUP_SCALE     = "2. Display Scale"
+const string GROUP_DYNAMICS  = "3. Momentum Dynamics"
+const string GROUP_VISUALS   = "4. Visual Layers"
+const string GROUP_MARKERS   = "5. Event Markers"
+const string GROUP_READOUT   = "6. Context Readout"
+const string GROUP_COLORS    = "7. Visual Palette"
+const string GROUP_ALERTS    = "8. Alerts"
+
+f_ma(series float sourceValue, simple int lengthValue, simple string averageType) =>
+    switch averageType
+        "SMA" => ta.sma(sourceValue, lengthValue)
+        "RMA" => ta.rma(sourceValue, lengthValue)
+        "WMA" => ta.wma(sourceValue, lengthValue)
+        "HMA" => ta.hma(sourceValue, lengthValue)
+        => ta.ema(sourceValue, lengthValue)
+
+f_position(simple string selection) =>
+    switch selection
+        "Top Left" => position.top_left
+        "Middle Left" => position.middle_left
+        "Bottom Left" => position.bottom_left
+        "Top Center" => position.top_center
+        "Bottom Center" => position.bottom_center
+        "Middle Right" => position.middle_right
+        "Bottom Right" => position.bottom_right
+        => position.top_right
+
+f_text_size(simple string selection) =>
+    switch selection
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Large" => size.large
+        "Huge" => size.huge
+        => size.normal
+
+f_number(float value) =>
+    na(value) ? "n/a" : str.tostring(value, "#.######")
+
+f_percent(float value) =>
+    na(value) ? "n/a" : str.tostring(value, "#.0") + "%"
+
+f_readout_row(table panel, int rowIndex, string labelText, string valueText, color valueColor, color rowColor, simple string sizeSelection) =>
+    table.cell(panel, 0, rowIndex, labelText,
+         text_color = color.new(color.white, 22),
+         text_size = f_text_size(sizeSelection),
+         text_halign = text.align_left,
+         bgcolor = rowColor)
+    table.cell(panel, 1, rowIndex, valueText,
+         text_color = valueColor,
+         text_size = f_text_size(sizeSelection),
+         text_halign = text.align_right,
+         bgcolor = rowColor)
+
+//------------------------------------------------------------------------------
+// Inputs — all values remain available in Settings while staying out of the
+// chart status line so the top-left label shows only the full indicator name.
+//------------------------------------------------------------------------------
+float sourceInput = input.source(close, "Source",
+     group = GROUP_CORE,
+     display = display.none,
+     tooltip = "Price series used by the fast and slow moving averages.")
+int fastLength = input.int(12, "Fast Length", minval = 1, maxval = 1000,
+     group = GROUP_CORE,
+     display = display.none,
+     tooltip = "Length of the faster moving average. It must be lower than Slow Length.")
+string fastAverageType = input.string("EMA", "Fast Average Type", options = ["EMA", "SMA", "RMA", "WMA", "HMA"],
+     group = GROUP_CORE,
+     display = display.none)
+int slowLength = input.int(26, "Slow Length", minval = 2, maxval = 2000,
+     group = GROUP_CORE,
+     display = display.none,
+     tooltip = "Length of the slower moving average. It must be higher than Fast Length.")
+string slowAverageType = input.string("EMA", "Slow Average Type", options = ["EMA", "SMA", "RMA", "WMA", "HMA"],
+     group = GROUP_CORE,
+     display = display.none)
+int signalLength = input.int(9, "Signal Length", minval = 1, maxval = 1000,
+     group = GROUP_CORE,
+     display = display.none)
+string signalAverageType = input.string("EMA", "Signal Average Type", options = ["EMA", "SMA", "RMA", "WMA", "HMA"],
+     group = GROUP_CORE,
+     display = display.none)
+
+string scaleMode = input.string("Raw MACD", "Display Mode", options = ["Raw MACD", "Percent of Slow Average"],
+     group = GROUP_SCALE,
+     display = display.none,
+     tooltip = "Raw MACD preserves native price units. Percent of Slow Average divides MACD, Signal, and Histogram by one percent of the absolute Slow Average. Analytical events are calculated from the raw MACD and Signal series, so the display unit cannot rewrite event history.")
+
+int accelerationSmoothing = input.int(3, "Histogram Acceleration Smoothing", minval = 1, maxval = 100,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Smooths one-bar Histogram change. Display acceleration uses the selected display scale, while phase classification uses the raw MACD structure so changing the display scale does not rewrite the analytical state.")
+int phaseNoiseLength = input.int(8, "Phase Noise Length", minval = 2, maxval = 500,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Estimates ordinary one-bar movement in absolute Histogram magnitude. The resulting deadband reduces phase switching caused by very small changes around zero velocity.")
+float phaseNoiseMultiplier = input.float(0.25, "Phase Noise Multiplier", minval = 0.0, maxval = 5.0, step = 0.05,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Scales the adaptive phase deadband. Higher values require a clearer magnitude change before Expansion or Contraction is allowed to replace the prior motion state.")
+int equilibriumLength = input.int(34, "Adaptive Equilibrium Length", minval = 2, maxval = 2000,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Lookback used to estimate the recent mean absolute histogram magnitude.")
+float equilibriumMultiplier = input.float(0.28, "Equilibrium Band Multiplier", minval = 0.0, maxval = 5.0, step = 0.01,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "The equilibrium entry band equals the EMA of absolute raw Histogram magnitude multiplied by this value.")
+float equilibriumExitMultiplier = input.float(1.25, "Equilibrium Exit Hysteresis", minval = 1.0, maxval = 5.0, step = 0.05,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Once Near Equilibrium is active, the Histogram must leave a wider band before the state changes. This hysteresis reduces rapid state flapping near the boundary.")
+int magnitudeLookback = input.int(120, "Magnitude Rank Lookback", minval = 10, maxval = 5000,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Lookback for the robust Histogram magnitude score. The score can use observation rank, rolling-range position, or a hybrid of both.")
+string magnitudeScoreMethod = input.string("Hybrid Rank", "Magnitude Score Method", options = ["Hybrid Rank", "Percent Rank", "Range Rank"],
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Percent Rank is less dominated by one extreme observation. Range Rank preserves excursion size inside the rolling minimum-to-maximum span. Hybrid Rank combines 65% Percent Rank with 35% Range Rank.")
+float subduedThreshold = input.float(20.0, "Subdued Magnitude Threshold", minval = 0.0, maxval = 99.0, step = 1.0,
+     group = GROUP_DYNAMICS,
+     display = display.none)
+float reactivationThreshold = input.float(35.0, "Magnitude Reactivation Threshold", minval = 1.0, maxval = 100.0, step = 1.0,
+     group = GROUP_DYNAMICS,
+     display = display.none)
+float extendedThreshold = input.float(80.0, "Extended Magnitude Threshold", minval = 1.0, maxval = 100.0, step = 1.0,
+     group = GROUP_DYNAMICS,
+     display = display.none)
+int minimumSubduedBars = input.int(3, "Minimum Subdued Bars", minval = 1, maxval = 100,
+     group = GROUP_DYNAMICS,
+     display = display.none)
+int efficiencyLength = input.int(20, "MACD Path Efficiency Length", minval = 2, maxval = 1000,
+     group = GROUP_DYNAMICS,
+     display = display.none,
+     tooltip = "Compares net MACD displacement with total MACD travel over the selected lookback. The result is descriptive and ranges from 0 to 100.")
+
+bool showHistogram = input.bool(true, "Show Histogram",
+     group = GROUP_VISUALS,
+     display = display.none)
+bool showHistogramGlow = input.bool(true, "Show Histogram Depth Layer",
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showHistogram)
+bool fadeLowMagnitudeBars = input.bool(true, "Fade Lower-Magnitude Histogram Bars",
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showHistogram)
+bool showMacdLine = input.bool(true, "Show MACD Line",
+     group = GROUP_VISUALS,
+     display = display.none)
+bool showSignalLine = input.bool(true, "Show Signal Line",
+     group = GROUP_VISUALS,
+     display = display.none)
+bool showLineGlow = input.bool(true, "Show Line Glow",
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showMacdLine or showSignalLine)
+bool showLineFill = input.bool(true, "Fill Between MACD and Signal",
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showMacdLine and showSignalLine)
+bool showEquilibriumBand = input.bool(true, "Show Adaptive Equilibrium Band",
+     group = GROUP_VISUALS,
+     display = display.none)
+bool showPhaseRail = input.bool(true, "Show Momentum Phase Rail at Zero",
+     group = GROUP_VISUALS,
+     display = display.none,
+     tooltip = "Colors the zero line by the current histogram phase without adding another scale.")
+bool showPhaseBackground = input.bool(false, "Show Phase Background Tint",
+     group = GROUP_VISUALS,
+     display = display.none)
+int backgroundTransparency = input.int(94, "Background Transparency", minval = 75, maxval = 100,
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showPhaseBackground)
+int lineFillTransparency = input.int(88, "Line Fill Transparency", minval = 50, maxval = 100,
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showLineFill)
+int histogramGlowTransparency = input.int(78, "Histogram Depth Transparency", minval = 0, maxval = 100,
+     group = GROUP_VISUALS,
+     display = display.none,
+     active = showHistogram and showHistogramGlow)
+
+bool showSignalCrossMarkers = input.bool(true, "Signal-Line Cross Markers",
+     group = GROUP_MARKERS,
+     display = display.none)
+bool showAccelerationTurnMarkers = input.bool(false, "Acceleration Turn Markers",
+     group = GROUP_MARKERS,
+     display = display.none)
+bool showZeroCrossMarkers = input.bool(false, "MACD Zero-Cross Markers",
+     group = GROUP_MARKERS,
+     display = display.none)
+bool showMagnitudeReactivationMarkers = input.bool(true, "Magnitude Reactivation Markers",
+     group = GROUP_MARKERS,
+     display = display.none)
+
+string readoutMode = input.string("Compact", "Readout Mode", options = ["Off", "Compact", "Detailed"],
+     group = GROUP_READOUT,
+     display = display.none)
+string readoutPosition = input.string("Top Right", "Readout Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+string readoutTextSize = input.string("Normal", "Readout Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"],
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+string readoutHeaderSize = input.string("Normal", "Header Text Size", options = ["Tiny", "Small", "Normal", "Large", "Huge"],
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+color readoutBackground = input.color(color.rgb(16, 20, 30), "Readout Background",
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+color readoutHeaderBackground = input.color(color.rgb(35, 42, 58), "Readout Header Background",
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+color readoutBorderColor = input.color(color.rgb(75, 88, 112), "Readout Border",
+     group = GROUP_READOUT,
+     display = display.none,
+     active = readoutMode != "Off")
+
+color macdLineColor = input.color(color.rgb(245, 247, 250), "MACD Line",
+     group = GROUP_COLORS,
+     display = display.none)
+color signalLineColor = input.color(color.rgb(41, 121, 255), "Signal Line",
+     group = GROUP_COLORS,
+     display = display.none)
+color positiveExpansionColor = input.color(color.rgb(0, 230, 118), "Positive Expansion",
+     group = GROUP_COLORS,
+     display = display.none)
+color positiveContractionColor = input.color(color.rgb(0, 191, 165), "Positive Contraction",
+     group = GROUP_COLORS,
+     display = display.none)
+color negativeExpansionColor = input.color(color.rgb(255, 45, 122), "Negative Expansion",
+     group = GROUP_COLORS,
+     display = display.none)
+color negativeContractionColor = input.color(color.rgb(255, 145, 0), "Negative Contraction",
+     group = GROUP_COLORS,
+     display = display.none)
+color equilibriumColor = input.color(color.rgb(213, 0, 249), "Equilibrium",
+     group = GROUP_COLORS,
+     display = display.none)
+color zeroLineColor = input.color(color.rgb(120, 144, 156), "Zero Guide",
+     group = GROUP_COLORS,
+     display = display.none)
+color magnitudeReactivationColor = input.color(color.rgb(255, 234, 0), "Magnitude Reactivation Marker",
+     group = GROUP_COLORS,
+     display = display.none)
+
+bool confirmedEventsOnly = input.bool(true, "Confirmed Bars Only",
+     group = GROUP_ALERTS,
+     display = display.none,
+     tooltip = "When enabled, markers and alert conditions trigger only after the chart bar closes. The live plots and readout can still update on the forming bar.")
+bool enableSignalCrossAlerts = input.bool(true, "Enable Signal-Line Cross Alerts",
+     group = GROUP_ALERTS,
+     display = display.none)
+bool enableZeroCrossAlerts = input.bool(false, "Enable MACD Zero-Cross Alerts",
+     group = GROUP_ALERTS,
+     display = display.none)
+bool enableAccelerationAlerts = input.bool(true, "Enable Acceleration Turn Alerts",
+     group = GROUP_ALERTS,
+     display = display.none)
+bool enableMagnitudeReactivationAlerts = input.bool(true, "Enable Magnitude Reactivation Alert",
+     group = GROUP_ALERTS,
+     display = display.none)
+bool enablePhaseAlerts = input.bool(false, "Enable Momentum Phase Alerts",
+     group = GROUP_ALERTS,
+     display = display.none)
+
+//------------------------------------------------------------------------------
+// Core MACD engine
+//------------------------------------------------------------------------------
+bool lengthsValid = fastLength < slowLength
+bool sourceAvailable = not na(sourceInput)
+
+float fastAverage = f_ma(sourceInput, fastLength, fastAverageType)
+float slowAverage = f_ma(sourceInput, slowLength, slowAverageType)
+float rawMacd = lengthsValid ? fastAverage - slowAverage : na
+max_bars_back(rawMacd, 1001)
+float rawSignal = lengthsValid ? f_ma(rawMacd, signalLength, signalAverageType) : na
+float rawHistogram = rawMacd - rawSignal
+
+float scaleDivisor = f_scale_divisor(scaleMode, slowAverage)
+bool scaleValid = scaleMode == "Raw MACD" or (not na(scaleDivisor) and scaleDivisor > EPSILON)
+float macdLine = lengthsValid and scaleValid ? f_safe_div(rawMacd, scaleDivisor) : na
+max_bars_back(macdLine, 1001)
+float signalLine = lengthsValid and scaleValid ? f_safe_div(rawSignal, scaleDivisor) : na
+float histogram = lengthsValid and scaleValid ? f_safe_div(rawHistogram, scaleDivisor) : na
+
+int coreWarmup = slowLength + signalLength + 2
+bool rawCoreReady = lengthsValid and sourceAvailable and bar_index >= coreWarmup and not na(rawHistogram)
+bool coreReady = rawCoreReady and scaleValid and not na(histogram)
+
+//------------------------------------------------------------------------------
+// Momentum dynamics
+//
+// Phase logic deliberately uses raw MACD structure, while plotting can use
+// raw or percent-of-slow-average units. This separation prevents a display-only setting from
+// rewriting phase history. All magnitude metrics self-normalize against their
+// own recent history, so they remain comparable without a fixed price unit.
+//------------------------------------------------------------------------------
+float displayHistogramChange = ta.change(histogram)
+float histogramAcceleration = accelerationSmoothing == 1 ? displayHistogramChange : ta.ema(displayHistogramChange, accelerationSmoothing)
+
+float rawHistogramChange = ta.change(rawHistogram)
+float rawHistogramAcceleration = accelerationSmoothing == 1 ? rawHistogramChange : ta.ema(rawHistogramChange, accelerationSmoothing)
+float absoluteHistogram = math.abs(rawHistogram)
+max_bars_back(absoluteHistogram, 5000)
+
+float magnitudeChange = ta.change(absoluteHistogram)
+float magnitudeVelocity = accelerationSmoothing == 1 ? magnitudeChange : ta.ema(magnitudeChange, accelerationSmoothing)
+float phaseNoiseBasis = ta.ema(math.abs(magnitudeChange), phaseNoiseLength)
+float phaseDeadband = phaseNoiseBasis * phaseNoiseMultiplier
+
+float equilibriumBasis = ta.ema(absoluteHistogram, equilibriumLength)
+float equilibriumEntryBandRaw = equilibriumBasis * equilibriumMultiplier
+float equilibriumExitBandRaw = equilibriumEntryBandRaw * equilibriumExitMultiplier
+float equilibriumDisplayBand = scaleValid ? f_safe_div(equilibriumEntryBandRaw, scaleDivisor) : na
+
+int phaseWarmup = coreWarmup + math.max(math.max(equilibriumLength, accelerationSmoothing), phaseNoiseLength) + 2
+bool phaseReady = rawCoreReady and bar_index >= phaseWarmup and not na(magnitudeVelocity) and not na(phaseDeadband) and not na(equilibriumEntryBandRaw)
+
+// Entry/exit hysteresis prevents rapid boundary flapping. The state remains
+// deterministic on historical bars and is recalculated from the latest live
+// price on the open bar; confirmed-event gating is handled separately below.
+var bool equilibriumState = false
+if not phaseReady
+    equilibriumState := false
+else if not phaseReady[1]
+    equilibriumState := absoluteHistogram <= equilibriumEntryBandRaw
+else if equilibriumState
+    equilibriumState := absoluteHistogram <= equilibriumExitBandRaw
+else
+    equilibriumState := absoluteHistogram <= equilibriumEntryBandRaw
+
+// A noise-aware motion state holds its prior classification when magnitude
+// movement is too small to distinguish reliably from recent one-bar variation.
+var int motionState = 0
+if not phaseReady
+    motionState := 0
+else if magnitudeVelocity > phaseDeadband
+    motionState := 1
+else if magnitudeVelocity < -phaseDeadband
+    motionState := -1
+else if motionState == 0
+    motionState := magnitudeVelocity >= 0.0 ? 1 : -1
+
+int phaseCode = not phaseReady ? 0 :
+     equilibriumState ? 0 :
+     rawHistogram > 0.0 and motionState == 1 ? 1 :
+     rawHistogram > 0.0 ? 2 :
+     rawHistogram < 0.0 and motionState == 1 ? -1 :
+     -2
+
+string phaseText = switch phaseCode
+    1 => "Positive expansion"
+    2 => "Positive contraction"
+    -1 => "Negative expansion"
+    -2 => "Negative contraction"
+    => phaseReady ? "Near equilibrium" : "Warming up"
+
+color histogramStateColor = switch phaseCode
+    1 => positiveExpansionColor
+    2 => positiveContractionColor
+    -1 => negativeExpansionColor
+    -2 => negativeContractionColor
+    => equilibriumColor
+
+color phaseColor = histogramStateColor
+color phaseValueTextColor = phaseCode == -1 or phaseCode == 0 ? color.white : color.black
+
+bool phaseChangedRaw = phaseReady and phaseReady[1] and phaseCode != phaseCode[1]
+var int phaseAge = 0
+if not phaseReady
+    phaseAge := 0
+else if phaseChangedRaw
+    phaseAge := 1
+else
+    phaseAge := phaseAge + 1
+
+// Robust magnitude score: observation rank resists single-window outliers,
+// range position retains excursion information, and Hybrid Rank combines both.
+float magnitudeLow = ta.lowest(absoluteHistogram, magnitudeLookback)
+float magnitudeHigh = ta.highest(absoluteHistogram, magnitudeLookback)
+float magnitudeSpan = magnitudeHigh - magnitudeLow
+float magnitudePercentRank = ta.percentrank(absoluteHistogram, magnitudeLookback)
+int magnitudeWarmup = coreWarmup + magnitudeLookback - 1
+bool magnitudeReady = rawCoreReady and bar_index >= magnitudeWarmup and not na(magnitudeLow) and not na(magnitudeHigh) and not na(magnitudePercentRank)
+float magnitudeRangeRank = not magnitudeReady ? na : magnitudeSpan > EPSILON ? f_clamp(100.0 * (absoluteHistogram - magnitudeLow) / magnitudeSpan, 0.0, 100.0) : 0.0
+float magnitudeScore = na
+if magnitudeReady
+    magnitudeScore := magnitudeSpan <= EPSILON ? 0.0 :
+         magnitudeScoreMethod == "Percent Rank" ? f_clamp(magnitudePercentRank, 0.0, 100.0) :
+         magnitudeScoreMethod == "Range Rank" ? magnitudeRangeRank :
+         f_clamp(0.65 * magnitudePercentRank + 0.35 * magnitudeRangeRank, 0.0, 100.0)
+
+bool thresholdsValid = subduedThreshold < reactivationThreshold and reactivationThreshold < extendedThreshold
+bool magnitudeSubdued = magnitudeReady and thresholdsValid and magnitudeScore <= subduedThreshold
+bool magnitudeExtended = magnitudeReady and thresholdsValid and magnitudeScore >= extendedThreshold
+string magnitudeState = not thresholdsValid ? "Check thresholds" :
+     not magnitudeReady ? "Warming up" :
+     magnitudeSubdued ? "Subdued" :
+     magnitudeExtended ? "Extended" :
+     "Typical"
+
+// Stateful reactivation logic updates on confirmed bars by default. Users may
+// deliberately permit intrabar events, in which case those events are fluid
+// until the realtime bar closes, as expected under Pine's execution model.
+bool stateUpdateGate = not barstate.isrealtime or not confirmedEventsOnly or barstate.isconfirmed
+var int subduedBars = 0
+var bool reactivationArmed = false
+bool magnitudeReactivationRaw = false
+if stateUpdateGate
+    if not magnitudeReady or not thresholdsValid
+        subduedBars := 0
+        reactivationArmed := false
+    else
+        if magnitudeSubdued
+            subduedBars := subduedBars + 1
+            if subduedBars >= minimumSubduedBars
+                reactivationArmed := true
+        else
+            subduedBars := 0
+        if reactivationArmed and magnitudeScore >= reactivationThreshold
+            magnitudeReactivationRaw := true
+            reactivationArmed := false
+
+float macdStepDistance = math.abs(ta.change(rawMacd))
+float macdPathDistance = math.sum(macdStepDistance, efficiencyLength)
+float macdNetDistance = math.abs(rawMacd - rawMacd[efficiencyLength])
+int efficiencyWarmup = coreWarmup + efficiencyLength
+bool efficiencyReady = rawCoreReady and bar_index >= efficiencyWarmup and not na(macdPathDistance) and not na(macdNetDistance)
+float macdPathEfficiency = efficiencyReady and macdPathDistance > EPSILON ? f_clamp(100.0 * macdNetDistance / macdPathDistance, 0.0, 100.0) : na
+
+//------------------------------------------------------------------------------
+// Events and descriptive timing
+//------------------------------------------------------------------------------
+bool signalCrossUpTest = ta.crossover(rawMacd, rawSignal)
+bool signalCrossDownTest = ta.crossunder(rawMacd, rawSignal)
+bool macdZeroCrossUpTest = ta.crossover(rawMacd, 0.0)
+bool macdZeroCrossDownTest = ta.crossunder(rawMacd, 0.0)
+bool accelerationTurnUpTest = ta.crossover(rawHistogramAcceleration, 0.0)
+bool accelerationTurnDownTest = ta.crossunder(rawHistogramAcceleration, 0.0)
+bool signalCrossRaw = signalCrossUpTest or signalCrossDownTest
+
+// Cross-cycle peak retention uses confirmed state updates by default. A live
+// shadow peak keeps the readout bounded on an open bar without committing an
+// intrabar extreme that historical bars could not reproduce.
+var float committedCyclePeak = na
+if stateUpdateGate
+    if not rawCoreReady
+        committedCyclePeak := na
+    else if signalCrossRaw or na(committedCyclePeak)
+        committedCyclePeak := absoluteHistogram
+    else
+        committedCyclePeak := math.max(committedCyclePeak, absoluteHistogram)
+float liveCyclePeak = rawCoreReady ? math.max(nz(committedCyclePeak, absoluteHistogram), absoluteHistogram) : na
+float cyclePeakRetention = rawCoreReady and not na(liveCyclePeak) and liveCyclePeak > EPSILON ? f_clamp(100.0 * absoluteHistogram / liveCyclePeak, 0.0, 100.0) : na
+
+bool eventGate = not confirmedEventsOnly or barstate.isconfirmed
+bool signalCrossUp = rawCoreReady and eventGate and signalCrossUpTest
+bool signalCrossDown = rawCoreReady and eventGate and signalCrossDownTest
+bool macdZeroCrossUp = rawCoreReady and eventGate and macdZeroCrossUpTest
+bool macdZeroCrossDown = rawCoreReady and eventGate and macdZeroCrossDownTest
+bool accelerationTurnUp = phaseReady and eventGate and accelerationTurnUpTest
+bool accelerationTurnDown = phaseReady and eventGate and accelerationTurnDownTest
+bool magnitudeReactivation = magnitudeReady and eventGate and magnitudeReactivationRaw
+bool phaseChanged = phaseReady and eventGate and phaseChangedRaw
+
+bool signalCrossAgeEvent = signalCrossRaw and (not confirmedEventsOnly or barstate.isconfirmed)
+int signalCrossAge = ta.barssince(signalCrossAgeEvent)
+string scaleUnit = switch scaleMode
+    "Percent of Slow Average" => "%"
+    => ""
+
+string locationText = not rawCoreReady ? "Warming up" : rawMacd > 0.0 ? "Above zero" : rawMacd < 0.0 ? "Below zero" : "At zero"
+string accelerationText = not phaseReady or not coreReady ? "n/a" : f_number(histogramAcceleration) + (histogramAcceleration > 0.0 ? "  ↗" : histogramAcceleration < 0.0 ? "  ↘" : "  →")
+string magnitudeText = not magnitudeReady ? "Warming up" : f_percent(magnitudeScore) + " · " + magnitudeState
+string histogramText = not coreReady ? "n/a" : f_number(histogram) + (scaleUnit == "" ? "" : " " + scaleUnit)
+
+string configurationText = not lengthsValid ? "Fast Length must be lower" :
+     not sourceAvailable ? "Source unavailable" :
+     not scaleValid ? "Selected scale unavailable" :
+     not thresholdsValid ? "Set Subdued < Reactivation < Extended" :
+     not coreReady ? "Warming up" :
+     "Ready"
+
+color configurationColor = configurationText == "Ready" ? positiveExpansionColor : configurationText == "Warming up" ? signalLineColor : negativeExpansionColor
+
+//------------------------------------------------------------------------------
+// Visual layers
+//------------------------------------------------------------------------------
+int histogramCoreTransparency = fadeLowMagnitudeBars and magnitudeReady ?
+     int(math.round(math.max(0.0, math.min(42.0, 42.0 - magnitudeScore * 0.42)))) : 0
+color histogramCoreColor = color.new(histogramStateColor, histogramCoreTransparency)
+color histogramDepthColor = color.new(histogramStateColor, histogramGlowTransparency)
+
+pEquilibriumUpper = plot(showEquilibriumBand and phaseReady ? equilibriumDisplayBand : na,
+     "Adaptive Equilibrium Upper",
+     color = color.new(equilibriumColor, 42),
+     linewidth = 1,
+     display = display.pane)
+pEquilibriumLower = plot(showEquilibriumBand and phaseReady ? -equilibriumDisplayBand : na,
+     "Adaptive Equilibrium Lower",
+     color = color.new(equilibriumColor, 42),
+     linewidth = 1,
+     display = display.pane)
+fill(pEquilibriumUpper, pEquilibriumLower,
+     color = showEquilibriumBand ? color.new(equilibriumColor, 92) : na,
+     title = "Adaptive Equilibrium Fill")
+
+plot(0.0,
+     "Zero Guide",
+     color = color.new(zeroLineColor, 35),
+     linewidth = 1,
+     display = display.pane)
+plot(showPhaseRail and phaseReady ? 0.0 : na,
+     "Momentum Phase Rail",
+     color = color.new(phaseColor, 34),
+     linewidth = 6,
+     display = display.pane)
+
+plot(showHistogram and showHistogramGlow ? histogram : na,
+     "Histogram Depth",
+     color = histogramDepthColor,
+     style = plot.style_histogram,
+     linewidth = 7,
+     display = display.pane)
+plot(showHistogram ? histogram : na,
+     "MACD Histogram",
+     color = histogramCoreColor,
+     style = plot.style_histogram,
+     linewidth = 3,
+     display = display.pane + display.data_window)
+
+plot(showMacdLine and showLineGlow ? macdLine : na,
+     "MACD Line Glow",
+     color = color.new(macdLineColor, 80),
+     linewidth = 7,
+     display = display.pane)
+plot(showSignalLine and showLineGlow ? signalLine : na,
+     "Signal Line Glow",
+     color = color.new(signalLineColor, 82),
+     linewidth = 6,
+     display = display.pane)
+
+pMacdLine = plot(showMacdLine ? macdLine : na,
+     "MACD Line",
+     color = macdLineColor,
+     linewidth = 3,
+     display = display.pane + display.data_window)
+pSignalLine = plot(showSignalLine ? signalLine : na,
+     "Signal Line",
+     color = signalLineColor,
+     linewidth = 2,
+     display = display.pane + display.data_window)
+fill(pMacdLine, pSignalLine,
+     color = showLineFill ? color.new(signalLineColor, lineFillTransparency) : na,
+     title = "MACD Signal Separation")
+
+bgcolor(showPhaseBackground and phaseReady ? color.new(phaseColor, backgroundTransparency) : na,
+     title = "Momentum Phase Background")
+
+// Neutral event markers identify confirmed transitions; they do not
+// represent trade entries or recommendations.
+plotshape(showSignalCrossMarkers and signalCrossUp,
+     title = "MACD Crossed Above Signal",
+     style = shape.arrowup,
+     location = location.bottom,
+     color = positiveExpansionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showSignalCrossMarkers and signalCrossDown,
+     title = "MACD Crossed Below Signal",
+     style = shape.arrowdown,
+     location = location.top,
+     color = negativeExpansionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showAccelerationTurnMarkers and accelerationTurnUp ? histogram : na,
+     title = "Histogram Acceleration Turned Positive",
+     style = shape.diamond,
+     location = location.absolute,
+     color = positiveContractionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showAccelerationTurnMarkers and accelerationTurnDown ? histogram : na,
+     title = "Histogram Acceleration Turned Negative",
+     style = shape.diamond,
+     location = location.absolute,
+     color = negativeContractionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showZeroCrossMarkers and macdZeroCrossUp ? 0.0 : na,
+     title = "MACD Crossed Above Zero",
+     style = shape.circle,
+     location = location.absolute,
+     color = positiveExpansionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showZeroCrossMarkers and macdZeroCrossDown ? 0.0 : na,
+     title = "MACD Crossed Below Zero",
+     style = shape.circle,
+     location = location.absolute,
+     color = negativeExpansionColor,
+     size = size.tiny,
+     display = display.pane)
+plotshape(showMagnitudeReactivationMarkers and magnitudeReactivation,
+     title = "Histogram Magnitude Reactivated",
+     style = shape.circle,
+     location = location.top,
+     color = magnitudeReactivationColor,
+     size = size.tiny,
+     display = display.pane)
+
+// Research values remain available in the Data Window without appearing in the
+// top-left status line.
+plot(histogramAcceleration, "Histogram Acceleration", color = na, display = display.data_window)
+plot(magnitudeScore, "Histogram Magnitude Robust Score", color = na, display = display.data_window)
+plot(macdPathEfficiency, "MACD Path Efficiency", color = na, display = display.data_window)
+plot(cyclePeakRetention, "Cross-Cycle Peak Retention", color = na, display = display.data_window)
+plot(phaseCode, "Momentum Phase Code", color = na, display = display.data_window)
+
+//------------------------------------------------------------------------------
+// Context readout
+//------------------------------------------------------------------------------
+var table momentumReadout = table.new(
+     f_position(readoutPosition),
+     2,
+     10,
+     frame_color = readoutBorderColor,
+     frame_width = 1,
+     border_color = color.new(readoutBorderColor, 35),
+     border_width = 1)
+
+if barstate.isfirst
+    table.merge_cells(momentumReadout, 0, 0, 1, 0)
+
+if barstate.islast
+    table.clear(momentumReadout, 0, 0, 1, 9)
+    if readoutMode != "Off"
+        color rowOne = color.new(readoutBackground, 0)
+        color rowTwo = color.new(readoutBackground, 8)
+        table.cell(momentumReadout, 0, 0, "MACD Momentum",
+             text_color = color.white,
+             text_size = f_text_size(readoutHeaderSize),
+             text_halign = text.align_center,
+             bgcolor = readoutHeaderBackground)
+
+        f_readout_row(momentumReadout, 1, "Phase", phaseText, phaseValueTextColor, phaseColor, readoutTextSize)
+        f_readout_row(momentumReadout, 2, "Location", locationText, macdLine >= 0 ? positiveContractionColor : negativeContractionColor, rowOne, readoutTextSize)
+        f_readout_row(momentumReadout, 3, "Histogram", histogramText, histogramStateColor, rowTwo, readoutTextSize)
+        f_readout_row(momentumReadout, 4, "Magnitude", magnitudeText, magnitudeExtended ? negativeContractionColor : magnitudeSubdued ? equilibriumColor : color.white, rowOne, readoutTextSize)
+        f_readout_row(momentumReadout, 5, "Status", configurationText, configurationColor, rowTwo, readoutTextSize)
+
+        if readoutMode == "Detailed"
+            f_readout_row(momentumReadout, 6, "Acceleration", accelerationText, histogramAcceleration >= 0 ? positiveContractionColor : negativeContractionColor, rowOne, readoutTextSize)
+            f_readout_row(momentumReadout, 7, "Phase Age", phaseReady ? str.tostring(phaseAge) + (phaseAge == 1 ? " bar" : " bars") : "n/a", color.white, rowTwo, readoutTextSize)
+            f_readout_row(momentumReadout, 8, "Cross Cycle", na(signalCrossAge) ? "No cross yet" : str.tostring(signalCrossAge + 1) + (signalCrossAge == 0 ? " bar · " : " bars · ") + f_percent(cyclePeakRetention) + " peak", color.white, rowOne, readoutTextSize)
+            f_readout_row(momentumReadout, 9, "Efficiency · Bar", f_percent(macdPathEfficiency) + " · " + (barstate.isconfirmed ? "Confirmed" : "Live"), barstate.isconfirmed ? positiveExpansionColor : signalLineColor, rowTwo, readoutTextSize)
+
+//------------------------------------------------------------------------------
+// Alert conditions
+//------------------------------------------------------------------------------
+alertcondition(enableSignalCrossAlerts and signalCrossUp,
+     title = "MACD Crossed Above Signal",
+     message = "MACD crossed above its signal line on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableSignalCrossAlerts and signalCrossDown,
+     title = "MACD Crossed Below Signal",
+     message = "MACD crossed below its signal line on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableZeroCrossAlerts and macdZeroCrossUp,
+     title = "MACD Crossed Above Zero",
+     message = "MACD crossed above zero on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableZeroCrossAlerts and macdZeroCrossDown,
+     title = "MACD Crossed Below Zero",
+     message = "MACD crossed below zero on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableAccelerationAlerts and accelerationTurnUp,
+     title = "Histogram Acceleration Turned Positive",
+     message = "MACD histogram acceleration turned positive on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableAccelerationAlerts and accelerationTurnDown,
+     title = "Histogram Acceleration Turned Negative",
+     message = "MACD histogram acceleration turned negative on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enableMagnitudeReactivationAlerts and magnitudeReactivation,
+     title = "Histogram Magnitude Reactivated",
+     message = "MACD histogram magnitude reactivated after a sustained subdued sequence on {{exchange}}:{{ticker}} ({{interval}}). Close: {{close}}.")
+alertcondition(enablePhaseAlerts and phaseChanged and phaseCode == 1,
+     title = "Positive Expansion Phase Began",
+     message = "The MACD histogram entered a positive expansion phase on {{exchange}}:{{ticker}} ({{interval}}).")
+alertcondition(enablePhaseAlerts and phaseChanged and phaseCode == 2,
+     title = "Positive Contraction Phase Began",
+     message = "The MACD histogram entered a positive contraction phase on {{exchange}}:{{ticker}} ({{interval}}).")
+alertcondition(enablePhaseAlerts and phaseChanged and phaseCode == -1,
+     title = "Negative Expansion Phase Began",
+     message = "The MACD histogram entered a negative expansion phase on {{exchange}}:{{ticker}} ({{interval}}).")
+alertcondition(enablePhaseAlerts and phaseChanged and phaseCode == -2,
+     title = "Negative Contraction Phase Began",
+     message = "The MACD histogram entered a negative contraction phase on {{exchange}}:{{ticker}} ({{interval}}).")
+alertcondition(enablePhaseAlerts and phaseChanged and phaseCode == 0,
+     title = "Near-Equilibrium Phase Began",
+     message = "The MACD histogram entered the adaptive near-equilibrium phase on {{exchange}}:{{ticker}} ({{interval}}).")

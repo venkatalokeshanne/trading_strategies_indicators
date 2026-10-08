@@ -1,0 +1,300 @@
+//@version=6
+indicator("Reticle — Structural Reversal Grid", "Reticle", overlay=true, max_lines_count=500, max_boxes_count=100, max_labels_count=50)
+
+// Reticle v1.0
+// Structural grid and geometric S/R engine.
+// Added MTF mapping, true squaring, and dynamic exhaustion gradients.
+
+// Colors & Theme 
+color c_navy      = #0A192F
+color c_gold      = color.new(#B8860B, 80)
+color c_gold_edge = color.new(#B8860B, 35)
+color c_red       = #FF0000                  
+color c_lattice8  = color.new(#00FFFF, 85)   
+color c_lattice4  = color.new(#00FFFF, 70)   
+color c_anchor    = color.new(#00FFFF, 0)    
+
+// --- UI & Inputs ---
+g_mode = "Anchor Mode & MTF"
+i_auto_anchors   = input.bool(true, "Auto Anchors", group=g_mode)
+i_use_mtf        = input.bool(false, "Use Higher Timeframe (MTF) Swings", group=g_mode, tooltip="Calculate dominant swing on a higher timeframe (e.g., Daily) and project onto your lower execution timeframe.")
+i_mtf_res        = input.timeframe("D", "MTF Resolution", group=g_mode)
+i_anchor_engine  = input.string("Dominant Swing", "Auto Engine", options=["Dominant Swing", "Latest Pivots"], group=g_mode)
+i_swing_lookback = input.int(60, "Dominant swing lookback (bars)", minval=10, group=g_mode)
+i_pivot_left     = input.int(15, "Pivot Strength (left)",  minval=1, group=g_mode)
+i_pivot_right    = input.int(15, "Pivot Strength (right)", minval=1, group=g_mode)
+
+g_settings = "Engine Parameters & Squaring"
+i_slope_unit   = input.string("Auto (A→B Ratio)", "Death Line Slope Basis", options=["Squaring Factor", "Auto (A→B Ratio)", "Bar", "Hour", "Day"], group=g_settings)
+i_sq_factor    = input.float(100.0, "True Squaring (Price Units per Bar)", tooltip="Used only if 'Squaring Factor' is selected. E.g., 100 means $100 per 1 bar of time.", group=g_settings)
+i_atr_length   = input.int(14, "ATR Length", minval=1, group=g_settings)
+i_slope_mult   = input.float(0.5, "Death Line Angle ×", minval=0.1, maxval=4.0, step=0.1, group=g_settings)
+i_band_extend  = input.int(120, "Exhaustion Band Forward Extension (bars)", minval=1, group=g_settings)
+i_show_lattice = input.bool(true, "Show Lattice", group=g_settings)
+i_show_band    = input.bool(true, "Show 50–62.5% Exhaustion Band", group=g_settings)
+i_show_death   = input.bool(true, "Show 45° Death Line", group=g_settings)
+i_show_spine   = input.bool(true, "Show A→B vector spine", group=g_settings)
+
+g_alerts = "Alerts"
+i_al_death  = input.bool(true,  "Alert · Death Line break (close)",      group=g_alerts)
+i_al_zone   = input.bool(true,  "Alert · Enter 50–62.5% exhaustion zone", group=g_alerts)
+i_al_reject = input.bool(true,  "Alert · Exhaustion zone rejection",      group=g_alerts)
+i_al_node   = input.bool(false, "Alert · Lattice node tag (1/8ths)",      group=g_alerts)
+i_al_leg    = input.bool(true,  "Alert · New structural leg detected",    group=g_alerts)
+i_al_json   = input.bool(false, "Format alerts as JSON", group=g_alerts)
+
+g_table = "Status Table"
+i_show_table = input.bool(true, "Show status table", group=g_table)
+i_table_pos  = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group=g_table)
+
+
+// --- Core Data & MTF Routing ---
+float atr_series = ta.atr(i_atr_length)
+
+// Helper function to grab swing extremes so we can call it securely via MTF
+f_get_swing_data() =>
+    float h_p = ta.highest(high, i_swing_lookback)
+    float l_p = ta.lowest(low,  i_swing_lookback)
+    int   h_o = -ta.highestbars(high, i_swing_lookback)
+    int   l_o = -ta.lowestbars(low,  i_swing_lookback)
+    float h_atr = atr_series[h_o]
+    float l_atr = atr_series[l_o]
+    [h_p, l_p, time[h_o], time[l_o], h_atr, l_atr]
+
+// Pull both local and higher timeframe data
+[local_hp, local_lp, local_ht, local_lt, local_hatr, local_latr] = f_get_swing_data()
+[mtf_hp, mtf_lp, mtf_ht, mtf_lt, mtf_hatr, mtf_latr] = request.security(syminfo.tickerid, i_mtf_res, f_get_swing_data(), lookahead=barmerge.lookahead_on)
+
+// Route the variables depending on the user's MTF toggle
+float hh_price = i_use_mtf ? mtf_hp : local_hp
+float ll_price = i_use_mtf ? mtf_lp : local_lp
+int   hh_time  = i_use_mtf ? mtf_ht : local_ht
+int   ll_time  = i_use_mtf ? mtf_lt : local_lt
+float hh_atr   = i_use_mtf ? mtf_hatr : local_hatr
+float ll_atr   = i_use_mtf ? mtf_latr : local_latr
+
+// We need to map the absolute timestamps back to local bar_index for correct line drawing
+var int hh_bar = na
+var int ll_bar = na
+if time == hh_time
+    hh_bar := bar_index
+if time == ll_time
+    ll_bar := bar_index
+
+// Set the effective anchors (A is the start of the leg, B is the end)
+float eff_A_price = na
+float eff_B_price = na
+float eff_A_atr   = na
+int   eff_A_bar   = na
+int   eff_B_bar   = na
+bool  anchorsReady = false
+
+if i_auto_anchors
+    bool highEarlier = hh_time <= ll_time
+    eff_A_bar   := highEarlier ? hh_bar   : ll_bar
+    eff_A_price := highEarlier ? hh_price : ll_price
+    eff_A_atr   := highEarlier ? hh_atr   : ll_atr
+    eff_B_bar   := highEarlier ? ll_bar   : hh_bar
+    eff_B_price := highEarlier ? ll_price : hh_price
+    anchorsReady := not na(eff_A_bar) and not na(eff_B_bar) and eff_B_bar > eff_A_bar
+
+
+// --- Math & Geometry Engines ---
+float price_range = eff_B_price - eff_A_price          
+float dirSign     = price_range >= 0 ? 1.0 : -1.0      
+
+// The Exhaustion Band (50% to 62.5% retracement)
+float lo_pct   = 0.50
+float hi_pct   = 0.625
+float level_lo = eff_B_price - lo_pct * price_range
+float level_hi = eff_B_price - hi_pct * price_range
+float band_top = math.max(level_lo, level_hi)
+float band_bot = math.min(level_lo, level_hi)
+
+// Price divisions for the lattice
+float price_inc = price_range / 8.0
+float bar_secs = timeframe.in_seconds()
+int   ab_bars  = (not na(eff_B_bar) and not na(eff_A_bar)) ? eff_B_bar - eff_A_bar : na
+
+// Figure out how steep the Death Line should be
+float slopePerBar = na
+if i_slope_unit == "Squaring Factor"
+    slopePerBar := i_sq_factor
+else if i_slope_unit == "Auto (A→B Ratio)"
+    slopePerBar := (not na(ab_bars) and ab_bars > 0) ? math.abs(price_range) / ab_bars : na
+else if i_slope_unit == "Bar"
+    slopePerBar := eff_A_atr
+else if i_slope_unit == "Hour"
+    slopePerBar := na(eff_A_atr) ? na : eff_A_atr * (bar_secs / 3600.0)
+else
+    slopePerBar := na(eff_A_atr) ? na : eff_A_atr * (bar_secs / 86400.0)
+
+slopePerBar := na(slopePerBar) ? na : slopePerBar * i_slope_mult
+
+// Function to calculate the line value at any given bar
+f_death(int evalBar) =>
+    (anchorsReady and not na(slopePerBar)) ? eff_A_price + dirSign * slopePerBar * (evalBar - eff_A_bar) : na
+
+float dl_now  = f_death(bar_index)
+float dl_prev = f_death(bar_index - 1)
+
+
+// --- Drawing & Rendering ---
+var array<line>  latticeLines = array.new<line>()
+var array<label> breakMarks  = array.new<label>()
+var box   exhaustionBox = na
+var line  deathLine     = na
+var line  spineLine     = na
+var label anchorAlabel  = na
+var label anchorBlabel  = na
+
+// Init table once so it doesn't lag the chart in real-time
+table_pos = i_table_pos == "Top Right" ? position.top_right : i_table_pos == "Top Left" ? position.top_left : i_table_pos == "Bottom Right" ? position.bottom_right : i_table_pos == "Bottom Left" ? position.bottom_left : position.middle_right
+var table infoTable = table.new(table_pos, 2, 10, bgcolor=color.new(#0A192F, 15), border_color=color.new(#00FFFF, 70), border_width=1, frame_color=color.new(#00FFFF, 55), frame_width=1)
+
+// Calculate dynamic color for when price pushes deep into the exhaustion zone
+float zonePenetration = (close - band_bot) / (band_top - band_bot)
+color dynZoneColor = color.from_gradient(zonePenetration, 0.0, 1.0, color.new(#B8860B, 80), color.new(#FF0000, 60))
+
+// Only draw on the last bar to save memory and stop zooming bugs
+if barstate.islast
+    if array.size(latticeLines) > 0
+        for ln in latticeLines
+            line.delete(ln)
+        array.clear(latticeLines)
+    if array.size(breakMarks) > 0
+        for lb in breakMarks
+            label.delete(lb)
+        array.clear(breakMarks)
+
+    box.delete(exhaustionBox)
+    line.delete(deathLine)
+    line.delete(spineLine)
+    label.delete(anchorAlabel)
+    label.delete(anchorBlabel)
+
+    if anchorsReady
+        // 1. Render the Exhaustion Box
+        if i_show_band
+            int boxRight = bar_index + i_band_extend
+            color currentFill = (close <= band_top and close >= band_bot) ? dynZoneColor : c_gold
+            exhaustionBox := box.new(eff_B_bar, band_top, boxRight, band_bot, border_color=c_gold_edge, border_width=1, bgcolor=currentFill, force_overlay=true)
+            box.set_text(exhaustionBox, "50–62.5% EXHAUSTION ZONE")
+            box.set_text_color(exhaustionBox, c_gold_edge)
+            box.set_text_size(exhaustionBox, size.small)
+
+        // 2. Render the 1/8th Lattice
+        if i_show_lattice and eff_B_bar > eff_A_bar
+            float p_lo = math.min(eff_A_price, eff_B_price)
+            float p_hi = math.max(eff_A_price, eff_B_price)
+            int   bar_span = eff_B_bar - eff_A_bar
+            for i = 1 to 7
+                float py = eff_A_price + i * price_inc
+                bool isQuarter = (i % 2 == 0)
+                array.push(latticeLines, line.new(eff_A_bar, py, eff_B_bar, py, xloc=xloc.bar_index, color=isQuarter ? c_lattice4 : c_lattice8, width=1, style=isQuarter ? line.style_solid : line.style_dotted, force_overlay=true))
+                int vx = eff_A_bar + math.round(i * bar_span / 8.0)
+                array.push(latticeLines, line.new(vx, p_lo, vx, p_hi, xloc=xloc.bar_index, color=isQuarter ? c_lattice4 : c_lattice8, width=1, style=isQuarter ? line.style_solid : line.style_dotted, force_overlay=true))
+
+        // 3. Render the Death Line & Break Marks
+        if i_show_death
+            float endVal = f_death(bar_index)
+            deathLine := line.new(eff_A_bar, eff_A_price, bar_index, endVal, xloc=xloc.bar_index, color=c_red, width=2, extend=extend.right, force_overlay=true)
+            
+            // Look back to see where price crossed the current line geometry
+            int scanBars = math.min(bar_index - eff_B_bar - 1, 1000)
+            if scanBars > 0
+                for o = 0 to scanBars
+                    float curLine  = f_death(bar_index - o)
+                    float prevLine = f_death(bar_index - o - 1)
+                    if not na(curLine) and not na(prevLine)
+                        if (close[o] < curLine and close[o + 1] >= prevLine) or (close[o] > curLine and close[o + 1] <= prevLine)
+                            if array.size(breakMarks) < 45
+                                array.push(breakMarks, label.new(bar_index - o, curLine, "", xloc=xloc.bar_index, style=label.style_xcross, color=c_red, size=size.tiny, force_overlay=true))
+
+        // 4. Render Spine and Anchors
+        if i_show_spine and eff_B_bar > eff_A_bar
+            spineLine := line.new(eff_A_bar, eff_A_price, eff_B_bar, eff_B_price, xloc=xloc.bar_index, color=color.new(#00FFFF, 35), width=1, style=line.style_dashed, force_overlay=true)
+
+        anchorAlabel := label.new(eff_A_bar, eff_A_price, "A", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_up,   color=c_navy, textcolor=c_anchor, size=size.small, force_overlay=true)
+        anchorBlabel := label.new(eff_B_bar, eff_B_price, "B", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=c_navy, textcolor=c_anchor, size=size.small, force_overlay=true)
+
+    // Update Table Strings
+    if i_show_table
+        color hdrBg = color.new(#0A192F, 0)
+        color txt   = color.new(#00FFFF, 0)
+        bool  isUp  = dirSign > 0
+        string legStr = isUp ? "▲ UP-LEG" : "▼ DOWN-LEG"
+        color  legCol = isUp ? color.new(color.lime, 0) : color.new(color.red, 0)
+        float  vecPct = eff_A_price != 0 ? math.abs(price_range) / eff_A_price * 100.0 : na
+        float  atrPct = eff_A_price != 0 ? eff_A_atr / math.abs(eff_A_price) * 100.0 : na
+        float  distPct = (not na(dl_now) and close != 0) ? (close - dl_now) / close * 100.0 : na
+
+        table.cell(infoTable, 0, 0, "RETICLE " + (i_use_mtf ? "[MTF]" : ""), text_color=color.new(#B8860B, 0), text_size=size.small, bgcolor=hdrBg)
+        table.cell(infoTable, 1, 0, i_auto_anchors ? "AUTO" : "MANUAL", text_color=txt, text_size=size.small, bgcolor=hdrBg)
+        table.cell(infoTable, 0, 1, "Leg", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 1, legStr, text_color=legCol, text_size=size.small)
+        table.cell(infoTable, 0, 2, "A price", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 2, str.tostring(eff_A_price, format.mintick), text_color=txt, text_size=size.small)
+        table.cell(infoTable, 0, 3, "B price", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 3, str.tostring(eff_B_price, format.mintick), text_color=txt, text_size=size.small)
+        table.cell(infoTable, 0, 4, "Vector", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 4, str.tostring(vecPct, "#.##") + "%", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 0, 5, "ATR%", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 5, str.tostring(atrPct, "#.###") + "%", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 0, 6, "Slope", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 6, i_slope_unit + (i_slope_mult != 1.0 ? " ×" + str.tostring(i_slope_mult, "#.#") : ""), text_color=txt, text_size=size.small)
+        table.cell(infoTable, 0, 7, "Zone", text_color=color.new(#B8860B, 0), text_size=size.small)
+        table.cell(infoTable, 1, 7, str.tostring(band_bot, format.mintick) + "–" + str.tostring(band_top, format.mintick), text_color=color.new(#B8860B, 0), text_size=size.small)
+        table.cell(infoTable, 0, 8, "Death", text_color=color.new(color.red, 0), text_size=size.small)
+        table.cell(infoTable, 1, 8, na(dl_now) ? "—" : str.tostring(dl_now, format.mintick), text_color=color.new(color.red, 0), text_size=size.small)
+        table.cell(infoTable, 0, 9, "Δ to line", text_color=txt, text_size=size.small)
+        table.cell(infoTable, 1, 9, na(distPct) ? "—" : str.tostring(distPct, "#.##") + "%", text_color=distPct >= 0 ? color.new(color.lime, 0) : color.new(color.red, 0), text_size=size.small)
+
+
+// --- Alerts Engine ---
+bool afterB     = anchorsReady and bar_index > eff_B_bar and not na(dl_now) and not na(dl_prev)
+bool brokeDown  = afterB and close < dl_now and close[1] >= dl_prev
+bool brokeUp    = afterB and close > dl_now and close[1] <= dl_prev
+bool deathBreak = brokeDown or brokeUp
+
+bool inBand     = anchorsReady and close <= band_top and close >= band_bot
+bool zoneEntry  = inBand and not inBand[1]
+bool bullReject = anchorsReady and dirSign > 0 and low  <= band_top and close > band_top
+bool bearReject = anchorsReady and dirSign < 0 and high >= band_bot and close < band_bot
+
+int  nodeIdx    = (anchorsReady and price_inc != 0) ? int(math.round((close - eff_A_price) / price_inc)) : na
+int  nodePrev   = (anchorsReady and price_inc != 0) ? int(math.round((close[1] - eff_A_price) / price_inc)) : na
+bool nodeTag    = anchorsReady and not na(nodeIdx) and nodeIdx >= 0 and nodeIdx <= 8 and nodeIdx != nodePrev
+bool legChanged = anchorsReady and barstate.isconfirmed and (eff_A_bar != eff_A_bar[1] or eff_B_bar != eff_B_bar[1])
+
+alertcondition(deathBreak, title="Death Line Break",  message="Reticle — Death Line broken by a candle CLOSE")
+alertcondition(zoneEntry,  title="Enter Exhaustion Zone",   message="Reticle — Price entered exhaustion zone")
+alertcondition(bullReject or bearReject, title="Zone Rejection", message="Reticle — Rejection off the exhaustion zone")
+
+f_px(float x) => str.tostring(x, format.mintick)
+
+string ev = na
+string detail = ""
+if i_al_death and brokeDown
+    ev := "DEATH_BREAK_DOWN"
+    detail := "Bearish — close " + f_px(close) + " closed BELOW Death Line " + f_px(dl_now)
+else if i_al_death and brokeUp
+    ev := "DEATH_BREAK_UP"
+    detail := "Bullish — close " + f_px(close) + " closed ABOVE Death Line " + f_px(dl_now)
+else if i_al_reject and bullReject
+    ev := "ZONE_REJECT_BULL"
+    detail := "Bullish rejection off exhaustion zone " + f_px(band_bot) + "–" + f_px(band_top)
+else if i_al_reject and bearReject
+    ev := "ZONE_REJECT_BEAR"
+    detail := "Bearish rejection off exhaustion zone " + f_px(band_bot) + "–" + f_px(band_top)
+else if i_al_zone and zoneEntry
+    ev := "ZONE_ENTER"
+    detail := "Price entered exhaustion zone " + f_px(band_bot) + "–" + f_px(band_top)
+else if i_al_leg and legChanged
+    ev := "NEW_LEG"
+    detail := (dirSign > 0 ? "UP" : "DOWN") + "-leg A=" + f_px(eff_A_price) + " B=" + f_px(eff_B_price)
+
+if not na(ev) and barstate.isconfirmed
+    float atrPctMsg = eff_A_price != 0 ? eff_A_atr / math.abs(eff_A_price) * 100.0 : na
+    string msg = i_al_json ? "{\"indicator\":\"Reticle\",\"event\":\"" + ev + "\",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"price\":" + f_px(close) + ",\"deathline\":" + (na(dl_now) ? "null" : f_px(dl_now)) + ",\"zone_lo\":" + f_px(band_bot) + ",\"zone_hi\":" + f_px(band_top) + ",\"leg\":\"" + (dirSign > 0 ? "up" : "down") + "\",\"atr_pct\":" + (na(atrPctMsg) ? "null" : str.tostring(atrPctMsg, "#.###")) + "}" : "⚡ RETICLE [" + syminfo.ticker + " " + timeframe.period + "]\n" + ev + " — " + detail
+    alert(msg, alert.freq_once_per_bar_close)

@@ -1,0 +1,215 @@
+//@version=6
+indicator("XYZ BRENTOIL — historical BZ roll", shorttitle="XYZ BRENTOIL Roll", overlay=true, dynamic_requests=true)
+
+// Reconstructs the futures-weighting component of the XYZ BRENTOIL external price.
+// Official designated-contract sequence:
+// Jan H, Feb J, Mar K, Apr M, May N, Jun Q, Jul U, Aug V, Sep X, Oct Z, Nov F, Dec G.
+// At 17:30 America/New_York on the 5th-9th Monday-Friday business days, the
+// front weight changes to 80%, 60%, 40%, 20%, and 0%, respectively.
+//
+// Important: TradingView provides exchange trades/OHLC, while the XYZ relayer
+// can consume executable institutional quotes. Therefore this script is a close
+// historical reconstruction of the roll methodology, not the official oracle.
+
+// ───────────────────────────── Inputs ─────────────────────────────
+
+string GROUP_DATA = "Data"
+string GROUP_ROLL = "Roll schedule"
+string GROUP_VIEW = "Display"
+string TZ = "America/New_York"
+
+string exchangePrefix = input.string("NYMEX", "TradingView exchange prefix", group=GROUP_DATA)
+string contractRoot = input.string("BZ", "Contract root", group=GROUP_DATA)
+string requestedTf = input.timeframe("1", "Live price timeframe", group=GROUP_DATA,
+     tooltip="1 = one-minute feed. On the open realtime bar, Last/current is the latest available trade and updates with incoming data. Exchange delays still apply.")
+string priceMode = input.string("Last/current", "Contract price", options=["Last/current", "HL2", "OHLC4"], group=GROUP_DATA,
+     tooltip="Last/current uses the current close of the open realtime bar. On historical bars it is the final close of that bar.")
+bool breakClosedSessions = input.bool(true, "Break lines when NYMEX is closed", group=GROUP_DATA,
+     tooltip="Prevents the last BZ price from being drawn as a flat line across exchange closures.")
+
+int calculationStart = input.time(timestamp("01 Jan 2026 00:00 -0500"), "Calculation start", group=GROUP_DATA)
+int calculationEnd = input.time(timestamp("31 Dec 2026 23:59 -0500"), "Calculation end", group=GROUP_DATA)
+
+int rollHour = input.int(17, "Roll hour (New York)", minval=0, maxval=23, group=GROUP_ROLL)
+int rollMinute = input.int(30, "Roll minute (New York)", minval=0, maxval=59, group=GROUP_ROLL)
+int firstRollWeekday = input.int(5, "First 80/20 cutoff ordinal", minval=1, maxval=15, group=GROUP_ROLL,
+     tooltip="At this Monday-Friday business-day cutoff the front weight becomes 80%.")
+
+bool showComponents = input.bool(true, "Show front and next contracts", group=GROUP_VIEW)
+bool showChartPrice = input.bool(false, "Show chart close", group=GROUP_VIEW)
+bool shadeRoll = input.bool(true, "Shade active roll period", group=GROUP_VIEW)
+bool showTable = input.bool(true, "Show status table", group=GROUP_VIEW)
+float spreadAlert = input.float(0.50, "Absolute spread alert, %", minval=0.0, step=0.05, group=GROUP_VIEW)
+
+// ───────────────────────────── Helpers ─────────────────────────────
+
+// Builds the designated front and next BZ tickers for a calendar month.
+f_contractTickers(int calendarYear, int calendarMonth) =>
+    string frontCode = switch calendarMonth
+        1  => "H"
+        2  => "J"
+        3  => "K"
+        4  => "M"
+        5  => "N"
+        6  => "Q"
+        7  => "U"
+        8  => "V"
+        9  => "X"
+        10 => "Z"
+        11 => "F"
+        => "G"
+
+    string nextCode = switch calendarMonth
+        1  => "J"
+        2  => "K"
+        3  => "M"
+        4  => "N"
+        5  => "Q"
+        6  => "U"
+        7  => "V"
+        8  => "X"
+        9  => "Z"
+        10 => "F"
+        11 => "G"
+        => "H"
+
+    int frontYear = calendarMonth >= 11 ? calendarYear + 1 : calendarYear
+    int nextYear = calendarMonth >= 10 ? calendarYear + 1 : calendarYear
+
+    string prefix = exchangePrefix + ":" + contractRoot
+    string frontTicker = prefix + frontCode + str.tostring(frontYear)
+    string nextTicker = prefix + nextCode + str.tostring(nextYear)
+    [frontTicker, nextTicker]
+
+
+// Counts Monday-Friday cutoffs already completed in the current New York month.
+// This matches the date convention visible in XYZ's published roll schedules.
+f_completedWeekdayCutoffs(int calendarYear, int calendarMonth, int currentTimestamp) =>
+    int completed = 0
+    for calendarDay = 1 to 31
+        int cutoff = timestamp(TZ, calendarYear, calendarMonth, calendarDay, rollHour, rollMinute)
+        bool belongsToMonth = month(cutoff, TZ) == calendarMonth
+        int weekday = dayofweek(cutoff, TZ)
+        bool isWeekday = weekday >= dayofweek.monday and weekday <= dayofweek.friday
+        if belongsToMonth and isWeekday and cutoff <= currentTimestamp
+            completed += 1
+    completed
+
+// Weight after each scheduled cutoff:
+// before #5 = 100%, #5 = 80%, #6 = 60%, #7 = 40%, #8 = 20%, #9+ = 0%.
+f_frontWeight(int completedCutoffs) =>
+    int completedRollSteps = math.max(completedCutoffs - firstRollWeekday + 1, 0)
+    float weight = 1.0 - 0.20 * completedRollSteps
+    math.max(math.min(weight, 1.0), 0.0)
+
+f_requestedPrice() =>
+    switch priceMode
+        "HL2" => hl2
+        "OHLC4" => ohlc4
+        => close
+
+f_num(float value) =>
+    na(value) ? "n/a" : str.tostring(value, format.mintick)
+
+f_pct(float value) =>
+    na(value) ? "n/a" : str.tostring(value, "#.###") + "%"
+
+f_time(int value) =>
+    na(value) ? "n/a" : str.format_time(value, "yyyy-MM-dd HH:mm", TZ)
+
+// ───────────────────────────── Calculation ─────────────────────────────
+
+int nyYear = year(time, TZ)
+int nyMonth = month(time, TZ)
+[frontTicker, nextTicker] = f_contractTickers(nyYear, nyMonth)
+
+int completedCutoffs = f_completedWeekdayCutoffs(nyYear, nyMonth, time)
+float frontWeight = f_frontWeight(completedCutoffs)
+float nextWeight = 1.0 - frontWeight
+
+bool inDateRange = time >= calculationStart and time <= calculationEnd
+string dataTf = requestedTf == "" ? "1" : requestedTf
+
+int firstSelectedMonth = year(calculationStart, TZ) * 12 + month(calculationStart, TZ)
+int lastSelectedMonth = year(calculationEnd, TZ) * 12 + month(calculationEnd, TZ)
+int selectedMonthCount = lastSelectedMonth - firstSelectedMonth + 1
+if barstate.isfirst and calculationStart > calculationEnd
+    runtime.error("Calculation start must be earlier than calculation end.")
+if barstate.isfirst and selectedMonthCount > 35
+    runtime.error("Select no more than 35 calendar months to stay inside TradingView's dynamic request limit.")
+
+float frontPrice = na
+float nextPrice = na
+int frontDataTime = na
+int nextDataTime = na
+if inDateRange
+    [requestedFrontPrice, requestedFrontTime] = request.security(frontTicker, dataTf, [f_requestedPrice(), time],
+         gaps=breakClosedSessions ? barmerge.gaps_on : barmerge.gaps_off,
+         lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    [requestedNextPrice, requestedNextTime] = request.security(nextTicker, dataTf, [f_requestedPrice(), time],
+         gaps=breakClosedSessions ? barmerge.gaps_on : barmerge.gaps_off,
+         lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+    frontPrice := requestedFrontPrice
+    nextPrice := requestedNextPrice
+    frontDataTime := requestedFrontTime
+    nextDataTime := requestedNextTime
+
+float weightedReference = not na(frontPrice) and not na(nextPrice) ?
+     frontPrice * frontWeight + nextPrice * nextWeight : na
+
+// On the open realtime bar, close is the latest available trade and updates on
+// every incoming chart tick. On historical bars, it is the confirmed bar close.
+float chartPrice = close
+float spreadPct = not na(weightedReference) and weightedReference != 0.0 ?
+     (chartPrice / weightedReference - 1.0) * 100.0 : na
+
+bool rollActive = frontWeight > 0.0 and frontWeight < 1.0
+
+// ───────────────────────────── Plots ─────────────────────────────
+
+
+plot(showComponents ? frontPrice : na, "Designated front BZ", color=color.new(color.blue, 15), linewidth=1, style=plot.style_linebr)
+plot(showComponents ? nextPrice : na, "Designated next BZ", color=color.new(color.purple, 15), linewidth=1, style=plot.style_linebr)
+plot(weightedReference, "XYZ weighted BRENTOIL reference", color=color.orange, linewidth=3, style=plot.style_linebr)
+plot(showChartPrice ? chartPrice : na, "Chart last/current", color=color.new(color.white, 0), linewidth=1)
+plot(spreadPct, "Chart vs reference spread, %", display=display.data_window)
+
+bgcolor(shadeRoll and rollActive ? color.new(color.orange, 90) : na, title="Roll period")
+
+bool spreadCrossed = not na(spreadPct) and math.abs(spreadPct) >= spreadAlert
+alertcondition(spreadCrossed, "BRENTOIL spread threshold", "BRENTOIL chart/reference spread reached the configured threshold.")
+
+
+// ───────────────────────────── Status table ─────────────────────────────
+
+var table status = table.new(position.top_right, 2, 12, border_width=1)
+
+if barstate.islast and showTable
+    table.cell(status, 0, 0, "Field", bgcolor=color.new(color.gray, 65), text_color=color.white)
+    table.cell(status, 1, 0, "Value", bgcolor=color.new(color.gray, 65), text_color=color.white)
+
+    table.cell(status, 0, 1, "Front")
+    table.cell(status, 1, 1, frontTicker)
+    table.cell(status, 0, 2, "Next")
+    table.cell(status, 1, 2, nextTicker)
+    table.cell(status, 0, 3, "Weights")
+    table.cell(status, 1, 3, str.tostring(frontWeight * 100.0, "#") + "% / " + str.tostring(nextWeight * 100.0, "#") + "%")
+    table.cell(status, 0, 4, "Price source")
+    table.cell(status, 1, 4, priceMode + " @ " + dataTf)
+    table.cell(status, 0, 5, "Front price")
+    table.cell(status, 1, 5, f_num(frontPrice))
+    table.cell(status, 0, 6, "Next price")
+    table.cell(status, 1, 6, f_num(nextPrice))
+    table.cell(status, 0, 7, "Weighted")
+    table.cell(status, 1, 7, f_num(weightedReference), text_color=color.orange)
+    table.cell(status, 0, 8, "Chart last/current")
+    table.cell(status, 1, 8, f_num(chartPrice))
+    table.cell(status, 0, 9, "Spread")
+    table.cell(status, 1, 9, f_pct(spreadPct), text_color=spreadCrossed ? color.red : color.white)
+    table.cell(status, 0, 10, "Front data time")
+    table.cell(status, 1, 10, f_time(frontDataTime))
+    table.cell(status, 0, 11, "Next data time")
+    table.cell(status, 1, 11, f_time(nextDataTime))
+
+if barstate.islast and not showTable
+    table.clear(status, 0, 0, 1, 11)

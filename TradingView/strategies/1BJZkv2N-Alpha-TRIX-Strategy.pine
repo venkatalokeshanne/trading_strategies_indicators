@@ -1,0 +1,133 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BVLabs
+
+//@version=6
+strategy('Alpha TRIX Strategy', overlay = true, calc_on_every_tick = false,
+     initial_capital = 1000, default_qty_type = strategy.cash, default_qty_value = 10000,
+     commission_type = strategy.commission.percent, commission_value = 0, pyramiding = 0, margin_long = 0, margin_short = 0, slippage = 2)
+
+// =========================================================================
+// 1. INPUT SETTINGS
+// =========================================================================
+grp_main = 'Main Strategy Settings'
+tradeDirection = input.string('Both', title = 'Trade Direction', options = ['Long', 'Short', 'Both'], group = grp_main)
+allowReversal  = input.bool(true, title = 'Reverse Position on Opposite Signal', group = grp_main)
+
+grp_filters = 'Entry Filters (CHOP & ADX)'
+chopLen   = input.int(14, title = 'Choppiness Length', minval = 1, group = grp_filters)
+chopThresh = input.float(50.0, title = 'Choppiness Threshold (<)', group = grp_filters)
+adxLen    = input.int(7, title = 'ADX Length', minval = 1, group = grp_filters)
+adxMin    = input.float(20.0, title = 'ADX Minimum Threshold (>)', group = grp_filters)
+
+grp_trend = 'Trend Filter (EMA)'
+useTrendFilter = input.bool(true, title = 'Only trade with the trend', group = grp_trend)
+trendLen  = input.int(200, title = 'Trend EMA Length', minval = 1, group = grp_trend)
+
+grp_trigger = 'Trigger Settings (TRIX)'
+trixLen     = input.int(8, title = 'TRIX Length', minval = 1, group = grp_trigger)
+minTrixSlope = input.float(0.0, title = 'Min TRIX Slope at Cross (abs value)', minval = 0.0, step = 0.01, group = grp_trigger)
+
+grp_exit = 'Exit Settings (ATR % Based)'
+atrLen = input.int(7, title = 'Fast ATR Length', minval = 1, group = grp_exit)
+tpMult = input.float(1.5, title = 'Take Profit Multiplier (x ATR)', step = 0.1, group = grp_exit)
+slMult = input.float(1.0, title = 'Stop Loss Multiplier (x ATR)', step = 0.1, group = grp_exit)
+
+grp_risk = 'Risk Management'
+useEquityRisk = input.bool(false, title = 'Size Position by % Equity Risk', group = grp_risk)
+riskPct = input.float(1.0, title = 'Risk per Trade (% of Equity)', minval = 0.1, step = 0.1, group = grp_risk)
+
+// =========================================================================
+// 2. INDICATOR CALCULATIONS
+// =========================================================================
+rangeHL = ta.highest(high, chopLen) - ta.lowest(low, chopLen)
+chopValue = rangeHL == 0 ? 0.0 : 100 * math.log10(math.sum(ta.atr(1), chopLen) / rangeHL) / math.log10(chopLen)
+
+[diPlus, diMinus, adxValue] = ta.dmi(adxLen, adxLen)
+
+trendEma = ta.ema(close, trendLen)
+uptrend   = close > trendEma
+downtrend = close < trendEma
+
+ema1 = ta.ema(close, trixLen)
+ema2 = ta.ema(ema1, trixLen)
+ema3 = ta.ema(ema2, trixLen)
+trixValue = ta.roc(ema3, 1)
+trixSlope = trixValue - trixValue[1]
+
+fastAtr = ta.atr(atrLen)
+tpDistance = fastAtr * tpMult
+slDistance = fastAtr * slMult
+
+// =========================================================================
+// 3. LOGIC & CONDITIONS
+// =========================================================================
+canLong  = tradeDirection == 'Both' or tradeDirection == 'Long'
+canShort = tradeDirection == 'Both' or tradeDirection == 'Short'
+
+filtersMet = chopValue < chopThresh and adxValue > adxMin
+
+trendOkLong  = not useTrendFilter or uptrend
+trendOkShort = not useTrendFilter or downtrend
+
+longTrigger  = ta.crossover(trixValue, 0) and math.abs(trixSlope) >= minTrixSlope
+shortTrigger = ta.crossunder(trixValue, 0) and math.abs(trixSlope) >= minTrixSlope
+
+enterLong  = canLong and filtersMet and trendOkLong and longTrigger
+enterShort = canShort and filtersMet and trendOkShort and shortTrigger
+
+// =========================================================================
+// 4. POSITION SIZING (FIXED: Capped to available equity)
+// =========================================================================
+equity = strategy.equity
+riskAmount = equity * (riskPct / 100)
+
+// Calculate maximum units we can afford without using margin
+maxQty = equity / close 
+
+// math.min ensures we never attempt to buy more than our account can afford
+longQty  = useEquityRisk and slDistance > 0 ? math.min(riskAmount / slDistance, maxQty) : na
+shortQty = useEquityRisk and slDistance > 0 ? math.min(riskAmount / slDistance, maxQty) : na
+
+// =========================================================================
+// 5. ORDER EXECUTION & STATIC EXITS (FIXED)
+// =========================================================================
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+flat    = strategy.position_size == 0
+
+// Variables to lock in the ATR values at the time of entry
+var float locked_tp = na
+var float locked_sl = na
+
+if enterLong and (flat or (inShort and allowReversal))
+    locked_tp := tpDistance
+    locked_sl := slDistance
+    if useEquityRisk
+        strategy.entry('Long', strategy.long, qty = longQty)
+    else
+        strategy.entry('Long', strategy.long)
+
+if enterShort and (flat or (inLong and allowReversal))
+    locked_tp := tpDistance
+    locked_sl := slDistance
+    if useEquityRisk
+        strategy.entry('Short', strategy.short, qty = shortQty)
+    else
+        strategy.entry('Short', strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit('Exit Long', 'Long',
+         limit = strategy.position_avg_price + locked_tp,
+         stop  = strategy.position_avg_price - locked_sl)
+
+if strategy.position_size < 0
+    strategy.exit('Exit Short', 'Short',
+         limit = strategy.position_avg_price - locked_tp,
+         stop  = strategy.position_avg_price + locked_sl)
+
+// =========================================================================
+// 6. VISUALS
+// =========================================================================
+plot(useTrendFilter ? trendEma : na, title = 'Trend EMA', color = color.orange, linewidth = 2)
+plotshape(enterLong, title = 'Long Signal', style = shape.triangleup, location = location.belowbar, color = color.green, size = size.small)
+plotshape(enterShort, title = 'Short Signal', style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small)

@@ -1,0 +1,634 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// ██  MULTI-MODULE ICT/SMC STRATEGY ENGINE  ██
+// ══════════════════════════════════════════════════════════════════════════════
+// PineScript v6 | Daily Timeframe
+// Modules: Acceptance & Rejection | SFP | HTF Liquidity | Displacement | FVG
+// Money Management: Single Order | ATR-Based SL & TP | 1:1 Reward-to-Risk
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+strategy("Multi-Module ICT Strategy Engine",
+     overlay        = true,
+     pyramiding     = 1,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 2,
+     initial_capital  = 100000,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage       = 2,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     calc_on_every_tick = false)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 0 — GLOBAL INPUTS & CONFIGURATION
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Module Toggles
+grp_tog  = "═══ Module Toggles ═══"
+use_mod1 = input.bool(true,  "Module 1: Acceptance & Rejection", group = grp_tog)
+use_mod2 = input.bool(true,  "Module 2: Swing Failure Pattern",  group = grp_tog)
+use_mod3 = input.bool(true,  "Module 3: HTF Liquidity Magnet",   group = grp_tog)
+use_mod4 = input.bool(true,  "Module 4: Displacement",           group = grp_tog)
+use_mod5 = input.bool(true,  "Module 5: Fair Value Gaps",        group = grp_tog)
+
+// ═══ Money Management (Simplified 1:1 RR) ═══
+grp_mm       = "═══ Money Management ═══"
+mm_sl_atr    = input.float(1.5,  "Stop Loss (ATR multiplier)",  minval = 0.5, step = 0.1, group = grp_mm,
+     tooltip = "SL = entry ± ATR × this value. TP mirrors at 1:1.")
+atr_length   = input.int(14,     "ATR Length",                   minval = 5,   group = grp_mm)
+
+// Module-Specific Parameters
+grp_m1   = "═══ Module 1: Acceptance & Rejection ═══"
+m1_sr_lb = input.int(20,  "S/R Lookback Period",              minval = 5,   group = grp_m1)
+m1_conf  = input.int(2,   "Acceptance Candles Required",      minval = 1, maxval = 5, group = grp_m1)
+
+grp_m3   = "═══ Module 3: HTF Liquidity ═══"
+m3_ma_len    = input.int(50,  "Macro Trend MA Length",          minval = 10,  group = grp_m3)
+m3_ma_type   = input.string("EMA", "MA Type", options = ["SMA", "EMA"], group = grp_m3)
+
+grp_m4   = "═══ Module 4: Displacement ═══"
+m4_atr_mult  = input.float(2.0, "ATR Body-Size Multiplier",    minval = 1.0, step = 0.1, group = grp_m4)
+m4_body_pct  = input.float(0.75, "Min Body/Range Ratio",       minval = 0.5, maxval = 0.95, step = 0.05, group = grp_m4)
+m4_pullback_bars = input.int(10, "Max Pullback Wait (bars)",   minval = 3, maxval = 30, group = grp_m4)
+
+grp_m5   = "═══ Module 5: FVG ═══"
+m5_ce_entry  = input.bool(true, "Enter at 50% CE (vs Edge)",   group = grp_m5)
+m5_max_fvg   = input.int(10,  "Max Active FVGs Tracked",       minval = 3, maxval = 20, group = grp_m5)
+m5_expiry    = input.int(20,  "FVG Expiry (bars)",              minval = 5, maxval = 100, group = grp_m5)
+
+// Visual Settings
+grp_vis  = "═══ Visuals ═══"
+show_sr      = input.bool(true,  "Show S/R Levels",             group = grp_vis)
+show_pwhl    = input.bool(true,  "Show PWH/PWL",                group = grp_vis)
+show_fvg     = input.bool(true,  "Show FVG Boxes",              group = grp_vis)
+show_disp    = input.bool(true,  "Show Displacement Zones",     group = grp_vis)
+show_mm      = input.bool(true,  "Show SL/TP Lines",            group = grp_vis)
+col_bull     = input.color(#089981, "Bullish Color",             group = grp_vis)
+col_bear     = input.color(#f23645, "Bearish Color",             group = grp_vis)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 1 — SHARED UTILITIES
+// ──────────────────────────────────────────────────────────────────────────────
+
+atr_val = ta.atr(atr_length)
+
+safe_gt(float a, float b) =>
+    not na(a) and not na(b) and a > b
+
+safe_lt(float a, float b) =>
+    not na(a) and not na(b) and a < b
+
+safe_gte(float a, float b) =>
+    not na(a) and not na(b) and a >= b
+
+safe_lte(float a, float b) =>
+    not na(a) and not na(b) and a <= b
+
+is_bull = close > open
+is_bear = close < open
+body_size = math.abs(close - open)
+candle_range = high - low
+confirmed = barstate.isconfirmed
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 1B — SINGLE-TRADE GUARD
+// ──────────────────────────────────────────────────────────────────────────────
+
+has_open_trade = strategy.opentrades > 0
+
+var bool entry_taken_this_bar = false
+var int  entry_taken_bar_idx  = -1
+
+if bar_index != entry_taken_bar_idx
+    entry_taken_this_bar := false
+
+can_enter() =>
+    not has_open_trade and not entry_taken_this_bar and confirmed
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 1C — TRADE STATE (for visual plotting)
+// ──────────────────────────────────────────────────────────────────────────────
+
+var int    trade_dir      = 0       // 1 = long, -1 = short, 0 = flat
+var float  trade_sl       = na
+var float  trade_tp       = na
+var string trade_label    = ""
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 1D — SIGNAL FLAGS
+// ──────────────────────────────────────────────────────────────────────────────
+
+var int    signal_dir   = 0
+var string signal_label = ""
+
+// Reset signal each bar
+signal_dir   := 0
+signal_label := ""
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 2 — WEEKLY DATA (PWH / PWL)
+// ──────────────────────────────────────────────────────────────────────────────
+
+[pw_high_raw, pw_low_raw] = request.security(syminfo.tickerid, "W",
+     [high[1], low[1]], lookahead = barmerge.lookahead_off)
+
+[cw_high_raw, cw_low_raw] = request.security(syminfo.tickerid, "W",
+     [high, low], lookahead = barmerge.lookahead_off)
+
+float pwh = nz(pw_high_raw, high)
+float pwl = nz(pw_low_raw, low)
+float cwh = nz(cw_high_raw, high)
+float cwl = nz(cw_low_raw, low)
+
+plot(show_pwhl ? pwh : na, "PWH", color.new(col_bear, 40), 1, plot.style_stepline)
+plot(show_pwhl ? pwl : na, "PWL", color.new(col_bull, 40), 1, plot.style_stepline)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 3 — MODULE 1: ACCEPTANCE & REJECTION
+// ──────────────────────────────────────────────────────────────────────────────
+
+pivot_hi = ta.pivothigh(high, m1_sr_lb, m1_sr_lb)
+pivot_lo = ta.pivotlow(low,  m1_sr_lb, m1_sr_lb)
+
+var float res_level = na
+var float sup_level = na
+var float prev_res  = na
+var float prev_sup  = na
+
+if not na(pivot_hi)
+    prev_res  := res_level
+    res_level := pivot_hi
+
+if not na(pivot_lo)
+    prev_sup  := sup_level
+    sup_level := pivot_lo
+
+plot(show_sr and not na(res_level) ? res_level : na, "Resistance", color.new(col_bear, 60), 1, plot.style_cross)
+plot(show_sr and not na(sup_level) ? sup_level : na, "Support",    color.new(col_bull, 60), 1, plot.style_cross)
+
+var int   bull_accept_count    = 0
+var int   bear_accept_count    = 0
+var float bull_breakout_level  = na
+var float bear_breakout_level  = na
+var float bull_breakout_low    = na
+var float bear_breakout_high   = na
+var bool  bull_accepted        = false
+var bool  bear_accepted        = false
+var bool  m1_await_bull_retest = false
+var bool  m1_await_bear_retest = false
+
+if use_mod1 and confirmed and not na(res_level) and not na(sup_level)
+    if safe_gt(close, res_level) and not bull_accepted
+        if bull_accept_count == 0
+            bull_breakout_level := res_level
+            bull_breakout_low   := low
+        bull_accept_count += 1
+        bull_breakout_low := math.min(bull_breakout_low, low)
+        if bull_accept_count >= m1_conf
+            bull_accepted        := true
+            m1_await_bull_retest := true
+            bull_accept_count    := 0
+    else if safe_lte(close, res_level)
+        bull_accept_count := 0
+
+    if safe_lt(close, sup_level) and not bear_accepted
+        if bear_accept_count == 0
+            bear_breakout_level := sup_level
+            bear_breakout_high  := high
+        bear_accept_count += 1
+        bear_breakout_high := math.max(bear_breakout_high, high)
+        if bear_accept_count >= m1_conf
+            bear_accepted        := true
+            m1_await_bear_retest := true
+            bear_accept_count    := 0
+    else if safe_gte(close, sup_level)
+        bear_accept_count := 0
+
+    if m1_await_bull_retest and can_enter() and signal_dir == 0 and safe_lte(low, bull_breakout_level) and safe_gt(close, bull_breakout_level)
+        signal_dir   := 1
+        signal_label := "M1"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+        m1_await_bull_retest := false
+        bull_accepted        := false
+
+    if m1_await_bear_retest and can_enter() and signal_dir == 0 and safe_gte(high, bear_breakout_level) and safe_lt(close, bear_breakout_level)
+        signal_dir   := -1
+        signal_label := "M1"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+        m1_await_bear_retest := false
+        bear_accepted        := false
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 4 — MODULE 2: SWING FAILURE PATTERN (SFP)
+// ──────────────────────────────────────────────────────────────────────────────
+
+if use_mod2 and bar_index > 5 and signal_dir == 0
+    bool sfp_long_wick = safe_lt(low, pwl)
+    bool sfp_long_body = safe_gt(close, pwl)
+
+    if sfp_long_wick and sfp_long_body and can_enter()
+        signal_dir   := 1
+        signal_label := "M2"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+
+    bool sfp_short_wick = safe_gt(high, pwh)
+    bool sfp_short_body = safe_lt(close, pwh)
+
+    if sfp_short_wick and sfp_short_body and can_enter()
+        signal_dir   := -1
+        signal_label := "M2"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 5 — MODULE 3: HTF LIQUIDITY MAGNET
+// ──────────────────────────────────────────────────────────────────────────────
+
+float m3_ma = m3_ma_type == "EMA" ? ta.ema(close, m3_ma_len) : ta.sma(close, m3_ma_len)
+bool macro_bull = safe_gt(close, m3_ma)
+bool macro_bear = safe_lt(close, m3_ma)
+
+plot(m3_ma, "Macro MA", color.gray, 1, plot.style_line)
+
+var bool m3_pwl_swept = false
+var bool m3_pwh_swept = false
+
+if confirmed
+    if safe_lt(low[1], pwl)
+        m3_pwl_swept := true
+    if safe_gt(high[1], pwh)
+        m3_pwh_swept := true
+
+bool bull_engulf   = is_bull and safe_gt(close, open[1]) and safe_lt(open, close[1]) and is_bear[1]
+bool bull_pin      = is_bull and (open - low) > body_size * 2 and body_size > 0
+bool bull_reaction = bull_engulf or bull_pin
+
+bool bear_engulf   = is_bear and safe_lt(close, open[1]) and safe_gt(open, close[1]) and is_bull[1]
+bool bear_pin      = is_bear and (high - open) > body_size * 2 and body_size > 0
+bool bear_reaction = bear_engulf or bear_pin
+
+if use_mod3 and bar_index > m3_ma_len and signal_dir == 0
+    if macro_bull and m3_pwl_swept and bull_reaction and can_enter()
+        signal_dir   := 1
+        signal_label := "M3"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+        m3_pwl_swept := false
+
+    if macro_bear and m3_pwh_swept and bear_reaction and can_enter()
+        signal_dir   := -1
+        signal_label := "M3"
+        entry_taken_this_bar := true
+        entry_taken_bar_idx  := bar_index
+        m3_pwh_swept := false
+
+    if m3_pwl_swept and not bull_reaction
+        m3_pwl_swept := false
+    if m3_pwh_swept and not bear_reaction
+        m3_pwh_swept := false
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 6 — MODULE 4: DISPLACEMENT (Power Move)
+// ──────────────────────────────────────────────────────────────────────────────
+
+var float m4_bull_entry_zone_top = na
+var float m4_bull_entry_zone_bot = na
+var float m4_bull_origin         = na
+var int   m4_bull_bar            = na
+var bool  m4_bull_active         = false
+
+var float m4_bear_entry_zone_top = na
+var float m4_bear_entry_zone_bot = na
+var float m4_bear_origin         = na
+var int   m4_bear_bar            = na
+var bool  m4_bear_active         = false
+
+if use_mod4 and confirmed and not na(atr_val) and atr_val > 0
+    float b_ratio = candle_range > 0 ? body_size / candle_range : 0.0
+
+    bool bull_disp = is_bull
+         and body_size > atr_val * m4_atr_mult
+         and b_ratio > m4_body_pct
+         and safe_gt(close, res_level)
+
+    if bull_disp
+        m4_bull_entry_zone_top := close
+        m4_bull_entry_zone_bot := open + body_size * 0.5
+        m4_bull_origin         := open
+        m4_bull_bar            := bar_index
+        m4_bull_active         := true
+
+    bool bear_disp = is_bear
+         and body_size > atr_val * m4_atr_mult
+         and b_ratio > m4_body_pct
+         and safe_lt(close, sup_level)
+
+    if bear_disp
+        m4_bear_entry_zone_top := open - body_size * 0.5
+        m4_bear_entry_zone_bot := close
+        m4_bear_origin         := open
+        m4_bear_bar            := bar_index
+        m4_bear_active         := true
+
+    if m4_bull_active
+        if (bar_index - m4_bull_bar > m4_pullback_bars) or safe_lt(low, m4_bull_origin)
+            m4_bull_active := false
+        else if can_enter() and signal_dir == 0 and safe_lte(low, m4_bull_entry_zone_top) and safe_gte(close, m4_bull_entry_zone_bot)
+            signal_dir   := 1
+            signal_label := "M4"
+            entry_taken_this_bar := true
+            entry_taken_bar_idx  := bar_index
+            m4_bull_active := false
+
+    if m4_bear_active
+        if (bar_index - m4_bear_bar > m4_pullback_bars) or safe_gt(high, m4_bear_origin)
+            m4_bear_active := false
+        else if can_enter() and signal_dir == 0 and safe_gte(high, m4_bear_entry_zone_bot) and safe_lte(close, m4_bear_entry_zone_top)
+            signal_dir   := -1
+            signal_label := "M4"
+            entry_taken_this_bar := true
+            entry_taken_bar_idx  := bar_index
+            m4_bear_active := false
+
+// Draw displacement zones
+var box m4_bull_box = na
+var box m4_bear_box = na
+
+if show_disp and m4_bull_active and not na(m4_bull_bar)
+    if not na(m4_bull_box)
+        box.delete(m4_bull_box)
+    m4_bull_box := box.new(left = m4_bull_bar, top = m4_bull_entry_zone_top,
+         right = bar_index + 3, bottom = m4_bull_entry_zone_bot,
+         border_color = color.new(col_bull, 80), border_width = 1,
+         border_style = line.style_dotted, bgcolor = color.new(col_bull, 90))
+
+if show_disp and m4_bear_active and not na(m4_bear_bar)
+    if not na(m4_bear_box)
+        box.delete(m4_bear_box)
+    m4_bear_box := box.new(left = m4_bear_bar, top = m4_bear_entry_zone_top,
+         right = bar_index + 3, bottom = m4_bear_entry_zone_bot,
+         border_color = color.new(col_bear, 80), border_width = 1,
+         border_style = line.style_dotted, bgcolor = color.new(col_bear, 90))
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 7 — MODULE 5: FAIR VALUE GAPS (FVG)
+// ──────────────────────────────────────────────────────────────────────────────
+
+var array<float> fvg_top    = array.new_float(0)
+var array<float> fvg_bot    = array.new_float(0)
+var array<int>   fvg_dir    = array.new_int(0)
+var array<int>   fvg_birth  = array.new_int(0)
+var array<bool>  fvg_filled = array.new_bool(0)
+var array<box>   fvg_boxes  = array.new_box(0)
+var array<line>  fvg_ce     = array.new_line(0)
+var array<bool>  fvg_traded = array.new_bool(0)
+
+if use_mod5 and confirmed and bar_index >= 3
+    float d1_high = high[2]
+    float d3_low  = low
+    if safe_lt(d1_high, d3_low)
+        float gap_top = d3_low
+        float gap_bot = d1_high
+        float gap_ce  = (gap_top + gap_bot) / 2.0
+
+        array.push(fvg_top,    gap_top)
+        array.push(fvg_bot,    gap_bot)
+        array.push(fvg_dir,    1)
+        array.push(fvg_birth,  bar_index)
+        array.push(fvg_filled, false)
+        array.push(fvg_traded, false)
+
+        if show_fvg
+            box b = box.new(left = bar_index - 2, top = gap_top,
+                 right = bar_index + m5_expiry, bottom = gap_bot,
+                 border_color = color.new(col_bull, 70), border_width = 1,
+                 border_style = line.style_solid, bgcolor = color.new(col_bull, 90))
+            array.push(fvg_boxes, b)
+            line l = line.new(x1 = bar_index - 2, y1 = gap_ce,
+                 x2 = bar_index + m5_expiry, y2 = gap_ce,
+                 color = color.new(col_bull, 50), style = line.style_dashed, width = 1)
+            array.push(fvg_ce, l)
+        else
+            array.push(fvg_boxes, box(na))
+            array.push(fvg_ce,    line(na))
+
+    float d1_low  = low[2]
+    float d3_high = high
+    if safe_gt(d1_low, d3_high)
+        float gap_top = d1_low
+        float gap_bot = d3_high
+        float gap_ce  = (gap_top + gap_bot) / 2.0
+
+        array.push(fvg_top,    gap_top)
+        array.push(fvg_bot,    gap_bot)
+        array.push(fvg_dir,    -1)
+        array.push(fvg_birth,  bar_index)
+        array.push(fvg_filled, false)
+        array.push(fvg_traded, false)
+
+        if show_fvg
+            box b = box.new(left = bar_index - 2, top = gap_top,
+                 right = bar_index + m5_expiry, bottom = gap_bot,
+                 border_color = color.new(col_bear, 70), border_width = 1,
+                 border_style = line.style_solid, bgcolor = color.new(col_bear, 90))
+            array.push(fvg_boxes, b)
+            line l = line.new(x1 = bar_index - 2, y1 = gap_ce,
+                 x2 = bar_index + m5_expiry, y2 = gap_ce,
+                 color = color.new(col_bear, 50), style = line.style_dashed, width = 1)
+            array.push(fvg_ce, l)
+        else
+            array.push(fvg_boxes, box(na))
+            array.push(fvg_ce,    line(na))
+
+    int sz = array.size(fvg_top)
+    if sz > 0
+        for i = sz - 1 to 0
+            if i >= array.size(fvg_top)
+                continue
+
+            bool already_filled = array.get(fvg_filled, i)
+            bool already_traded = array.get(fvg_traded, i)
+            int  birth          = array.get(fvg_birth, i)
+            int  direction      = array.get(fvg_dir, i)
+            float ftop          = array.get(fvg_top, i)
+            float fbot          = array.get(fvg_bot, i)
+            float fce           = (ftop + fbot) / 2.0
+
+            if (bar_index - birth) > m5_expiry or already_filled
+                box b = array.get(fvg_boxes, i)
+                if not na(b)
+                    box.delete(b)
+                line l = array.get(fvg_ce, i)
+                if not na(l)
+                    line.delete(l)
+                array.remove(fvg_top,    i)
+                array.remove(fvg_bot,    i)
+                array.remove(fvg_dir,    i)
+                array.remove(fvg_birth,  i)
+                array.remove(fvg_filled, i)
+                array.remove(fvg_traded, i)
+                array.remove(fvg_boxes,  i)
+                array.remove(fvg_ce,     i)
+                continue
+
+            if direction == 1 and safe_lte(close, fbot)
+                array.set(fvg_filled, i, true)
+                continue
+            if direction == -1 and safe_gte(close, ftop)
+                array.set(fvg_filled, i, true)
+                continue
+
+            if already_traded or has_open_trade or entry_taken_this_bar or signal_dir != 0
+                continue
+
+            float entry_level = m5_ce_entry ? fce : (direction == 1 ? ftop : fbot)
+
+            if direction == 1 and safe_lte(low, entry_level) and safe_gt(close, fbot)
+                signal_dir   := 1
+                signal_label := "M5"
+                entry_taken_this_bar := true
+                entry_taken_bar_idx  := bar_index
+                array.set(fvg_traded, i, true)
+
+            if direction == -1 and safe_gte(high, entry_level) and safe_lt(close, ftop)
+                signal_dir   := -1
+                signal_label := "M5"
+                entry_taken_this_bar := true
+                entry_taken_bar_idx  := bar_index
+                array.set(fvg_traded, i, true)
+
+    while array.size(fvg_top) > m5_max_fvg
+        box b = array.get(fvg_boxes, 0)
+        if not na(b)
+            box.delete(b)
+        line l = array.get(fvg_ce, 0)
+        if not na(l)
+            line.delete(l)
+        array.remove(fvg_top,    0)
+        array.remove(fvg_bot,    0)
+        array.remove(fvg_dir,    0)
+        array.remove(fvg_birth,  0)
+        array.remove(fvg_filled, 0)
+        array.remove(fvg_traded, 0)
+        array.remove(fvg_boxes,  0)
+        array.remove(fvg_ce,     0)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 8 — CENTRALIZED ORDER PLACEMENT (1:1 RR)
+// ══════════════════════════════════════════════════════════════════════════════
+// Single order. SL = ATR × multiplier. TP = same distance (1:1).
+// This gives a clean, unambiguous winrate in the Strategy Tester.
+// ══════════════════════════════════════════════════════════════════════════════
+
+if signal_dir != 0
+    float entry   = close
+    float atr_now = nz(atr_val, close * 0.02)
+    float sl_dist = atr_now * mm_sl_atr
+    float tp_dist = sl_dist                    // 1:1 — TP mirrors SL distance
+
+    float sl_px = signal_dir == 1 ? entry - sl_dist : entry + sl_dist
+    float tp_px = signal_dir == 1 ? entry + tp_dist : entry - tp_dist
+
+    // Store for visuals and re-issue
+    trade_dir   := signal_dir
+    trade_sl    := sl_px
+    trade_tp    := tp_px
+    trade_label := signal_label
+
+    if signal_dir == 1
+        strategy.entry(signal_label + "_L", strategy.long,
+             comment = signal_label + " Long")
+        strategy.exit(signal_label + "_LX", signal_label + "_L",
+             stop = sl_px, limit = tp_px, comment = "SL/TP")
+    else
+        strategy.entry(signal_label + "_S", strategy.short,
+             comment = signal_label + " Short")
+        strategy.exit(signal_label + "_SX", signal_label + "_S",
+             stop = sl_px, limit = tp_px, comment = "SL/TP")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// § 9 — EXIT PERSISTENCE + STATE RESET
+// ══════════════════════════════════════════════════════════════════════════════
+// Re-issue strategy.exit() every bar to guarantee the SL/TP stays active.
+// Reset trade state when position closes.
+// ══════════════════════════════════════════════════════════════════════════════
+
+if trade_dir != 0
+    if strategy.opentrades == 0
+        // Position closed — reset
+        trade_dir   := 0
+        trade_sl    := na
+        trade_tp    := na
+        trade_label := ""
+    else if signal_dir == 0 and not na(trade_sl) and not na(trade_tp)
+        // No new signal this bar — re-issue exit to keep it alive
+        if trade_dir == 1
+            strategy.exit(trade_label + "_LX", trade_label + "_L",
+                 stop = trade_sl, limit = trade_tp, comment = "SL/TP")
+        else
+            strategy.exit(trade_label + "_SX", trade_label + "_S",
+                 stop = trade_sl, limit = trade_tp, comment = "SL/TP")
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 9B — VISUAL: SL / TP LINES
+// ──────────────────────────────────────────────────────────────────────────────
+
+bool in_trade = trade_dir != 0 and strategy.opentrades > 0
+
+plot(show_mm and in_trade ? trade_sl : na,
+     "Stop Loss", color.new(col_bear, 20), 2, plot.style_stepline)
+
+plot(show_mm and in_trade ? trade_tp : na,
+     "Take Profit", color.new(col_bull, 20), 2, plot.style_stepline)
+
+// ──────────────────────────────────────────────────────────────────────────────
+// § 10 — DASHBOARD TABLE
+// ──────────────────────────────────────────────────────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 9, bgcolor = color.new(color.black, 80),
+     border_color = color.new(color.white, 80), border_width = 1)
+
+if barstate.islast
+    // ── Module status rows ──
+    table.cell(dash, 0, 0, "Module",        text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, "Status",        text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 1, "1: Accept/Rej", text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, use_mod1 ? "ON" : "OFF",
+         text_color = use_mod1 ? col_bull : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 2, "2: SFP",        text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, use_mod2 ? "ON" : "OFF",
+         text_color = use_mod2 ? col_bull : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 3, "3: HTF Liq",    text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, use_mod3 ? "ON" : "OFF",
+         text_color = use_mod3 ? col_bull : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 4, "4: Displace",   text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, use_mod4 ? "ON" : "OFF",
+         text_color = use_mod4 ? col_bull : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 5, "5: FVG",        text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, use_mod5 ? "ON" : "OFF",
+         text_color = use_mod5 ? col_bull : color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 6, "Active FVGs",   text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(array.size(fvg_top)),
+         text_color = color.white, text_size = size.tiny)
+
+    // ── Winrate stats ──
+    int total_trades = strategy.closedtrades
+    int wins = strategy.wintrades
+    int losses = strategy.losstrades
+    float winrate = total_trades > 0 ? (wins / total_trades) * 100.0 : 0.0
+
+    table.cell(dash, 0, 7, "─ Winrate ─",   text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 7, "",               text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 0, 8, str.tostring(wins) + "W / " + str.tostring(losses) + "L",
+         text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 8, str.tostring(winrate, "#.1") + "%",
+         text_color = winrate >= 50 ? col_bull : col_bear, text_size = size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF STRATEGY
+// ══════════════════════════════════════════════════════════════════════════════

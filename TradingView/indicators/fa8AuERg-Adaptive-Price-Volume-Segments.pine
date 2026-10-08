@@ -1,0 +1,195 @@
+//@version=6
+indicator("Adaptive Price-Volume Segments", "APV Profile", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// High-Contrast Palette Optimized for Light/White Chart Backgrounds
+//---------------------------------------------------------------------------------------------------------------------}
+var color[] LIGHT_CANVAS_PALETTE = array.from(
+     #0039A6, // Deep Ocean Blue
+     #C62828, // Crimson Red
+     #1B5E20, // Dark Emerald Green
+     #E65100, // Rich Amber Orange
+     #4A148C, // Deep Violet
+     #006064, // Slate Teal
+     #F57F17, // Burnt Yellow
+     #AD1457, // Deep Rose Pink
+     #3E2723, // Espresso Brown
+     #263238  // Dark Charcoal
+ )
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Configuration Inputs
+//---------------------------------------------------------------------------------------------------------------------}
+grp_alg      = "Grouping Parameters"
+depthBars    = input.int(200, "Historical Depth (Bars)", minval = 10, group = grp_alg, tooltip = "Number of historical bars used for price partition.")
+groupCount   = input.int(5, "Total Segments", minval = 2, maxval = 10, group = grp_alg, tooltip = "Number of distinct price clusters to calculate.")
+maxLoops     = input.int(40, "Optimization Iterations", minval = 5, maxval = 50, group = grp_alg)
+
+grp_draw     = "Histogram & Visual Layout"
+gridBins     = input.int(20, "Bins per Segment", minval = 2, group = grp_draw, tooltip = "Vertical resolution for segment volume distribution.")
+profileSpan  = input.int(40, "Max Histogram Width", minval = 5, group = grp_draw)
+rightGap     = input.int(10, "Right Plot Margin", group = grp_draw)
+drawMarkers  = input.bool(true, "Display Price Markers", group = grp_draw)
+markerScale  = input.string(size.small, "Marker Scale", options = [size.tiny, size.small, size.normal, size.large, size.huge], group = grp_draw)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Custom Weighted Clustering Engine
+//---------------------------------------------------------------------------------------------------------------------{
+f_runPartitionEngine(int depth, int numK, int totalIters) =>
+    float[] priceData = array.new_float(0)
+    float[] volumeData = array.new_float(0)
+    float pMin = 1e10, pMax = -1e10
+    
+    for idx = 0 to depth - 1
+        float pVal = hl2[idx]
+        float vVal = volume[idx]
+        priceData.push(pVal)
+        volumeData.push(vVal)
+        pMin := math.min(pMin, pVal)
+        pMax := math.max(pMax, pVal)
+            
+    float[] clusterCenters = array.new_float(numK)
+    float intervalStep = (pMax - pMin) / (numK + 1)
+    for idx = 0 to numK - 1
+        clusterCenters.set(idx, pMin + (idx + 1) * intervalStep)
+        
+    int[] mappedIndices = array.new_int(depth, 0)
+    
+    for loop = 1 to totalIters
+        for idx = 0 to depth - 1
+            float currentPrice = priceData.get(idx)
+            int targetGroup = 0
+            float shortestDist = 1e10
+            for kIdx = 0 to numK - 1
+                float distance = math.abs(currentPrice - clusterCenters.get(kIdx))
+                if distance < shortestDist
+                    shortestDist := distance
+                    targetGroup := kIdx
+            mappedIndices.set(idx, targetGroup)
+            
+        float[] volWeightedSum = array.new_float(numK, 0.0)
+        float[] sumVolume = array.new_float(numK, 0.0)
+        
+        for idx = 0 to depth - 1
+            int assignedGroup = mappedIndices.get(idx)
+            volWeightedSum.set(assignedGroup, volWeightedSum.get(assignedGroup) + priceData.get(idx) * volumeData.get(idx))
+            sumVolume.set(assignedGroup, sumVolume.get(assignedGroup) + volumeData.get(idx))
+            
+        for kIdx = 0 to numK - 1
+            if sumVolume.get(kIdx) > 0
+                clusterCenters.set(kIdx, volWeightedSum.get(kIdx) / sumVolume.get(kIdx))
+    
+    [mappedIndices, clusterCenters]
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Drawing and Graphic Management
+//---------------------------------------------------------------------------------------------------------------------{
+var box[] drawBoxes = array.new_box()
+var label[] drawLabels = array.new_label()
+var line[] drawLines = array.new_line()
+
+if barstate.islast
+    // Clear graphic objects from previous calculation
+    if drawBoxes.size() > 0
+        for item in drawBoxes
+            item.delete()
+        drawBoxes.clear()
+        
+    if drawLabels.size() > 0
+        for item in drawLabels
+            item.delete()
+        drawLabels.clear()
+        
+    if drawLines.size() > 0
+        for item in drawLines
+            item.delete()
+        drawLines.clear()
+
+    // Execute clustering calculation
+    [mappedIndices, clusterCenters] = f_runPartitionEngine(depthBars, groupCount, maxLoops)
+
+    int leftBoundaryIdx = bar_index - depthBars + 1
+    int profileStartBar = bar_index + rightGap
+
+    int metricReserveCount = groupCount * 2
+    int activeLabelCounter = 0
+
+    for segmentId = 0 to groupCount - 1
+        color activeColor = LIGHT_CANVAS_PALETTE.get(segmentId % LIGHT_CANVAS_PALETTE.size())
+        
+        float[] segPrices = array.new_float(0)
+        float[] segVolumes = array.new_float(0)
+        float[] segHighs  = array.new_float(0)
+        float[] segLows   = array.new_float(0)
+        
+        float segMin = 1e10, segMax = -1e10
+        float segVolumeSum = 0.0
+        
+        for idx = 0 to depthBars - 1
+            if mappedIndices.get(idx) == segmentId
+                float priceVal = hl2[idx], volVal = volume[idx], highVal = high[idx], lowVal = low[idx]
+                segPrices.push(priceVal)
+                segVolumes.push(volVal)
+                segHighs.push(highVal)
+                segLows.push(lowVal)
+                
+                segMin := math.min(segMin, lowVal)
+                segMax := math.max(segMax, highVal)
+                segVolumeSum += volVal
+                
+                if drawMarkers and activeLabelCounter < (500 - metricReserveCount)
+                    drawLabels.push(label.new(bar_index - idx, priceVal, "•", 
+                         color = #00000000, 
+                         textcolor = activeColor, 
+                         style = label.style_label_center, 
+                         size = markerScale))
+                    activeLabelCounter += 1
+
+        if segPrices.size() > 0
+            float[] binVolumes = array.new_float(gridBins, 0.0)
+            float binHeight = (segMax - segMin) / gridBins
+            if binHeight == 0
+                binHeight := syminfo.mintick
+                
+            for idx = 0 to segPrices.size() - 1
+                float candleH = segHighs.get(idx), candleL = segLows.get(idx), candleV = segVolumes.get(idx)
+                float priceSpan = math.max(candleH - candleL, syminfo.mintick)
+                
+                for bIdx = 0 to gridBins - 1
+                    float binFloor = segMin + bIdx * binHeight
+                    float binCeil = binFloor + binHeight
+                    float intersL = math.max(candleL, binFloor)
+                    float intersH = math.min(candleH, binCeil)
+                    if intersH > intersL
+                        binVolumes.set(bIdx, binVolumes.get(bIdx) + candleV * (intersH - intersL) / priceSpan)
+                
+            float maxVolumeInBin = binVolumes.max()
+            int peakBinIndex = binVolumes.indexof(maxVolumeInBin)
+            
+            for bIdx = 0 to gridBins - 1
+                if drawBoxes.size() >= 500
+                    break
+                float binVol = binVolumes.get(bIdx)
+                if binVol == 0
+                    continue
+                    
+                float yLower = segMin + bIdx * binHeight
+                float yUpper = yLower + binHeight
+                int binLength = int((binVol / maxVolumeInBin) * profileSpan)
+                int profileEndBar = profileStartBar + binLength
+                bool isMaxPeak = (bIdx == peakBinIndex)
+                
+                // Opacity tuned for sharp light-background visibility
+                color boxFill = isMaxPeak ? activeColor : color.new(activeColor, 68)
+                
+                drawBoxes.push(box.new(profileStartBar, yUpper, profileEndBar, yLower, bgcolor = boxFill, border_color = isMaxPeak ? activeColor : #00000000))
+                    
+                if isMaxPeak
+                    float pocPrice = (yUpper + yLower) / 2
+                    drawLines.push(line.new(leftBoundaryIdx, pocPrice, profileStartBar, pocPrice, color = activeColor, width = 1, style = line.style_dashed))
+
+                    drawLabels.push(label.new(leftBoundaryIdx, pocPrice, str.tostring(binVol, format.volume), 
+                         color = #00000000, textcolor = activeColor, style = label.style_label_right, size = size.small))
+                         
+                    drawLabels.push(label.new(profileEndBar, pocPrice, "Vol: " + str.tostring(segVolumeSum, format.volume), 
+                         color = #00000000, textcolor = activeColor, style = label.style_label_left, size = size.small))

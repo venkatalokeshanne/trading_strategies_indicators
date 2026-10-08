@@ -1,0 +1,170 @@
+// This work is licensed under the Mozilla Public License 2.0
+// © original author: (Mansoor Anwar)
+//@version=6
+indicator("Reversal Signal: ZigZag Trend + RSI Divergence + HA", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ============================================================
+// INPUTS
+// ============================================================
+grpTrend = "Trend (ZigZag)"
+pivotLen   = input.int(5,  "Pivot Lookback (bars each side)", minval=2, group=grpTrend)
+
+grpRSI = "RSI Divergence"
+rsiLen     = input.int(14, "RSI Length", minval=2, group=grpRSI)
+rsiSrc     = input.source(close, "RSI Source", group=grpRSI)
+divLookback = input.int(60, "Max Bars Between Divergence Pivots", minval=5, group=grpRSI)
+
+grpHA = "Heikin Ashi"
+showHA     = input.bool(true, "Plot Custom Heikin Ashi Candles", group=grpHA)
+
+grpSL = "Stop Loss"
+slBuffer   = input.float(0.1, "Stop Loss Buffer (% below support)", minval=0.0, step=0.05, group=grpSL) / 100
+
+// ============================================================
+// 1. CUSTOM HEIKIN ASHI (computed manually on standard OHLC,
+//    independent of the chart's own candle type, to avoid the
+//    distortion of switching the whole chart to HA)
+// ============================================================
+haClose = (open + high + low + close) / 4.0
+var float haOpen = na
+haOpen := na(haOpen[1]) ? (open + close) / 2.0 : (haOpen[1] + haClose[1]) / 2.0
+haHigh  = math.max(high, math.max(haOpen, haClose))
+haLow   = math.min(low,  math.min(haOpen, haClose))
+haBullish = haClose > haOpen
+
+plotcandle(showHA ? haOpen : na, showHA ? haHigh : na, showHA ? haLow : na, showHA ? haClose : na,
+     title="Custom Heikin Ashi",
+     color = haBullish ? color.new(color.lime, 0) : color.new(color.red, 0),
+     wickcolor = color.gray,
+     bordercolor = haBullish ? color.new(color.lime, 0) : color.new(color.red, 0))
+
+// First green HA candle after a run of red HA candles
+redRun = ta.barssince(haBullish)
+firstGreenAfterReds = haBullish and redRun[1] >= 1
+
+// ============================================================
+// 2. ZIGZAG-BASED TREND DETECTION
+//    Find swing highs/lows with pivotLen bars on each side and
+//    classify the trend from the sequence of the last two
+//    confirmed swing highs and lows (HH/HL = bullish structure,
+//    LH/LL = bearish structure).
+// ============================================================
+swingHigh = ta.pivothigh(high, pivotLen, pivotLen)
+swingLow  = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastHigh1 = na, var float lastHigh2 = na
+var float lastLow1  = na, var float lastLow2  = na
+var int   lastHighBar = na, var int lastLowBar = na
+
+if not na(swingHigh)
+    lastHigh2 := lastHigh1
+    lastHigh1 := swingHigh
+    lastHighBar := bar_index - pivotLen
+
+if not na(swingLow)
+    lastLow2 := lastLow1
+    lastLow1 := swingLow
+    lastLowBar := bar_index - pivotLen
+
+var string trend = "Undefined"
+if not na(lastHigh1) and not na(lastHigh2) and not na(lastLow1) and not na(lastLow2)
+    bool higherHighs = lastHigh1 > lastHigh2
+    bool higherLows  = lastLow1  > lastLow2
+    bool lowerHighs  = lastHigh1 < lastHigh2
+    bool lowerLows   = lastLow1  < lastLow2
+    if higherHighs and higherLows
+        trend := "Bullish"
+    else if lowerHighs and lowerLows
+        trend := "Bearish"
+    // mixed structure keeps the previous trend value (no update)
+
+isBearishTrend = trend == "Bearish"
+
+// draw the zigzag line for visual reference
+var float zzPrevPrice = na
+var int   zzPrevBar   = na
+
+if not na(swingHigh)
+    zzHighBar = bar_index - pivotLen
+    if not na(zzPrevPrice)
+        line.new(zzPrevBar, zzPrevPrice, zzHighBar, swingHigh, xloc.bar_index, color=color.new(color.blue, 40), width=1)
+    zzPrevPrice := swingHigh
+    zzPrevBar   := zzHighBar
+
+if not na(swingLow)
+    zzLowBar = bar_index - pivotLen
+    if not na(zzPrevPrice)
+        line.new(zzPrevBar, zzPrevPrice, zzLowBar, swingLow, xloc.bar_index, color=color.new(color.blue, 40), width=1)
+    zzPrevPrice := swingLow
+    zzPrevBar   := zzLowBar
+
+// ============================================================
+// 3. BULLISH RSI DIVERGENCE
+//    Price makes a lower low while RSI makes a higher low,
+//    compared across the two most recent confirmed pivot lows.
+// ============================================================
+rsiVal = ta.rsi(rsiSrc, rsiLen)
+
+var float rsiAtLow1 = na, var float rsiAtLow2 = na
+
+if not na(swingLow)
+    rsiAtLow2 := rsiAtLow1
+    rsiAtLow1 := rsiVal[pivotLen]   // RSI value at the bar the pivot low occurred
+
+bullishDivergence = false
+if not na(swingLow) and not na(lastLow1) and not na(lastLow2) and not na(rsiAtLow1) and not na(rsiAtLow2)
+    barsBetween = lastLowBar - nz(lastLowBar[1], lastLowBar)
+    priceLL = lastLow1 < lastLow2          // price: lower low
+    rsiHL   = rsiAtLow1 > rsiAtLow2        // rsi: higher low
+    if priceLL and rsiHL and (bar_index - lastLowBar) <= divLookback
+        bullishDivergence := true
+
+// keep divergence flag "active" for a window of bars after it fires,
+// so it can combine with the HA trigger candle that follows shortly after
+var int divergenceBar = na
+if bullishDivergence
+    divergenceBar := bar_index
+recentDivergence = not na(divergenceBar) and (bar_index - divergenceBar) <= pivotLen * 3
+
+if bullishDivergence
+    label.new(lastLowBar, lastLow1, "Bull Div", xloc.bar_index, yloc.belowbar,
+         color=color.new(color.purple, 0), style=label.style_label_up, textcolor=color.white, size=size.small)
+
+// ============================================================
+// 4. BUY SIGNAL
+//    Bearish trend + recent bullish RSI divergence +
+//    first green HA candle after a run of red HA candles
+// ============================================================
+buySignal = isBearishTrend and recentDivergence and firstGreenAfterReds
+
+plotshape(buySignal, title="Buy Signal", style=shape.triangleup, location=location.belowbar,
+     color=color.new(color.lime, 0), size=size.small, text="BUY")
+
+// ============================================================
+// 5. DYNAMIC STOP LOSS
+//    Placed just below the most recent confirmed swing low
+//    (support), offset by an optional buffer percentage.
+// ============================================================
+var float stopLossLevel = na
+if buySignal and not na(lastLow1)
+    stopLossLevel := lastLow1 * (1 - slBuffer)
+
+plot(stopLossLevel, title="Dynamic Stop Loss", style=plot.style_linebr, color=color.new(color.red, 0), linewidth=2)
+
+// ============================================================
+// ALERTS
+// ============================================================
+alertcondition(buySignal, title="Bullish Reversal Signal",
+     message="Bearish trend + bullish RSI divergence + first green HA candle: potential long entry.")
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+var table dash = table.new(position.top_right, 2, 3, border_width=1)
+if barstate.islast
+    table.cell(dash, 0, 0, "Trend", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 0, trend, text_color=color.white, bgcolor=isBearishTrend ? color.red : color.green)
+    table.cell(dash, 0, 1, "Bull Divergence", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 1, recentDivergence ? "Active" : "None", text_color=color.white, bgcolor=recentDivergence ? color.purple : color.gray)
+    table.cell(dash, 0, 2, "Stop Loss", text_color=color.white, bgcolor=color.gray)
+    table.cell(dash, 1, 2, na(stopLossLevel) ? "—" : str.tostring(stopLossLevel, format.mintick), text_color=color.white, bgcolor=color.gray)

@@ -1,0 +1,379 @@
+//@version=6
+strategy('AI MES Globex Overnight Strategy',
+     overlay = true,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.62,
+     calc_on_every_tick = false)
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+// Session
+globexStartH     = input.int(18, 'Globex Start Hour (ET)',        group = 'Session', minval = 0, maxval = 23)
+globexStartM     = input.int(0,  'Globex Start Minute (ET)',      group = 'Session', minval = 0, maxval = 59)
+rangeEndH        = input.int(18, 'Range Build End Hour (ET)',     group = 'Session', minval = 0, maxval = 23)
+rangeEndM        = input.int(30, 'Range Build End Minute (ET)',   group = 'Session', minval = 0, maxval = 59)
+globexEndH       = input.int(9,  'Globex End Hour (ET)',          group = 'Session', minval = 0, maxval = 23)
+globexEndM       = input.int(30, 'Globex End Minute (ET)',        group = 'Session', minval = 0, maxval = 59)
+
+// Range
+minRangeSize     = input.float(3.0,  'Min Range Size (pts)',              group = 'Range', step = 0.5)
+maxRangeSize     = input.float(25.0, 'Max Range Size (pts)',              group = 'Range', step = 0.5)
+breakoutBuffer   = input.float(0.75, 'Breakout Confirmation (pts)',       group = 'Range', step = 0.25)
+fadeBuffer       = input.float(1.0,  'Fade Entry Buffer (pts)',           group = 'Range', step = 0.25)
+
+// HTF
+htfTF            = input.timeframe('60', 'HTF Timeframe',                 group = 'Higher Timeframe')
+htfEMALen        = input.int(21,          'HTF EMA Length',                group = 'Higher Timeframe')
+useHTFFilter     = input.bool(true,       'Use HTF Bias Filter',           group = 'Higher Timeframe')
+
+// Momentum
+rsiLen           = input.int(14,   'RSI Length',                          group = 'Momentum')
+rsiOB            = input.float(65, 'RSI Overbought (fade threshold)',      group = 'Momentum', step = 1.0)
+rsiOS            = input.float(35, 'RSI Oversold (fade threshold)',        group = 'Momentum', step = 1.0)
+rsiBreakMin      = input.float(52, 'RSI Min for breakout longs',           group = 'Momentum', step = 1.0)
+rsiBreakMax      = input.float(48, 'RSI Max for breakout shorts',          group = 'Momentum', step = 1.0)
+
+// Volume
+volLen           = input.int(20,    'Volume MA Length',                    group = 'Volume')
+volMultBreak     = input.float(1.3, 'Volume Multiplier (breakout)',        group = 'Volume', step = 0.1)
+volMultFade      = input.float(0.7, 'Volume Multiplier (fade)',            group = 'Volume', step = 0.1)
+useVolFilter     = input.bool(true, 'Use Volume Filter',                   group = 'Volume')
+
+// Pivot structure (for trend following)
+pivotLen         = input.int(4, 'Pivot Lookback (bars each side)',         group = 'Structure', minval = 2, maxval = 10)
+
+// Risk
+riskRatio        = input.float(1.5, 'Reward:Risk Ratio',                   group = 'Risk', step = 0.1)
+atrLen           = input.int(14,    'ATR Length',                          group = 'Risk')
+atrMult          = input.float(2.0, 'ATR Stop Multiplier (wider overnight)', group = 'Risk', step = 0.1)
+stopBuffer       = input.float(2.0, 'Stop Buffer beyond range (pts)',      group = 'Risk', step = 0.25)
+maxTrades        = input.int(2,     'Max Trades Per Session',              group = 'Risk', minval = 1, maxval = 5)
+
+// News blackout (avoid entries around major releases)
+useNewsBlackout  = input.bool(true, 'Use News Blackout Window',            group = 'News Blackout')
+blackoutStartH   = input.int(8,  'Blackout Start Hour (ET)',               group = 'News Blackout', minval = 0, maxval = 23)
+blackoutStartM   = input.int(15, 'Blackout Start Minute (ET)',             group = 'News Blackout', minval = 0, maxval = 59)
+blackoutEndH     = input.int(8,  'Blackout End Hour (ET)',                 group = 'News Blackout', minval = 0, maxval = 23)
+blackoutEndM     = input.int(45, 'Blackout End Minute (ET)',               group = 'News Blackout', minval = 0, maxval = 59)
+
+// ══════════════════════════════════════════════════════
+// SESSION LOGIC
+// ══════════════════════════════════════════════════════
+
+etHour = hour(time, 'America/New_York')
+etMin  = minute(time, 'America/New_York')
+etTime = etHour * 100 + etMin
+
+globexStartT  = globexStartH * 100 + globexStartM
+rangeEndT     = rangeEndH    * 100 + rangeEndM
+globexEndT    = globexEndH   * 100 + globexEndM
+blackoutStartT = blackoutStartH * 100 + blackoutStartM
+blackoutEndT   = blackoutEndH   * 100 + blackoutEndM
+
+// Globex spans midnight so we need two conditions:
+// either >= 18:00 OR <= 09:30
+inRangeBuild  = etTime >= globexStartT and etTime < rangeEndT
+inGlobex      = (etTime >= rangeEndT) and (etTime < globexEndT or etTime >= globexStartT)
+inAnySession  = inRangeBuild or inGlobex
+
+// News blackout window
+inBlackout    = useNewsBlackout and etTime >= blackoutStartT and etTime < blackoutEndT
+
+newSession    = inGlobex and not inGlobex[1]
+
+var int sessionTrades = 0
+if newSession
+    sessionTrades := 0
+
+underTradeLimit = sessionTrades < maxTrades
+
+// ══════════════════════════════════════════════════════
+// OPENING RANGE (first 30 min after 6pm ET)
+// ══════════════════════════════════════════════════════
+
+var float rangeHigh       = na
+var float rangeLow        = na
+var float rangeHighLocked = na
+var float rangeLowLocked  = na
+var float rangeMid        = na
+
+if inRangeBuild
+    rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+    rangeLow  := na(rangeLow)  ? low  : math.min(rangeLow,  low)
+
+if newSession
+    rangeHighLocked := rangeHigh
+    rangeLowLocked  := rangeLow
+    rangeMid        := (rangeHigh + rangeLow) / 2
+    rangeHigh       := na
+    rangeLow        := na
+
+rangeSize  = na(rangeHighLocked) or na(rangeLowLocked) ? na : rangeHighLocked - rangeLowLocked
+validRange = not na(rangeSize) and rangeSize >= minRangeSize and rangeSize <= maxRangeSize
+
+// ══════════════════════════════════════════════════════
+// HIGHER TIMEFRAME BIAS
+// ══════════════════════════════════════════════════════
+
+htfEMA   = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEMALen), lookahead = barmerge.lookahead_off)
+bullBias = close > htfEMA
+bearBias = close < htfEMA
+
+htfLong  = not useHTFFilter or bullBias
+htfShort = not useHTFFilter or bearBias
+
+// ══════════════════════════════════════════════════════
+// PIVOT STRUCTURE (trend following trigger)
+// ══════════════════════════════════════════════════════
+
+pivHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivLow  = ta.pivotlow(low,  pivotLen, pivotLen)
+
+var float lastPivHigh = na
+var float lastPivLow  = na
+
+if not na(pivHigh)
+    lastPivHigh := pivHigh
+if not na(pivLow)
+    lastPivLow := pivLow
+
+pivotBreakHigh = not na(lastPivHigh) and close > lastPivHigh and close[1] <= lastPivHigh
+pivotBreakLow  = not na(lastPivLow)  and close < lastPivLow  and close[1] >= lastPivLow
+
+// ══════════════════════════════════════════════════════
+// MOMENTUM & VOLUME
+// ══════════════════════════════════════════════════════
+
+rsi    = ta.rsi(close, rsiLen)
+atr    = ta.atr(atrLen)
+avgVol = ta.sma(volume, volLen)
+
+volBreak = not useVolFilter or volume > avgVol * volMultBreak
+volFade  = not useVolFilter or volume > avgVol * volMultFade
+
+// ══════════════════════════════════════════════════════
+// STRATEGY 1 — RANGE BREAKOUT
+// Clean break outside opening range with volume + momentum
+// Also triggers on pivot structure break (trend continuation)
+// ══════════════════════════════════════════════════════
+
+rangeBreakLong  = validRange and
+                 close > rangeHighLocked + breakoutBuffer and
+                 close[1] <= rangeHighLocked + breakoutBuffer and
+                 rsi > rsiBreakMin and volBreak and htfLong
+
+rangeBreakShort = validRange and
+                 close < rangeLowLocked - breakoutBuffer and
+                 close[1] >= rangeLowLocked - breakoutBuffer and
+                 rsi < rsiBreakMax and volBreak and htfShort
+
+trendLong  = pivotBreakHigh and bullBias and rsi > rsiBreakMin and volBreak
+trendShort = pivotBreakLow  and bearBias and rsi < rsiBreakMax and volBreak
+
+breakoutLong  = rangeBreakLong  or trendLong
+breakoutShort = rangeBreakShort or trendShort
+
+// ══════════════════════════════════════════════════════
+// STRATEGY 2 — MEAN REVERSION
+// Price tags range extreme with overbought/oversold RSI
+// then closes back inside — fade back toward midpoint
+// Extra conservative overnight: require RSI deeper OB/OS
+// ══════════════════════════════════════════════════════
+
+taggedHigh = high >= rangeHighLocked - fadeBuffer
+taggedLow  = low  <= rangeLowLocked  + fadeBuffer
+
+fadeShort = validRange and taggedHigh and
+             close < rangeHighLocked and close[1] >= rangeHighLocked and
+             rsi > rsiOB and volFade and htfShort
+
+fadeLong  = validRange and taggedLow and
+             close > rangeLowLocked and close[1] <= rangeLowLocked and
+             rsi < rsiOS and volFade and htfLong
+
+// ══════════════════════════════════════════════════════
+// COMBINED ENTRY — whichever fires first wins
+// Blocked during news blackout window
+// ══════════════════════════════════════════════════════
+
+longCondition  = inGlobex and underTradeLimit and strategy.position_size == 0 and
+                 not inBlackout and (breakoutLong or fadeLong)
+
+shortCondition = inGlobex and underTradeLimit and strategy.position_size == 0 and
+                 not inBlackout and (breakoutShort or fadeShort)
+
+// ══════════════════════════════════════════════════════
+// DYNAMIC STOP & TARGET
+// Overnight uses wider ATR multiplier (2.0×) to account
+// for slower price action and wider spreads
+// ══════════════════════════════════════════════════════
+
+atrLongStop   = close - atr * atrMult
+atrShortStop  = close + atr * atrMult
+
+pivLongStop   = na(lastPivLow)  ? atrLongStop  : lastPivLow  - stopBuffer
+pivShortStop  = na(lastPivHigh) ? atrShortStop : lastPivHigh + stopBuffer
+
+// Use wider of ATR or pivot stop (conservative)
+longStop  = math.min(pivLongStop,  atrLongStop)
+shortStop = math.max(pivShortStop, atrShortStop)
+
+longRisk  = close - longStop
+shortRisk = shortStop - close
+
+// Fades target range midpoint, breakouts/trend use R:R ratio
+longTarget  = (fadeLong  and not breakoutLong)  ? rangeMid : close + longRisk  * riskRatio
+shortTarget = (fadeShort and not breakoutShort) ? rangeMid : close - shortRisk * riskRatio
+
+// ══════════════════════════════════════════════════════
+// ENTRIES
+// ══════════════════════════════════════════════════════
+
+var float entryStop   = na
+var float entryTarget = na
+
+if strategy.position_size == 0
+    entryStop   := na
+    entryTarget := na
+
+if longCondition
+    entryStop   := longStop
+    entryTarget := longTarget
+    strategy.entry('Long', strategy.long)
+    sessionTrades += 1
+    alert('🟢 MES GLOBEX LONG\n' +
+         'Type: '        + (fadeLong ? 'Mean Reversion Fade' : trendLong ? 'Trend/Pivot Break' : 'Range Breakout') + '\n' +
+         'Entry: '       + str.tostring(math.round(close, 2))           + '\n' +
+         'Range High: '  + str.tostring(math.round(rangeHighLocked, 2)) + '\n' +
+         'Range Low: '   + str.tostring(math.round(rangeLowLocked,  2)) + '\n' +
+         'Range Mid: '   + str.tostring(math.round(rangeMid, 2))        + '\n' +
+         'Stop: '        + str.tostring(math.round(longStop, 2))        + '\n' +
+         'Target: '      + str.tostring(math.round(longTarget, 2))      + '\n' +
+         'Risk (pts): '  + str.tostring(math.round(longRisk, 2))        + '\n' +
+         'RSI: '         + str.tostring(math.round(rsi, 1))             + '\n' +
+         'ATR: '         + str.tostring(math.round(atr, 2))             + '\n' +
+         'HTF Bias: BULL', alert.freq_once_per_bar)
+
+if shortCondition
+    entryStop   := shortStop
+    entryTarget := shortTarget
+    strategy.entry('Short', strategy.short)
+    sessionTrades += 1
+    alert('🔴 MES GLOBEX SHORT\n' +
+         'Type: '        + (fadeShort ? 'Mean Reversion Fade' : trendShort ? 'Trend/Pivot Break' : 'Range Breakout') + '\n' +
+         'Entry: '       + str.tostring(math.round(close, 2))           + '\n' +
+         'Range High: '  + str.tostring(math.round(rangeHighLocked, 2)) + '\n' +
+         'Range Low: '   + str.tostring(math.round(rangeLowLocked,  2)) + '\n' +
+         'Range Mid: '   + str.tostring(math.round(rangeMid, 2))        + '\n' +
+         'Stop: '        + str.tostring(math.round(shortStop, 2))       + '\n' +
+         'Target: '      + str.tostring(math.round(shortTarget, 2))     + '\n' +
+         'Risk (pts): '  + str.tostring(math.round(shortRisk, 2))       + '\n' +
+         'RSI: '         + str.tostring(math.round(rsi, 1))             + '\n' +
+         'ATR: '         + str.tostring(math.round(atr, 2))             + '\n' +
+         'HTF Bias: BEAR', alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// EXITS
+// ══════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    strategy.exit('Long Exit', 'Long', stop = entryStop, limit = entryTarget)
+    if low <= entryStop
+        alert('🛑 MES GLOBEX LONG STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,     2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop, 2)), alert.freq_once_per_bar)
+    if high >= entryTarget
+        alert('✅ MES GLOBEX LONG TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+if strategy.position_size < 0
+    strategy.exit('Short Exit', 'Short', stop = entryStop, limit = entryTarget)
+    if high >= entryStop
+        alert('🛑 MES GLOBEX SHORT STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,     2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop, 2)), alert.freq_once_per_bar)
+    if low <= entryTarget
+        alert('✅ MES GLOBEX SHORT TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+sessionEnd = not inAnySession and inAnySession[1]
+if sessionEnd
+    strategy.close_all(comment = 'Session End')
+    alert('🔔 MES GLOBEX SESSION END — All positions closed. Price: ' +
+         str.tostring(math.round(close, 2)), alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════
+
+plot(htfEMA,        '1hr EMA (21)', color = color.new(color.yellow, 20), linewidth = 2)
+plot(ta.vwap(hlc3), 'VWAP',        color = color.new(color.purple, 20), linewidth = 1)
+plot(lastPivHigh,   'Pivot High',  color = color.new(color.red,    50), style = plot.style_circles, linewidth = 1)
+plot(lastPivLow,    'Pivot Low',   color = color.new(color.green,  50), style = plot.style_circles, linewidth = 1)
+
+// Opening range levels
+plot(inAnySession ? rangeHighLocked : na, 'Range High', color = color.new(color.orange, 10), style = plot.style_linebr, linewidth = 2)
+plot(inAnySession ? rangeLowLocked  : na, 'Range Low',  color = color.new(color.aqua,   10), style = plot.style_linebr, linewidth = 2)
+plot(inAnySession ? rangeMid        : na, 'Range Mid',  color = color.new(color.white,  40), style = plot.style_linebr, linewidth = 1)
+
+// Entry signals
+plotshape(longCondition,  style = shape.triangleup,   location = location.belowbar, color = color.lime, size = size.normal, title = 'Long Entry')
+plotshape(shortCondition, style = shape.triangledown, location = location.abovebar, color = color.red,  size = size.normal, title = 'Short Entry')
+
+// Faint circles show when fade setup is present but blocked
+plotshape(fadeLong  and inGlobex and not longCondition,  style = shape.circle, location = location.belowbar, color = color.new(color.lime, 65), size = size.tiny, title = 'Fade Long Setup')
+plotshape(fadeShort and inGlobex and not shortCondition, style = shape.circle, location = location.abovebar, color = color.new(color.red,  65), size = size.tiny, title = 'Fade Short Setup')
+
+// Open position lines
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+plot(isLong  ? entryStop   : na, 'Long Stop',    color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isLong  ? entryTarget : na, 'Long Target',  color = color.lime, style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryStop   : na, 'Short Stop',   color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryTarget : na, 'Short Target', color = color.lime, style = plot.style_linebr, linewidth = 1)
+
+// Session backgrounds
+bgcolor(inRangeBuild ? color.new(color.orange, 92) : na, title = 'Range Build Window')
+bgcolor(inGlobex     ? color.new(color.blue,   94) : na, title = 'Globex Session')
+bgcolor(inBlackout   ? color.new(color.red,    88) : na, title = 'News Blackout')
+bgcolor(inGlobex and not validRange ? color.new(color.yellow, 91) : na, title = 'Invalid Range Warning')
+
+// ══════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════
+
+var table info = table.new(position.top_right, 2, 13, bgcolor = color.new(color.black, 78), border_width = 1)
+if barstate.isrealtime or barstate.islastconfirmedhistory
+    table.cell(info, 0, 0,  'Session',    text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 0,  inRangeBuild ? 'Building Range' : inGlobex ? 'Globex' : 'Closed', text_color = inAnySession ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 1,  'Blackout',   text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 1,  inBlackout ? 'YES 🚫' : 'clear',         text_color = inBlackout ? color.red : color.lime, text_size = size.small)
+    table.cell(info, 0, 2,  'HTF EMA',    text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 2,  str.tostring(math.round(htfEMA, 2)),     text_color = color.yellow, text_size = size.small)
+    table.cell(info, 0, 3,  'Bias',       text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 3,  bullBias ? 'BULL ▲' : 'BEAR ▼',         text_color = bullBias ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 4,  'Range High', text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 4,  na(rangeHighLocked) ? '–' : str.tostring(math.round(rangeHighLocked, 2)), text_color = color.orange, text_size = size.small)
+    table.cell(info, 0, 5,  'Range Low',  text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 5,  na(rangeLowLocked) ? '–' : str.tostring(math.round(rangeLowLocked, 2)),   text_color = color.aqua,   text_size = size.small)
+    table.cell(info, 0, 6,  'Range Mid',  text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 6,  na(rangeMid) ? '–' : str.tostring(math.round(rangeMid, 2)),               text_color = color.white,  text_size = size.small)
+    table.cell(info, 0, 7,  'Range Size', text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 7,  na(rangeSize) ? '–' : str.tostring(math.round(rangeSize, 2)) + (validRange ? ' ✓' : ' invalid'), text_color = validRange ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 8,  'RSI',        text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 8,  str.tostring(math.round(rsi, 1)),        text_color = rsi > rsiOB ? color.red : rsi < rsiOS ? color.lime : color.white, text_size = size.small)
+    table.cell(info, 0, 9,  'ATR',        text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 9,  str.tostring(math.round(atr, 2)),        text_color = color.white,  text_size = size.small)
+    table.cell(info, 0, 10, 'Volume',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 10, volume > avgVol * volMultBreak ? 'HIGH ✓' : volume > avgVol * volMultFade ? 'med' : 'low', text_color = volume > avgVol * volMultBreak ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 11, 'Trades',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 11, str.tostring(sessionTrades) + '/' + str.tostring(maxTrades), text_color = underTradeLimit ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 12, 'Position',   text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 12, isLong ? 'LONG ▲' : isShort ? 'SHORT ▼' : 'FLAT', text_color = isLong ? color.lime : isShort ? color.red : color.gray, text_size = size.small)

@@ -1,0 +1,553 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("MTF SMC / ICT Market State Engine", "MTF Market State", overlay = true, max_bars_back = 5000, calc_bars_count = 5000)
+
+// --- Constants ---
+int BULL = 1
+int BEAR = -1
+int NEUTRAL = 0
+int STRONG_BULL = 2
+int STRONG_BEAR = -2
+int E_NONE = 0
+int E_HH = 1
+int E_HL = 2
+int E_LH = 3
+int E_LL = 4
+int E_BOS_BULL = 5
+int E_BOS_BEAR = 6
+int E_MSS_BULL = 7
+int E_MSS_BEAR = 8
+int ST_ACC = 1
+int ST_LIQ = 2
+int ST_MAN = 3
+int ST_IND = 4
+int ST_SHIFT = 5
+int ST_EXP = 6
+int ST_RET = 7
+int ST_CONT = 8
+int ST_EXH = 9
+int ST_DIST = 10
+int ST_REV = 11
+int ST_CREV = 12
+int L_NONE = 0
+int L_BSL = 1
+int L_SSL = 2
+int L_EQH = 3
+int L_EQL = 4
+int L_BSL_SWEPT = 5
+int L_SSL_SWEPT = 6
+int R_NONE = 0
+int R_WARN = 1
+int R_DEV = 2
+int R_BULL = 3
+int R_BEAR = 4
+int C_LOW = 1
+int C_MED = 2
+int C_HIGH = 3
+int Q_NONE = 0
+int Q_HH = 1
+int Q_HL = 2
+int Q_LH = 3
+int Q_LL = 4
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color NEUTRAL_COLOR = #787B86
+color LIQUIDITY_COLOR = #ff9800
+color WARNING_COLOR = #f5c542
+color SHIFT_COLOR = #5b9cf6
+
+// --- Inputs ---
+string tfD = input.timeframe("D", "Macro timeframe", group = "Timeframes", tooltip = "Independent macro timeframe. Default 1D.")
+string tf4 = input.timeframe("240", "Primary timeframe", group = "Timeframes", tooltip = "Independent primary timeframe. Default 4H.")
+string tf15 = input.timeframe("15", "Setup timeframe", group = "Timeframes", tooltip = "Independent setup timeframe. Default 15M.")
+string tf1 = input.timeframe("1", "Execution timeframe", group = "Timeframes", tooltip = "Independent execution timeframe. Default 1M.")
+bool useDeveloping = input.bool(false, "Use developing data", group = "Timeframes", tooltip = "Off returns the last completed source candle. On exposes live data and adds LIVE.")
+int swingLen = input.int(3, "Swing sensitivity", minval = 2, maxval = 20, group = "Market Structure", tooltip = "Pivot distance for meaningful swing structure.")
+int internalLen = input.int(2, "Internal sensitivity", minval = 1, maxval = 10, group = "Market Structure", tooltip = "Pivot distance for internal structure.")
+float displacementMult = input.float(1.6, "Displacement range multiplier", minval = 1.0, step = 0.1, group = "Market Structure", tooltip = "Current range must exceed this multiple of average range.")
+float displacementBody = input.float(0.65, "Displacement body ratio", minval = 0.4, maxval = 0.95, step = 0.05, group = "Market Structure", tooltip = "Minimum body-to-range ratio for displacement.")
+int contextLen = input.int(12, "FVG / OB context lookback", minval = 3, maxval = 50, group = "Market Structure", tooltip = "Memory window for FVG and order-block context.")
+float equalTolerance = input.float(0.20, "Equal high/low tolerance", minval = 0.05, maxval = 1.0, step = 0.05, group = "Liquidity", tooltip = "Equal-level tolerance in average-range units.")
+int sweepMemory = input.int(8, "Sweep memory", minval = 1, maxval = 30, group = "Liquidity", tooltip = "Bars for which a sweep remains active.")
+int minimumEvidence = input.int(3, "Minimum reversal evidence", minval = 2, maxval = 5, group = "Reversal", tooltip = "Evidence required for developing. This is structural confidence, not probability.")
+bool requireProtected = input.bool(true, "Require protected structure break", group = "Reversal", tooltip = "Confirmed reversal requires a close through the protected high or low.")
+bool requireDisplacement = input.bool(true, "Require displacement", group = "Reversal", tooltip = "Confirmed reversal requires opposing displacement.")
+bool requireFollowThrough = input.bool(true, "Require follow-through", group = "Reversal", tooltip = "Confirmed reversal requires a later continuation event.")
+string dashboardPosition = input.string("Top Right", "Position", options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group = "Dashboard", tooltip = "Dashboard location.")
+string dashboardSize = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = "Dashboard", tooltip = "Dashboard text size.")
+int dashboardTransparency = input.int(12, "Transparency", minval = 0, maxval = 100, group = "Dashboard", tooltip = "Dashboard cell background transparency.")
+bool showReversalPanel = input.bool(true, "Show reversal panel", group = "Dashboard", tooltip = "Show detailed reversal state at the bottom.")
+bool showMarkers = input.bool(true, "Show reversal markers", group = "Dashboard", tooltip = "Show compact chart markers.")
+bool enableStructureAlerts = input.bool(true, "Structure alerts", group = "Alerts", tooltip = "Enable BOS and MSS alerts.")
+bool enableLiquidityAlerts = input.bool(true, "Liquidity alerts", group = "Alerts", tooltip = "Enable liquidity sweep alerts.")
+bool enableBiasAlerts = input.bool(true, "Bias alerts", group = "Alerts", tooltip = "Enable bias change alerts.")
+bool enableReversalAlerts = input.bool(true, "Reversal alerts", group = "Alerts", tooltip = "Enable reversal alerts.")
+bool enableMtfAlerts = input.bool(true, "MTF alerts", group = "Alerts", tooltip = "Enable alignment and conflict alerts.")
+
+// --- Display helpers ---
+f_label(string tf) => tf == "D" ? "1D" : tf == "240" ? "4H" : tf == "15" ? "15M" : tf == "5" ? "5M" : tf == "1" ? "1M" : tf
+f_position(string p) =>
+    switch p
+        "Top Left" => position.top_left
+        "Top Center" => position.top_center
+        "Top Right" => position.top_right
+        "Middle Left" => position.middle_left
+        "Middle Right" => position.middle_right
+        "Bottom Left" => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        => position.bottom_right
+f_size(string s) => s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+f_direction(int b) => b > 0 ? 1 : b < 0 ? -1 : 0
+f_biasText(int b) => b == STRONG_BULL ? "STR. BULL" : b == BULL ? "BULLISH" : b == STRONG_BEAR ? "STR. BEAR" : b == BEAR ? "BEARISH" : "NEUTRAL"
+f_biasColor(int b) => b > 0 ? BULL_COLOR : b < 0 ? BEAR_COLOR : NEUTRAL_COLOR
+f_eventText(int e) => e == E_HH ? "HH" : e == E_HL ? "HL" : e == E_LH ? "LH" : e == E_LL ? "LL" : e == E_BOS_BULL ? "BOS ↑" : e == E_BOS_BEAR ? "BOS ↓" : e == E_MSS_BULL ? "MSS ↑" : e == E_MSS_BEAR ? "MSS ↓" : "—"
+f_structureText(int s, int i) => (s == Q_HH ? "HH" : s == Q_HL ? "HL" : s == Q_LH ? "LH" : s == Q_LL ? "LL" : "—") + " · " + (i == Q_HH ? "IHH" : i == Q_HL ? "IHL" : i == Q_LH ? "ILH" : i == Q_LL ? "ILL" : "—")
+f_liquidityText(int l) => l == L_BSL ? "BSL ABOVE" : l == L_SSL ? "SSL BELOW" : l == L_EQH ? "EQH / BSL" : l == L_EQL ? "EQL / SSL" : l == L_BSL_SWEPT ? "BSL SWEPT" : l == L_SSL_SWEPT ? "SSL SWEPT" : "NO MAJOR LIQ."
+f_reversalText(int r) => r == R_WARN ? "WARNING" : r == R_DEV ? "DEVELOPING" : r == R_BULL ? "CONFIRMED ↑" : r == R_BEAR ? "CONFIRMED ↓" : "NONE"
+f_confidenceText(int c) => c == C_HIGH ? "HIGH" : c == C_MED ? "MEDIUM" : "LOW"
+f_stageText(int s, int b, int rd) => s == ST_ACC ? "ACCUMULATION" : s == ST_LIQ ? "LIQUIDITY BUILD" : s == ST_MAN ? "MANIPULATION" : s == ST_IND ? "INDUCEMENT" : s == ST_SHIFT ? (rd > 0 ? "BULL SHIFT" : rd < 0 ? "BEAR SHIFT" : "CONFIRMED SHIFT") : s == ST_EXP ? (b > 0 ? "BULL EXPANSION" : b < 0 ? "BEAR EXPANSION" : "EXPANSION") : s == ST_RET ? "RETRACEMENT" : s == ST_CONT ? "CONTINUATION" : s == ST_EXH ? "EXHAUSTION" : s == ST_DIST ? "DISTRIBUTION" : s == ST_REV ? (rd > 0 ? "BULL REVERSAL DEV." : "BEAR REVERSAL DEV.") : s == ST_CREV ? (rd > 0 ? "CONFIRMED BULL REV." : "CONFIRMED BEAR REV.") : "—"
+f_stageColor(int s, int b) => s == ST_MAN or s == ST_REV ? LIQUIDITY_COLOR : s == ST_RET or s == ST_EXH ? WARNING_COLOR : s == ST_SHIFT ? SHIFT_COLOR : s == ST_CREV ? f_biasColor(b) : f_biasColor(b)
+
+// --- State engine ---
+// Private LuxAlgo internals cannot be introspected by Pine. This fallback uses confirmed OHLC proxies
+// for swing/internal structure, displacement, FVG/OB context, liquidity, protected levels, and memory.
+f_state() =>
+    var float swingHigh = na
+    var float priorSwingHigh = na
+    var float swingLow = na
+    var float priorSwingLow = na
+    var float internalHigh = na
+    var float priorInternalHigh = na
+    var float internalLow = na
+    var float priorInternalLow = na
+    var float protectedLow = na
+    var float protectedHigh = na
+    var float brokenHigh = na
+    var float brokenLow = na
+    var int swingStructure = Q_NONE
+    var int internalStructure = Q_NONE
+    var int structuralDirection = 0
+    var int activeBias = 0
+    var int event = E_NONE
+    var int stage = ST_ACC
+    var int reversalState = R_NONE
+    var int reversalDirection = 0
+    var int confidence = C_LOW
+    var bool reversalSweep = false
+    var bool reversalDisplacement = false
+    var bool reversalMss = false
+    var bool reversalProtected = false
+    var bool reversalFollowThrough = false
+    var int reversalMssBar = na
+    var int priorReversalState = R_NONE
+    var int sweepAge = 100000
+    var int liquidityMemory = L_NONE
+    var int bullFvgAge = 100000
+    var int bearFvgAge = 100000
+    var int bullObAge = 100000
+    var int bearObAge = 100000
+    float ph = ta.pivothigh(high, swingLen, swingLen)
+    float pl = ta.pivotlow(low, swingLen, swingLen)
+    float iph = ta.pivothigh(high, internalLen, internalLen)
+    float ipl = ta.pivotlow(low, internalLen, internalLen)
+    if not na(ph)
+        priorSwingHigh := swingHigh
+        swingHigh := ph
+        swingStructure := na(priorSwingHigh) ? Q_NONE : swingHigh > priorSwingHigh ? Q_HH : Q_LH
+        event := swingStructure == Q_HH ? E_HH : swingStructure == Q_LH ? E_LH : event
+        if activeBias < 0 or structuralDirection < 0
+            protectedHigh := swingHigh
+    if not na(pl)
+        priorSwingLow := swingLow
+        swingLow := pl
+        swingStructure := na(priorSwingLow) ? Q_NONE : swingLow > priorSwingLow ? Q_HL : Q_LL
+        event := swingStructure == Q_HL ? E_HL : swingStructure == Q_LL ? E_LL : event
+        if activeBias > 0 or structuralDirection > 0
+            protectedLow := swingLow
+    if not na(iph)
+        priorInternalHigh := internalHigh
+        internalHigh := iph
+        internalStructure := na(priorInternalHigh) ? Q_NONE : internalHigh > priorInternalHigh ? Q_HH : Q_LH
+    if not na(ipl)
+        priorInternalLow := internalLow
+        internalLow := ipl
+        internalStructure := na(priorInternalLow) ? Q_NONE : internalLow > priorInternalLow ? Q_HL : Q_LL
+    float candleRange = high - low
+    float averageRange = ta.sma(candleRange, 20)
+    float body = math.abs(close - open)
+    bool valid = not na(averageRange) and averageRange > 0 and candleRange > 0
+    bool displacementUp = valid and close > open and candleRange > averageRange * displacementMult and body / candleRange >= displacementBody
+    bool displacementDown = valid and close < open and candleRange > averageRange * displacementMult and body / candleRange >= displacementBody
+    bool newBullFvg = not na(high[2]) and low > high[2]
+    bool newBearFvg = not na(low[2]) and high < low[2]
+    bullFvgAge := newBullFvg ? 0 : math.min(bullFvgAge + 1, 100000)
+    bearFvgAge := newBearFvg ? 0 : math.min(bearFvgAge + 1, 100000)
+    bool bullFvgActive = bullFvgAge <= contextLen
+    bool bearFvgActive = bearFvgAge <= contextLen
+    bool newBullOb = displacementUp and close[1] < open[1]
+    bool newBearOb = displacementDown and close[1] > open[1]
+    bullObAge := newBullOb ? 0 : math.min(bullObAge + 1, 100000)
+    bearObAge := newBearOb ? 0 : math.min(bearObAge + 1, 100000)
+    bool bullObActive = bullObAge <= contextLen
+    bool bearObActive = bearObAge <= contextLen
+    bool equalHighs = not na(swingHigh) and not na(priorSwingHigh) and valid and math.abs(swingHigh - priorSwingHigh) <= averageRange * equalTolerance
+    bool equalLows = not na(swingLow) and not na(priorSwingLow) and valid and math.abs(swingLow - priorSwingLow) <= averageRange * equalTolerance
+    bool bslSweep = not na(swingHigh) and high > swingHigh and close < swingHigh
+    bool sslSweep = not na(swingLow) and low < swingLow and close > swingLow
+    if bslSweep
+        sweepAge := 0
+        liquidityMemory := L_BSL_SWEPT
+    else if sslSweep
+        sweepAge := 0
+        liquidityMemory := L_SSL_SWEPT
+    else
+        sweepAge := math.min(sweepAge + 1, 100000)
+    if sweepAge > sweepMemory and liquidityMemory == L_BSL_SWEPT
+        liquidityMemory := L_BSL
+    if sweepAge > sweepMemory and liquidityMemory == L_SSL_SWEPT
+        liquidityMemory := L_SSL
+    int poolLiquidity = equalHighs ? L_EQH : equalLows ? L_EQL : activeBias >= 0 ? L_BSL : L_SSL
+    int liquidity = sweepAge <= sweepMemory ? liquidityMemory : poolLiquidity
+    bool breakUp = not na(swingHigh) and close > swingHigh and (na(brokenHigh) or swingHigh != brokenHigh)
+    bool breakDown = not na(swingLow) and close < swingLow and (na(brokenLow) or swingLow != brokenLow)
+    int oldDirection = structuralDirection
+    bool mssUp = breakUp and oldDirection < 0
+    bool mssDown = breakDown and oldDirection > 0
+    if breakUp
+        brokenHigh := swingHigh
+        structuralDirection := 1
+        event := mssUp ? E_MSS_BULL : E_BOS_BULL
+        if activeBias == 0
+            activeBias := 1
+            protectedLow := swingLow
+    if breakDown
+        brokenLow := swingLow
+        structuralDirection := -1
+        event := mssDown ? E_MSS_BEAR : E_BOS_BEAR
+        if activeBias == 0
+            activeBias := -1
+            protectedHigh := swingHigh
+    bool internalShiftUp = not na(internalHigh) and close > internalHigh and internalStructure == Q_LH
+    bool internalShiftDown = not na(internalLow) and close < internalLow and internalStructure == Q_HL
+    bool protectedBreakUp = activeBias < 0 and not na(protectedHigh) and close > protectedHigh
+    bool protectedBreakDown = activeBias > 0 and not na(protectedLow) and close < protectedLow
+    priorReversalState := reversalState
+    if activeBias > 0 and bslSweep
+        reversalDirection := -1
+        reversalSweep := true
+    if activeBias < 0 and sslSweep
+        reversalDirection := 1
+        reversalSweep := true
+    if activeBias > 0 and (mssDown or protectedBreakDown or displacementDown or internalShiftDown)
+        if reversalDirection != -1
+            reversalDirection := -1
+            reversalSweep := false
+            reversalDisplacement := false
+            reversalMss := false
+            reversalProtected := false
+            reversalFollowThrough := false
+        reversalDisplacement := reversalDisplacement or displacementDown
+        reversalMss := reversalMss or mssDown or internalShiftDown
+        reversalProtected := reversalProtected or protectedBreakDown
+        if mssDown
+            reversalMssBar := bar_index
+    if activeBias < 0 and (mssUp or protectedBreakUp or displacementUp or internalShiftUp)
+        if reversalDirection != 1
+            reversalDirection := 1
+            reversalSweep := false
+            reversalDisplacement := false
+            reversalMss := false
+            reversalProtected := false
+            reversalFollowThrough := false
+        reversalDisplacement := reversalDisplacement or displacementUp
+        reversalMss := reversalMss or mssUp or internalShiftUp
+        reversalProtected := reversalProtected or protectedBreakUp
+        if mssUp
+            reversalMssBar := bar_index
+    if reversalDirection == -1 and (newBearFvg or newBearOb)
+        reversalDisplacement := reversalDisplacement or displacementDown
+    if reversalDirection == 1 and (newBullFvg or newBullOb)
+        reversalDisplacement := reversalDisplacement or displacementUp
+    if reversalDirection == -1 and not na(reversalMssBar) and bar_index > reversalMssBar and structuralDirection < 0 and (displacementDown or breakDown)
+        reversalFollowThrough := true
+    if reversalDirection == 1 and not na(reversalMssBar) and bar_index > reversalMssBar and structuralDirection > 0 and (displacementUp or breakUp)
+        reversalFollowThrough := true
+    int evidence = (reversalSweep ? 1 : 0) + (reversalDisplacement ? 1 : 0) + (reversalMss ? 1 : 0) + (reversalProtected ? 1 : 0) + (reversalFollowThrough ? 1 : 0)
+    confidence := evidence >= 5 ? C_HIGH : evidence >= 3 ? C_MED : C_LOW
+    bool confirmedBull = activeBias < 0 and reversalDirection == 1 and reversalSweep and reversalMss and (not requireDisplacement or reversalDisplacement) and (not requireProtected or reversalProtected) and (not requireFollowThrough or reversalFollowThrough)
+    bool confirmedBear = activeBias > 0 and reversalDirection == -1 and reversalSweep and reversalMss and (not requireDisplacement or reversalDisplacement) and (not requireProtected or reversalProtected) and (not requireFollowThrough or reversalFollowThrough)
+    if confirmedBull
+        reversalState := R_BULL
+        activeBias := 1
+        structuralDirection := 1
+    else if confirmedBear
+        reversalState := R_BEAR
+        activeBias := -1
+        structuralDirection := -1
+    else if reversalDirection != 0 and evidence >= minimumEvidence and (reversalMss or reversalDisplacement)
+        reversalState := R_DEV
+    else if reversalDirection != 0 and evidence > 0
+        reversalState := R_WARN
+    bool compressed = valid and candleRange < averageRange * 0.8
+    bool ranged = compressed and not na(close[10]) and math.abs(close - close[10]) < averageRange * 2
+    bool upSequence = close > open and close[1] > open[1] and close[2] > open[2]
+    bool downSequence = close < open and close[1] < open[1] and close[2] < open[2]
+    bool alignedUp = activeBias > 0 and (displacementUp or breakUp or upSequence)
+    bool alignedDown = activeBias < 0 and (displacementDown or breakDown or downSequence)
+    bool countertrend = activeBias > 0 and close < close[1] or activeBias < 0 and close > close[1]
+    bool reactionContext = bullFvgActive or bearFvgActive or bullObActive or bearObActive
+    bool targetSweep = activeBias > 0 and bslSweep or activeBias < 0 and sslSweep
+    if reversalState == R_BULL or reversalState == R_BEAR
+        stage := ST_CREV
+    else if reversalState == R_DEV
+        stage := ST_REV
+    else if reversalState == R_WARN
+        stage := ST_EXH
+    else if mssUp and displacementUp or mssDown and displacementDown
+        stage := ST_SHIFT
+    else if targetSweep
+        stage := ST_EXH
+    else if (bslSweep or sslSweep) and reversalState == R_NONE
+        stage := ST_MAN
+    else if stage == ST_RET and (alignedUp or alignedDown)
+        stage := ST_CONT
+    else if countertrend and reactionContext and activeBias != 0
+        stage := ST_RET
+    else if alignedUp or alignedDown
+        stage := ST_EXP
+    else if ranged and (equalHighs or equalLows)
+        stage := ST_LIQ
+    else if ranged
+        stage := ST_ACC
+    else if stage == ST_EXH and ranged
+        stage := ST_DIST
+    bool strongUp = activeBias > 0 and displacementUp and (upSequence or stage == ST_EXP)
+    bool strongDown = activeBias < 0 and displacementDown and (downSequence or stage == ST_EXP)
+    int biasCode = activeBias > 0 ? (strongUp ? STRONG_BULL : BULL) : activeBias < 0 ? (strongDown ? STRONG_BEAR : BEAR) : NEUTRAL
+    bool warningPulse = reversalState == R_WARN and priorReversalState < R_WARN
+    bool developingPulse = reversalState == R_DEV and priorReversalState < R_DEV
+    bool confirmedBullPulse = reversalState == R_BULL and priorReversalState != R_BULL
+    bool confirmedBearPulse = reversalState == R_BEAR and priorReversalState != R_BEAR
+    int confidenceCode = reversalState == R_NONE ? C_LOW : confidence
+
+    // Confirmed mode returns the prior source candle's output, accepting confirmation delay and avoiding repainting.
+    var int previousBias = na
+    var int previousEvent = na
+    var int previousStage = na
+    var int previousLiquidity = na
+    var int previousReversal = na
+    var int previousReversalDirection = na
+    var int previousConfidence = na
+    var int previousSwing = na
+    var int previousInternal = na
+    var float previousProtectedLow = na
+    var float previousProtectedHigh = na
+    var bool previousBullBos = false
+    var bool previousBearBos = false
+    var bool previousBullMss = false
+    var bool previousBearMss = false
+    var bool previousBslSweep = false
+    var bool previousSslSweep = false
+    var bool previousWarning = false
+    var bool previousDeveloping = false
+    var bool previousConfirmedBull = false
+    var bool previousConfirmedBear = false
+    int outBias = useDeveloping ? biasCode : previousBias
+    int outEvent = useDeveloping ? event : previousEvent
+    int outStage = useDeveloping ? stage : previousStage
+    int outLiquidity = useDeveloping ? liquidity : previousLiquidity
+    int outReversal = useDeveloping ? reversalState : previousReversal
+    int outReversalDirection = useDeveloping ? reversalDirection : previousReversalDirection
+    int outConfidence = useDeveloping ? confidenceCode : previousConfidence
+    int outSwing = useDeveloping ? swingStructure : previousSwing
+    int outInternal = useDeveloping ? internalStructure : previousInternal
+    float outProtectedLow = useDeveloping ? protectedLow : previousProtectedLow
+    float outProtectedHigh = useDeveloping ? protectedHigh : previousProtectedHigh
+    bool outBullBos = useDeveloping ? breakUp : previousBullBos
+    bool outBearBos = useDeveloping ? breakDown : previousBearBos
+    bool outBullMss = useDeveloping ? mssUp : previousBullMss
+    bool outBearMss = useDeveloping ? mssDown : previousBearMss
+    bool outBslSweep = useDeveloping ? bslSweep : previousBslSweep
+    bool outSslSweep = useDeveloping ? sslSweep : previousSslSweep
+    bool outWarning = useDeveloping ? warningPulse : previousWarning
+    bool outDeveloping = useDeveloping ? developingPulse : previousDeveloping
+    bool outConfirmedBull = useDeveloping ? confirmedBullPulse : previousConfirmedBull
+    bool outConfirmedBear = useDeveloping ? confirmedBearPulse : previousConfirmedBear
+    previousBias := biasCode
+    previousEvent := event
+    previousStage := stage
+    previousLiquidity := liquidity
+    previousReversal := reversalState
+    previousReversalDirection := reversalDirection
+    previousConfidence := confidenceCode
+    previousSwing := swingStructure
+    previousInternal := internalStructure
+    previousProtectedLow := protectedLow
+    previousProtectedHigh := protectedHigh
+    previousBullBos := breakUp
+    previousBearBos := breakDown
+    previousBullMss := mssUp
+    previousBearMss := mssDown
+    previousBslSweep := bslSweep
+    previousSslSweep := sslSweep
+    previousWarning := warningPulse
+    previousDeveloping := developingPulse
+    previousConfirmedBull := confirmedBullPulse
+    previousConfirmedBear := confirmedBearPulse
+    [outBias, outEvent, outStage, outLiquidity, outReversal, outReversalDirection, outConfidence, outSwing, outInternal, outProtectedLow, outProtectedHigh, outBullBos, outBearBos, outBullMss, outBearMss, outBslSweep, outSslSweep, outWarning, outDeveloping, outConfirmedBull, outConfirmedBear]
+
+// --- Four independent MTF requests; no lookahead is used ---
+[bD, eD, stD, lD, rD, rdD, cD, swD, inD, lowD, highD, bosD, bearBosD, mssD, bearMssD, sweepD, sslD, warnD, devD, bullRevD, bearRevD] = request.security(syminfo.tickerid, tfD, f_state(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[b4, e4, st4, l4, r4, rd4, c4, sw4, in4, low4, high4, bos4, bearBos4, mss4, bearMss4, sweep4, ssl4, warn4, dev4, bullRev4, bearRev4] = request.security(syminfo.tickerid, tf4, f_state(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[b15, e15, st15, l15, r15, rd15, c15, sw15, in15, low15, high15, bos15, bearBos15, mss15, bearMss15, sweep15, ssl15, warn15, dev15, bullRev15, bearRev15] = request.security(syminfo.tickerid, tf15, f_state(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+[b1, e1, st1, l1, r1, rd1, c1, sw1, in1, low1, high1, bos1, bearBos1, mss1, bearMss1, sweep1, ssl1, warn1, dev1, bullRev1, bearRev1] = request.security(syminfo.tickerid, tf1, f_state(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// --- MTF hierarchy ---
+int dD = f_direction(bD)
+int d4 = f_direction(b4)
+int d15 = f_direction(b15)
+int d1 = f_direction(b1)
+int htfDirection = dD != 0 ? dD : d4
+int intradayDirection = d4 != 0 ? d4 : d15
+int executionDirection = d15 != 0 ? d15 : d1
+bool fullBullish = dD > 0 and d4 > 0 and d15 > 0 and d1 > 0
+bool fullBearish = dD < 0 and d4 < 0 and d15 < 0 and d1 < 0
+bool bullishRetracement = dD > 0 and d4 > 0 and d15 < 0 and d1 < 0 and (na(low4) or close > low4)
+bool bearishRetracement = dD < 0 and d4 < 0 and d15 > 0 and d1 > 0 and (na(high4) or close < high4)
+bool ltfConflict = d4 != 0 and d15 != 0 and d4 != d15
+bool htfTransition = dD != 0 and d4 != 0 and dD != d4
+bool htfReversal = r4 == R_DEV or r4 == R_BULL or r4 == R_BEAR
+string mtfState = fullBullish ? "FULL BULLISH ALIGNMENT" : fullBearish ? "FULL BEARISH ALIGNMENT" : bullishRetracement ? "HTF BULLISH / LTF RETRACEMENT" : bearishRetracement ? "HTF BEARISH / LTF RETRACEMENT" : htfReversal ? f_label(tf4) + " REVERSAL: " + f_reversalText(r4) : htfTransition ? "HTF TRANSITION" : ltfConflict ? "LTF COUNTERTREND / CONFLICT" : "PARTIAL ALIGNMENT"
+string primaryBias = f_biasText(dD != 0 ? bD : b4)
+string htfBias = f_biasText(htfDirection > 0 ? BULL : htfDirection < 0 ? BEAR : NEUTRAL)
+string intradayBias = f_biasText(intradayDirection > 0 ? BULL : intradayDirection < 0 ? BEAR : NEUTRAL)
+string executionBias = f_biasText(executionDirection > 0 ? BULL : executionDirection < 0 ? BEAR : NEUTRAL)
+int summaryStage = stD
+int summaryBias = bD
+int summaryReversal = rD
+int summaryReversalDirection = rdD
+int summaryConfidence = cD
+string reversalTf = f_label(tfD)
+if htfReversal
+    summaryStage := st4
+    summaryBias := b4
+    summaryReversal := r4
+    summaryReversalDirection := rd4
+    summaryConfidence := c4
+    reversalTf := f_label(tf4)
+else if r15 == R_DEV or r15 == R_BULL or r15 == R_BEAR
+    summaryStage := st15
+    summaryBias := b15
+    summaryReversal := r15
+    summaryReversalDirection := rd15
+    summaryConfidence := c15
+    reversalTf := f_label(tf15)
+else if r1 == R_DEV or r1 == R_BULL or r1 == R_BEAR
+    summaryStage := st1
+    summaryBias := b1
+    summaryReversal := r1
+    summaryReversalDirection := rd1
+    summaryConfidence := c1
+string reversalSummary = summaryReversal == R_NONE ? "NONE" : reversalTf + " " + f_reversalText(summaryReversal) + " — " + f_confidenceText(summaryConfidence)
+string actionState = bullishRetracement or bearishRetracement ? "WAIT FOR HTF-DIRECTION MSS" : summaryReversal == R_WARN ? "REVERSAL WARNING — WAIT FOR STRUCTURE" : summaryReversal == R_DEV ? "REVERSAL DEVELOPING — PROTECTED LEVEL" : summaryReversal == R_BULL or summaryReversal == R_BEAR ? "CONFIRMED STRUCTURAL TRANSITION" : "READ STRUCTURE / LIQUIDITY CONTEXT"
+
+// --- Dashboard ---
+var table dashboard = table.new(f_position(dashboardPosition), 7, 17, border_width = 1, frame_width = 1, border_color = color.new(chart.fg_color, 65), frame_color = color.new(chart.fg_color, 65))
+color dashboardBg = color.new(chart.bg_color, dashboardTransparency)
+color dashboardHeader = color.new(SHIFT_COLOR, dashboardTransparency)
+f_cell(table target, int column, int row, string value, color cellColor) =>
+    table.cell(target, column, row, value, bgcolor = cellColor, text_color = chart.fg_color, text_size = f_size(dashboardSize), text_halign = text.align_center, text_valign = text.align_center)
+f_row(table target, int row, string label, int biasCode, int stageCode, int reversalDirectionCode, int swingCode, int internalCode, int eventCode, int liquidityCode, int reversalCode) =>
+    color biasColor = color.new(f_biasColor(biasCode), dashboardTransparency)
+    color stageColor = color.new(f_stageColor(stageCode, biasCode), dashboardTransparency)
+    color eventColor = eventCode == E_MSS_BULL or eventCode == E_MSS_BEAR ? color.new(SHIFT_COLOR, dashboardTransparency) : eventCode == E_BOS_BULL or eventCode == E_BOS_BEAR ? biasColor : dashboardBg
+    color liquidityColor = liquidityCode == L_BSL_SWEPT or liquidityCode == L_SSL_SWEPT or liquidityCode == L_EQH or liquidityCode == L_EQL ? color.new(LIQUIDITY_COLOR, dashboardTransparency) : dashboardBg
+    color reversalColor = reversalCode == R_WARN ? color.new(WARNING_COLOR, dashboardTransparency) : reversalCode == R_DEV ? color.new(LIQUIDITY_COLOR, dashboardTransparency) : reversalCode == R_BULL or reversalCode == R_BEAR ? color.new(f_biasColor(reversalDirectionCode), dashboardTransparency) : dashboardBg
+    f_cell(target, 0, row, label, dashboardBg)
+    f_cell(target, 1, row, f_biasText(biasCode), biasColor)
+    f_cell(target, 2, row, f_stageText(stageCode, biasCode, reversalDirectionCode), stageColor)
+    f_cell(target, 3, row, f_structureText(swingCode, internalCode), dashboardBg)
+    f_cell(target, 4, row, f_eventText(eventCode), eventColor)
+    f_cell(target, 5, row, f_liquidityText(liquidityCode), liquidityColor)
+    f_cell(target, 6, row, f_reversalText(reversalCode), reversalColor)
+if barstate.islast
+    f_cell(dashboard, 0, 0, "MTF SMC / ICT MARKET STATE" + (useDeveloping ? " · LIVE" : " · CONFIRMED"), dashboardHeader)
+    table.merge_cells(dashboard, 0, 0, 6, 0)
+    f_cell(dashboard, 0, 1, "TF", dashboardHeader)
+    f_cell(dashboard, 1, 1, "BIAS", dashboardHeader)
+    f_cell(dashboard, 2, 1, "STAGE", dashboardHeader)
+    f_cell(dashboard, 3, 1, "STRUCTURE", dashboardHeader)
+    f_cell(dashboard, 4, 1, "EVENT", dashboardHeader)
+    f_cell(dashboard, 5, 1, "LIQUIDITY", dashboardHeader)
+    f_cell(dashboard, 6, 1, "REVERSAL", dashboardHeader)
+    f_row(dashboard, 2, f_label(tfD), bD, stD, rdD, swD, inD, eD, lD, rD)
+    f_row(dashboard, 3, f_label(tf4), b4, st4, rd4, sw4, in4, e4, l4, r4)
+    f_row(dashboard, 4, f_label(tf15), b15, st15, rd15, sw15, in15, e15, l15, r15)
+    f_row(dashboard, 5, f_label(tf1), b1, st1, rd1, sw1, in1, e1, l1, r1)
+    f_cell(dashboard, 0, 6, "SUMMARY", dashboardHeader)
+    table.merge_cells(dashboard, 0, 6, 6, 6)
+    f_cell(dashboard, 0, 7, "PRIMARY BIAS", dashboardBg)
+    table.merge_cells(dashboard, 1, 7, 6, 7)
+    f_cell(dashboard, 1, 7, primaryBias, color.new(f_biasColor(dD != 0 ? bD : b4), dashboardTransparency))
+    f_cell(dashboard, 0, 8, "HTF BIAS", dashboardBg)
+    table.merge_cells(dashboard, 1, 8, 6, 8)
+    f_cell(dashboard, 1, 8, htfBias, color.new(f_biasColor(htfDirection), dashboardTransparency))
+    f_cell(dashboard, 0, 9, "INTRADAY BIAS", dashboardBg)
+    table.merge_cells(dashboard, 1, 9, 6, 9)
+    f_cell(dashboard, 1, 9, intradayBias, color.new(f_biasColor(intradayDirection), dashboardTransparency))
+    f_cell(dashboard, 0, 10, "EXECUTION BIAS", dashboardBg)
+    table.merge_cells(dashboard, 1, 10, 6, 10)
+    f_cell(dashboard, 1, 10, executionBias, color.new(f_biasColor(executionDirection), dashboardTransparency))
+    f_cell(dashboard, 0, 11, "MTF STATE", dashboardBg)
+    table.merge_cells(dashboard, 1, 11, 6, 11)
+    f_cell(dashboard, 1, 11, mtfState, color.new(ltfConflict or htfTransition ? LIQUIDITY_COLOR : fullBullish or fullBearish ? f_biasColor(htfDirection) : NEUTRAL_COLOR, dashboardTransparency))
+    f_cell(dashboard, 0, 12, "MARKET STAGE", dashboardBg)
+    table.merge_cells(dashboard, 1, 12, 6, 12)
+    f_cell(dashboard, 1, 12, f_stageText(summaryStage, summaryBias, summaryReversalDirection), color.new(f_stageColor(summaryStage, summaryBias), dashboardTransparency))
+    f_cell(dashboard, 0, 13, "LIQUIDITY", dashboardBg)
+    table.merge_cells(dashboard, 1, 13, 6, 13)
+    f_cell(dashboard, 1, 13, f_liquidityText(lD), color.new(lD == L_BSL_SWEPT or lD == L_SSL_SWEPT ? LIQUIDITY_COLOR : NEUTRAL_COLOR, dashboardTransparency))
+    f_cell(dashboard, 0, 14, "REVERSAL", dashboardBg)
+    table.merge_cells(dashboard, 1, 14, 6, 14)
+    f_cell(dashboard, 1, 14, reversalSummary, color.new(summaryReversal == R_NONE ? NEUTRAL_COLOR : summaryReversalDirection > 0 ? BULL_COLOR : BEAR_COLOR, dashboardTransparency))
+    f_cell(dashboard, 0, 15, "ACTION STATE", dashboardBg)
+    table.merge_cells(dashboard, 1, 15, 6, 15)
+    f_cell(dashboard, 1, 15, actionState, dashboardBg)
+    table.merge_cells(dashboard, 0, 16, 6, 16)
+    f_cell(dashboard, 0, 16, showReversalPanel ? (summaryReversal == R_NONE ? "REVERSAL EVIDENCE: NONE ACTIVE" : "REVERSAL EVIDENCE: " + reversalTf + " · " + f_reversalText(summaryReversal) + " · " + f_confidenceText(summaryConfidence)) : "", dashboardHeader)
+
+// --- Markers ---
+bool warningAny = warnD == true or warn4 == true or warn15 == true or warn1 == true
+bool developingAny = devD == true or dev4 == true or dev15 == true or dev1 == true
+bool confirmedBullAny = bullRevD == true or bullRev4 == true or bullRev15 == true or bullRev1 == true
+bool confirmedBearAny = bearRevD == true or bearRev4 == true or bearRev15 == true or bearRev1 == true
+plotshape(showMarkers and warningAny, "Reversal Warning", shape.circle, location.abovebar, WARNING_COLOR, size = size.tiny)
+plotshape(showMarkers and developingAny, "Reversal Developing", shape.diamond, location.abovebar, LIQUIDITY_COLOR, size = size.tiny)
+plotshape(showMarkers and confirmedBullAny, "Confirmed Bullish Reversal", shape.triangleup, location.belowbar, BULL_COLOR, size = size.small)
+plotshape(showMarkers and confirmedBearAny, "Confirmed Bearish Reversal", shape.triangledown, location.abovebar, BEAR_COLOR, size = size.small)
+
+// --- Alerts ---
+bool bullishBosAny = bosD == true or bos4 == true or bos15 == true or bos1 == true
+bool bearishBosAny = bearBosD == true or bearBos4 == true or bearBos15 == true or bearBos1 == true
+bool bullishMssAny = mssD == true or mss4 == true or mss15 == true or mss1 == true
+bool bearishMssAny = bearMssD == true or bearMss4 == true or bearMss15 == true or bearMss1 == true
+bool bslSweepAny = sweepD == true or sweep4 == true or sweep15 == true or sweep1 == true
+bool sslSweepAny = sslD == true or ssl4 == true or ssl15 == true or ssl1 == true
+bool bullishBiasChange = (dD > 0 and f_direction(bD[1]) <= 0) or (d4 > 0 and f_direction(b4[1]) <= 0) or (d15 > 0 and f_direction(b15[1]) <= 0) or (d1 > 0 and f_direction(b1[1]) <= 0)
+bool bearishBiasChange = (dD < 0 and f_direction(bD[1]) >= 0) or (d4 < 0 and f_direction(b4[1]) >= 0) or (d15 < 0 and f_direction(b15[1]) >= 0) or (d1 < 0 and f_direction(b1[1]) >= 0)
+alertcondition(enableStructureAlerts and bullishBosAny and barstate.isconfirmed, "Bullish BOS", "Bullish BOS confirmed in a configured timeframe.")
+alertcondition(enableStructureAlerts and bearishBosAny and barstate.isconfirmed, "Bearish BOS", "Bearish BOS confirmed in a configured timeframe.")
+alertcondition(enableStructureAlerts and bullishMssAny and barstate.isconfirmed, "Bullish MSS", "Bullish MSS confirmed in a configured timeframe.")
+alertcondition(enableStructureAlerts and bearishMssAny and barstate.isconfirmed, "Bearish MSS", "Bearish MSS confirmed in a configured timeframe.")
+alertcondition(enableLiquidityAlerts and bslSweepAny and barstate.isconfirmed, "BSL Sweep", "Buy-side liquidity sweep confirmed.")
+alertcondition(enableLiquidityAlerts and sslSweepAny and barstate.isconfirmed, "SSL Sweep", "Sell-side liquidity sweep confirmed.")
+alertcondition(enableBiasAlerts and bullishBiasChange and barstate.isconfirmed, "Bullish Bias Change", "Bullish bias change confirmed.")
+alertcondition(enableBiasAlerts and bearishBiasChange and barstate.isconfirmed, "Bearish Bias Change", "Bearish bias change confirmed.")
+alertcondition(enableReversalAlerts and warningAny and barstate.isconfirmed, "Reversal Warning", "Multi-factor reversal warning detected.")
+alertcondition(enableReversalAlerts and developingAny and barstate.isconfirmed, "Reversal Developing", "Reversal developing: liquidity, displacement, and structure are aligning.")
+alertcondition(enableReversalAlerts and confirmedBullAny and barstate.isconfirmed, "Confirmed Bullish Reversal", "Confirmed bullish reversal with protected structure and follow-through.")
+alertcondition(enableReversalAlerts and confirmedBearAny and barstate.isconfirmed, "Confirmed Bearish Reversal", "Confirmed bearish reversal with protected structure and follow-through.")
+alertcondition(enableMtfAlerts and fullBullish and not fullBullish[1] and barstate.isconfirmed, "Full Bullish Alignment", "All configured timeframes are structurally bullish.")
+alertcondition(enableMtfAlerts and fullBearish and not fullBearish[1] and barstate.isconfirmed, "Full Bearish Alignment", "All configured timeframes are structurally bearish.")
+alertcondition(enableMtfAlerts and ltfConflict and barstate.isconfirmed, "HTF / LTF Conflict", "Timeframes conflict; distinguish retracement from reversal.")
+alertcondition(enableMtfAlerts and htfReversal and barstate.isconfirmed, "HTF Reversal Developing", "The primary timeframe has entered a developing or confirmed reversal state.")

@@ -1,0 +1,361 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// © Dots3Red
+// TradingView: https://www.tradingview.com/u/Dots3Red/
+
+//@version=6
+indicator("Squeeze AI - Breakout Direction Probability [Dots3Red]",
+          shorttitle = "KNN Squeeze Breakout [D3R]",
+          overlay    = true,
+          max_labels_count = 500)
+
+
+// COLORS
+C_BULL    = color.new(#00f0ff, 0)
+C_BEAR    = color.new(#ff00aa, 0)
+C_GREEN   = color.new(#00c896, 0)
+C_RED     = color.new(#ff4466, 0)
+C_AMBER   = color.new(#ffb700, 0)
+C_NEUTRAL = color.new(#64748b, 0)
+C_BG      = color.new(#131722, 5)
+C_TXT     = color.new(#f8fafc, 0)
+C_DIM     = color.new(#94a3b8, 0)
+C_BORD    = color.new(#334155, 0)
+C_CYAN    = color.new(#00f0ff,0)
+C_GAPFILL = color.new(#6366f1,0)
+C_K_CHANN = color.new(#64748b,0)
+C_SQ_Z_BOX= color.new(#f59e0b,0)
+
+
+
+// INPUTS
+GRP_SQZ = "🗜️ Squeeze Detection"
+GRP_KNN = "📊 KNN Engine"
+GRP_VIS = "🎨 Visualization"
+GRP_HUD = "🖥️ Dashboard"
+
+bb_len    = input.int  (20,  "BB Length",        minval=5,  group=GRP_SQZ)
+bb_mult   = input.float(2.0, "BB Multiplier",    minval=0.5, step=0.25, group=GRP_SQZ)
+kc_len    = input.int  (20,  "KC Length",        minval=5,  group=GRP_SQZ)
+kc_mult   = input.float(1.5, "KC Multiplier",    minval=0.5, step=0.25, group=GRP_SQZ)
+min_sqz_bars = input.int(4,  "Min Squeeze Duration (bars)", minval=1, maxval=30, group=GRP_SQZ,
+               tooltip="Squeezes shorter than this are ignored — brief compressions carry little information.")
+
+outcome_bars = input.int(10, "Outcome Window (bars)", minval=3, maxval=50, group=GRP_KNN,
+               tooltip="Bars after a squeeze fires over which the breakout direction and distance are measured.")
+knn_k        = input.int(15,  "K Neighbors",          minval=3, maxval=50, group=GRP_KNN)
+knn_max_train = input.int(300,"Max Training Samples", minval=30, maxval=1000, group=GRP_KNN)
+knn_min_train = input.int(12, "Min Samples Before Display", minval=5, maxval=100, group=GRP_KNN)
+atr_base_len = input.int(50, "ATR Baseline Period",   minval=10, group=GRP_KNN)
+
+fill_bb       = input.bool(false, "Fill Between BB", group=GRP_VIS)
+show_sqz_bg   = input.bool(false, "Squeeze Background Tint", group=GRP_VIS)
+show_sqz_box  = input.bool(true,  "Squeeze Zone Box", group=GRP_VIS)
+show_fire_lbl = input.bool(true, "Fire Labels with Probability", group=GRP_VIS)
+show_antic    = input.bool(true, "Live Anticipation Label During Squeeze", group=GRP_VIS,
+               tooltip="While a squeeze is active, shows the KNN read for the CURRENT compression as it develops.")
+
+show_hud = input.bool(true, "Show Dashboard", group=GRP_HUD)
+hud_pos  = input.string("Top Right", "Position",
+           options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=GRP_HUD)
+
+
+// CORE SERIES
+atr_raw     = ta.atr(14)
+atr_base_ma = ta.sma(atr_raw, atr_base_len)
+atr_ratio   = atr_raw / math.max(atr_base_ma, 1e-9)
+vol_ma      = ta.sma(volume, 20)
+vol_ratio   = vol_ma > 0 ? volume / vol_ma : 1.0
+[_dp, _dm, _adx] = ta.dmi(14, 14)
+di_diff     = _dp - _dm
+
+// Squeeze: BB inside KC
+bb_basis = ta.sma(close, bb_len)
+bb_dev   = bb_mult * ta.stdev(close, bb_len)
+bb_up    = bb_basis + bb_dev
+bb_lo    = bb_basis - bb_dev
+
+kc_basis = ta.sma(close, kc_len)
+kc_rng   = kc_mult * ta.atr(kc_len)
+kc_up    = kc_basis + kc_rng
+kc_lo    = kc_basis - kc_rng
+
+// Box vars for squeeze zones
+var box   sqz_box     = na
+var float sqz_box_top = na
+var float sqz_box_bot = na
+
+bool sqz_on = bb_up < kc_up and bb_lo > kc_lo
+
+// Compression depth: how tight BB is vs KC (0 = as wide as KC, 1 = fully collapsed)
+float compress = kc_up - kc_lo > 0 ? 1.0 - (bb_up - bb_lo) / (kc_up - kc_lo) : 0.0
+
+// Momentum at/inside squeeze: linear regression slope of close
+float mom = ta.linreg(close, 20, 0) - ta.linreg(close, 20, 1)
+
+
+// KNN STORAGE — 5 features per completed squeeze
+// [duration_norm, compress, vol_ratio_norm, mom_sign_scaled, atr_ratio_norm]
+int KNN_STRIDE = 5
+var float[] kf       = array.new<float>()
+var float[] ko_dir   = array.new<float>()  // 1 = broke up, 0 = broke down
+var float[] ko_dist  = array.new<float>()  // absolute move in ATR
+
+f_feat(float dur, float cmp, float vr, float mo, float ar) =>
+    float f1 = math.min(1.0, dur / 40.0)
+    float f2 = math.max(0.0, math.min(1.0, cmp))
+    float f3 = math.min(1.0, vr / 3.0)
+    float f4 = math.max(-1.0, math.min(1.0, mo / math.max(atr_raw, 1e-9)))
+    float f5 = math.min(1.0, ar / 3.0)
+    [f1, f2, f3, f4, f5]
+
+f_knn_push(float f1, float f2, float f3, float f4, float f5, float o_dir, float o_dist) =>
+    array.push(kf, f1)
+    array.push(kf, f2)
+    array.push(kf, f3)
+    array.push(kf, f4)
+    array.push(kf, f5)
+    array.push(ko_dir,  o_dir)
+    array.push(ko_dist, o_dist)
+    if array.size(ko_dir) > knn_max_train
+        for _i = 0 to KNN_STRIDE - 1
+            array.shift(kf)
+        array.shift(ko_dir)
+        array.shift(ko_dist)
+
+f_knn_query(float f1, float f2, float f3, float f4, float f5) =>
+    int   n       = array.size(ko_dir)
+    int   ku      = math.min(knn_k, n)
+    float up_pct  = 50.0
+    float avg_mv  = 0.0
+    if n >= knn_min_train
+        float[] ds = array.new<float>(n, 0.0)
+        for i = 0 to n - 1
+            int b = i * KNN_STRIDE
+            float d = 0.0
+            d += math.pow(array.get(kf, b)     - f1, 2.0)
+            d += math.pow(array.get(kf, b + 1) - f2, 2.0)
+            d += math.pow(array.get(kf, b + 2) - f3, 2.0)
+            d += math.pow(array.get(kf, b + 3) - f4, 2.0)
+            d += math.pow(array.get(kf, b + 4) - f5, 2.0)
+            array.set(ds, i, math.sqrt(d))
+        float[] dc = array.copy(ds)
+        int[]   ix = array.new<int>(n, 0)
+        for i = 0 to n - 1
+            array.set(ix, i, i)
+        float s_up = 0.0
+        float s_mv = 0.0
+        for k = 0 to ku - 1
+            int mp = k
+            float mv = array.get(dc, k)
+            if k + 1 <= n - 1
+                for j = k + 1 to n - 1
+                    v = array.get(dc, j)
+                    if v < mv
+                        mv := v
+                        mp := j
+            float td = array.get(dc, k)
+            array.set(dc, k, array.get(dc, mp))
+            array.set(dc, mp, td)
+            int ti = array.get(ix, k)
+            array.set(ix, k, array.get(ix, mp))
+            array.set(ix, mp, ti)
+            ni = array.get(ix, k)
+            s_up += array.get(ko_dir,  ni)
+            s_mv += array.get(ko_dist, ni)
+        up_pct := (s_up / float(ku)) * 100.0
+        avg_mv := s_mv / float(ku)
+    [up_pct, avg_mv, n]
+
+
+// SQUEEZE STATE MACHINE
+var bool  in_sqz       = false
+var int   sqz_start    = na
+var float sqz_max_cmp  = 0.0
+var float sqz_vol_sum  = 0.0
+var int   sqz_bar_cnt  = 0
+
+// Fired squeeze pending outcome
+var int   fire_bar     = na
+var float fire_close   = na
+var float fire_atr     = na
+var float fire_f1 = na
+var float fire_f2 = na
+var float fire_f3 = na
+var float fire_f4 = na
+var float fire_f5 = na
+
+bool fired_this_bar = false
+float fired_up_pct  = na
+float fired_avg_mv  = na
+int   fired_n       = 0
+
+if barstate.isconfirmed
+    // SQUEEZE TRACKING
+    if sqz_on
+        if not in_sqz
+            in_sqz      := true
+            sqz_start   := bar_index
+            sqz_max_cmp := compress
+            sqz_vol_sum := vol_ratio
+            sqz_bar_cnt := 1
+            if show_sqz_box
+                sqz_box_top := bb_up
+                sqz_box_bot := bb_lo
+                sqz_box     := box.new(bar_index, sqz_box_top, bar_index, sqz_box_bot,
+                                       border_color=color.new(C_SQ_Z_BOX, 30),
+                                       bgcolor=color.new(C_SQ_Z_BOX, 85),
+                                       border_width=1)
+        else
+            sqz_max_cmp := math.max(sqz_max_cmp, compress)
+            sqz_vol_sum += vol_ratio
+            sqz_bar_cnt += 1
+            if show_sqz_box and not na(sqz_box)
+                sqz_box_top := math.max(sqz_box_top, bb_up)
+                sqz_box_bot := math.min(sqz_box_bot, bb_lo)
+                box.set_right(sqz_box, bar_index)
+                box.set_top(sqz_box, sqz_box_top)
+                box.set_bottom(sqz_box, sqz_box_bot)
+
+    else
+        if in_sqz
+            in_sqz := false
+            if not na(sqz_box)
+                box.set_right(sqz_box, bar_index)
+                sqz_box := na
+            int dur = bar_index - sqz_start
+            if dur >= min_sqz_bars and na(fire_bar)
+                float avg_vr = sqz_bar_cnt > 0 ? sqz_vol_sum / float(sqz_bar_cnt) : 1.0
+                [f1, f2, f3, f4, f5] = f_feat(float(dur), sqz_max_cmp, avg_vr, mom, atr_ratio)
+                fire_bar   := bar_index
+                fire_close := close
+                fire_atr   := atr_raw
+                fire_f1 := f1
+                fire_f2 := f2
+                fire_f3 := f3
+                fire_f4 := f4
+                fire_f5 := f5
+                [up_pct, avg_mv, n] = f_knn_query(f1, f2, f3, f4, f5)
+                fired_this_bar := true
+                fired_up_pct   := up_pct
+                fired_avg_mv   := avg_mv
+                fired_n        := n
+
+    // OUTCOME GRADING of the fired squeeze
+    if not na(fire_bar) and (bar_index - fire_bar) >= outcome_bars
+        float ret = close - fire_close
+        float o_dir  = ret > 0 ? 1.0 : 0.0
+        float o_dist = math.abs(ret) / math.max(fire_atr, 1e-9)
+        f_knn_push(fire_f1, fire_f2, fire_f3, fire_f4, fire_f5, o_dir, o_dist)
+        fire_bar := na
+
+
+// LIVE KNN READ (for anticipation label + HUD) — current conditions
+float live_dur = in_sqz ? float(bar_index - sqz_start) : 0.0
+float live_avg_vr = in_sqz and sqz_bar_cnt > 0 ? sqz_vol_sum / float(sqz_bar_cnt) : 1.0
+[lf1, lf2, lf3, lf4, lf5] = f_feat(live_dur, sqz_max_cmp, live_avg_vr, mom, atr_ratio)
+[live_up_pct, live_avg_mv, live_n] = f_knn_query(lf1, lf2, lf3, lf4, lf5)
+
+
+// VISUALS
+bgcolor(show_sqz_bg and in_sqz ? color.new(C_AMBER, 89) : na)
+
+plot(bb_up, "BB Upper", color=color.new(C_TXT, 75), linewidth=1)
+plot(bb_lo, "BB Lower", color=color.new(C_TXT, 75), linewidth=1)
+
+plot(kc_up, "KC Upper", color=color.new(C_TXT, 75), linewidth=1)
+plot(kc_lo, "KC Lower", color=color.new(C_TXT, 75), linewidth=1)
+
+
+p_bb_u = plot(bb_up, display=display.none)
+p_kc_u = plot(kc_up, display=display.none)
+fill_c = fill_bb ? color.new(C_K_CHANN,88) : color.new(C_K_CHANN, 100)
+fill(p_bb_u, p_kc_u, color=fill_c, title="Upper Squeeze Gap") 
+
+p_bb_l = plot(bb_lo, display=display.none)
+p_kc_l = plot(kc_lo, display=display.none)
+fill(p_bb_l, p_kc_l, color=fill_c, title="Lower Squeeze Gap")
+
+if barstate.isconfirmed and fired_this_bar and show_fire_lbl
+    bool up_bias = fired_up_pct >= 50.0
+    color fc = fired_n >= knn_min_train ? (up_bias ? C_GREEN : C_RED) : C_NEUTRAL
+    string dir_s = up_bias ? "▲ " + str.tostring(math.round(fired_up_pct)) + "%"
+                           : "▼ " + str.tostring(math.round(100.0 - fired_up_pct)) + "%"
+    string txt = na
+    if fired_n >= knn_min_train
+        txt := "SQZ FIRE  " + dir_s
+        txt := txt + "\n±" + str.tostring(fired_avg_mv, "#.#") + " ATR | N=" + str.tostring(fired_n)
+    else
+        txt := "SQZ FIRE"
+        txt := txt + "\nTraining… (" + str.tostring(fired_n) + "/" + str.tostring(knn_min_train) + ")"
+    label.new(bar_index, up_bias ? low - atr_raw : high + atr_raw, txt,
+              style=up_bias ? label.style_label_up : label.style_label_down,
+              color=color.new(#000000, 100), textcolor=fc, size=size.small)
+
+var label antic_lbl = na
+if show_antic
+    if not na(antic_lbl)
+        label.delete(antic_lbl)
+        antic_lbl := na
+    if in_sqz and barstate.islast and live_n >= knn_min_train
+        bool up_b = live_up_pct >= 50.0
+        string a_dir = up_b ? "▲ " + str.tostring(math.round(live_up_pct)) + "%"
+                             : "▼ " + str.tostring(math.round(100.0 - live_up_pct)) + "%"
+        string a_txt = "SQUEEZE " + str.tostring(int(live_dur)) + " bars"
+        a_txt := a_txt + "\nKNN lean: " + a_dir + " | N=" + str.tostring(live_n)
+        antic_lbl := label.new(bar_index + 3, close, a_txt,
+                               style=label.style_label_left,
+                               color=color.new(#000000, 100),
+                               textcolor=C_AMBER, size=size.small)
+
+
+// DASHBOARD
+f_hud_pos(string s) =>
+    switch s
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        =>                position.bottom_left
+
+var table hud = table.new(f_hud_pos(hud_pos), 2, 8,
+                           bgcolor=C_BG, border_color=C_BORD,
+                           border_width=1, frame_color=C_BORD, frame_width=2)
+
+if show_hud and barstate.islast
+    table.cell(hud, 0, 0, "KNN SQUEEZE [D3R]", text_color=C_TXT,
+               bgcolor=color.new(#1e293b, 0), text_size=11, text_halign=text.align_center)
+    table.merge_cells(hud, 0, 0, 1, 0)
+
+    table.cell(hud, 0, 1, "State", text_color=C_DIM, bgcolor=color.new(#1e293b, 40), text_size=11)
+    table.cell(hud, 1, 1, in_sqz ? "🗜️ SQUEEZE (" + str.tostring(bar_index - sqz_start) + " bars)" : "RELEASED",
+               text_color=in_sqz ? C_AMBER : C_DIM, bgcolor=color.new(#1e293b, 40),
+               text_size=11, text_halign=text.align_center)
+
+    table.cell(hud, 0, 2, "Compression", text_color=C_DIM, bgcolor=color.new(#0f172a, 40), text_size=11)
+    table.cell(hud, 1, 2, str.tostring(math.round(compress * 100)) + "%",
+               text_color=compress > 0.5 ? C_AMBER : C_TXT, bgcolor=color.new(#0f172a, 40),
+               text_size=11, text_halign=text.align_center)
+
+    string knn_s = live_n >= knn_min_train
+         ? "▲ " + str.tostring(math.round(live_up_pct)) + "% | ±" + str.tostring(live_avg_mv, "#.#") + " ATR"
+         : "Training… " + str.tostring(live_n) + "/" + str.tostring(knn_min_train)
+    table.cell(hud, 0, 3, "KNN Read", text_color=C_DIM, bgcolor=color.new(#1e293b, 40), text_size=11)
+    table.cell(hud, 1, 3, knn_s,
+               text_color=live_n >= knn_min_train ? (live_up_pct >= 50 ? C_GREEN : C_RED) : C_DIM,
+               bgcolor=color.new(#1e293b, 40), text_size=11, text_halign=text.align_center)
+
+    int n_train = array.size(ko_dir)
+    float g_up = 0.0
+    if n_train > 0
+        for _i = 0 to n_train - 1
+            g_up += array.get(ko_dir, _i)
+    table.cell(hud, 0, 4, "Samples", text_color=C_DIM, bgcolor=color.new(#0f172a, 40), text_size=11)
+    table.cell(hud, 1, 4, str.tostring(n_train) + " squeezes | " +
+               (n_train > 0 ? str.tostring(math.round(g_up / float(n_train) * 100)) + "% broke up" : "—"),
+               text_color=C_DIM, bgcolor=color.new(#0f172a, 40),
+               text_size=11, text_halign=text.align_center)
+
+
+// ALERTS
+bool sqz_started = in_sqz and not in_sqz[1]
+alertcondition(sqz_started,    "Squeeze Started", "D3R KNN Squeeze: compression began — volatility loading")
+alertcondition(fired_this_bar, "Squeeze Fired",   "D3R KNN Squeeze: squeeze released — check KNN direction probability")

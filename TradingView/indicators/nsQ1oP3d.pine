@@ -1,0 +1,2598 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Nonthoen212538
+
+// ============================================================================
+// KTC STRUCTURE + CONFLUENCE  v74
+//
+// XAUUSD M5. Structure, zones and a graded entry. Nothing repaints: every
+// module evaluates on barstate.isconfirmed, and the entry levels are fixed on
+// the bar the zone forms rather than recomputed when price arrives.
+//
+// The per-version changelog that used to sit here ran from v29 to v73 and was
+// over a thousand lines - a third of the file. It is gone. What follows is the
+// system as it stands, plus the decisions that are easy to undo by accident.
+//
+// ------------------------------------------------- ZONE POSITION (v94)
+// Two fixes.
+//
+// 1. The loop that slid waiting zones forward each bar was deleted by mistake
+//    in the v92 strip-back - it sat inside the block being removed. Zones were
+//    left frozen at the bar they were born on, so price simply walked away
+//    from them and they ended up off the left of the screen. Restored.
+//
+// 2. Zones were parked entirely in the empty space past the last bar, which
+//    puts them off-screen on a phone unless you scroll right. The band now
+//    ENDS a few bars past price and reaches BACK across the candles, so it
+//    lies over the chart with only its nose in the margin.
+//
+// Also: the made-count is split buy / sell. Only sell zones were showing up
+// and nothing in the two conditions is directional, so the counter needs to
+// say whether buy zones are being rejected or never queued at all.
+//
+// ------------------------------------------------- LIMIT ZONES (v92 / v93)
+// Back to the rule as originally specified, and nothing else:
+//
+//   an FVG lies between price and the OB   AND   an S/R level sits in the OB
+//   -> draw the zone, labelled with its price range and its stop
+//
+// Everything piled on top of that between v77 and v91 is gone: the grade
+// filter, the premium/discount gate, the overlap-dedupe, the CHoCH
+// cancellation, the minimum distance from price, and the arming rule. Each was
+// added to fix a problem the previous addition had caused, and between them
+// they were rejecting nearly every candidate for reasons that had nothing to
+// do with the two conditions actually asked for.
+//
+// v93 - every distance on the entry and zone side is set in POINTS, the way
+// the reference does it and the way the labels already read. "SL Buffer 60pts"
+// is a number you can picture; "0.2 ATR" is one you have to do arithmetic on
+// first, every time. Converted at roughly the values they worked out to:
+//     SL Buffer  60   S/R Tolerance 250   Approach 150
+//     Min OB Height 75    TP Liquidity Pad 30
+//
+// ATR is deliberately KEPT for the OB width filter and the minimum FVG size.
+// Those ask "is this bar abnormal for current conditions" - a question about
+// volatility, which a fixed distance cannot answer.
+//
+// ------------------------------------------------- COMPILE FIX (v90)
+// f_tradeTxt is called with na for _ref on the entry label, because the entry
+// has no distance from itself. Pine cannot infer a type from a bare na, so it
+// refused the call (CE10189). The parameters are now explicitly typed in the
+// signature, which is the fix Pine wants and also documents what the function
+// expects.
+//
+// ------------------------------------------------- LINE REMOVAL (v89)
+// When a trade closes - stop, breakeven stop, or TP3 - the entry, stop and
+// all three target lines are removed together with their labels. Previously
+// they stayed on the chart forever and every closed trade left another five
+// lines behind, which on a long session buried the live trade and ate into
+// Pine's 500-line ceiling.
+//
+// Deliberately NOT one line at a time as each level is reached: while the
+// trade is running, seeing the TP1 line still sitting there is how you know
+// price has already been through it. The set is only useful, or only
+// clutter, as a set.
+//
+// The handles are reset to na after deleting, so the redraw guards elsewhere
+// can tell "no drawing exists" from "drawing exists but was deleted".
+//
+// ------------------------------------------------- TRADE LABELS (v88)
+// Entry, stop and target labels now read like the reference: a badge at the
+// right-hand end of each line carrying the level AND its distance from entry
+// in points - "SL 4066.00  600pts", "TP2 4050.00  1000pts". The distance is
+// the number that actually matters when sizing a position, and working it out
+// from two prices on a phone is exactly the kind of arithmetic a chart should
+// have already done.
+//
+// The badge has a solid background rather than floating text, so it stays
+// readable over candles, and the lines run further right by default.
+//
+// ------------------------------------------------- ZONE DISTANCE (v87)
+// The diagnostics answered the "no boxes on the right" question: 181 zones
+// were being made and 0 were waiting. They were not failing to appear - they
+// were being created at prices right next to the bar that made them, touched
+// within a bar or two, and converted straight into entries. A resting order
+// placed where price already is is not a resting order.
+//
+// A zone must now sit at least lzMinDistATR away from price to be created at
+// all. The reference indicator's zones sit tens of dollars from the current
+// price; that gap is what makes them worth waiting for.
+//
+// The S/R requirement was also rejecting 1,607 of 2,105 candidates - 76% -
+// on a 0.3 ATR tolerance. An OB box on gold M5 is only a few dollars tall, so
+// demanding a level land inside it that precisely threw most of them away.
+// Default is now 0.8.
+//
+// ------------------------------------------------- ZONE LOOK (v86)
+// Zones now read the way the reference draws them: one clear band with a
+// bright border, a faint fill, and the label centred inside it rather than
+// hanging off the left edge.
+//
+// The bigger change is that overlapping zones are no longer stacked. OB and
+// FVG frequently mark the same area within a bar or two of each other, and
+// with twenty allowed to wait at once the right-hand side turned into a pile
+// of translucent bands with nothing legible in it. A new zone that covers
+// substantially the same prices as one already waiting is now skipped - the
+// older one is the one price has been approaching, so it keeps the slot.
+//
+// ------------------------------------------------- ZONE ENGINE (v85)
+// "Show Limit Zones" was gating the whole zone engine, not just its drawing.
+// With it off no zone was built, no entry could fire from one, and - the part
+// that made this hard to diagnose - the counters that say WHY zones are
+// missing were themselves hidden behind the same switch. A display option
+// should not decide whether the logic runs.
+//
+// Now the engine always runs. showLZ controls the boxes and labels only, and
+// the diagnostics row is always visible while any zone requirement is on.
+//
+// The row reads:  queued -> made / waiting , then the rejection breakdown.
+// If "queued" is 0 nothing upstream is producing OB or FVG zones at all and
+// the problem is not here. If "queued" is high but "made" is 0, the number
+// under FVG / SR / Gr / PD says which requirement is eating them.
+//
+// ------------------------------------------------- ZONE BUG FIX (v84)
+// FVG-sourced zones never appeared. The queue push had top and bottom the
+// wrong way round: a bullish FVG box runs from high[2] up to low, and the two
+// were pushed as top = high[2], bottom = low - inverted. The drain then tests
+// `zT > zB` before drawing anything, which for an inverted pair is never
+// true, so every FVG zone was discarded in silence. Bearish the same. This
+// has been wrong since the zones were first fed from FVG.
+//
+// A diagnostics row was added at the same time: the dashboard now reports how
+// many zones are waiting and how many were rejected this session, broken down
+// by which requirement stopped them. Guessing which filter is too strict is
+// not something the chart should make you do.
+//
+// ------------------------------------------------- ZONE LIFETIME (v83)
+// A zone price has never reached does not expire. It keeps sliding forward
+// beside the last bar for as long as it takes. The old 200-bar cutoff was
+// throwing away levels for the crime of being patient, which is the opposite
+// of what a resting order is for.
+//
+// "Drop After (bars)" is now 0 = never, and 0 is the default. A non-zero
+// value still works if a cutoff is ever wanted.
+//
+// The one thing that still removes an untouched zone is the waiting cap, and
+// that limit is not arbitrary: Pine allows a script 500 boxes, 500 lines and
+// 500 labels in total, shared with the OB boxes, the FVG boxes, the S/R lines
+// and the trade drawings. Past that TradingView silently drops the oldest of
+// whatever it likes, which could be a live OB rather than a stale zone. The
+// cap keeps that decision here instead of there.
+//
+// ------------------------------------------------- ZONE REMOVAL (v82)
+// A zone that gets touched is DELETED, not greyed out. Once it has become a
+// live entry it is drawing nothing the entry lines do not already show, and
+// since v81 parks waiting zones in a stack beside price, leaving spent ones
+// there stacked them on top of each other and hid the live ones behind them.
+//
+// ------------------------------------------------- ZONE PLACEMENT (v81)
+// Waiting zones are parked in the empty space to the RIGHT of the last bar
+// instead of sitting where the block formed. They slide forward every bar, so
+// however long a zone waits it stays beside current price as a row of shelves
+// rather than drifting off the left of the screen with its candles.
+//
+// Only zones still waiting move. The moment one is touched it is left where
+// it was - a filled zone is a record of where the trade happened and should
+// not follow price around.
+//
+// ------------------------------------------------- COUNTERS (v80)
+// TP and SL only. The breakeven sub-count is gone, along with the array that
+// fed it - it was an extra number to read for a question that was not being
+// asked. Four buckets, mutually exclusive, keyed on the highest TP the trade
+// reached: a run to TP2 that comes back is a TP2, and only a trade that never
+// reached TP1 is an SL.
+//
+// ------------------------------------------------- ALERT SEQUENCE (v79)
+// Three messages now follow a trade, in order:
+//   1. "APPROACHING"  price comes within a set distance of a waiting zone.
+//                     Fires ONCE per zone - a per-zone flag stops it
+//                     re-firing every bar while price hovers nearby.
+//   2. "ENTRY"        price touches the zone. The trade is live.
+//   3. "TP CONFIRMED" PA and Stochastic agree; targets are now drawn.
+//
+// ------------------------------------------------- HOW A TRADE HAPPENS (v78)
+//
+// The limit zone is now the primary path and the graded entry is the fallback.
+//
+//   1. An OB forms. A zone is drawn ONLY if both are true:
+//        - an unfilled FVG sits between price and that OB, so price has to
+//          travel through the imbalance to reach the block
+//        - an S/R level lies inside the OB box
+//      Label: "BUY LIMIT <entry>  SL <sl>". Levels are frozen right here.
+//
+//   2. Price returns and touches the zone -> ENTRY FIRES IMMEDIATELY. Entry
+//      and SL lines are drawn. Nothing waits on PA or Stochastic, which is
+//      what used to make the signal late.
+//
+//   3. PA and Stochastic confirm afterwards -> the TP lines appear. Until
+//      they do, the trade is on the chart with a stop and no targets, which
+//      is an accurate picture of what is known.
+//
+// TP levels are computed at entry either way, so the counters below are not
+// affected by when the lines get drawn.
+//
+// ------------------------------------------------- OUTCOME COUNTERS
+// Five rows on the dashboard. SL / TP1 / TP2 / TP3 are mutually exclusive and
+// use the highest TP the trade reached, as instructed: a trade that ran to TP2
+// and came back counts as TP2, not as a loss.
+//
+// BE is deliberately NOT in that set. Under a highest-TP rule a breakeven stop
+// can only happen after TP1, so it would never be reachable as its own bucket.
+// It is reported as a SUB-COUNT instead - how many of the TP wins gave it all
+// back to the stop - which is the thing worth knowing. It overlaps the TP
+// rows on purpose, so the five numbers do not sum to the trade count.
+//
+// ------------------------------------------------- LIMIT ZONES vs ENTRY
+// Limit zones are now graded on the same ladder as the entry, and only zones
+// meeting a minimum grade are drawn.
+//
+// They cannot use the SAME conditions, and it is worth being clear why. The
+// entry core is: FVG touched earlier -> price IN the OB now -> Stoch cross on
+// this bar. A limit zone is placed BEFORE price gets there, so at the moment
+// it is drawn price is not in the zone and there is no Stoch cross to read -
+// those two legs are exactly what has not happened yet.
+//
+// What CAN be judged at zone-creation time is the same set of extra layers the
+// entry grades on, so that is what is used:
+//     D = zone only     C = +Trend     B = +S/R     A = +Price Action
+// with the Premium/Discount gate applied too when it is on. Set the minimum
+// grade to C and a buy zone only appears when structure agrees with it.
+//
+// Zones are also cancelled now: an opposite CHoCH kills every zone on the
+// wrong side, so a buy zone does not sit waiting through a trend reversal.
+//
+// ---------------------------------------------------------------- ALERTS
+// Two kinds, and they are set up differently in TradingView.
+//
+//  alertcondition  - appears as a named entry in the Condition dropdown when
+//                    creating an alert. One alert per condition, fixed text.
+//  alert()         - fires with a message built at runtime, so the actual
+//                    prices go in it. Choose "Any alert() function call" as
+//                    the condition and one alert covers everything.
+//
+// Both need "Show pop-up" ticked in the alert dialog to appear on screen.
+// Zone alerts fire when the zone FORMS, which is before price gets there -
+// that is the point of them.
+//
+// ---------------------------------------------------------------- MODULES
+//  Market Structure   pivots, BOS / CHoCH, HH-HL-LH-LL labels
+//  Support/Resistance single lines at wick tips, role reversal, drift cap
+//  Order Blocks       two detection paths, retract-and-freeze lifecycle
+//  FVG                3-candle gap, shrinks to the wick that fills it
+//  Liquidity          EQH / EQL + sweep. DISPLAY ONLY - feeds nothing
+//  Stochastic         %K 9 / smooth 3 / %D 3, zones 20 / 80
+//  Trend              EMA, Structure, Both, SAR or LRC (selectable)
+//  Premium/Discount   dealing-range halves, optional entry gate
+//  Strong/Weak H-L    the week's running extreme, wording flips on structure
+//  Sessions           Asian / London / New York shading + trade window
+//  Limit Zones        pending-order boxes drawn ahead of price
+//  Entry + Grade      the signal
+//  Dashboards         trade state top-right, MTF trend bottom-right
+//
+// ---------------------------------------------------------------- ENTRY
+// Core, all three required and in this order:
+//     FVG touched on an EARLIER bar  ->  price in an OB now  ->  Stoch cross
+// The FVG leg is a latch, not a same-bar test: price meets the FVG on the way
+// down to the OB, so by the time the OB is tested that FVG box has already
+// shrunk or gone. Without the latch the condition could never be true.
+//
+// Grade is how many extra layers agree:
+//     D = core     C = +Trend     B = +S/R     A = +Price Action
+// One signal per bar, highest grade wins, both sides on one bar cancels out.
+//
+// Entry is the NEAR edge of the OB, SL the FAR edge, so risk is the box
+// height. TP1/2/3 are 1:1, 1:2, 1:3 from entry; TP3 can instead anchor to the
+// nearest EQH/EQL. TP1 moves the stop to entry +/- the BE offset.
+//
+// Winrate: TP1 before SL is a win, SL first is a loss, both in one bar is a
+// loss - bar data cannot say which came first and the pessimistic read is the
+// honest one. Rolling window, not all of loaded history.
+//
+// ------------------------------------------------- DECISIONS, AND WHY
+// Easy to "fix" back into bugs. Each of these was deliberate.
+//
+//  - A TOUCH does not flip an OB into a Breaker; a CLOSE through the far edge
+//    does. A breaker is a block that FAILED. One price tapped and respected
+//    did its job, and retiring it on the tap removed zones from the pool on
+//    the exact bar they should have been trading.
+//  - Used-up blocks are never deleted, they are frozen: right edge retracted,
+//    extension stopped, dead to the entry logic. Same for a block a newer
+//    block overlaps - it is cut to newBar-1. Deleting destroyed the history
+//    of a zone; leaving them extending stacked live boxes on one price.
+//  - OB candidates wider than a multiple of ATR are skipped. A news bar is
+//    volatility, not an institutional footprint.
+//  - Liquidity feeds nothing into grades. That is a choice, not an oversight.
+//  - Signals fire on bar close. Faster was considered and rejected: an
+//    intrabar Stoch cross can un-cross before the bar ends, which would make
+//    the markers flicker and the winrate flattering and false.
+//
+// ------------------------------------------------- CHECKED, NOT BROKEN
+// Twice I misread this file and proposed fixing something already correct.
+// Recording both so it does not happen a third time:
+//
+//  - Mitigation is ALREADY close-based. `invalid3` is a close beyond the far
+//    edge; `touched3` is the wick test that counts retests. That is the
+//    standard lifecycle, already implemented.
+//  - HH / HL / LH / LL labels ALREADY exist in the swing blocks, behind the
+//    "Show Swing Labels" switch. They were never missing.
+//
+// ------------------------------------------------- DELIBERATELY ABSENT
+//  - The aqua / fuchsia EMA200 cross triangles. On gold M5 price wanders back
+//    and forth across the 200 EMA for long stretches, so the markers fired in
+//    contradictory pairs minutes apart and cluttered the chart without adding
+//    information. The alertconditions are kept - the crossings can still be
+//    alerted on, they just no longer draw.
+//  - Volume Profile. A real profile needs lower-timeframe data to know where
+//    inside a bar the volume traded. Without it the only option is spreading
+//    each bar's volume evenly over its height, which on gold M5 put the POC
+//    in the wrong place often enough to mislead. TradingView's built-in does
+//    it properly and costs this script nothing.
+//  - MTF confluence on M1. Reaching DOWN a timeframe means
+//    request.security_lower_tf(), whose values move inside the forming bar.
+//    As a mandatory entry gate that would repaint every signal. Upward
+//    (M15/H1) is safe if it is ever wanted.
+// ============================================================================
+
+//@version=6
+indicator("KTC Structure + Confluence v95", overlay = true, max_bars_back = 1000,
+     max_lines_count = 500, max_boxes_count = 500, max_labels_count = 500)
+
+// v95 - one bar's worth of milliseconds on whatever timeframe is open. Order
+// Block boxes are positioned by TIMESTAMP rather than bar index (see the OB
+// section), and every "n bars ahead" setting has to be converted through this.
+tfMs = timeframe.in_seconds() * 1000
+
+// ============================================================================
+// GROUPS
+// ============================================================================
+G_MS   = "01. Market Structure"
+G_SR   = "03. FIP SR (Support/Resistance Role-Reversal)"
+G_OB   = "05. Order Block"
+G_FVG  = "06. Fair Value Gap"
+G_EMA  = "08. EMA Ribbon"
+G_LQ   = "09. Liquidity (EQH/EQL Sweep)"
+G_STO  = "11. Stochastic"
+G_ENT  = "12. Entry / Grade"
+G_DASH = "14. Dashboard"
+G_SESS = "15. Sessions / Trade Window"
+G_SWH  = "18. Strong / Weak High-Low"
+G_LZ   = "16. Limit Zones"
+
+// ============================================================================
+// CORE CALC
+// ============================================================================
+atrLen   = input.int(14, "ATR Length", group = G_MS)
+atr      = ta.atr(atrLen)
+
+// ============================================================================
+// SESSIONS + TRADE WINDOW  (v64)
+// Same three windows and the same timezone the reference ships with. The
+// shading is cosmetic; the trade window is reported and nothing more - by
+// instruction it must not gate a signal.
+// ============================================================================
+showSess  = input.bool(true,  "Shade Sessions", group = G_SESS)
+sessTZ    = input.string("Asia/Bangkok", "Timezone", group = G_SESS)
+useAsian  = input.bool(true,  "Asian",    inline = "as", group = G_SESS)
+sessAsian = input.session("0600-1400", "", inline = "as", group = G_SESS)
+useLdn    = input.bool(true,  "London",   inline = "ld", group = G_SESS)
+sessLdn   = input.session("1400-2200", "", inline = "ld", group = G_SESS)
+useNY     = input.bool(true,  "New York", inline = "ny", group = G_SESS)
+sessNY    = input.session("1930-0400", "", inline = "ny", group = G_SESS)
+colAsian  = input.color(color.new(color.purple, 93), "Asian Color",    group = G_SESS)
+colLdn    = input.color(color.new(color.teal,   93), "London Color",   group = G_SESS)
+colNY     = input.color(color.new(color.orange, 93), "New York Color", group = G_SESS)
+tradeWin  = input.session("1400-0400", "Trade Window (display only)", group = G_SESS)
+
+inAsian = useAsian and not na(time(timeframe.period, sessAsian, sessTZ))
+inLdn   = useLdn   and not na(time(timeframe.period, sessLdn,   sessTZ))
+inNY    = useNY    and not na(time(timeframe.period, sessNY,    sessTZ))
+inTrade = not na(time(timeframe.period, tradeWin, sessTZ))
+
+bgcolor(showSess and inNY  ? colNY  : na, title = "NY Session")
+bgcolor(showSess and inLdn ? colLdn : na, title = "London Session")
+bgcolor(showSess and inAsian and not inLdn ? colAsian : na, title = "Asian Session")
+
+// ============================================================================
+// LIMIT ZONE QUEUE  (v64)
+// Declared up here so the Order Block and FVG modules can both push into it
+// at the moment a zone is born. That is the whole point of the module: the
+// entry and stop are fixed on the bar the zone forms, not recomputed when
+// price arrives, so the fill test later is a bare comparison.
+// ============================================================================
+var float[] lzQTop  = array.new_float()
+var float[] lzQBot  = array.new_float()
+var bool[]  lzQBull = array.new_bool()
+// v72 - true when the Order Block module raised the zone, false when FVG did.
+// Without this the "Build From..." switches had nothing to switch on.
+var bool[]  lzQFromOB = array.new_bool()
+body     = math.abs(close - open)
+
+pivotLen   = input.int(5, "Swing Length", minval = 1, group = G_MS)
+useATRBuf  = input.bool(true, "Use ATR Break Buffer", group = G_MS)
+atrBufMult = input.float(0.10, "ATR Buffer", step = 0.05, group = G_MS)
+useBodyFlt = input.bool(true, "Use Body Break Filter", group = G_MS)
+minBodyATR = input.float(0.15, "Min Body ATR", step = 0.05, group = G_MS)
+showSwingTxt = input.bool(true, "Show HH/HL/LH/LL", group = G_MS)
+showBOS      = input.bool(true, "Show BOS / CHoCH", group = G_MS)
+bosColor     = input.color(color.white, "BOS Color", group = G_MS)
+chochColor   = input.color(color.white, "CHoCH Color", group = G_MS)
+bosWidth     = input.int(1, "BOS/CHoCH Width", minval = 1, maxval = 5, group = G_MS)
+
+f_round(_p) => math.round(_p / syminfo.mintick) * syminfo.mintick
+f_fmt(_p) => str.tostring(_p, format.mintick)
+
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastHigh = na
+var float lastLow  = na
+var int   lastHighBar = na
+var int   lastLowBar  = na
+var int   trend = 0
+var bool  highBroken = false
+var bool  lowBroken  = false
+
+
+breakBuffer = useATRBuf ? atr * atrBufMult : 0.0
+bodyOK      = not useBodyFlt or body >= atr * minBodyATR
+
+var int[]   swHighBar   = array.new_int()
+var float[] swHighPrice = array.new_float()
+var int[]   swLowBar    = array.new_int()
+var float[] swLowPrice  = array.new_float()
+maxSwingHistory = 60
+
+f_isBullEngulf(_i) =>
+    close[_i] > open[_i] and close[_i+1] < open[_i+1] and close[_i] >= open[_i+1] and open[_i] <= close[_i+1]
+f_isBearEngulf(_i) =>
+    close[_i] < open[_i] and close[_i+1] > open[_i+1] and close[_i] <= open[_i+1] and open[_i] >= close[_i+1]
+f_isBullPinBar(_i) =>
+    r = high[_i] - low[_i]
+    r > 0 and (math.min(open[_i], close[_i]) - low[_i]) >= r * 0.55 and (high[_i] - math.max(open[_i], close[_i])) <= r * 0.20
+f_isBearPinBar(_i) =>
+    r = high[_i] - low[_i]
+    r > 0 and (high[_i] - math.max(open[_i], close[_i])) >= r * 0.55 and (math.min(open[_i], close[_i]) - low[_i]) <= r * 0.20
+f_isMorningStar() =>
+    body2 = math.abs(close[1] - open[1])
+    rng2  = high[1] - low[1]
+    dojiMid = rng2 > 0 and body2 <= rng2 * 0.25
+    close[2] < open[2] and dojiMid and close > open and close >= open[2] + (close[2] - open[2]) * -0.6
+f_isEveningStar() =>
+    body2 = math.abs(close[1] - open[1])
+    rng2  = high[1] - low[1]
+    dojiMid = rng2 > 0 and body2 <= rng2 * 0.25
+    close[2] > open[2] and dojiMid and close < open and close <= open[2] + (close[2] - open[2]) * -0.6
+
+if not na(ph) and barstate.isconfirmed
+    array.push(swHighBar, bar_index - pivotLen)
+    array.push(swHighPrice, ph)
+    if array.size(swHighBar) > maxSwingHistory
+        array.shift(swHighBar)
+        array.shift(swHighPrice)
+    txt = na(lastHigh) ? "HH" : ph > lastHigh ? "HH" : "LH"
+    lastHigh := ph
+    lastHighBar := bar_index - pivotLen
+    highBroken := false
+    if showSwingTxt
+        label.new(bar_index - pivotLen, ph, txt, style = label.style_label_down,
+             color = color.new(color.black, 100),
+             textcolor = txt == "HH" ? color.lime : color.orange, size = size.small)
+
+if not na(pl) and barstate.isconfirmed
+    array.push(swLowBar, bar_index - pivotLen)
+    array.push(swLowPrice, pl)
+    if array.size(swLowBar) > maxSwingHistory
+        array.shift(swLowBar)
+        array.shift(swLowPrice)
+    txt = na(lastLow) ? "HL" : pl > lastLow ? "HL" : "LL"
+    lastLow := pl
+    lastLowBar := bar_index - pivotLen
+    lowBroken := false
+    if showSwingTxt
+        label.new(bar_index - pivotLen, pl, txt, style = label.style_label_up,
+             color = color.new(color.black, 100),
+             textcolor = txt == "HL" ? color.green : color.red, size = size.small)
+
+// ============================================================================
+// v57 - BOS / CHoCH, measured the standard way.
+//
+//   BOS   price closes beyond the last swing IN the direction of the trend
+//         (continuation)
+//   CHoCH price closes beyond the last swing AGAINST the trend
+//         (the first sign of a reversal)
+//
+// Both are measured against the most recent swing, which is what the
+// mainstream implementations do. v44-v56 measured CHoCH against a separate
+// "protected" swing locked in at the previous break; that is a defensible
+// reading of the concept but it is not the common one, and it meant the
+// CHoCH shown here would not line up with the same event on any other
+// structure indicator. The protected-swing state is gone.
+//
+// A break requires a CLOSE beyond the level plus the ATR buffer - a wick
+// through is not enough. The references are unanimous that closing
+// confirmation is what filters fakeouts.
+// ============================================================================
+upRaw = barstate.isconfirmed and not na(lastHigh) and not highBroken and close > lastHigh + breakBuffer and close[1] <= lastHigh and bodyOK
+dnRaw = barstate.isconfirmed and not na(lastLow)  and not lowBroken  and close < lastLow  - breakBuffer and close[1] >= lastLow  and bodyOK
+
+// direction of the break vs the trend it happens in decides the name.
+// trend == 0 is the very first break in the dataset - the trend changing
+// from undefined to defined is a change of character.
+bullBOS   = upRaw and trend == 1
+bullCHoCH = upRaw and trend != 1
+bearBOS   = dnRaw and trend == -1
+bearCHoCH = dnRaw and trend != -1
+
+msRefPx  = upRaw ? lastHigh : dnRaw ? lastLow : float(na)
+msRefBar = upRaw ? lastHighBar : dnRaw ? lastLowBar : int(na)
+
+bullBreak = bullBOS or bullCHoCH
+bearBreak = bearBOS or bearCHoCH
+
+if bullBreak
+    txt2 = bullCHoCH ? "CHoCH" : "BOS"
+    c2   = bullCHoCH ? chochColor : bosColor
+    if showBOS and not na(msRefBar) and not na(msRefPx)
+        line.new(msRefBar, msRefPx, bar_index, msRefPx, color = c2, width = bosWidth, style = line.style_dashed)
+        label.new(math.floor((msRefBar + bar_index) / 2), msRefPx, txt2, style = label.style_none, textcolor = c2, size = size.small)
+    trend := 1
+    highBroken := true
+    lowBroken  := false
+
+if bearBreak
+    txt3 = bearCHoCH ? "CHoCH" : "BOS"
+    c3   = bearCHoCH ? chochColor : bosColor
+    if showBOS and not na(msRefBar) and not na(msRefPx)
+        line.new(msRefBar, msRefPx, bar_index, msRefPx, color = c3, width = bosWidth, style = line.style_dashed)
+        label.new(math.floor((msRefBar + bar_index) / 2), msRefPx, txt3, style = label.style_none, textcolor = c3, size = size.small)
+    trend := -1
+    lowBroken  := true
+    highBroken := false
+
+// v44 - every "Show ..." switch is a DRAWING switch only; detection always
+// runs and only the colours are swapped. Defined here because the swing
+// levels below are the first thing that needs it.
+f_vis(_c, _on) => _on ? _c : color.new(color.black, 100)
+
+// ============================================================================
+// UNBROKEN SWING LEVELS  (v57)
+// ----------------------------------------------------------------------------
+// Every confirmed swing gets a dotted line extending right, and it stays
+// there until price closes through it. These are the levels the market has
+// left behind and not yet dealt with - resting liquidity - and having them
+// drawn is the difference between seeing where price might be headed and
+// only seeing where it has already been. The reference implementations all
+// carry some version of this; it was the one visible feature this script had
+// no equivalent of.
+//
+// A level is removed the moment it is broken, so what remains on the chart
+// is only ever the untouched ones.
+// ============================================================================
+showLiqLines = input.bool(true, "Show Unbroken Swing Levels", group = G_MS)
+liqHighColor = input.color(color.new(color.red, 40), "Unbroken High", group = G_MS)
+liqLowColor  = input.color(color.new(color.lime, 40), "Unbroken Low", group = G_MS)
+maxLiqLines  = input.int(12, "Max Unbroken Levels Per Side", minval = 1, maxval = 40, group = G_MS)
+
+var line[]  liqLines  = array.new_line()
+var float[] liqPrices = array.new_float()
+var bool[]  liqIsHigh = array.new_bool()
+
+f_liqDelete(_i) =>
+    line.delete(array.get(liqLines, _i))
+    array.remove(liqLines, _i)
+    array.remove(liqPrices, _i)
+    array.remove(liqIsHigh, _i)
+
+f_liqTrim(_isHigh) =>
+    cnt = 0
+    if array.size(liqLines) > 0
+        for i = 0 to array.size(liqLines) - 1
+            if array.get(liqIsHigh, i) == _isHigh
+                cnt += 1
+    guard = 0
+    while cnt > maxLiqLines and guard < 100
+        oldest = int(na)
+        if array.size(liqLines) > 0
+            for i = 0 to array.size(liqLines) - 1
+                if na(oldest) and array.get(liqIsHigh, i) == _isHigh
+                    oldest := i
+        if not na(oldest)
+            f_liqDelete(oldest)
+            cnt -= 1
+        else
+            cnt := maxLiqLines
+        guard += 1
+    true
+
+if barstate.isconfirmed and not na(ph)
+    lnH = line.new(bar_index - pivotLen, ph, bar_index + 3, ph, xloc = xloc.bar_index,
+         color = f_vis(liqHighColor, showLiqLines), style = line.style_dotted, width = 1)
+    array.push(liqLines, lnH), array.push(liqPrices, ph), array.push(liqIsHigh, true)
+    f_liqTrim(true)
+
+if barstate.isconfirmed and not na(pl)
+    lnL = line.new(bar_index - pivotLen, pl, bar_index + 3, pl, xloc = xloc.bar_index,
+         color = f_vis(liqLowColor, showLiqLines), style = line.style_dotted, width = 1)
+    array.push(liqLines, lnL), array.push(liqPrices, pl), array.push(liqIsHigh, false)
+    f_liqTrim(false)
+
+liqDelQueue = array.new_int()
+if barstate.isconfirmed and array.size(liqLines) > 0
+    for kq = 0 to array.size(liqLines) - 1
+        iq = array.size(liqLines) - 1 - kq
+        lq = array.get(liqLines, iq)
+        pq = array.get(liqPrices, iq)
+        isHiQ = array.get(liqIsHigh, iq)
+        line.set_x2(lq, bar_index + 3)
+        if isHiQ ? close > pq : close < pq
+            array.push(liqDelQueue, iq)
+if array.size(liqDelQueue) > 0
+    for kdl = 0 to array.size(liqDelQueue) - 1
+        f_liqDelete(array.get(liqDelQueue, kdl))
+
+// ============================================================================
+// STRUCTURE ALERTS - one per event, configured from the chart's alert dialog
+// ============================================================================
+alertcondition(bullBOS,   "Bullish BOS",   "Bullish Break of Structure")
+alertcondition(bearBOS,   "Bearish BOS",   "Bearish Break of Structure")
+alertcondition(bullCHoCH, "Bullish CHoCH", "Bullish Change of Character")
+alertcondition(bearCHoCH, "Bearish CHoCH", "Bearish Change of Character")
+
+// ============================================================================
+// FIP SR  (role-reversal support/resistance) — unchanged from v11
+// ============================================================================
+
+// ============================================================================
+// v44 - VISIBILITY vs DETECTION
+// Every "Show ..." switch below is now a DRAWING switch only. In v43 these
+// same switches also gated the detection code, so turning off a purely
+// cosmetic option silently disabled part of the engine: with "Show Demand /
+// Supply" off, inDemandZone was false on every bar and the main entry signal
+// could never fire at all; with "Show EQH/EQL" off the sweep component of
+// the score was permanently 0. Detection now always runs and only the
+// colours/labels are switched, which is how showPA and showPatterns already
+// behaved.
+// ============================================================================
+
+showSR       = input.bool(true, "Show FIP SR", group = G_SR)
+srPivotLen   = input.int(7, "Pivot Length", minval = 2, group = G_SR)
+// v44 - a level is now stored as TWO prices from the same pivot candle: the
+// WICK extreme (drawn on the chart, and the reference a stop is placed
+// beyond) and the BODY extreme (the hidden level that arms the touch, so an
+// entry is not made to wait for the absolute spike before it can trigger).
+// Merging keeps the EXTREME of each rather than a running average: v43
+// averaged every touch, which walked the level into the middle of the price
+// action where noise broke it constantly and stops sat too close.
+srWickGuardATR = input.float(2.0, "Ignore Wick Beyond Body Over (ATR)", minval = 0.0, step = 0.25, group = G_SR)
+srSupColor   = input.color(color.lime, "Support Color", group = G_SR)
+srResColor   = input.color(color.red, "Resistance Color", group = G_SR)
+srWaitColor  = input.color(color.gray, "Waiting Retest Color", group = G_SR)
+srWidth      = input.int(1, "Width", minval = 1, maxval = 5, group = G_SR)
+srExtend     = input.int(3, "Extend Bars Ahead", minval = 0, group = G_SR)  // v49 - bars AHEAD of the current one. The right edge is redrawn every bar, so this is pure padding; nothing in the touch test reads it.
+srMergeATR   = input.float(0.20, "Merge Nearby ATR", minval = 0.0, step = 0.05, group = G_SR)
+srBreakATR   = input.float(0.10, "Break ATR Buffer", minval = 0.0, step = 0.05, group = G_SR)
+srBreakBodyATR = input.float(0.20, "Min Break Body ATR", minval = 0.0, step = 0.05, group = G_SR)
+srRetestATR  = input.float(0.15, "Retest Tolerance ATR", minval = 0.0, step = 0.05, group = G_SR)
+srRetestExp  = input.int(25, "Retest Expire Bars", minval = 1, group = G_SR)
+srMaxEach    = input.int(4, "Max Levels Per Side", minval = 1, group = G_SR)
+// v46 - the DRAWN line stays on the wick extreme, unchanged. What is
+// configurable here is only which level a CLOSE has to clear before the
+// level counts as broken. Requiring a close past the wick (v45) made breaks
+// so rare that levels never entered the retest/flip cycle at all, so the
+// grey "waiting" lines and role reversals stopped appearing. Mid splits the
+// difference between the spike and the body cluster.
+srBreakBasis = input.string("Mid", "Break Measured At", options = ["Wick", "Mid", "Body"], group = G_SR)
+// merging keeps the extreme, which nudges a level a little further out each
+// time; without a cap those nudges accumulate and the line drifts away from
+// the price action it was drawn for.
+srMaxDriftATR = input.float(1.0, "Max Level Drift From Origin (ATR)", minval = 0.0, step = 0.25, group = G_SR)
+
+var line[]  srLines   = array.new_line()
+var float[] srPrices  = array.new_float()   // wick extreme  - drawn + SL basis
+var float[] srBodies  = array.new_float()   // body extreme  - touch trigger
+var float[] srOrigPx  = array.new_float()   // price at creation - drift anchor
+var int[]   srTypes   = array.new_int()
+var int[]   srStates  = array.new_int()
+var int[]   srBreakBar= array.new_int()
+var bool[]  srFlipped = array.new_bool()
+var int[]   srCreated = array.new_int()
+var int[]   srTouches = array.new_int()
+
+f_srDelete(_i) =>
+    line.delete(array.get(srLines, _i))
+    array.remove(srLines, _i)
+    array.remove(srPrices, _i)
+    array.remove(srBodies, _i)
+    array.remove(srOrigPx, _i)
+    array.remove(srTypes, _i)
+    array.remove(srStates, _i)
+    array.remove(srBreakBar, _i)
+    array.remove(srFlipped, _i)
+    array.remove(srCreated, _i)
+    array.remove(srTouches, _i)
+
+f_srAddOrMerge(_srcBar, _wick, _body, _type) =>
+    mergeDist = atr * srMergeATR
+    mergeIdx  = int(na)
+    if array.size(srLines) > 0
+        for i = 0 to array.size(srLines) - 1
+            if na(mergeIdx) and array.get(srTypes, i) == _type and array.get(srStates, i) == 0 and math.abs(array.get(srPrices, i) - _wick) <= mergeDist
+                mergeIdx := i
+    if not na(mergeIdx)
+        oldP = array.get(srPrices, mergeIdx)
+        oldB = array.get(srBodies, mergeIdx)
+        // resistance keeps the HIGHER extreme, support keeps the LOWER one,
+        // but never further than srMaxDriftATR from where it was first drawn
+        candP = _type == 1 ? math.min(oldP, _wick) : math.max(oldP, _wick)
+        origP = array.get(srOrigPx, mergeIdx)
+        driftCap = atr * srMaxDriftATR
+        newP = srMaxDriftATR <= 0 ? candP : (_type == 1 ? math.max(candP, origP - driftCap) : math.min(candP, origP + driftCap))
+        newB = _type == 1 ? math.min(oldB, _body) : math.max(oldB, _body)
+        array.set(srPrices, mergeIdx, newP)
+        array.set(srBodies, mergeIdx, newB)
+        array.set(srTouches, mergeIdx, array.get(srTouches, mergeIdx) + 1)
+        ln = array.get(srLines, mergeIdx)
+        line.set_y1(ln, newP)
+        line.set_y2(ln, newP)
+    else
+        col = f_vis(_type == 1 ? srSupColor : srResColor, showSR)
+        ln2 = line.new(_srcBar, _wick, bar_index + srExtend, _wick, xloc = xloc.bar_index,
+             extend = extend.none, color = col, width = srWidth)
+        array.push(srLines, ln2)
+        array.push(srPrices, _wick)
+        array.push(srBodies, _body)
+        array.push(srOrigPx, _wick)
+        array.push(srTypes, _type)
+        array.push(srStates, 0)
+        array.push(srBreakBar, int(na))
+        array.push(srFlipped, false)
+        array.push(srCreated, _srcBar)
+        array.push(srTouches, 1)
+
+f_srTrim(_type, _max) =>
+    cnt = 0
+    if array.size(srLines) > 0
+        for i = 0 to array.size(srLines) - 1
+            if array.get(srTypes, i) == _type
+                cnt += 1
+    safety = 0
+    while cnt > _max and safety < 100
+        oldestIdx = int(na)
+        oldestBar = int(na)
+        if array.size(srLines) > 0
+            for i = 0 to array.size(srLines) - 1
+                if array.get(srTypes, i) == _type and (na(oldestBar) or array.get(srCreated, i) < oldestBar)
+                    oldestIdx := i
+                    oldestBar := array.get(srCreated, i)
+        if not na(oldestIdx)
+            f_srDelete(oldestIdx)
+            cnt -= 1
+        else
+            cnt := _max
+        safety += 1
+    true
+
+srPH = ta.pivothigh(high, srPivotLen, srPivotLen)
+srPL = ta.pivotlow(low, srPivotLen, srPivotLen)
+
+if barstate.isconfirmed
+    if not na(srPH)
+        bodyH = math.max(open[srPivotLen], close[srPivotLen])
+        // manipulation-wick guard: a spike far beyond the body is treated as
+        // a stop-hunt, so the body extreme is used for BOTH levels instead of
+        // letting one outlier candle drag the level away from real trade.
+        wickH = (srPH - bodyH) > atr * srWickGuardATR and srWickGuardATR > 0 ? bodyH : srPH
+        f_srAddOrMerge(bar_index - srPivotLen, wickH, bodyH, -1)
+    if not na(srPL)
+        bodyL = math.min(open[srPivotLen], close[srPivotLen])
+        wickL = (bodyL - srPL) > atr * srWickGuardATR and srWickGuardATR > 0 ? bodyL : srPL
+        f_srAddOrMerge(bar_index - srPivotLen, wickL, bodyL, 1)
+
+srBreakBuf   = atr * srBreakATR
+srRetestTol  = atr * srRetestATR
+srBreakBodyOK = atr > 0 and body >= atr * srBreakBodyATR
+var float touchedSupportPrice = na
+var float touchedResistancePrice = na
+bool touchingSupportNow = false
+bool touchingResistanceNow = false
+
+// v44 - deletions are collected here and applied AFTER the loop. Deleting
+// inside the loop shrank the array while `i = size - 1 - k` was being
+// recomputed from the new size each pass, so on any bar where something was
+// removed one surviving item got skipped entirely - it was not extended and
+// not tested for a touch that bar. Indices are pushed newest-first, so
+// replaying them in push order stays valid.
+srDelQueue = array.new_int()
+if barstate.isconfirmed and array.size(srLines) > 0
+    for k = 0 to array.size(srLines) - 1
+        i = array.size(srLines) - 1 - k
+        ln3   = array.get(srLines, i)
+        pr    = array.get(srPrices, i)
+        typ   = array.get(srTypes, i)
+        st    = array.get(srStates, i)
+        brBar = array.get(srBreakBar, i)
+        flp   = array.get(srFlipped, i)
+        prBody = array.get(srBodies, i)
+        // the level a close must clear to count as a break - the line itself
+        // is still drawn at pr, the wick extreme
+        prBreak = srBreakBasis == "Wick" ? pr : srBreakBasis == "Body" ? prBody : (pr + prBody) / 2
+        line.set_x2(ln3, bar_index + srExtend)
+        line.set_y1(ln3, pr)
+        line.set_y2(ln3, pr)
+        if st == 0
+            resBroken = typ == -1 and close > prBreak + srBreakBuf and srBreakBodyOK
+            supBroken = typ == 1  and close < prBreak - srBreakBuf and srBreakBodyOK
+            // the touch arms at the BODY level (earlier, so the entry is
+            // not made to chase the spike); the stop still references pr,
+            // the wick extreme, further out.
+            touchActive = low <= prBody + srRetestTol and high >= prBody - srRetestTol
+            if resBroken or supBroken
+                if flp
+                    array.push(srDelQueue, i)
+                else
+                    array.set(srStates, i, 1)
+                    array.set(srBreakBar, i, bar_index)
+                    line.set_color(ln3, f_vis(srWaitColor, showSR))
+                    line.set_style(ln3, line.style_dotted)
+            else if touchActive
+                if typ == 1
+                    touchedSupportPrice := pr
+                    touchingSupportNow := true
+                if typ == -1
+                    touchedResistancePrice := pr
+                    touchingResistanceNow := true
+        else if st == 1
+            expired = not na(brBar) and bar_index - brBar > srRetestExp
+            canCheck = not na(brBar) and bar_index > brBar
+            if expired
+                array.push(srDelQueue, i)
+            else if canCheck
+                touch = low <= prBody + srRetestTol and high >= prBody - srRetestTol
+                resToSup = typ == -1 and touch and close > prBreak
+                supToRes = typ == 1  and touch and close < prBreak
+                if resToSup
+                    array.set(srTypes, i, 1)
+                    array.set(srStates, i, 0)
+                    array.set(srFlipped, i, true)
+                    array.set(srCreated, i, bar_index)
+                    line.set_color(ln3, f_vis(srSupColor, showSR))
+                    line.set_style(ln3, line.style_solid)
+                else if supToRes
+                    array.set(srTypes, i, -1)
+                    array.set(srStates, i, 0)
+                    array.set(srFlipped, i, true)
+                    array.set(srCreated, i, bar_index)
+                    line.set_color(ln3, f_vis(srResColor, showSR))
+                    line.set_style(ln3, line.style_solid)
+
+if array.size(srDelQueue) > 0
+    for kdq = 0 to array.size(srDelQueue) - 1
+        f_srDelete(array.get(srDelQueue, kdq))
+
+f_srTrim(1, srMaxEach)
+f_srTrim(-1, srMaxEach)
+
+// ============================================================================
+// ORDER BLOCK — candle selection now anchored to an actual FVG forming
+// within 3 candles after the candidate, plus an inside-bar filter and a
+// "next candle breaks this candle's extreme" confirmation. Same-type overlap
+// check retained; Breaker Block retained.
+// ============================================================================
+showOB    = input.bool(true, "Show Order Block", group = G_OB)
+// v44 - the fixed 20-bar search window is gone. It counted back from the
+// bar that CONFIRMED the break, but that bar is normally several candles
+// into the move, not where the move began; walking back from there ran past
+// the whole impulse leg and marked a candle from an older cluster. The scan
+// now finds where the impulse actually started and takes the candle
+// immediately before it.
+// and when even that finds nothing, fall back to the v43 behaviour of
+// taking the nearest opposite-colour candle, bounded.
+// ============================================================================
+// v47 - HOW AN ORDER BLOCK IS FOUND
+// The classic three-candle sequence is now the default and only active
+// source. It reads straight off the candles in front of you - opposite
+// candle, turn, strong continuation - and needs no swing pivot, no BOS and
+// no FVG to exist. That matters because everything upstream was a shared
+// point of failure: a mis-placed swing gave a mis-placed break, which gave
+// a mis-placed block, and there was no way to tell which link went wrong.
+// This rule has no upstream.
+//
+// The three previous sources are kept but switched OFF, so they can be
+// turned back on one at a time and compared on the same chart.
+//
+// Everything AFTER creation is untouched, per direct instruction: the same
+// box drawing, the same overlap guard, the same two-stage mitigation into a
+// Breaker, the same retest cap and the same deletion rules.
+// ============================================================================
+obExtend  = input.int(3, "OB Extend Bars Ahead", minval = 0, group = G_OB)
+// v55 - raised. The three-candle rule produces boxes far more often than
+// the structure-anchored search it replaced, and the old cap was purging
+// the oldest box on nearly every new one, which removed blocks before price
+// could return and break them.
+// v63 - 150 was a per-bar cost: the lifecycle loop walks every block on
+// every bar. LuxAlgo shows its last 5. 50 keeps plenty of history and cuts
+// the loop by two thirds.
+maxOB     = input.int(50, "Max OB Boxes", minval = 5, group = G_OB)
+// the three-candle pattern is its own displacement proof, so this extra
+// check is optional rather than required
+obOverlapPct = input.float(50.0, "Skip New OB If Overlaps Existing %", minval = 0.0, maxval = 100.0, group = G_OB)
+// v46 - the overlap guard used to compare only against boxes of the SAME
+// bias. When an Order Block fails it flips into a Breaker and its bias is
+// inverted, which made it invisible to that check: a fresh OB of the
+// original bias could then be drawn straight on top of the Breaker it came
+// from, leaving OB and BKB stacked in one area. A price area now holds one
+// block whatever its bias, and the newer reading replaces the older - the
+// same rule Demand/Supply uses.
+// v54 - back ON. Turning it off in v53 was a side effect of copying the
+// reference wholesale, but the reference has no Breaker stage, so it never
+// has to worry about a flipped block and a fresh one occupying the same
+// prices. This script does, and that pair stacking on top of each other was
+// a reported problem. The guard ignores bias, so a BKB is visible to it.
+obOneBlockPerArea = input.bool(true, "One Block Per Price Area (ignore bias)", group = G_OB)
+obShowMidline = input.bool(true, "Show Block Midline", group = G_OB)
+obMidColor = input.color(color.gray, "Midline Color", group = G_OB)
+obMaxRetest = input.int(2, "Max Retests Before OB/Breaker Is Used Up (0 = unlimited)", minval = 0, group = G_OB)
+// v59 - a used-up block is not deleted any more. It stays on screen and keeps
+// extending for this many bars, then its right edge snaps back to the bar
+// where it became a Breaker and stops following price. 3 bars = 15 minutes on
+// M5. Counted in bars rather than minutes so it scales with the chart.
+obBkbHold = input.int(3, "BKB Hold Bars Before Retract", minval = 0, group = G_OB)
+// v63 - LuxAlgo's ob_filter: a candidate candle whose own range is wide
+// relative to the threshold is not a block, it is a volatility event. Its
+// default threshold is ATR; this uses the same idea with a visible multiple.
+// v64 - second detection path, OFF by default. Runs beside the three-candle
+// rule; blocks are labelled "ICT" so the two are told apart on the chart.
+// v68 - ON = the v56 rule, a tap flips OB -> BKB. OFF (default) = a Breaker
+// is only born when price CLOSES through the block, which is what the word
+// means and what every published implementation does.
+// v73 - on overlap, cut the older box at newBar-1 instead of leaving it
+// extending (or deleting it). Applies to plain OBs and to BKBs alike.
+obFreezeOverlap = input.bool(true, "Freeze Older Box When New OB Overlaps", group = G_OB)
+obFlipOnTouch = input.bool(false, "Flip OB to BKB on Touch (not just close)", group = G_OB)
+obUseICT   = input.bool(false, "OB Rule 2: ICT (walk back from BOS)", group = G_OB)
+obICTScan  = input.int(20, "   Walk-Back Limit (bars)", minval = 3, group = G_OB)
+obUseVolFilter = input.bool(true, "Skip Candles Wider Than ATR x", group = G_OB)
+obVolMult      = input.float(2.0, "   ATR Multiple", minval = 0.5, step = 0.5, group = G_OB)
+// (a mitigate/invalidate split input was planned here and dropped - see the
+// header. This script already had it.)
+bullOBColor = input.color(color.new(color.aqua, 82), "Bullish OB Color", group = G_OB)
+bearOBColor = input.color(color.new(color.aqua, 82), "Bearish OB Color", group = G_OB)
+obBreakerColor = input.color(color.new(color.gray, 80), "Breaker OB Color", group = G_OB)
+
+var box[]  obBoxes = array.new_box()
+var bool[] obBull  = array.new_bool()
+var bool[] obIsBreaker = array.new_bool()
+var int[]  obRetest = array.new_int()
+var bool[] obWasIn  = array.new_bool()
+var bool[] obQualify = array.new_bool()
+var bool[] obHasLeft = array.new_bool()
+// v44 - D/S guards its "price has left the zone" flag with `bar_index >
+// created`, so a zone cannot be marked as already-left on the bar it is
+// born. OB had no creation bar stored at all, so hasLeft flipped true
+// almost immediately and the two-stage mitigation was far weaker than the
+// equivalent rule on Demand/Supply.
+var int[]  obSrcBar = array.new_int()
+// v53 - a midline per block. Half way through a block is where the reference
+// puts its entry marker, and it is the level most of these methods actually
+// trade rather than the outer edge.
+var line[] obMidLine = array.new_line()
+// v59 - three more per-block fields for the retract-and-freeze lifecycle:
+// the bar the block flipped to BKB (the retract target), the bar it was used
+// up on (starts the hold), and whether the retract has already happened.
+var int[]  obBkbBar  = array.new_int()
+var int[]  obUsedBar = array.new_int()
+var bool[] obFrozen  = array.new_bool()
+// v95 - the same two events stored as TIMESTAMPS. The bar-index copies above
+// stay because the hold counter and the creation-bar guard count BARS; these
+// are purely drawing coordinates. An OB that price never reached survives
+// indefinitely (v83), so by the time it is finally used up the retract target
+// can be ten thousand bars back - far beyond max_bars_back, which is what
+// threw RE10026 on the box.set_right() below. Timestamps have no such reach
+// limit, so the retract always lands where it should.
+var int[]  obBkbTime  = array.new_int()
+var int[]  obUsedTime = array.new_int()
+
+f_obDelete(_i) =>
+    box.delete(array.get(obBoxes, _i))
+    array.remove(obBoxes, _i), array.remove(obBull, _i), array.remove(obIsBreaker, _i)
+    array.remove(obRetest, _i), array.remove(obWasIn, _i), array.remove(obQualify, _i)
+    array.remove(obHasLeft, _i)
+    array.remove(obSrcBar, _i)
+    array.remove(obBkbBar, _i), array.remove(obUsedBar, _i), array.remove(obFrozen, _i)
+    array.remove(obBkbTime, _i), array.remove(obUsedTime, _i)
+    if array.size(obMidLine) > _i
+        ml = array.get(obMidLine, _i)
+        if not na(ml)
+            line.delete(ml)
+        array.remove(obMidLine, _i)
+
+// v95 - _left is now the TIMESTAMP of the block's candle, not its bar index.
+// Both places it is used compare it against box.get_left(), which returns the
+// same unit now that OB boxes are drawn with xloc.bar_time, so the newer-wins
+// test and the overlap cut behave exactly as before.
+f_obSlotOK(_left, _top, _bot, _isBull) =>
+    ovIdx = int(na)
+    if array.size(obBoxes) > 0
+        myHeight = _top - _bot
+        for i = 0 to array.size(obBoxes) - 1
+            // v55 - THE BKB FIX. Old blocks were not becoming Breakers, and
+            // the Breaker logic was never at fault: blocks were being
+            // deleted before they could get there. The three-candle rule
+            // fires often, and this guard used to displace ANY older box a
+            // new one overlapped, so a block seldom survived long enough for
+            // price to return and break it. A box price has already touched,
+            // or that has already flipped to Breaker, has earned its place;
+            // only untouched duplicates can be displaced now.
+            earned = array.get(obIsBreaker, i) or array.get(obRetest, i) > 0 or array.get(obWasIn, i)
+            if not earned and (obOneBlockPerArea or array.get(obBull, i) == _isBull)
+                eob = array.get(obBoxes, i)
+                eTop = box.get_top(eob)
+                eBot = box.get_bottom(eob)
+                overlapTop = math.min(_top, eTop)
+                overlapBot = math.max(_bot, eBot)
+                overlapAmt = math.max(overlapTop - overlapBot, 0.0)
+                smallerHeight = math.min(myHeight, eTop - eBot)
+                if smallerHeight > 0 and (overlapAmt / smallerHeight * 100) >= obOverlapPct
+                    ovIdx := i
+    create = true
+    if not na(ovIdx)
+        existingLeft = box.get_left(array.get(obBoxes, ovIdx))
+        // the newer candle is the one closer to the impulse, so it wins the
+        // area; the older box is not deleted any more, it is frozen below
+        create := _left > existingLeft
+
+    // v73 - now that we know the new block is really being created, cut every
+    // box it overlaps. This pass ignores `earned`, so an old BKB sitting under
+    // the new block is stopped too - that was the case the scan above skipped.
+    if create and obFreezeOverlap and array.size(obBoxes) > 0
+        cutAt = _left - tfMs
+        myH2 = _top - _bot
+        for j = 0 to array.size(obBoxes) - 1
+            if not array.get(obFrozen, j)
+                jb = array.get(obBoxes, j)
+                jTop = box.get_top(jb)
+                jBot = box.get_bottom(jb)
+                ovT = math.min(_top, jTop)
+                ovB = math.max(_bot, jBot)
+                ovA = math.max(ovT - ovB, 0.0)
+                smH = math.min(myH2, jTop - jBot)
+                // cutAt must stay right of the box's own left edge, or the
+                // box would be inverted or squashed to nothing
+                if smH > 0 and (ovA / smH * 100) >= obOverlapPct and cutAt > box.get_left(jb)
+                    box.set_right(jb, cutAt)
+                    if array.size(obMidLine) > j
+                        mlJ = array.get(obMidLine, j)
+                        if not na(mlJ)
+                            line.set_x2(mlJ, cutAt)
+                    array.set(obFrozen, j, true)
+    create
+
+// returns true if a new OB box at this price range would overlap an
+// existing same-type OB beyond the threshold - in which case we SKIP
+// creating it (never merge/extend). OB must stay a single fixed candle's
+// box; the v30 "merge into existing" behaviour let overlapping single-
+// candle boxes keep extending each other's top/bottom, which is exactly
+// what caused OB to visually creep into a box spanning several base
+// candles instead of staying pinned to one candle.
+// returns true if a NEW OB box at this location should be created. If it
+// overlaps an existing same-type OB beyond the threshold, per direct
+// instruction the candle that should represent that zone is "the last
+// opposite-coloured candle right before the real breakout out of the
+// zone" - i.e. whichever candidate sits CLOSER to the actual impulse (a
+// more recent bar/further right). So on a duplicate: if the new candidate's
+// candle is more recent than the existing one, the existing (older, wrong)
+// box is deleted and the new one takes its place; if the new candidate is
+// the same age or older, it is skipped and the existing box - already the
+// correct, more recent pick - is left alone. OB stays pinned to exactly one
+// candle either way (never merges/extends into a multi-candle box).
+// confluence/entry engine.
+// ============================================================================
+// genuinely opposite the impulse candles along the way".
+// ============================================================================
+if barstate.isconfirmed
+
+    // v53 - three candles and a gap, nothing else. v47-v52 also demanded the
+    // third candle pass an impulse test (body >= 40% and >= 0.5 ATR) and
+    // close beyond both the previous close AND the block candle's high. Each
+    // of those was an extra filter the reference does not have, and together
+    // they were rejecting most valid blocks - which is why so few were being
+    // drawn. The gap itself (candle[0]'s low clearing candle[2]'s high) is
+    // the displacement proof; measuring candle size on top of it was
+    // redundant.
+    classicBull = close[2] < open[2] and close[1] > open[1] and low > high[2]
+    classicBear = close[2] > open[2] and close[1] < open[1] and high < low[2]
+
+    // v63 - the LuxAlgo volatility guard, applied to the block candle itself
+    obNarrow = not obUseVolFilter or (high[2] - low[2]) < atr * obVolMult
+
+    if classicBull
+        obTopC = high[2], obBotC = low[2]
+        // the gap this very pattern leaves: candle[0]'s low above candle[2]'s
+        // high IS the fair value gap, so it needs no reference to the FVG
+        // module (which is declared further down the file anyway)
+        if obTopC > obBotC and obNarrow and f_obSlotOK(time[2], obTopC, obBotC, true)
+            bC1 = box.new(time[2], obTopC, time + obExtend * tfMs, obBotC, xloc = xloc.bar_time, bgcolor = f_vis(bullOBColor, showOB),
+                 border_color = color.new(color.white, 100), text = showOB ? "OB" : "", text_color = f_vis(color.white, showOB), text_size = size.small)
+            array.push(obBoxes, bC1), array.push(obBull, true), array.push(obIsBreaker, false)
+            array.push(obRetest, 0), array.push(obWasIn, false), array.push(obQualify, true)
+            array.push(obHasLeft, false), array.push(obSrcBar, bar_index)
+            array.push(obBkbBar, int(na)), array.push(obUsedBar, int(na)), array.push(obFrozen, false)
+            array.push(obBkbTime, int(na)), array.push(obUsedTime, int(na))
+            midC1 = obShowMidline ? line.new(time[2], (obTopC + obBotC) / 2, time + obExtend * tfMs, (obTopC + obBotC) / 2, xloc = xloc.bar_time, color = f_vis(obMidColor, showOB)) : na
+            array.push(obMidLine, midC1)
+            array.push(lzQTop, obTopC), array.push(lzQBot, obBotC), array.push(lzQBull, true), array.push(lzQFromOB, true)
+
+    if classicBear
+        obTopC2 = high[2], obBotC2 = low[2]
+        if obTopC2 > obBotC2 and obNarrow and f_obSlotOK(time[2], obTopC2, obBotC2, false)
+            bC2 = box.new(time[2], obTopC2, time + obExtend * tfMs, obBotC2, xloc = xloc.bar_time, bgcolor = f_vis(bearOBColor, showOB),
+                 border_color = color.new(color.white, 100), text = showOB ? "OB" : "", text_color = f_vis(color.white, showOB), text_size = size.small)
+            array.push(obBoxes, bC2), array.push(obBull, false), array.push(obIsBreaker, false)
+            array.push(obRetest, 0), array.push(obWasIn, false), array.push(obQualify, true)
+            array.push(obHasLeft, false), array.push(obSrcBar, bar_index)
+            array.push(obBkbBar, int(na)), array.push(obUsedBar, int(na)), array.push(obFrozen, false)
+            array.push(obBkbTime, int(na)), array.push(obUsedTime, int(na))
+            midC2 = obShowMidline ? line.new(time[2], (obTopC2 + obBotC2) / 2, time + obExtend * tfMs, (obTopC2 + obBotC2) / 2, xloc = xloc.bar_time, color = f_vis(obMidColor, showOB)) : na
+            array.push(obMidLine, midC2)
+            array.push(lzQTop, obTopC2), array.push(lzQBot, obBotC2), array.push(lzQBull, false), array.push(lzQFromOB, true)
+
+// ============================================================================
+// OB RULE 2 - ICT  (v64)
+// The three-candle rule only ever inspects bar[2], so when the impulse runs
+// four or five bars before the gap appears, the real last-opposite candle is
+// further back and is missed. This walks back over the impulse the way
+// LuxAlgo's ob_coord() and every ICT description do, and stops at the first
+// opposite-close candle narrow enough to be a footprint rather than a news
+// bar. Same box drawing, same slot guard, same lifecycle afterwards.
+// ============================================================================
+if barstate.isconfirmed and obUseICT and not na(atr)
+    ictBosUp = not na(lastHigh) and close > lastHigh and close[1] <= lastHigh
+    ictBosDn = not na(lastLow)  and close < lastLow  and close[1] >= lastLow
+    if ictBosUp or ictBosDn
+        ictDone = false
+        for ki = 1 to obICTScan
+            if not ictDone
+                ictOpp    = ictBosUp ? close[ki] < open[ki] : close[ki] > open[ki]
+                ictNarrow = not obUseVolFilter or (high[ki] - low[ki]) < atr * obVolMult
+                if ictOpp and ictNarrow and high[ki] > low[ki] and f_obSlotOK(time[ki], high[ki], low[ki], ictBosUp)
+                    bI = box.new(time[ki], high[ki], time + obExtend * tfMs, low[ki],
+                         xloc = xloc.bar_time,
+                         bgcolor = f_vis(ictBosUp ? bullOBColor : bearOBColor, showOB),
+                         border_color = color.new(color.orange, 40),
+                         text = showOB ? "ICT" : "", text_color = f_vis(color.orange, showOB),
+                         text_size = size.small)
+                    array.push(obBoxes, bI), array.push(obBull, ictBosUp), array.push(obIsBreaker, false)
+                    array.push(obRetest, 0), array.push(obWasIn, false), array.push(obQualify, true)
+                    array.push(obHasLeft, false), array.push(obSrcBar, bar_index)
+                    array.push(obBkbBar, int(na)), array.push(obUsedBar, int(na)), array.push(obFrozen, false)
+                    array.push(obBkbTime, int(na)), array.push(obUsedTime, int(na))
+                    midI = obShowMidline ? line.new(time[ki], (high[ki] + low[ki]) / 2, time + obExtend * tfMs, (high[ki] + low[ki]) / 2, xloc = xloc.bar_time, color = f_vis(obMidColor, showOB)) : na
+                    array.push(obMidLine, midI)
+                    array.push(lzQTop, high[ki]), array.push(lzQBot, low[ki]), array.push(lzQBull, ictBosUp), array.push(lzQFromOB, true)
+                    ictDone := true
+
+// v55 - when trimming history, drop the oldest UNTOUCHED block first and
+// leave Breakers and tested blocks alone for as long as possible; they are
+// the ones carrying information.
+if array.size(obBoxes) > maxOB
+    victim = 0
+    foundV = false
+    // v59 - retracted (dead) boxes are the first to go. They carry no future
+    // signal, only history, so they should not push a live block out of the cap.
+    for kf = 0 to array.size(obBoxes) - 1
+        if not foundV and array.get(obFrozen, kf)
+            victim := kf
+            foundV := true
+    // v83 - a block price has not reached yet is the LAST thing to drop, not
+    // the first. Prefer anything already used: frozen (above), then a spent
+    // Breaker, then a block that has been touched. Only if every block on the
+    // chart is still untouched does one of those go.
+    for kb = 0 to array.size(obBoxes) - 1
+        if not foundV and array.get(obIsBreaker, kb)
+            victim := kb
+            foundV := true
+    for kv = 0 to array.size(obBoxes) - 1
+        if not foundV and (array.get(obRetest, kv) > 0 or array.get(obWasIn, kv))
+            victim := kv
+            foundV := true
+    f_obDelete(victim)
+
+// ============================================================================
+// OB per-bar state - v58: this block was lost when Demand/Supply and Entry
+// were removed in v55/v56, leaving 12 undeclared-identifier errors. Restored
+// unchanged. inBullOB/inBearOB feed the dashboard; the best*/retest values are
+// the OB boundary + retest count that the new Entry/SL design will read.
+// The first ten reset every bar (like touchingSupportNow); the two touched*
+// values persist across bars (like touchedSupportPrice) as an SL basis.
+// ============================================================================
+bool  inBullOB          = false
+bool  inBearOB          = false
+float bestBullOBTop     = na
+float bestBullOBBot     = na
+
+float bestBearOBTop     = na
+float bestBearOBBot     = na
+
+
+
+
+
+
+// v44 - deletions are collected here and applied AFTER the loop. Deleting
+// inside the loop shrank the array while `i = size - 1 - k` was being
+// recomputed from the new size each pass, so on any bar where something was
+// removed one surviving item got skipped entirely - it was not extended and
+// not tested for a touch that bar. Indices are pushed newest-first, so
+// replaying them in push order stays valid.
+if barstate.isconfirmed and array.size(obBoxes) > 0
+    for k3 = 0 to array.size(obBoxes) - 1
+        i3 = array.size(obBoxes) - 1 - k3
+        bb = array.get(obBoxes, i3)
+        isBull3 = array.get(obBull, i3)
+        isBreaker3 = array.get(obIsBreaker, i3)
+        wasIn3 = array.get(obWasIn, i3)
+        hasLeft3 = array.get(obHasLeft, i3)
+        top3 = box.get_top(bb), bot3 = box.get_bottom(bb)
+        mlB = array.size(obMidLine) > i3 ? array.get(obMidLine, i3) : na
+        // v59 - THREE STATES, not two:
+        //   live    - extends with price, can be touched, can be graded
+        //   pending - already used up; still extends so it stays visible for
+        //             obBkbHold bars, but takes no further part in anything
+        //   frozen  - right edge pulled back to the BKB bar, extending for
+        //             good, dead to the entry logic
+        usedBar3 = array.get(obUsedBar, i3)
+        pending3 = not na(usedBar3)
+        frozen3  = array.get(obFrozen, i3)
+        // a block past its life takes no further part: no touch, no retest,
+        // no second trip through the lifecycle. Without this guard a close
+        // beyond a pending box would re-stamp its used-bar every bar and the
+        // retract would never arrive.
+        liveNow3 = not pending3 and not frozen3
+        if not frozen3
+            box.set_right(bb, time + obExtend * tfMs)
+            if not na(mlB)
+                line.set_x2(mlB, time + obExtend * tfMs)
+        if pending3 and not frozen3 and bar_index - usedBar3 >= obBkbHold
+            // retract to the bar that turned this OB into a BKB. A block that
+            // died on the retest cap never flipped, so there is no such bar -
+            // it retracts to the bar it was used up on instead.
+            // v95 - the retract target is read from the TIMESTAMP copies. The
+            // bar-index versions are what threw RE10026: an untouched block
+            // can sit for tens of thousands of bars before price finally
+            // reaches it, and by then its birth bar is long past the reach of
+            // max_bars_back. Timestamps carry no such limit.
+            bkbT3 = array.get(obBkbTime, i3)
+            usedT3 = array.get(obUsedTime, i3)
+            backTo = na(bkbT3) ? usedT3 : bkbT3
+            if not na(backTo)
+                box.set_right(bb, backTo)
+                if not na(mlB)
+                    line.set_x2(mlB, backTo)
+            array.set(obFrozen, i3, true)
+        touched3 = liveNow3 and low <= top3 and high >= bot3
+        obQualifies3 = isBreaker3 or array.get(obQualify, i3)
+        if isBull3 and touched3 and obQualifies3
+            inBullOB := true
+            if na(bestBullOBBot) or bot3 > bestBullOBBot
+                bestBullOBBot := bot3
+                bestBullOBTop := top3
+        if not isBull3 and touched3 and obQualifies3
+            inBearOB := true
+            if na(bestBearOBTop) or top3 < bestBearOBTop
+                bestBearOBTop := top3
+                bestBearOBBot := bot3
+
+        newRetest3 = touched3 and not wasIn3
+        if newRetest3
+            array.set(obRetest, i3, array.get(obRetest, i3) + 1)
+        array.set(obWasIn, i3, touched3)
+
+        // must run away from the zone first: only once price has actually
+        // been away from the box (not touching it) at least one bar does
+        // it count as genuinely tested - matches the same rule now used for
+        // Demand/Supply, including its creation-bar guard (v44).
+        if bar_index > array.get(obSrcBar, i3) and not touched3
+            array.set(obHasLeft, i3, true)
+
+        // v56 - TWO-STAGE LIFECYCLE, each stage the same shape:
+        //
+        //   OB born -> price leaves the zone -> price returns and either
+        //   TOUCHES it or closes through -> becomes a Breaker (BKB)
+        //   BKB -> price leaves it -> returns and touches or closes
+        //   through -> used up (v59: retracted and frozen, not deleted)
+        //
+        // The change from v55 is that a TOUCH is now enough. Before, only a
+        // close beyond the far boundary counted, so a block price came back
+        // and reacted off - without closing past it - stayed an untouched OB
+        // forever and no Breaker ever appeared. Reacting at the zone is the
+        // event; demanding a close through it was demanding the zone fail
+        // rather than simply be used.
+        //
+        // Each stage needs its own leave-and-return: flipping to Breaker
+        // resets hasLeft, so the BKB has to be departed from and revisited
+        // on its own account before it can be removed.
+        invalid3 = isBull3 ? close < bot3 : close > top3
+        // v68 - the flip needs a CLOSE through the block by default. A touch
+        // still counts as a retest below; it just no longer retires the zone.
+        revisited3 = obFlipOnTouch ? (touched3 or invalid3) : invalid3
+        tooMany3 = obMaxRetest > 0 and array.get(obRetest, i3) > obMaxRetest
+        if liveNow3 and revisited3 and hasLeft3
+            if not isBreaker3
+                // OB used -> flips into a Breaker of the opposite bias
+                array.set(obBull, i3, not isBull3)
+                array.set(obIsBreaker, i3, true)
+                array.set(obRetest, i3, 0)
+                array.set(obWasIn, i3, false)
+                array.set(obHasLeft, i3, false)
+                // remember where the flip happened - this is where the box
+                // will eventually be pulled back to
+                array.set(obBkbBar, i3, bar_index)
+                array.set(obBkbTime, i3, time)
+                box.set_bgcolor(bb, f_vis(obBreakerColor, showOB))
+                box.set_text(bb, showOB ? "BKB" : "")
+                box.set_text_color(bb, f_vis(color.red, showOB))
+            else
+                // v59 - Breaker used up. Previously deleted outright; now it
+                // starts the hold and will retract instead. Colour and text
+                // stay exactly as they are.
+                array.set(obUsedBar, i3, bar_index)
+                array.set(obUsedTime, i3, time)
+        else if liveNow3 and tooMany3
+            // used up: touched too many times with no close-through either
+            // way - same retract-and-freeze treatment as above rather than a
+            // deletion, so the history stays readable.
+            array.set(obUsedBar, i3, bar_index)
+            array.set(obUsedTime, i3, time)
+
+
+
+// ============================================================================
+// FVG — unchanged from v11
+// ============================================================================
+showFVG   = input.bool(true, "Show FVG", group = G_FVG)
+fvgExtend = input.int(3, "FVG Extend Bars Ahead", minval = 0, group = G_FVG)
+maxFVG    = input.int(100, "Max FVG Boxes", minval = 5, group = G_FVG)
+// v62 - was 0.00 (no filter). A gap smaller than this is noise, not an
+// imbalance worth trading, and letting it through made the FVG leg of the
+// entry grade meaningless.
+minFVGATR = input.float(0.20, "Min FVG Size ATR", minval = 0.0, step = 0.05, group = G_FVG)
+bullFVGColor = input.color(color.new(color.orange, 82), "Bullish FVG Color", group = G_FVG)
+bearFVGColor = input.color(color.new(color.orange, 82), "Bearish FVG Color", group = G_FVG)
+
+var box[]  fvgBoxes = array.new_box()
+var bool[] fvgBull  = array.new_bool()
+
+f_fvgDelete(_i) =>
+    box.delete(array.get(fvgBoxes, _i))
+    array.remove(fvgBoxes, _i)
+    array.remove(fvgBull, _i)
+
+bullFVGSize = low - high[2]
+bearFVGSize = low[2] - high
+bullFVG = barstate.isconfirmed and low > high[2] and bullFVGSize >= atr * minFVGATR
+bearFVG = barstate.isconfirmed and high < low[2] and bearFVGSize >= atr * minFVGATR
+
+if bullFVG
+    fb = box.new(bar_index - 2, low, bar_index + fvgExtend, high[2], bgcolor = f_vis(bullFVGColor, showFVG),
+         border_color = color.new(color.white, 100), text = showFVG ? "FVG" : "", text_color = f_vis(color.white, showFVG), text_size = size.tiny)
+    array.push(fvgBoxes, fb), array.push(fvgBull, true)
+    // top is `low`, bottom is `high[2]` - the gap condition is low > high[2]
+    array.push(lzQTop, low), array.push(lzQBot, high[2]), array.push(lzQBull, true), array.push(lzQFromOB, false)
+if bearFVG
+    fb2 = box.new(bar_index - 2, low[2], bar_index + fvgExtend, high, bgcolor = f_vis(bearFVGColor, showFVG),
+         border_color = color.new(color.white, 100), text = showFVG ? "FVG" : "", text_color = f_vis(color.white, showFVG), text_size = size.tiny)
+    array.push(fvgBoxes, fb2), array.push(fvgBull, false)
+    // bearish gap runs from `high` up to `low[2]`
+    array.push(lzQTop, low[2]), array.push(lzQBot, high), array.push(lzQBull, false), array.push(lzQFromOB, false)
+
+while array.size(fvgBoxes) > maxFVG
+    f_fvgDelete(0)
+
+bool priceInBullFVG = false
+bool priceInBearFVG = false
+
+// v44 - deletions are collected here and applied AFTER the loop. Deleting
+// inside the loop shrank the array while `i = size - 1 - k` was being
+// recomputed from the new size each pass, so on any bar where something was
+// removed one surviving item got skipped entirely - it was not extended and
+// not tested for a touch that bar. Indices are pushed newest-first, so
+// replaying them in push order stays valid.
+fvgDelQueue = array.new_int()
+if barstate.isconfirmed and array.size(fvgBoxes) > 0
+    for k4 = 0 to array.size(fvgBoxes) - 1
+        i4 = array.size(fvgBoxes) - 1 - k4
+        fb3 = array.get(fvgBoxes, i4)
+        isBull4 = array.get(fvgBull, i4)
+        top4 = box.get_top(fb3), bot4 = box.get_bottom(fb3)
+        box.set_right(fb3, bar_index + fvgExtend)
+        touchedFvg = low <= top4 and high >= bot4
+        if isBull4
+            if touchedFvg
+                priceInBullFVG := true
+            if low < top4 and low > bot4
+                box.set_top(fb3, low)
+            if low <= bot4
+                array.push(fvgDelQueue, i4)
+        else
+            if touchedFvg
+                priceInBearFVG := true
+            if high > bot4 and high < top4
+                box.set_bottom(fb3, high)
+            if high >= top4
+                array.push(fvgDelQueue, i4)
+
+if array.size(fvgDelQueue) > 0
+    for kdf = 0 to array.size(fvgDelQueue) - 1
+        f_fvgDelete(array.get(fvgDelQueue, kdf))
+
+// v59 - FVG LATCH. Price meets the FVG on its way to the OB, so by the time
+// the OB is tested the FVG box has been trimmed to the wick that filled it or
+// deleted altogether, and asking "is price in an FVG" on the OB bar would
+// answer no forever. These two remember the bar the FVG was last touched;
+// the entry module checks how long ago that was. Nothing is drawn for it.
+var int bullFvgArmBar = na
+var int bearFvgArmBar = na
+if barstate.isconfirmed
+    if priceInBullFVG
+        bullFvgArmBar := bar_index
+    if priceInBearFVG
+        bearFvgArmBar := bar_index
+
+
+// EMA RIBBON  (20 / 50 / 100 / 200) + Golden / Dead Cross
+// ============================================================================
+showEMA   = input.bool(false, "Show EMA Ribbon", group = G_EMA)
+showEma200Only = input.bool(true, "Show EMA 200", group = G_EMA)
+ema20Len  = input.int(20, "EMA 1", group = G_EMA)
+ema50Len  = input.int(50, "EMA 2", group = G_EMA)
+ema100Len = input.int(100, "EMA 3", group = G_EMA)
+ema200Len = input.int(200, "EMA 4", group = G_EMA)
+
+ema20  = ta.ema(close, ema20Len)
+ema50  = ta.ema(close, ema50Len)
+ema100 = ta.ema(close, ema100Len)
+ema200 = ta.ema(close, ema200Len)
+
+plot(showEMA ? ema20  : na, "EMA 20",  color = color.red,    linewidth = 1)
+plot(showEMA ? ema50  : na, "EMA 50",  color = color.orange, linewidth = 1)
+plot(showEMA ? ema100 : na, "EMA 100", color = color.blue,   linewidth = 1)
+plot((showEMA or showEma200Only) ? ema200 : na, "EMA 200", color = color.aqua,   linewidth = 2)
+
+goldenCross = ta.crossover(ema20, ema50)
+deadCross   = ta.crossunder(ema20, ema50)
+emaTrendUp  = close > ema200 and ema50 > ema100
+emaTrendDn  = close < ema200 and ema50 < ema100
+
+if showEMA and goldenCross and barstate.isconfirmed
+    label.new(bar_index, low - atr, "GC", style = label.style_label_up, color = color.new(color.green, 20), textcolor = color.white, size = size.tiny)
+if showEMA and deadCross and barstate.isconfirmed
+    label.new(bar_index, high + atr, "DC", style = label.style_label_down, color = color.new(color.red, 20), textcolor = color.white, size = size.tiny)
+
+// ============================================================================
+// PARABOLIC SAR + LINEAR REGRESSION CHANNEL  (v64)
+//
+// Two more ways to read trend, both offered to the Entry module rather than
+// replacing what is there. Defaults are Wilder's for SAR and the reference
+// indicator's 100 / 2 stdev for the channel.
+//
+// A warning worth keeping in the file: SAR was built for trending markets and
+// as a trailing stop. On gold M5 in a range it flips every two or three bars,
+// so as a trend gate it will contradict itself constantly. It is the better
+// tool for moving a stop, not for deciding direction.
+// ============================================================================
+G_TRD2  = "07. SAR / Regression Channel"
+showSAR = input.bool(false, "Show Parabolic SAR", group = G_TRD2)
+sarStart = input.float(0.02, "SAR Start",     step = 0.01, group = G_TRD2)
+sarInc   = input.float(0.02, "SAR Increment", step = 0.01, group = G_TRD2)
+sarMax   = input.float(0.2,  "SAR Max",       step = 0.05, group = G_TRD2)
+showLRC  = input.bool(false, "Show Regression Channel", group = G_TRD2)
+lrcLen   = input.int(100, "LRC Length (bars)", minval = 10, group = G_TRD2)
+lrcDev   = input.float(2.0, "LRC Band (x stdev)", step = 0.5, group = G_TRD2)
+
+sarVal = ta.sar(sarStart, sarInc, sarMax)
+plot(showSAR ? sarVal : na, "SAR", style = plot.style_circles,
+     color = close > sarVal ? color.new(color.lime, 0) : color.new(color.red, 0), linewidth = 1)
+
+lrcMid = ta.linreg(close, lrcLen, 0)
+lrcSd  = ta.stdev(close, lrcLen) * lrcDev
+lrcUp  = lrcMid + lrcSd
+lrcDn  = lrcMid - lrcSd
+plot(showLRC ? lrcMid : na, "LRC Mid", color = color.new(color.teal, 0))
+plot(showLRC ? lrcUp  : na, "LRC Upper", color = color.new(color.teal, 55), style = plot.style_linebr)
+plot(showLRC ? lrcDn  : na, "LRC Lower", color = color.new(color.teal, 55), style = plot.style_linebr)
+
+sarTrendUp = close > sarVal
+sarTrendDn = close < sarVal
+// the channel is rising and price is on the upper side of it
+lrcTrendUp = close > lrcMid and lrcMid > lrcMid[1]
+lrcTrendDn = close < lrcMid and lrcMid < lrcMid[1]
+
+// ============================================================================
+// LIQUIDITY — Equal High / Equal Low + Sweep (trend-gated)
+// ============================================================================
+showLQ    = input.bool(true, "Show EQH/EQL + Sweep", group = G_LQ)
+eqTolATR  = input.float(0.18, "Equal High/Low Tolerance ATR", minval = 0.0, step = 0.02, group = G_LQ)
+// v61 - two pivot lengths. The long one finds the major swings, the short one
+// the smaller peaks in between that a single length walks straight past.
+lqPivA    = input.int(5, "Pivot Length A", minval = 1, group = G_LQ)
+lqUsePivB = input.bool(true, "Use Second Pivot Length", group = G_LQ)
+lqPivB    = input.int(3, "Pivot Length B", minval = 1, group = G_LQ)
+// two peaks this far apart are not the same pool of resting orders, however
+// close their prices happen to be
+lqMaxGap  = input.int(50, "Max Bars Between Equal Pivots", minval = 2, group = G_LQ)
+// v65 - the level itself, drawn as a line
+lqLineOn    = input.bool(true, "Draw EQH/EQL Lines", group = G_LQ)
+lqLineColor = input.color(color.white, "EQH/EQL Line Color", group = G_LQ)
+lqLineStyle = input.string("Dotted", "Line Style", options = ["Dotted", "Dashed", "Solid"], group = G_LQ)
+lqLineWidth = input.int(1, "Line Width", minval = 1, maxval = 4, group = G_LQ)
+lqLineExt   = input.int(10, "Extend Past Pivot (bars)", minval = 0, group = G_LQ)
+// v71 - keep the cut line after a sweep, or remove it
+lqKeepSwept = input.bool(true, "Keep Line After Sweep", group = G_LQ)
+// v66 - label colours, to match the lines
+lqEQHTxt    = input.color(color.white, "EQH Label Color", group = G_LQ)
+lqEQLTxt    = input.color(color.white, "EQL Label Color", group = G_LQ)
+lqSweepTxt  = input.color(color.white, "Sweep Label Color", group = G_LQ)
+
+var float[] eqhPrices = array.new_float()
+var float[] eqlPrices = array.new_float()
+maxEQHistory = 20
+eqTol = atr * eqTolATR
+
+
+// v65 - one line per stored level, index-aligned with eqhPrices / eqlPrices so
+// removing a level removes its line in the same step
+var line[] eqhLines = array.new_line()
+var line[] eqlLines = array.new_line()
+
+lqStyleVal = lqLineStyle == "Dashed" ? line.style_dashed : lqLineStyle == "Solid" ? line.style_solid : line.style_dotted
+
+// starts at the older of the two pivots that formed the level. The right end
+// is pushed forward every bar by the loop below until the level is swept.
+f_eqLine(_x1, _y) =>
+    line.new(_x1, _y, bar_index + lqLineExt, _y, xloc = xloc.bar_index,
+         color = lqLineColor, style = lqStyleVal, width = lqLineWidth)
+
+// the two lengths overlap, so the same level can be found twice - this keeps
+// one label per price area instead of stacking them
+f_eqNear(_arr, _lvl, _tol) =>
+    bool hit = false
+    if array.size(_arr) > 0
+        for _k = 0 to array.size(_arr) - 1
+            if math.abs(array.get(_arr, _k) - _lvl) <= _tol
+                hit := true
+    hit
+
+// last confirmed pivot for each length, kept separately so the two searches
+// do not contaminate each other
+var float lastPHa = na
+var int   lastPHaBar = na
+var float lastPLa = na
+var int   lastPLaBar = na
+var float lastPHb = na
+var int   lastPHbBar = na
+var float lastPLb = na
+var int   lastPLbBar = na
+
+phA = ta.pivothigh(high, lqPivA, lqPivA)
+plA = ta.pivotlow(low,  lqPivA, lqPivA)
+phB = ta.pivothigh(high, lqPivB, lqPivB)
+plB = ta.pivotlow(low,  lqPivB, lqPivB)
+
+if barstate.isconfirmed
+    // ---- length A, highs
+    if not na(phA)
+        pbA = bar_index - lqPivA
+        if not na(lastPHa) and math.abs(phA - lastPHa) <= eqTol and pbA - lastPHaBar <= lqMaxGap and not f_eqNear(eqhPrices, phA, eqTol)
+            lvlA = math.max(phA, lastPHa)
+            array.push(eqhPrices, lvlA)
+            array.push(eqhLines, showLQ and lqLineOn ? f_eqLine(lastPHaBar, lvlA) : na)
+            if array.size(eqhPrices) > maxEQHistory
+                line.delete(array.shift(eqhLines))
+                array.shift(eqhPrices)
+            if showLQ
+                label.new(pbA, phA, "EQH", style = label.style_label_down, color = color.new(color.black, 100), textcolor = lqEQHTxt, size = size.tiny)
+        lastPHa := phA
+        lastPHaBar := pbA
+    // ---- length A, lows
+    if not na(plA)
+        pbA2 = bar_index - lqPivA
+        if not na(lastPLa) and math.abs(plA - lastPLa) <= eqTol and pbA2 - lastPLaBar <= lqMaxGap and not f_eqNear(eqlPrices, plA, eqTol)
+            lvlB = math.min(plA, lastPLa)
+            array.push(eqlPrices, lvlB)
+            array.push(eqlLines, showLQ and lqLineOn ? f_eqLine(lastPLaBar, lvlB) : na)
+            if array.size(eqlPrices) > maxEQHistory
+                line.delete(array.shift(eqlLines))
+                array.shift(eqlPrices)
+            if showLQ
+                label.new(pbA2, plA, "EQL", style = label.style_label_up, color = color.new(color.black, 100), textcolor = lqEQLTxt, size = size.tiny)
+        lastPLa := plA
+        lastPLaBar := pbA2
+    // ---- length B, highs
+    if lqUsePivB and not na(phB)
+        pbB = bar_index - lqPivB
+        if not na(lastPHb) and math.abs(phB - lastPHb) <= eqTol and pbB - lastPHbBar <= lqMaxGap and not f_eqNear(eqhPrices, phB, eqTol)
+            lvlC = math.max(phB, lastPHb)
+            array.push(eqhPrices, lvlC)
+            array.push(eqhLines, showLQ and lqLineOn ? f_eqLine(lastPHbBar, lvlC) : na)
+            if array.size(eqhPrices) > maxEQHistory
+                line.delete(array.shift(eqhLines))
+                array.shift(eqhPrices)
+            if showLQ
+                label.new(pbB, phB, "EQH", style = label.style_label_down, color = color.new(color.black, 100), textcolor = lqEQHTxt, size = size.tiny)
+        lastPHb := phB
+        lastPHbBar := pbB
+    // ---- length B, lows
+    if lqUsePivB and not na(plB)
+        pbB2 = bar_index - lqPivB
+        if not na(lastPLb) and math.abs(plB - lastPLb) <= eqTol and pbB2 - lastPLbBar <= lqMaxGap and not f_eqNear(eqlPrices, plB, eqTol)
+            lvlD = math.min(plB, lastPLb)
+            array.push(eqlPrices, lvlD)
+            array.push(eqlLines, showLQ and lqLineOn ? f_eqLine(lastPLbBar, lvlD) : na)
+            if array.size(eqlPrices) > maxEQHistory
+                line.delete(array.shift(eqlLines))
+                array.shift(eqlPrices)
+            if showLQ
+                label.new(pbB2, plB, "EQL", style = label.style_label_up, color = color.new(color.black, 100), textcolor = lqEQLTxt, size = size.tiny)
+        lastPLb := plB
+        lastPLbBar := pbB2
+
+// v44 - every stored level is checked, not just the newest one. v43 only
+// ever looked at the last entry, so an older equal-high sitting in the list
+// could never be swept - it just aged out silently and its liquidity grab
+// was never scored.
+eqhSweptIdx = array.new_int()
+if barstate.isconfirmed and array.size(eqhPrices) > 0
+    for ke = 0 to array.size(eqhPrices) - 1
+        ie = array.size(eqhPrices) - 1 - ke
+        lvl = array.get(eqhPrices, ie)
+        if high > lvl and close < lvl
+            array.push(eqhSweptIdx, ie)
+    if array.size(eqhSweptIdx) > 0
+        if showLQ
+            label.new(bar_index, high, "Sweep", style = label.style_label_down, color = color.new(color.black, 100), textcolor = lqSweepTxt, size = size.tiny)
+        for kes = 0 to array.size(eqhSweptIdx) - 1
+            idxE = array.get(eqhSweptIdx, kes)
+            // cut at the sweep bar and hand the line over - it stops moving
+            lnE = array.remove(eqhLines, idxE)
+            if lqKeepSwept
+                line.set_x2(lnE, bar_index)
+            else
+                line.delete(lnE)
+            array.remove(eqhPrices, idxE)
+
+eqlSweptIdx = array.new_int()
+if barstate.isconfirmed and array.size(eqlPrices) > 0
+    for kl = 0 to array.size(eqlPrices) - 1
+        il = array.size(eqlPrices) - 1 - kl
+        lvl2 = array.get(eqlPrices, il)
+        if low < lvl2 and close > lvl2
+            array.push(eqlSweptIdx, il)
+    if array.size(eqlSweptIdx) > 0
+        if showLQ
+            label.new(bar_index, low, "Sweep", style = label.style_label_up, color = color.new(color.black, 100), textcolor = lqSweepTxt, size = size.tiny)
+        for kls = 0 to array.size(eqlSweptIdx) - 1
+            idxL = array.get(eqlSweptIdx, kls)
+            lnL = array.remove(eqlLines, idxL)
+            if lqKeepSwept
+                line.set_x2(lnL, bar_index)
+            else
+                line.delete(lnL)
+            array.remove(eqlPrices, idxL)
+
+// v71 - push the right end of every still-live level forward. Anything still
+// in these arrays has not been swept yet, so it keeps tracking price.
+if barstate.isconfirmed and lqLineOn
+    if array.size(eqhLines) > 0
+        for kle = 0 to array.size(eqhLines) - 1
+            lnLive = array.get(eqhLines, kle)
+            if not na(lnLive)
+                line.set_x2(lnLive, bar_index + lqLineExt)
+    if array.size(eqlLines) > 0
+        for kll = 0 to array.size(eqlLines) - 1
+            lnLive2 = array.get(eqlLines, kll)
+            if not na(lnLive2)
+                line.set_x2(lnLive2, bar_index + lqLineExt)
+
+// ============================================================================
+// STRONG / WEAK HIGH + LOW  (v70)
+//
+// The level is the running extreme of the current period (a week by
+// default). It resets on the period's first bar and ratchets from there:
+// the high only rises, the low only falls, and the bar that set each one is
+// remembered so the line can start where the extreme was actually made.
+//
+// The wording flips on structure:
+//   structure bearish + high not yet taken  -> STRONG HIGH  (real resistance)
+//   structure bullish + same high           -> WEAK HIGH    (likely to be run)
+// and mirrored for lows.
+// ============================================================================
+showSWH   = input.bool(false, "Show Strong / Weak High-Low", group = G_SWH)
+swhPeriod = input.string("1 Week", "Reset Period",
+     options = ["1 Day", "1 Week", "1 Month"], group = G_SWH)
+swhStrong = input.color(color.white, "Strong Color", group = G_SWH)
+swhWeak   = input.color(color.gray,  "Weak Color", group = G_SWH)
+swhExt    = input.int(20, "Extend Right (bars)", minval = 0, group = G_SWH)
+
+swhTF = swhPeriod == "1 Day" ? "D" : swhPeriod == "1 Month" ? "M" : "W"
+
+var float swhHigh    = na
+var int   swhHighBar = na
+var float swhLow     = na
+var int   swhLowBar  = na
+
+// timeframe.change fires on the first bar of each new period
+if timeframe.change(swhTF) or na(swhHigh)
+    swhHigh    := high
+    swhHighBar := bar_index
+    swhLow     := low
+    swhLowBar  := bar_index
+else
+    if high > swhHigh
+        swhHigh    := high
+        swhHighBar := bar_index
+    if low < swhLow
+        swhLow    := low
+        swhLowBar := bar_index
+
+var line  swhHiLine = na
+var label swhHiLbl  = na
+var line  swhLoLine = na
+var label swhLoLbl  = na
+
+if showSWH and barstate.islast
+    line.delete(swhHiLine), label.delete(swhHiLbl)
+    line.delete(swhLoLine), label.delete(swhLoLbl)
+    if not na(swhHigh)
+        hiStrong = trend < 0
+        cH = hiStrong ? swhStrong : swhWeak
+        swhHiLine := line.new(swhHighBar, swhHigh, bar_index + swhExt, swhHigh,
+             xloc = xloc.bar_index, color = cH, style = line.style_solid)
+        swhHiLbl := label.new(bar_index + swhExt, swhHigh,
+             hiStrong ? "Strong High" : "Weak High", style = label.style_label_left,
+             color = color.new(color.black, 100), textcolor = cH, size = size.tiny)
+    if not na(swhLow)
+        loStrong = trend > 0
+        cL = loStrong ? swhStrong : swhWeak
+        swhLoLine := line.new(swhLowBar, swhLow, bar_index + swhExt, swhLow,
+             xloc = xloc.bar_index, color = cL, style = line.style_solid)
+        swhLoLbl := label.new(bar_index + swhExt, swhLow,
+             loStrong ? "Strong Low" : "Weak Low", style = label.style_label_left,
+             color = color.new(color.black, 100), textcolor = cL, size = size.tiny)
+
+// ============================================================================
+// PRICE ACTION CONFIRMATION — required gate before ANY entry signal
+// ============================================================================
+// v59 - the labels are gone by instruction; the logic stays because grade A
+// needs it. Nothing in this section draws.
+bool bullPA_engulf = barstate.isconfirmed and f_isBullEngulf(0)
+bool bearPA_engulf = barstate.isconfirmed and f_isBearEngulf(0)
+bool bullPA_pin    = barstate.isconfirmed and f_isBullPinBar(0)
+bool bearPA_pin    = barstate.isconfirmed and f_isBearPinBar(0)
+bool bullPA_star   = barstate.isconfirmed and f_isMorningStar()
+bool bearPA_star   = barstate.isconfirmed and f_isEveningStar()
+
+bool bullPAConfirm = bullPA_engulf or bullPA_pin or bullPA_star
+bool bearPAConfirm = bearPA_engulf or bearPA_pin or bearPA_star
+
+// ============================================================================
+// STOCHASTIC  (v59)
+// %K 9, smoothing 3, %D 3, with the classic 80 / 20 levels.
+//
+// It never decides direction - structure and the zones do that. All it says
+// is whether the timing is right, and it says it as an EVENT (the %K/%D
+// cross) rather than a STATE (%K sitting under 20), because on gold M5 %K can
+// park in a zone for a dozen bars while price keeps trending, and "oversold
+// therefore buy" in that situation is just trading against the move.
+//
+// With %K 9 the line leaves the zone fast, so requiring %K < 20 on the exact
+// bar of the cross would miss most real entries. The test is instead "did %K
+// visit the zone within the last few bars", which keeps the 20/80 levels
+// meaningful without demanding the cross land on the same bar.
+// ============================================================================
+stoKLen     = input.int(9,  "Stoch %K Length", minval = 1, group = G_STO)
+stoSmoothK  = input.int(3,  "Stoch %K Smoothing", minval = 1, group = G_STO)
+stoDLen     = input.int(3,  "Stoch %D Length", minval = 1, group = G_STO)
+stoOSLevel  = input.int(20, "Oversold Level", minval = 1, maxval = 49, group = G_STO)
+stoOBLevel  = input.int(80, "Overbought Level", minval = 51, maxval = 99, group = G_STO)
+stoZoneBars = input.int(5,  "Zone Memory (bars)", minval = 1, group = G_STO)
+
+stoKRaw = ta.stoch(close, high, low, stoKLen)
+stoK    = ta.sma(stoKRaw, stoSmoothK)
+stoD    = ta.sma(stoK, stoDLen)
+
+stoCrossUp = ta.crossover(stoK, stoD)
+stoCrossDn = ta.crossunder(stoK, stoD)
+stoWasOS   = ta.lowest(stoK, stoZoneBars)  <= stoOSLevel
+stoWasOB   = ta.highest(stoK, stoZoneBars) >= stoOBLevel
+
+bool bullSto = barstate.isconfirmed and stoCrossUp and stoWasOS
+bool bearSto = barstate.isconfirmed and stoCrossDn and stoWasOB
+
+// ============================================================================
+// PREMIUM / DISCOUNT  (v63)
+//
+// Straight out of LuxAlgo's Premium & Discount Zones and out of every ICT
+// writeup on order blocks: a bullish block taken while price sits in the top
+// half of the dealing range is a long placed where the algorithm is
+// statistically delivering price lower. The range is the last pdLen bars and
+// equilibrium is its midpoint.
+//
+// Off by default - turn it on and watch how many past signals it removes
+// before deciding whether it belongs in the core.
+// ============================================================================
+G_PD    = "13. Premium / Discount"
+usePD   = input.bool(false, "Require Discount to Buy / Premium to Sell", group = G_PD)
+pdLen   = input.int(100, "Dealing Range Length (bars)", minval = 20, group = G_PD)
+showPD  = input.bool(false, "Draw Premium / Discount Zones", group = G_PD)
+
+pdTop = ta.highest(high, pdLen)
+pdBot = ta.lowest(low, pdLen)
+pdEq  = (pdTop + pdBot) / 2
+
+inDiscount = close < pdEq
+inPremium  = close > pdEq
+
+var box pdBoxPrem = na
+var box pdBoxDisc = na
+if showPD and barstate.islast
+    box.delete(pdBoxPrem), box.delete(pdBoxDisc)
+    pdBoxPrem := box.new(bar_index - pdLen, pdTop, bar_index + 10, pdEq,
+         bgcolor = color.new(color.red, 93), border_color = color.new(color.red, 75))
+    pdBoxDisc := box.new(bar_index - pdLen, pdEq, bar_index + 10, pdBot,
+         bgcolor = color.new(color.green, 93), border_color = color.new(color.green, 75))
+
+// ============================================================================
+// ENTRY + GRADE  (v59)
+//
+// One signal, graded by how many layers line up:
+//
+//   core (required)  FVG touched on an earlier bar -> price in an OB now
+//                    -> Stochastic trigger this bar          = D
+//   + Trend                                                  = C
+//   + Support/Resistance                                     = B
+//   + Price Action confirmation                              = A
+//
+// No FVG, no OB, or no Stoch trigger means no signal at all, however good the
+// trend looks.
+//
+// Entry is the NEAR edge of the OB box and SL the FAR edge, so the risk is
+// the height of the box itself: buying, entry is the top and SL the bottom.
+// TP1/2/3 are 1:1, 1:2 and 1:3 measured from entry. A box thinner than
+// a block thinner than minOBHeightPts is skipped rather than widened - widening would put the SL
+// outside the box, and a 0.3 USD box gives a TP1 the spread eats.
+// ============================================================================
+// v78 - the graded A-D entry is now the fallback path; the limit zone is
+// primary. Turn this back on to run both.
+useGradeEntry  = input.bool(false, "Use A-D Grade Entry (legacy)", group = G_ENT)
+entTrendSrc    = input.string("EMA", "Trend Source", options = ["EMA", "Structure", "Both", "SAR", "LRC"], group = G_ENT)
+fvgArmBars     = input.int(3, "FVG Armed Window (bars)", minval = 1, group = G_ENT)
+// v93 - one place defines what a point is; every distance below counts in them
+entPointSize   = input.float(0.01, "Point Size (gold: 0.01)", minval = 0.00001, group = G_ENT)
+minOBHeightPts = input.int(75, "Min OB Height (pts)", minval = 0, group = G_ENT)
+beOffset       = input.float(0.50, "BE Offset (price)", minval = 0.0, step = 0.01, group = G_ENT)
+showEntryLines = input.bool(true, "Show Entry / SL / TP Lines", group = G_ENT)
+entLineExtend  = input.int(25, "Extend Lines Past Last Bar", minval = 0, group = G_ENT)
+// v88 - badge styling and the points readout
+entLabelBg     = input.color(color.new(color.gray, 25), "Label Background", group = G_ENT)
+entShowPts     = input.bool(true, "Show Distance in Points", group = G_ENT)
+
+// v88 - "TP2 4050.00  1000pts". _ref is the entry; pass na to omit the
+// distance, since the entry line has no distance from itself.
+f_tradeTxt(string _tag, float _price, float _ref) =>
+    string dist = ""
+    if not na(_ref) and entShowPts
+        dist := "  " + str.tostring(math.round(math.abs(_price - _ref) / entPointSize)) + "pts"
+    _tag + " " + str.tostring(_price, format.mintick) + dist
+entryLineColor = input.color(color.yellow, "Entry Line Color", group = G_ENT)
+slLineColor    = input.color(color.red,    "SL Line Color", group = G_ENT)
+tpLineColor    = input.color(color.blue,   "TP Line Color", group = G_ENT)
+// v64 - the ICT rule: target the next draw on liquidity rather than a flat
+// multiple. If an EQH sits between entry and the 1:3 level, TP3 pulls back to
+// just short of it, because price reaching that pool is what stops the move.
+tpUseLiq       = input.bool(false, "TP3 Anchors to Nearest EQH / EQL", group = G_ENT)
+tpLiqPad       = input.int(30, "   Pad Before Level (pts)", minval = 0, group = G_ENT)
+maxTracked     = input.int(20, "Max Tracked Trades (winrate)", minval = 1, group = G_ENT)
+showEntryMark  = input.bool(true, "Show Entry Triangles", group = G_ENT)
+wrPeriod       = input.string("1 Day", "Winrate Period", options = ["1 Day", "1 Week", "1 Month"], group = G_ENT)
+
+// the FVG must be BEHIND us - same bar does not count, by instruction
+bullFvgReady = not na(bullFvgArmBar) and bar_index - bullFvgArmBar >= 1 and bar_index - bullFvgArmBar <= fvgArmBars
+bearFvgReady = not na(bearFvgArmBar) and bar_index - bearFvgArmBar >= 1 and bar_index - bearFvgArmBar <= fvgArmBars
+
+trendUpOK = switch entTrendSrc
+    "EMA"       => emaTrendUp
+    "Structure" => trend == 1
+    "SAR"       => sarTrendUp
+    "LRC"       => lrcTrendUp
+    => emaTrendUp and trend == 1
+trendDnOK = switch entTrendSrc
+    "EMA"       => emaTrendDn
+    "Structure" => trend == -1
+    "SAR"       => sarTrendDn
+    "LRC"       => lrcTrendDn
+    => emaTrendDn and trend == -1
+
+bullBoxOK = not na(bestBullOBTop) and not na(bestBullOBBot) and (bestBullOBTop - bestBullOBBot) >= minOBHeightPts * entPointSize
+bearBoxOK = not na(bestBearOBTop) and not na(bestBearOBBot) and (bestBearOBTop - bestBearOBBot) >= minOBHeightPts * entPointSize
+
+// v63 - the premium/discount gate joins the core when enabled
+pdOKBull = not usePD or inDiscount
+pdOKBear = not usePD or inPremium
+
+bullCore = bullSto and inBullOB and bullFvgReady and bullBoxOK and pdOKBull
+bearCore = bearSto and inBearOB and bearFvgReady and bearBoxOK and pdOKBear
+
+string bullGrade = ""
+string bearGrade = ""
+if bullCore
+    bullGrade := trendUpOK and touchingSupportNow and bullPAConfirm ? "A" : trendUpOK and touchingSupportNow ? "B" : trendUpOK ? "C" : "D"
+if bearCore
+    bearGrade := trendDnOK and touchingResistanceNow and bearPAConfirm ? "A" : trendDnOK and touchingResistanceNow ? "B" : trendDnOK ? "C" : "D"
+
+f_gradeRank(_g) => _g == "A" ? 4 : _g == "B" ? 3 : _g == "C" ? 2 : _g == "D" ? 1 : 0
+
+// both sides qualifying on one bar means the read is contradictory; the
+// stronger grade wins and a tie produces nothing rather than a coin flip
+rankBull = f_gradeRank(bullGrade)
+rankBear = f_gradeRank(bearGrade)
+bool buySignal  = useGradeEntry and rankBull > 0 and rankBull > rankBear
+bool sellSignal = useGradeEntry and rankBear > 0 and rankBear > rankBull
+
+// ---------------------------------------------------------------- live trade
+// act* describes the signal currently drawn on the chart. It stays after the
+// trade closes so the dashboard keeps showing the last set of levels.
+var int    actDir      = 0
+var string actGrade    = ""
+var int    actBar      = na
+var float  actEntry    = na
+var float  actSL       = na
+var float  actBE       = na
+var float  actTP1      = na
+var float  actTP2      = na
+var float  actTP3      = na
+var bool   actBEMoved  = false
+var bool   actOpen     = false
+// v78 - targets are drawn later than the entry now, so the trade has to
+// remember whether that has happened yet
+var bool   actTPDrawn  = false
+
+var line lnEntry = na
+var line lnSL    = na
+var line lnTP1   = na
+var line lnTP2   = na
+var line lnTP3   = na
+var label lbEntry = na
+var label lbSL    = na
+var label lbTP1   = na
+var label lbTP2   = na
+var label lbTP3   = na
+
+// ---------------------------------------------------------------- outcomes
+// Each live trade is followed until its stop or TP3 takes it out, and the
+// HIGHEST TP it reached is what gets recorded - a trade that ran to TP2 and
+// came back is a TP2, not a loss. Only a trade that never reached TP1 can be
+// an SL.
+//
+// Both-in-one-bar is resolved pessimistically: bar data cannot say which came
+// first, and assuming the good one flatters the record.
+var int[]   tkDir  = array.new_int()
+var float[] tkSL   = array.new_float()
+var float[] tkBE   = array.new_float()
+var float[] tkTP1  = array.new_float()
+var float[] tkTP2  = array.new_float()
+var float[] tkTP3  = array.new_float()
+var int[]   tkMax  = array.new_int()
+var bool[]  tkBEOn = array.new_bool()
+var int[]   tkBar  = array.new_int()
+
+var int[]  resTime = array.new_int()
+var int[]  resOut  = array.new_int()    // 0 = SL, 1..3 = highest TP reached
+
+wrWindowMs = wrPeriod == "1 Day" ? 86400000 : wrPeriod == "1 Week" ? 604800000 : 2592000000
+
+f_openTrade(_dir, _sl, _be, _t1, _t2, _t3) =>
+    array.push(tkDir, _dir), array.push(tkSL, _sl), array.push(tkBE, _be)
+    array.push(tkTP1, _t1), array.push(tkTP2, _t2), array.push(tkTP3, _t3)
+    array.push(tkMax, 0), array.push(tkBEOn, false), array.push(tkBar, bar_index)
+    if array.size(tkDir) > maxTracked
+        array.shift(tkDir), array.shift(tkSL), array.shift(tkBE)
+        array.shift(tkTP1), array.shift(tkTP2), array.shift(tkTP3)
+        array.shift(tkMax), array.shift(tkBEOn), array.shift(tkBar)
+
+f_clearTradeDrawings() =>
+    if not na(lnEntry)
+        line.delete(lnEntry), line.delete(lnSL), line.delete(lnTP1)
+        line.delete(lnTP2), line.delete(lnTP3)
+        label.delete(lbEntry), label.delete(lbSL), label.delete(lbTP1)
+        label.delete(lbTP2), label.delete(lbTP3)
+
+if barstate.isconfirmed and array.size(tkDir) > 0
+    for kt = array.size(tkDir) - 1 to 0
+        if array.get(tkBar, kt) < bar_index
+            dT = array.get(tkDir, kt)
+            // advance the high-water mark
+            mx = array.get(tkMax, kt)
+            if dT == 1 ? high >= array.get(tkTP3, kt) : low <= array.get(tkTP3, kt)
+                mx := 3
+            else if dT == 1 ? high >= array.get(tkTP2, kt) : low <= array.get(tkTP2, kt)
+                mx := math.max(mx, 2)
+            else if dT == 1 ? high >= array.get(tkTP1, kt) : low <= array.get(tkTP1, kt)
+                mx := math.max(mx, 1)
+            array.set(tkMax, kt, mx)
+            if mx >= 1
+                array.set(tkBEOn, kt, true)
+            beOn   = array.get(tkBEOn, kt)
+            stopAt = beOn ? array.get(tkBE, kt) : array.get(tkSL, kt)
+            hitStop = dT == 1 ? low <= stopAt : high >= stopAt
+            if hitStop or mx == 3
+                array.push(resTime, time)
+                array.push(resOut, mx)
+                array.remove(tkDir, kt), array.remove(tkSL, kt), array.remove(tkBE, kt)
+                array.remove(tkTP1, kt), array.remove(tkTP2, kt), array.remove(tkTP3, kt)
+                array.remove(tkMax, kt), array.remove(tkBEOn, kt), array.remove(tkBar, kt)
+
+// drop anything that has aged out of the window. Pushes are chronological, so
+// the oldest entry is always index 0.
+if barstate.isconfirmed and array.size(resTime) > 0
+    for kw = 0 to array.size(resTime) - 1
+        if array.size(resTime) > 0 and time - array.get(resTime, 0) > wrWindowMs
+            array.remove(resTime, 0), array.remove(resOut, 0)
+
+cntSL  = 0
+cntTP1 = 0
+cntTP2 = 0
+cntTP3 = 0
+wrTotal = array.size(resOut)
+if wrTotal > 0
+    for kr = 0 to wrTotal - 1
+        o = array.get(resOut, kr)
+        if o == 0
+            cntSL += 1
+        else if o == 1
+            cntTP1 += 1
+        else if o == 2
+            cntTP2 += 1
+        else
+            cntTP3 += 1
+wrWins = cntTP1 + cntTP2 + cntTP3
+
+// ---------------------------------------------------------------- new signal
+if buySignal or sellSignal
+    dirN   = buySignal ? 1 : -1
+    entryN = buySignal ? bestBullOBTop : bestBearOBBot
+    slN    = buySignal ? bestBullOBBot : bestBearOBTop
+    riskN  = math.abs(entryN - slN)
+    actDir     := dirN
+    actGrade   := buySignal ? bullGrade : bearGrade
+    actBar     := bar_index
+    actEntry   := entryN
+    actSL      := slN
+    actBE      := entryN + dirN * beOffset
+    actTP1     := entryN + dirN * riskN
+    actTP2     := entryN + dirN * riskN * 2
+    actTP3     := entryN + dirN * riskN * 3
+    if tpUseLiq
+        liqArr = dirN == 1 ? eqhPrices : eqlPrices
+        float liqTgt = na
+        if array.size(liqArr) > 0
+            for kq = 0 to array.size(liqArr) - 1
+                lv = array.get(liqArr, kq)
+                // nearest level that lies beyond entry but short of the 1:3
+                beyond = dirN == 1 ? lv > entryN : lv < entryN
+                nearer = na(liqTgt) or (dirN == 1 ? lv < liqTgt : lv > liqTgt)
+                if beyond and nearer
+                    liqTgt := lv
+        if not na(liqTgt)
+            pulled = liqTgt - dirN * tpLiqPad * entPointSize
+            // only pull TP3 IN, and never in past TP1 - a target closer than
+            // the first partial is not a target, it is a worse trade
+            inside = dirN == 1 ? pulled < actTP3 and pulled > actTP1 : pulled > actTP3 and pulled < actTP1
+            if inside
+                actTP3 := pulled
+    actBEMoved := false
+    actOpen    := true
+
+    actTPDrawn := true
+    f_openTrade(dirN, slN, actBE, actTP1, actTP2, actTP3)
+
+    if showEntryLines
+        f_clearTradeDrawings()
+        rx = bar_index + entLineExtend
+        lnEntry := line.new(bar_index, actEntry, rx, actEntry, color = entryLineColor, width = 2)
+        lnSL    := line.new(bar_index, actSL,    rx, actSL,    color = slLineColor,    width = 2)
+        lnTP1   := line.new(bar_index, actTP1,   rx, actTP1,   color = tpLineColor,    width = 1)
+        lnTP2   := line.new(bar_index, actTP2,   rx, actTP2,   color = tpLineColor,    width = 1)
+        lnTP3   := line.new(bar_index, actTP3,   rx, actTP3,   color = tpLineColor,    width = 1)
+        lbEntry := label.new(rx, actEntry, f_tradeTxt(dirN == 1 ? "BUY" : "SELL", actEntry, na), style = label.style_label_left, color = entLabelBg, textcolor = entryLineColor, size = size.small)
+        lbSL    := label.new(rx, actSL,    f_tradeTxt("SL",  actSL,  actEntry), style = label.style_label_left, color = entLabelBg, textcolor = slLineColor, size = size.small)
+        lbTP1   := label.new(rx, actTP1,   f_tradeTxt("TP1", actTP1, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+        lbTP2   := label.new(rx, actTP2,   f_tradeTxt("TP2", actTP2, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+        lbTP3   := label.new(rx, actTP3,   f_tradeTxt("TP3", actTP3, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+
+// ------------------------------------------------- manage the drawn trade
+// TP1 moves the stop to BE; the stop or TP3 closes it. Evaluation starts the
+// bar AFTER the signal, since the signal bar's own wick is what put price in
+// the zone in the first place.
+if barstate.isconfirmed and actOpen and bar_index > actBar
+    if actDir == 1 ? high >= actTP1 : low <= actTP1
+        actBEMoved := true
+    stopNow = actBEMoved ? actBE : actSL
+    hitStopA = actDir == 1 ? low <= stopNow : high >= stopNow
+    hitTP3A  = actDir == 1 ? high >= actTP3 : low <= actTP3
+    if hitStopA or hitTP3A
+        actOpen := false
+        // v89 - the trade is over; the whole set of drawings goes with it
+        f_clearTradeDrawings()
+        lnEntry := na
+        lnSL    := na
+        lnTP1   := na
+        lnTP2   := na
+        lnTP3   := na
+        lbEntry := na
+        lbSL    := na
+        lbTP1   := na
+        lbTP2   := na
+        lbTP3   := na
+        actTPDrawn := false
+
+// lines follow price while the trade is open. Once it closes they are gone,
+// so there is nothing left to follow.
+if actOpen and showEntryLines and not na(lnEntry)
+    rx2 = bar_index + entLineExtend
+    line.set_x2(lnEntry, rx2), line.set_x2(lnSL, rx2)
+    label.set_x(lbEntry, rx2), label.set_x(lbSL, rx2)
+    // the TP set may not exist yet - it appears only once PA and Stoch agree
+    if actTPDrawn and not na(lnTP1)
+        line.set_x2(lnTP1, rx2), line.set_x2(lnTP2, rx2), line.set_x2(lnTP3, rx2)
+        label.set_x(lbTP1, rx2), label.set_x(lbTP2, rx2), label.set_x(lbTP3, rx2)
+    if actBEMoved
+        line.set_y1(lnSL, actBE), line.set_y2(lnSL, actBE)
+        label.set_y(lbSL, actBE)
+        label.set_text(lbSL, f_tradeTxt("BE", actBE, actEntry))
+
+// ---------------------------------------------------------------- EMA entry
+// A separate signal with no zone behind it, so it carries no SL/TP and takes
+// no part in the winrate. Price closing across the 200 EMA, confirmed bars
+// only. v75 - it no longer draws; it survives as an alert only.
+emaEntryUp = barstate.isconfirmed and ta.crossover(close, ema200)
+emaEntryDn = barstate.isconfirmed and ta.crossunder(close, ema200)
+
+// v60 - the entry itself, on the bar that produced it
+plotshape(showEntryMark and buySignal,  "Entry Buy",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.tiny)
+plotshape(showEntryMark and sellSignal, "Entry Sell", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny)
+
+// v76 - the same signal as the alertconditions below, but with the levels in
+// the message. One "Any alert() function call" alert catches this and the
+// zone alerts together.
+if buySignal or sellSignal
+    alert((buySignal ? "BUY " : "SELL ") + (buySignal ? bullGrade : bearGrade) +
+         "   entry " + str.tostring(actEntry, format.mintick) +
+         "   SL " + str.tostring(actSL, format.mintick) +
+         "   TP1 " + str.tostring(actTP1, format.mintick) +
+         "   " + syminfo.ticker + " " + timeframe.period,
+         alert.freq_once_per_bar)
+
+alertcondition(buySignal  and bullGrade == "A", "KTC Buy A",  "KTC BUY grade A")
+alertcondition(buySignal  and bullGrade == "B", "KTC Buy B",  "KTC BUY grade B")
+alertcondition(buySignal  and bullGrade == "C", "KTC Buy C",  "KTC BUY grade C")
+alertcondition(buySignal  and bullGrade == "D", "KTC Buy D",  "KTC BUY grade D")
+alertcondition(sellSignal and bearGrade == "A", "KTC Sell A", "KTC SELL grade A")
+alertcondition(sellSignal and bearGrade == "B", "KTC Sell B", "KTC SELL grade B")
+alertcondition(sellSignal and bearGrade == "C", "KTC Sell C", "KTC SELL grade C")
+alertcondition(sellSignal and bearGrade == "D", "KTC Sell D", "KTC SELL grade D")
+alertcondition(buySignal,  "KTC Buy (any grade)",  "KTC BUY signal")
+alertcondition(sellSignal, "KTC Sell (any grade)", "KTC SELL signal")
+alertcondition(emaEntryUp, "KTC EMA200 Cross Up",   "Price closed above EMA200")
+alertcondition(emaEntryDn, "KTC EMA200 Cross Down", "Price closed below EMA200")
+
+// ============================================================================
+// LIMIT ZONES  (v64)
+//
+// A zone is drawn ahead of price as a pending-order area, labelled the way
+// the reference does it: "BUY LIMIT lo-hi  SL x". Entry is the near edge and
+// the stop sits a buffer past the far edge, and both are worked out on the
+// bar the zone forms and never recomputed. That is what makes the fill test
+// below a single comparison that cannot repaint - the numbers were already
+// fixed when the bar closed.
+//
+// A filled zone is greyed rather than deleted, so what happened stays
+// readable; zones that go stale are dropped by age.
+// ============================================================================
+showLZ    = input.bool(true, "Show Limit Zones", group = G_LZ)
+lzFromOB  = input.bool(true,  "Build From Order Blocks", group = G_LZ)
+lzFromFVG = input.bool(true,  "Build From FVG", group = G_LZ)
+lzExtend  = input.int(30, "Extend Ahead (bars)", minval = 5, group = G_LZ)
+lzSLBuf   = input.int(60, "SL Buffer (pts)", minval = 0, group = G_LZ)
+lzMaxOpen = input.int(8, "Max Waiting Zones", minval = 1, maxval = 100, group = G_LZ)
+lzMaxAge  = input.int(0, "Drop After (bars, 0 = never)", minval = 0, group = G_LZ)
+// v77 - grade the zone the way the entry grades, and refuse the weak ones
+// v78 - the two structural requirements
+lzNeedFVG   = input.bool(true, "Require FVG Between Price and OB", group = G_LZ)
+lzNeedSR    = input.bool(true, "Require S/R Inside the OB", group = G_LZ)
+lzSRTolPts  = input.int(250, "   S/R Tolerance (pts)", minval = 0, group = G_LZ)
+// v87 - a zone sitting on top of current price gets consumed instantly and
+// never functions as a pending order. This is the gap it must keep.
+lzZoneEntry = input.bool(true, "Fire Entry When Price Touches Zone", group = G_LZ)
+// v79 - warn before arrival, once per zone
+lzNearAlert = input.bool(true, "Alert When Price Approaches a Zone", group = G_LZ)
+lzNearPts   = input.int(150, "   Approach Distance (pts)", minval = 1, group = G_LZ)
+// v81 - park waiting zones off to the right of price
+lzAnchorRight = input.bool(true, "Park Zones Right of Price", group = G_LZ)
+lzRightGap    = input.int(3,  "   Nose Past Last Bar (bars)", minval = 0, group = G_LZ)
+lzRightWidth  = input.int(60, "   Zone Width (bars)", minval = 5, group = G_LZ)
+lzBuyCol  = input.color(color.new(color.aqua, 90), "Buy Zone Color", group = G_LZ)
+lzSellCol = input.color(color.new(color.red,  90), "Sell Zone Color", group = G_LZ)
+lzBorderW = input.int(2, "Zone Border Width", minval = 1, maxval = 4, group = G_LZ)
+
+// v76 - set when a zone is created this bar, so alertcondition (which cannot
+// live inside an if block) has something at global scope to watch
+bool lzNewBuy  = false
+bool lzNewSell = false
+
+// v78 - the two structural tests, run at the moment the zone would be drawn.
+//
+// FVG: price has to pass through an unfilled imbalance on its way to the
+// block, so the gap must sit in the band between the zone and current price.
+// For a buy that band is [zone top, price]; for a sell it is [price, bottom].
+f_fvgOnPath(_zTop, _zBot, _isBull) =>
+    bool found = false
+    if array.size(fvgBoxes) > 0
+        bandLo = _isBull ? _zTop : close
+        bandHi = _isBull ? close : _zBot
+        if bandHi > bandLo
+            for _k = 0 to array.size(fvgBoxes) - 1
+                fb = array.get(fvgBoxes, _k)
+                fT = box.get_top(fb)
+                fB = box.get_bottom(fb)
+                // any overlap with the band counts - the gap is in the way
+                if fT >= bandLo and fB <= bandHi
+                    found := true
+    found
+
+// S/R: a live level lying inside the block, give or take a tolerance
+f_srInZone(_zTop, _zBot) =>
+    bool found = false
+    tol = lzSRTolPts * entPointSize
+    if array.size(srPrices) > 0
+        for _k = 0 to array.size(srPrices) - 1
+            if array.get(srStates, _k) == 0
+                lv = array.get(srPrices, _k)
+                if lv >= _zBot - tol and lv <= _zTop + tol
+                    found := true
+    found
+
+var box[]   lzBox   = array.new_box()
+var label[] lzLbl   = array.new_label()
+var float[] lzEntry = array.new_float()
+var float[] lzStop  = array.new_float()
+var bool[]  lzIsBuy = array.new_bool()
+var bool[]  lzNeared = array.new_bool()   // approach alert already sent
+
+// v84 - why zones are not appearing should be readable, not guessable
+var int lzRejFVG   = 0
+var int lzRejSR    = 0
+var int lzMade     = 0
+var int lzMadeBuy  = 0
+var int lzMadeSell = 0
+var int lzQueued   = 0
+var int[]   lzBorn  = array.new_int()
+
+// drain whatever the OB and FVG modules queued this bar. v85 - runs whether or
+// not the zones are drawn; showLZ now only suppresses the drawing below.
+if barstate.isconfirmed and array.size(lzQTop) > 0
+    lzQueued += array.size(lzQTop)
+    for kz = 0 to array.size(lzQTop) - 1
+        zT = array.get(lzQTop, kz)
+        zB = array.get(lzQBot, kz)
+        zBull = array.get(lzQBull, kz)
+        zFromOB = array.get(lzQFromOB, kz)
+        srcOn = zFromOB ? lzFromOB : lzFromFVG
+        // the two conditions, and only these
+        zFvgOK = not lzNeedFVG or f_fvgOnPath(zT, zB, zBull)
+        zSrOK  = not lzNeedSR  or f_srInZone(zT, zB)
+        if zT > zB and not zFvgOK
+            lzRejFVG += 1
+        else if zT > zB and not zSrOK
+            lzRejSR += 1
+        if zT > zB and srcOn and zFvgOK and zSrOK
+            // frozen here, once
+            eL = zBull ? zT : zB
+            sL = zBull ? zB - lzSLBuf * entPointSize : zT + lzSLBuf * entPointSize
+            cl = zBull ? lzBuyCol : lzSellCol
+            // v94 - right edge just past price, body reaching back over the bars
+            bxR = lzAnchorRight ? bar_index + lzRightGap : bar_index + lzExtend
+            bxL = lzAnchorRight ? bxR - lzRightWidth : bar_index
+            bx = showLZ ? box.new(bxL, zT, bxR, zB,
+                 bgcolor = cl, border_color = zBull ? color.aqua : color.red,
+                 border_width = lzBorderW) : na
+            // centred in the band, the way the reference reads
+            lb = not showLZ ? na : label.new(math.round((bxL + bxR) / 2), (zT + zB) / 2,
+                 (zBull ? "BUY LIMIT " : "SELL LIMIT ") +
+                 str.tostring(zB, format.mintick) + "-" + str.tostring(zT, format.mintick) +
+                 "  SL " + str.tostring(sL, format.mintick),
+                 style = label.style_none, color = color.new(color.black, 100),
+                 textcolor = zBull ? color.aqua : color.red, size = size.small)
+            if zBull
+                lzNewBuy := true
+            else
+                lzNewSell := true
+            alert((zBull ? "BUY ZONE  " : "SELL ZONE  ") +
+                 str.tostring(zB, format.mintick) + "-" + str.tostring(zT, format.mintick) +
+                 "   entry " + str.tostring(eL, format.mintick) +
+                 "   SL " + str.tostring(sL, format.mintick) +
+                 "   " + syminfo.ticker + " " + timeframe.period,
+                 alert.freq_once_per_bar)
+            array.push(lzBox, bx), array.push(lzLbl, lb)
+            array.push(lzEntry, eL), array.push(lzStop, sL)
+            array.push(lzIsBuy, zBull), array.push(lzBorn, bar_index)
+            array.push(lzNeared, false)
+            // a zone born under price is not a pending order yet
+            lzMade += 1
+            if zBull
+                lzMadeBuy += 1
+            else
+                lzMadeSell += 1
+            if array.size(lzBox) > lzMaxOpen
+                box.delete(array.shift(lzBox)), label.delete(array.shift(lzLbl))
+                array.shift(lzEntry), array.shift(lzStop)
+                array.shift(lzIsBuy), array.shift(lzBorn), array.shift(lzNeared)
+
+if array.size(lzQTop) > 0
+    array.clear(lzQTop), array.clear(lzQBot), array.clear(lzQBull), array.clear(lzQFromOB)
+
+// v77 - an opposite CHoCH invalidates every zone facing the wrong way. This
+// is the cancellation rule the reference scripts have and this one did not:
+// without it a buy zone waits patiently through a trend reversal.
+// v94 - RESTORED (removed by accident in v92). Slide every waiting zone so the
+// set stays alongside the last bar; without this they freeze where they were
+// born and price walks away from them.
+if lzAnchorRight and array.size(lzBox) > 0
+    rgt = bar_index + lzRightGap
+    lft = rgt - lzRightWidth
+    for kp = 0 to array.size(lzBox) - 1
+        bxP = array.get(lzBox, kp)
+        if not na(bxP)
+            box.set_left(bxP, lft), box.set_right(bxP, rgt)
+            label.set_x(array.get(lzLbl, kp), math.round((lft + rgt) / 2))
+
+// v79 - approach warning. Distance is measured to the entry edge, and the
+// flag makes it a one-shot per zone: without it price drifting around near a
+// zone would fire on every single bar.
+if lzNearAlert and array.size(lzEntry) > 0
+    for kn = 0 to array.size(lzEntry) - 1
+        if not array.get(lzNeared, kn)
+            eN = array.get(lzEntry, kn)
+            if math.abs(close - eN) <= lzNearPts * entPointSize
+                array.set(lzNeared, kn, true)
+                alert((array.get(lzIsBuy, kn) ? "APPROACHING BUY ZONE  " : "APPROACHING SELL ZONE  ") +
+                     str.tostring(eN, format.mintick) +
+                     "   SL " + str.tostring(array.get(lzStop, kn), format.mintick) +
+                     "   " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar)
+
+// fill test - no barstate guard needed, the levels are already fixed
+if array.size(lzEntry) > 0
+    for kf = array.size(lzEntry) - 1 to 0
+        eNow = array.get(lzEntry, kf)
+        // v83 - 0 disables expiry entirely; an unreached zone simply waits
+        aged = lzMaxAge > 0 and bar_index - array.get(lzBorn, kf) > lzMaxAge
+        // only an armed zone can be hit
+        hit  = low <= eNow and high >= eNow
+        if hit or aged
+            // v82 - gone either way. Filled: the entry and stop lines take over.
+            // Aged out: it was never reached and means nothing now.
+            if not na(array.get(lzBox, kf))
+                box.delete(array.get(lzBox, kf)), label.delete(array.get(lzLbl, kf))
+            // v78 - the touch IS the entry. No wait on PA or Stochastic; those
+            // only decide when the TP lines get drawn.
+            if hit and lzZoneEntry
+                dZ = array.get(lzIsBuy, kf) ? 1 : -1
+                eZ = eNow
+                sZ = array.get(lzStop, kf)
+                rZ = math.abs(eZ - sZ)
+                actDir     := dZ
+                actGrade   := "LZ"
+                actBar     := bar_index
+                actEntry   := eZ
+                actSL      := sZ
+                actBE      := eZ + dZ * beOffset
+                actTP1     := eZ + dZ * rZ
+                actTP2     := eZ + dZ * rZ * 2
+                actTP3     := eZ + dZ * rZ * 3
+                actBEMoved := false
+                actOpen    := true
+                actTPDrawn := false
+                f_openTrade(dZ, sZ, actBE, actTP1, actTP2, actTP3)
+                if showEntryLines
+                    f_clearTradeDrawings()
+                    rxZ = bar_index + entLineExtend
+                    lnEntry := line.new(bar_index, eZ, rxZ, eZ, color = entryLineColor, width = 2)
+                    lnSL    := line.new(bar_index, sZ, rxZ, sZ, color = slLineColor, width = 2)
+                    lbEntry := label.new(rxZ, eZ, f_tradeTxt(dZ == 1 ? "BUY" : "SELL", eZ, na), style = label.style_label_left, color = entLabelBg, textcolor = entryLineColor, size = size.small)
+                    lbSL    := label.new(rxZ, sZ, f_tradeTxt("SL", sZ, eZ), style = label.style_label_left, color = entLabelBg, textcolor = slLineColor, size = size.small)
+                alert((dZ == 1 ? "ENTRY - PRICE REACHED BUY ZONE  " : "ENTRY - PRICE REACHED SELL ZONE  ") +
+                     str.tostring(eZ, format.mintick) + "   SL " + str.tostring(sZ, format.mintick) +
+                     "   " + syminfo.ticker + " " + timeframe.period, alert.freq_once_per_bar)
+            array.remove(lzBox, kf),   array.remove(lzLbl, kf)
+            array.remove(lzEntry, kf), array.remove(lzStop, kf)
+            array.remove(lzIsBuy, kf), array.remove(lzBorn, kf)
+            array.remove(lzNeared, kf)
+
+// ============================================================================
+// DEFERRED TP LINES  (v78)
+// The trade is already live with a stop. The targets appear only once Price
+// Action and the Stochastic agree with its direction - which is the old entry
+// requirement, demoted from "wait before entering" to "wait before drawing
+// the targets". The prices themselves were fixed at entry.
+// ============================================================================
+if actOpen and not actTPDrawn and showEntryLines and barstate.isconfirmed
+    paOKNow  = actDir == 1 ? bullPAConfirm : bearPAConfirm
+    stoOKNow = actDir == 1 ? bullSto : bearSto
+    if paOKNow and stoOKNow
+        actTPDrawn := true
+        rxT = bar_index + entLineExtend
+        lnTP1 := line.new(bar_index, actTP1, rxT, actTP1, color = tpLineColor, width = 1)
+        lnTP2 := line.new(bar_index, actTP2, rxT, actTP2, color = tpLineColor, width = 1)
+        lnTP3 := line.new(bar_index, actTP3, rxT, actTP3, color = tpLineColor, width = 1)
+        lbTP1 := label.new(rxT, actTP1, f_tradeTxt("TP1", actTP1, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+        lbTP2 := label.new(rxT, actTP2, f_tradeTxt("TP2", actTP2, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+        lbTP3 := label.new(rxT, actTP3, f_tradeTxt("TP3", actTP3, actEntry), style = label.style_label_left, color = entLabelBg, textcolor = tpLineColor, size = size.small)
+        alert("TP levels confirmed  TP1 " + str.tostring(actTP1, format.mintick) +
+             "  TP2 " + str.tostring(actTP2, format.mintick) +
+             "  TP3 " + str.tostring(actTP3, format.mintick), alert.freq_once_per_bar)
+
+// v76 - declared after the module above so the flags exist. Zone alerts fire
+// when the zone is DRAWN, which is before price reaches it.
+alertcondition(lzNewBuy,              "KTC Buy Zone Created",  "New BUY limit zone")
+alertcondition(lzNewSell,             "KTC Sell Zone Created", "New SELL limit zone")
+alertcondition(lzNewBuy or lzNewSell, "KTC Any Zone Created",  "New limit zone")
+
+// ============================================================================
+// DASHBOARD #1 (top-right) — tied strictly to THIS chart's own timeframe.
+// ============================================================================
+showDashTR = input.bool(true, "Show Top-Right Dashboard", group = G_DASH)
+
+var table dashTR = table.new(position = position.top_right, columns = 2, rows = 10,
+     bgcolor = color.new(color.black, 100), border_color = color.new(color.white, 100), border_width = 0,
+     frame_color = color.new(color.white, 100), frame_width = 0)
+
+// price or a dash when there is nothing to show yet
+f_px(_v) => na(_v) ? "-" : str.tostring(_v, format.mintick)
+
+
+f_dashCellTR(_r, _label, _val, _col) =>
+    table.cell(dashTR, 0, _r, _label, bgcolor = color.new(color.black, 100), text_color = color.silver, text_size = size.small, text_halign = text.align_left)
+    table.cell(dashTR, 1, _r, _val, bgcolor = color.new(color.black, 100), text_color = _col, text_size = size.small, text_halign = text.align_right)
+
+// v59 - the eight confluence rows are gone by instruction. What is left is
+// the trade itself: what grade fired, where the stop and targets sit, and how
+// the signals have actually performed on this chart. The entry price rides
+// along in the grade row rather than taking a row of its own.
+//
+// v60 - the BE row only exists once TP1 has been reached, so the rows below it
+// shift up by one when it is absent. The table is cleared first, otherwise the
+// row that used to be last would keep its old text after the shift.
+// v79 - condensed from thirteen rows to six. The old layout gave every price
+// its own line, which on a phone pushed the statistics off screen. Related
+// values now share a row: the three targets on one, the whole record on
+// another. The BE row no longer appears and disappears - the stop row simply
+// says "BE" once it has moved, which is the same information without the
+// layout shifting underneath you.
+if showDashTR and barstate.islast
+    table.clear(dashTR, 0, 0, 1, 9)
+    hasSig   = not na(actEntry)
+    gradeTxt = not hasSig ? "-" : (actDir == 1 ? "BUY " : "SELL ") + actGrade + "  " + str.tostring(actEntry, format.mintick)
+    gradeCol = not hasSig ? color.gray : actDir == 1 ? color.lime : color.red
+    stopTxt  = not hasSig ? "-" : (actBEMoved ? "BE " : "") + f_px(actBEMoved ? actBE : actSL)
+    tpTxt    = not hasSig ? "-" : actTPDrawn ? f_px(actTP1) + " / " + f_px(actTP2) + " / " + f_px(actTP3) : "waiting PA + Stoch"
+    tpCol    = hasSig and not actTPDrawn ? color.gray : tpLineColor
+    wrTxt    = wrTotal == 0 ? "-" : str.tostring(math.round(wrWins * 100.0 / wrTotal), "#") + "%  (" + str.tostring(wrTotal) + ")"
+    detTxt   = "TP " + str.tostring(cntTP1) + "/" + str.tostring(cntTP2) + "/" + str.tostring(cntTP3) +
+         "    SL " + str.tostring(cntSL)
+    sessTxt  = (inNY ? "New York" : inLdn ? "London" : inAsian ? "Asian" : "-") + (inTrade ? "  IN" : "  OUT")
+    table.cell(dashTR, 0, 0, "KTC", bgcolor = color.new(color.black, 100), text_color = color.white, text_size = size.small)
+    table.cell(dashTR, 1, 0, syminfo.ticker + " " + timeframe.period, bgcolor = color.new(color.black, 100), text_color = color.white, text_size = size.small, text_halign = text.align_right)
+    f_dashCellTR(1, "Entry",        gradeTxt, gradeCol)
+    f_dashCellTR(2, "Stop",         stopTxt,  slLineColor)
+    f_dashCellTR(3, "TP 1/2/3",     tpTxt,    tpCol)
+    f_dashCellTR(4, "Winrate",      wrTxt,    color.white)
+    f_dashCellTR(5, "Result", detTxt, color.silver)
+    f_dashCellTR(6, "Session",      sessTxt,  inTrade ? color.lime : color.gray)
+    f_dashCellTR(7, "Zones B/S  waiting",
+         str.tostring(lzMadeBuy) + "/" + str.tostring(lzMadeSell) + "   " + str.tostring(array.size(lzEntry)),
+         lzMade > 0 ? color.aqua : color.orange)
+    f_dashCellTR(8, "Rejected  FVG / SR",
+         str.tostring(lzRejFVG) + " / " + str.tostring(lzRejSR), color.gray)
+
+if not showDashTR
+    table.clear(dashTR, 0, 0, 1, 9)
+
+// ============================================================================
+// DASHBOARD #2 (bottom-right) — Major/Minor multi-timeframe trend (agreed
+// exception - intentionally cross-timeframe via request.security()).
+// ============================================================================
+showDashBR = input.bool(true, "Show Bottom-Right Multi-TF Dashboard", group = G_DASH)
+// v57 - four selectable timeframes instead of eight fixed ones. Every
+// request.security() call carries a cost, and this dashboard alone was
+// making eight of them, each computing a 200-period EMA - by a wide margin
+// the heaviest thing left in the file. The guidance is to use two or three;
+// four with the defaults below covers the same ground the eight did.
+//
+// Timeframes at or below the chart's own are skipped and shown as "-". Asking
+// for a LOWER timeframe returns whatever that timeframe last printed inside
+// the current bar, which says nothing useful about trend while still paying
+// the full cost - so on an M5 chart the old 1m and 3m rows were noise.
+// v59 - five rows instead of four: 15M / 30M / 1H / 4H / 1D. Each row is one
+// more request.security() call computing a 200 EMA, which is the heaviest
+// thing left in the file, so the count is worth keeping an eye on.
+dashTF1 = input.timeframe("15",  "MTF 1", group = G_DASH)
+dashTF2 = input.timeframe("30",  "MTF 2", group = G_DASH)
+dashTF3 = input.timeframe("60",  "MTF 3", group = G_DASH)
+dashTF4 = input.timeframe("240", "MTF 4", group = G_DASH)
+dashTF5 = input.timeframe("D",   "MTF 5", group = G_DASH)
+// a small band around the EMA so a price sitting right on it reads flat
+// rather than flickering between up and down
+dashBufferPct = input.float(0.05, "Flat Band Around EMA (%)", minval = 0.0, step = 0.01, group = G_DASH)
+
+f_emaTrend() =>
+    e50 = ta.ema(close, 50)
+    e200 = ta.ema(close, 200)
+    band = dashBufferPct / 100.0
+    bull = close > e50 * (1 + band) and e50 > e200
+    bear = close < e50 * (1 - band) and e50 < e200
+    bull ? 1 : bear ? -1 : 0
+
+f_tfUsable(_tf) =>
+    timeframe.in_seconds(_tf) > timeframe.in_seconds(timeframe.period)
+
+f_getTFTrend(_tf) =>
+    f_tfUsable(_tf) ? request.security(syminfo.tickerid, _tf, f_emaTrend(), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off) : 2
+
+trendD1 = f_getTFTrend(dashTF1)
+trendD2 = f_getTFTrend(dashTF2)
+trendD3 = f_getTFTrend(dashTF3)
+trendD4 = f_getTFTrend(dashTF4)
+trendD5 = f_getTFTrend(dashTF5)
+
+// raw timeframe strings read badly in a dashboard ("60" is not "1H")
+f_tfLabel(_tf) =>
+    switch _tf
+        "1"   => "1M"
+        "3"   => "3M"
+        "5"   => "5M"
+        "15"  => "15M"
+        "30"  => "30M"
+        "45"  => "45M"
+        "60"  => "1H"
+        "120" => "2H"
+        "180" => "3H"
+        "240" => "4H"
+        "360" => "6H"
+        "720" => "12H"
+        "D"   => "1D"
+        "W"   => "1W"
+        "M"   => "1Mo"
+        => _tf
+
+// 2 means "not applicable on this chart"
+f_trendEmoji(_v) => _v == 1 ? "🟢" : _v == -1 ? "🔴" : _v == 2 ? "-" : "⚪"
+f_trendCol(_v) => _v == 1 ? color.lime : _v == -1 ? color.red : color.gray
+
+var table dashBR = table.new(position = position.bottom_right, columns = 2, rows = 6,
+     bgcolor = color.new(color.black, 100), border_color = color.new(color.white, 100), border_width = 0,
+     frame_color = color.new(color.white, 100), frame_width = 0)
+
+f_dashRowBR(_r, _label, _val) =>
+    table.cell(dashBR, 0, _r, _label, bgcolor = color.new(color.black, 100), text_color = color.white, text_size = size.small)
+    table.cell(dashBR, 1, _r, f_trendEmoji(_val), bgcolor = color.new(color.black, 100), text_color = f_trendCol(_val), text_size = size.small)
+
+if showDashBR and barstate.islast
+    table.cell(dashBR, 0, 0, "TF", bgcolor = color.new(color.black, 100), text_color = color.white, text_size = size.small)
+    table.cell(dashBR, 1, 0, "Trend", bgcolor = color.new(color.black, 100), text_color = color.white, text_size = size.small)
+    f_dashRowBR(1, f_tfLabel(dashTF1), trendD1)
+    f_dashRowBR(2, f_tfLabel(dashTF2), trendD2)
+    f_dashRowBR(3, f_tfLabel(dashTF3), trendD3)
+    f_dashRowBR(4, f_tfLabel(dashTF4), trendD4)
+    f_dashRowBR(5, f_tfLabel(dashTF5), trendD5)
+
+if not showDashBR
+    table.clear(dashBR, 0, 0, 1, 5)
+

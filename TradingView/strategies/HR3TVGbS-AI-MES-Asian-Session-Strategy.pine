@@ -1,0 +1,350 @@
+//@version=6
+strategy('AI MES Asian Session Strategy',
+     overlay = true,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 0.62,
+     calc_on_every_tick = false)
+
+// ══════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════
+
+// Session times
+asianRangeStartH = input.int(18, 'Range Build Start Hour (ET)',   group = 'Session', minval = 0, maxval = 23)
+asianRangeStartM = input.int(0,  'Range Build Start Minute (ET)', group = 'Session', minval = 0, maxval = 59)
+asianRangeEndH   = input.int(18, 'Range Build End Hour (ET)',     group = 'Session', minval = 0, maxval = 23)
+asianRangeEndM   = input.int(30, 'Range Build End Minute (ET)',   group = 'Session', minval = 0, maxval = 59)
+asianEndH        = input.int(23, 'Session End Hour (ET)',         group = 'Session', minval = 0, maxval = 23)
+asianEndM        = input.int(59, 'Session End Minute (ET)',       group = 'Session', minval = 0, maxval = 59)
+
+// Range settings
+minRangeSize     = input.float(3.0,  'Min Range Size (pts)',          group = 'Range', step = 0.5)
+maxRangeSize     = input.float(20.0, 'Max Range Size (pts)',          group = 'Range', step = 0.5)
+breakoutBuffer   = input.float(0.5,  'Breakout Confirmation (pts)',   group = 'Range', step = 0.25)
+midRevertBuffer  = input.float(1.0,  'Mean Revert Entry Buffer (pts)', group = 'Range', step = 0.25)
+
+// HTF bias
+htfTF            = input.timeframe('60', 'HTF Timeframe',             group = 'Higher Timeframe')
+htfEMALen        = input.int(21,          'HTF EMA Length',            group = 'Higher Timeframe')
+useHTFFilter     = input.bool(true,       'Use HTF Bias Filter',       group = 'Higher Timeframe')
+
+// Momentum
+rsiLen           = input.int(14,   'RSI Length',                      group = 'Momentum')
+rsiOB            = input.float(62, 'RSI Overbought (fade shorts)',     group = 'Momentum', step = 1.0)
+rsiOS            = input.float(38, 'RSI Oversold (fade longs)',        group = 'Momentum', step = 1.0)
+rsiBreakMin      = input.float(50, 'RSI Min for breakout longs',       group = 'Momentum', step = 1.0)
+rsiBreakMax      = input.float(50, 'RSI Max for breakout shorts',      group = 'Momentum', step = 1.0)
+
+// Volume
+volLen           = input.int(20,   'Volume MA Length',                 group = 'Volume')
+volMultBreak     = input.float(1.2, 'Volume Multiplier (breakout)',    group = 'Volume', step = 0.1)
+volMultFade      = input.float(0.8, 'Volume Multiplier (fade)',        group = 'Volume', step = 0.1)
+useVolFilter     = input.bool(true, 'Use Volume Filter',               group = 'Volume')
+
+// Risk
+riskRatio        = input.float(1.5, 'Reward:Risk Ratio',               group = 'Risk', step = 0.1)
+atrLen           = input.int(14,    'ATR Length',                      group = 'Risk')
+atrMult          = input.float(1.5, 'ATR Stop Multiplier',             group = 'Risk', step = 0.1)
+stopBuffer       = input.float(1.5, 'Stop Buffer beyond range (pts)',  group = 'Risk', step = 0.25)
+maxTrades        = input.int(2,     'Max Trades Per Session',          group = 'Risk', minval = 1, maxval = 5)
+
+// ══════════════════════════════════════════════════════
+// SESSION LOGIC
+// ══════════════════════════════════════════════════════
+
+etHour = hour(time, 'America/New_York')
+etMin  = minute(time, 'America/New_York')
+etTime = etHour * 100 + etMin
+
+rangeStartT = asianRangeStartH * 100 + asianRangeStartM
+rangeEndT   = asianRangeEndH   * 100 + asianRangeEndM
+asianEndT   = asianEndH        * 100 + asianEndM
+
+inRangeBuild = etTime >= rangeStartT and etTime < rangeEndT
+inAsian      = etTime >= rangeEndT   and etTime <= asianEndT
+inAnySession = inRangeBuild or inAsian
+
+newSession   = inAsian and not inAsian[1]
+
+var int sessionTrades = 0
+if newSession
+    sessionTrades := 0
+
+underTradeLimit = sessionTrades < maxTrades
+
+// ══════════════════════════════════════════════════════
+// OPENING RANGE (first 30 min after 6pm ET)
+// ══════════════════════════════════════════════════════
+
+var float rangeHigh       = na
+var float rangeLow        = na
+var float rangeHighLocked = na
+var float rangeLowLocked  = na
+var float rangeMid        = na
+
+if inRangeBuild
+    rangeHigh := na(rangeHigh) ? high : math.max(rangeHigh, high)
+    rangeLow  := na(rangeLow)  ? low  : math.min(rangeLow,  low)
+
+if newSession
+    rangeHighLocked := rangeHigh
+    rangeLowLocked  := rangeLow
+    rangeMid        := (rangeHigh + rangeLow) / 2
+    rangeHigh       := na
+    rangeLow        := na
+
+rangeSize  = na(rangeHighLocked) or na(rangeLowLocked) ? na : rangeHighLocked - rangeLowLocked
+validRange = not na(rangeSize) and rangeSize >= minRangeSize and rangeSize <= maxRangeSize
+
+// ══════════════════════════════════════════════════════
+// HIGHER TIMEFRAME BIAS
+// ══════════════════════════════════════════════════════
+
+htfEMA   = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEMALen), lookahead = barmerge.lookahead_off)
+bullBias = close > htfEMA
+bearBias = close < htfEMA
+
+htfLong  = not useHTFFilter or bullBias
+htfShort = not useHTFFilter or bearBias
+
+// ══════════════════════════════════════════════════════
+// MOMENTUM & VOLUME
+// ══════════════════════════════════════════════════════
+
+rsi    = ta.rsi(close, rsiLen)
+atr    = ta.atr(atrLen)
+avgVol = ta.sma(volume, volLen)
+
+volBreak = not useVolFilter or volume > avgVol * volMultBreak
+volFade  = not useVolFilter or volume > avgVol * volMultFade
+
+// ══════════════════════════════════════════════════════
+// STRATEGY 1 — BREAKOUT
+// Price closes outside range with volume + momentum
+// ══════════════════════════════════════════════════════
+
+breakoutLong  = validRange and
+                 close > rangeHighLocked + breakoutBuffer and
+                 close[1] <= rangeHighLocked + breakoutBuffer and
+                 rsi > rsiBreakMin and
+                 volBreak and htfLong
+
+breakoutShort = validRange and
+                 close < rangeLowLocked - breakoutBuffer and
+                 close[1] >= rangeLowLocked - breakoutBuffer and
+                 rsi < rsiBreakMax and
+                 volBreak and htfShort
+
+// ══════════════════════════════════════════════════════
+// STRATEGY 2 — MEAN REVERSION (fade extremes)
+// Price tags range extreme with overbought/oversold RSI
+// then closes back inside — fade back to midpoint
+// ══════════════════════════════════════════════════════
+
+// Tag condition: price touched or exceeded range extreme
+taggedHigh = high >= rangeHighLocked - midRevertBuffer
+taggedLow  = low  <= rangeLowLocked  + midRevertBuffer
+
+// Reversion confirmation: close back inside range after tag
+fadeShort = validRange and
+             taggedHigh and
+             close < rangeHighLocked and
+             close[1] >= rangeHighLocked and
+             rsi > rsiOB and
+             volFade and htfShort
+
+fadeLong  = validRange and
+             taggedLow and
+             close > rangeLowLocked and
+             close[1] <= rangeLowLocked and
+             rsi < rsiOS and
+             volFade and htfLong
+
+// ══════════════════════════════════════════════════════
+// COMBINED ENTRY — whichever fires first wins
+// ══════════════════════════════════════════════════════
+
+longCondition  = inAsian and underTradeLimit and strategy.position_size == 0 and
+                 (breakoutLong or fadeLong)
+
+shortCondition = inAsian and underTradeLimit and strategy.position_size == 0 and
+                 (breakoutShort or fadeShort)
+
+// ══════════════════════════════════════════════════════
+// DYNAMIC STOP & TARGET
+// Breakout: stop is back inside range + buffer
+// Fade: stop is just beyond the range extreme
+// Target: always rangeMid for fades, risk × ratio for breakouts
+// ══════════════════════════════════════════════════════
+
+// Breakout stops — stop back inside the range
+breakoutLongStop   = rangeLowLocked  - stopBuffer
+breakoutShortStop  = rangeHighLocked + stopBuffer
+
+// Fade stops — stop just beyond the extreme that was tagged
+fadeLongStop       = rangeLowLocked  - stopBuffer
+fadeShortStop      = rangeHighLocked + stopBuffer
+
+// ATR floor (conservative — use whichever is wider)
+atrLongStop        = close - atr * atrMult
+atrShortStop       = close + atr * atrMult
+
+// Final stops
+longStop  = fadeLong  ? math.min(fadeLongStop,  atrLongStop)  :
+             math.min(breakoutLongStop,  atrLongStop)
+
+shortStop = fadeShort ? math.max(fadeShortStop, atrShortStop) :
+             math.max(breakoutShortStop, atrShortStop)
+
+longRisk  = close - longStop
+shortRisk = shortStop - close
+
+// Fades target the range midpoint, breakouts use fixed R:R
+longTarget  = fadeLong  ? rangeMid : close + longRisk  * riskRatio
+shortTarget = fadeShort ? rangeMid : close - shortRisk * riskRatio
+
+// ══════════════════════════════════════════════════════
+// ENTRIES
+// ══════════════════════════════════════════════════════
+
+var float entryStop   = na
+var float entryTarget = na
+
+if strategy.position_size == 0
+    entryStop   := na
+    entryTarget := na
+
+if longCondition
+    entryStop   := longStop
+    entryTarget := longTarget
+    strategy.entry('Long', strategy.long)
+    sessionTrades += 1
+    alert('🟢 MES ASIAN LONG\n' +
+         'Type: '          + (fadeLong ? 'Mean Reversion Fade' : 'Range Breakout') + '\n' +
+         'Entry: '         + str.tostring(math.round(close, 2))                    + '\n' +
+         'Range High: '    + str.tostring(math.round(rangeHighLocked, 2))          + '\n' +
+         'Range Low: '     + str.tostring(math.round(rangeLowLocked, 2))           + '\n' +
+         'Range Mid: '     + str.tostring(math.round(rangeMid, 2))                 + '\n' +
+         'Stop: '          + str.tostring(math.round(longStop, 2))                 + '\n' +
+         'Target: '        + str.tostring(math.round(longTarget, 2))               + '\n' +
+         'Risk (pts): '    + str.tostring(math.round(longRisk, 2))                 + '\n' +
+         'RSI: '           + str.tostring(math.round(rsi, 1))                      + '\n' +
+         'ATR: '           + str.tostring(math.round(atr, 2))                      + '\n' +
+         'HTF Bias: BULL', alert.freq_once_per_bar)
+
+if shortCondition
+    entryStop   := shortStop
+    entryTarget := shortTarget
+    strategy.entry('Short', strategy.short)
+    sessionTrades += 1
+    alert('🔴 MES ASIAN SHORT\n' +
+         'Type: '          + (fadeShort ? 'Mean Reversion Fade' : 'Range Breakout') + '\n' +
+         'Entry: '         + str.tostring(math.round(close, 2))                     + '\n' +
+         'Range High: '    + str.tostring(math.round(rangeHighLocked, 2))           + '\n' +
+         'Range Low: '     + str.tostring(math.round(rangeLowLocked, 2))            + '\n' +
+         'Range Mid: '     + str.tostring(math.round(rangeMid, 2))                  + '\n' +
+         'Stop: '          + str.tostring(math.round(shortStop, 2))                 + '\n' +
+         'Target: '        + str.tostring(math.round(shortTarget, 2))               + '\n' +
+         'Risk (pts): '    + str.tostring(math.round(shortRisk, 2))                 + '\n' +
+         'RSI: '           + str.tostring(math.round(rsi, 1))                       + '\n' +
+         'ATR: '           + str.tostring(math.round(atr, 2))                       + '\n' +
+         'HTF Bias: BEAR', alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// EXITS
+// ══════════════════════════════════════════════════════
+
+if strategy.position_size > 0
+    strategy.exit('Long Exit', 'Long', stop = entryStop, limit = entryTarget)
+    if low <= entryStop
+        alert('🛑 MES ASIAN LONG STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,      2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop,  2)), alert.freq_once_per_bar)
+    if high >= entryTarget
+        alert('✅ MES ASIAN LONG TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+if strategy.position_size < 0
+    strategy.exit('Short Exit', 'Short', stop = entryStop, limit = entryTarget)
+    if high >= entryStop
+        alert('🛑 MES ASIAN SHORT STOP HIT\n' +
+             'Price: ' + str.tostring(math.round(close,      2)) + '\n' +
+             'Stop: '  + str.tostring(math.round(entryStop,  2)), alert.freq_once_per_bar)
+    if low <= entryTarget
+        alert('✅ MES ASIAN SHORT TARGET HIT\n' +
+             'Price: '  + str.tostring(math.round(close,       2)) + '\n' +
+             'Target: ' + str.tostring(math.round(entryTarget, 2)), alert.freq_once_per_bar)
+
+sessionEnd = not inAnySession and inAnySession[1]
+if sessionEnd
+    strategy.close_all(comment = 'Session End')
+    alert('🔔 MES ASIAN SESSION END — All positions closed. Price: ' +
+         str.tostring(math.round(close, 2)), alert.freq_once_per_bar)
+
+// ══════════════════════════════════════════════════════
+// PLOTS
+// ══════════════════════════════════════════════════════
+
+plot(htfEMA,        '1hr EMA (21)', color = color.new(color.yellow, 20), linewidth = 2)
+plot(ta.vwap(hlc3), 'VWAP',        color = color.new(color.purple, 20), linewidth = 1)
+
+// Opening range levels
+plot(inAnySession ? rangeHighLocked : na, 'Range High', color = color.new(color.orange, 10), style = plot.style_linebr, linewidth = 2)
+plot(inAnySession ? rangeLowLocked  : na, 'Range Low',  color = color.new(color.aqua,   10), style = plot.style_linebr, linewidth = 2)
+plot(inAnySession ? rangeMid        : na, 'Range Mid',  color = color.new(color.white,  40), style = plot.style_linebr, linewidth = 1)
+
+// Entry signals
+plotshape(longCondition,  style = shape.triangleup,   location = location.belowbar, color = color.lime, size = size.normal, title = 'Long Entry')
+plotshape(shortCondition, style = shape.triangledown, location = location.abovebar, color = color.red,  size = size.normal, title = 'Short Entry')
+
+// Fade signal markers (secondary — shows when fade condition met even if not triggered)
+plotshape(fadeLong  and inAsian and not longCondition,  style = shape.circle, location = location.belowbar, color = color.new(color.lime, 60), size = size.tiny, title = 'Fade Long Setup')
+plotshape(fadeShort and inAsian and not shortCondition, style = shape.circle, location = location.abovebar, color = color.new(color.red,  60), size = size.tiny, title = 'Fade Short Setup')
+
+// Open position lines
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+plot(isLong  ? entryStop   : na, 'Long Stop',    color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isLong  ? entryTarget : na, 'Long Target',  color = color.lime, style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryStop   : na, 'Short Stop',   color = color.red,  style = plot.style_linebr, linewidth = 1)
+plot(isShort ? entryTarget : na, 'Short Target', color = color.lime, style = plot.style_linebr, linewidth = 1)
+
+// Session backgrounds
+bgcolor(inRangeBuild ? color.new(color.orange, 92) : na, title = 'Range Build Window')
+bgcolor(inAsian      ? color.new(color.teal,   93) : na, title = 'Asian Session')
+bgcolor(inAsian and not validRange ? color.new(color.red, 90) : na, title = 'Invalid Range Warning')
+
+// ══════════════════════════════════════════════════════
+// INFO TABLE
+// ══════════════════════════════════════════════════════
+
+var table info = table.new(position.top_right, 2, 12, bgcolor = color.new(color.black, 78), border_width = 1)
+if barstate.isrealtime or barstate.islastconfirmedhistory
+    table.cell(info, 0, 0,  'Session',    text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 0,  inRangeBuild ? 'Building Range' : inAsian ? 'Asian Open' : 'Closed', text_color = inAnySession ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 1,  'HTF EMA',    text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 1,  str.tostring(math.round(htfEMA, 2)),     text_color = color.yellow, text_size = size.small)
+    table.cell(info, 0, 2,  'Bias',       text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 2,  bullBias ? 'BULL ▲' : 'BEAR ▼',         text_color = bullBias ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 3,  'Range High', text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 3,  na(rangeHighLocked) ? '–' : str.tostring(math.round(rangeHighLocked, 2)), text_color = color.orange, text_size = size.small)
+    table.cell(info, 0, 4,  'Range Low',  text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 4,  na(rangeLowLocked) ? '–' : str.tostring(math.round(rangeLowLocked, 2)),   text_color = color.aqua,   text_size = size.small)
+    table.cell(info, 0, 5,  'Range Mid',  text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 5,  na(rangeMid) ? '–' : str.tostring(math.round(rangeMid, 2)),               text_color = color.white,  text_size = size.small)
+    table.cell(info, 0, 6,  'Range Size', text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 6,  na(rangeSize) ? '–' : str.tostring(math.round(rangeSize, 2)) + (validRange ? ' ✓' : ' invalid'), text_color = validRange ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 7,  'RSI',        text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 7,  str.tostring(math.round(rsi, 1)),        text_color = rsi > rsiOB ? color.red : rsi < rsiOS ? color.lime : color.white, text_size = size.small)
+    table.cell(info, 0, 8,  'ATR',        text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 8,  str.tostring(math.round(atr, 2)),        text_color = color.white,  text_size = size.small)
+    table.cell(info, 0, 9,  'Volume',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 9,  volume > avgVol * volMultBreak ? 'HIGH ✓' : volume > avgVol * volMultFade ? 'med' : 'low', text_color = volume > avgVol * volMultBreak ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 10, 'Trades',     text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 10, str.tostring(sessionTrades) + '/' + str.tostring(maxTrades), text_color = underTradeLimit ? color.lime : color.gray, text_size = size.small)
+    table.cell(info, 0, 11, 'Position',   text_color = color.white,  text_size = size.small)
+    table.cell(info, 1, 11, isLong ? 'LONG ▲' : isShort ? 'SHORT ▼' : 'FLAT', text_color = isLong ? color.lime : isShort ? color.red : color.gray, text_size = size.small)

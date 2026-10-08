@@ -1,0 +1,191 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator("Equalhigh — Stochastic Dominance Aurora v1", shorttitle="EH Aurora", overlay=false, max_bars_back=500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. RÉGLAGES
+// ═════════════════════════════════════════════════════════════════════════════
+groupModel = "1. Moteur de domination"
+benchmark  = input.symbol("AMEX:SPY", "Benchmark", group=groupModel)
+blockLen   = input.int(13, "Longueur d'un bloc", minval=5, maxval=40, group=groupModel,
+     tooltip="Quatre blocs successifs sont comparés. 13 sur un graphique hebdomadaire = 52 semaines.")
+zArmed     = input.float(1.15, "Seuil Armed (Z)", minval=0.25, step=0.05, group=groupModel)
+zConfirm   = input.float(1.65, "Seuil Confirmed (Z)", minval=0.50, step=0.05, group=groupModel)
+zMature    = input.float(2.50, "Seuil Mature (Z)", minval=1.00, step=0.05, group=groupModel)
+
+groupFilter = "2. Filtres du signal"
+relLookback = input.int(13, "Période de force relative", minval=3, maxval=52, group=groupFilter)
+effLookback = input.int(13, "Période d'efficacité", minval=3, maxval=52, group=groupFilter)
+minEff      = input.float(0.20, "Efficacité minimale", minval=0.00, maxval=1.00, step=0.05, group=groupFilter)
+needAccel   = input.bool(true, "Exiger une accélération du score", group=groupFilter)
+
+groupVisual = "3. Apparence"
+showRibbon  = input.bool(true, "Afficher l'aurore", group=groupVisual)
+showSignals = input.bool(true, "Afficher les premiers points", group=groupVisual)
+showTable   = input.bool(true, "Afficher le tableau", group=groupVisual)
+tablePos    = input.string("Haut droite", "Position du tableau",
+     options=["Haut gauche", "Haut centre", "Haut droite", "Milieu gauche", "Milieu droite", "Bas gauche", "Bas centre", "Bas droite"], group=groupVisual)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. DONNÉES RELATIVES — aucun lookahead
+// ═════════════════════════════════════════════════════════════════════════════
+benchClose = request.security(benchmark, timeframe.period, close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+assetRet   = math.log(close / close[1])
+benchRet   = math.log(benchClose / benchClose[1])
+relRet     = assetRet - benchRet
+relCurve   = math.log(close / benchClose)
+
+// Jonckheere–Terpstra : compte combien d'observations d'un bloc récent sont
+// supérieures à celles d'un bloc ancien. 0,5 est attribué aux égalités.
+f_pair_score(int oldStart, int newStart, int len) =>
+    float u = 0.0
+    for i = 0 to len - 1
+        float oldValue = relRet[oldStart + i]
+        for j = 0 to len - 1
+            float newValue = relRet[newStart + j]
+            u += newValue > oldValue ? 1.0 : newValue == oldValue ? 0.5 : 0.0
+    u
+
+int requiredBars = blockLen * 4 + 1
+bool enoughData = bar_index >= requiredBars and not na(relRet[blockLen * 4 - 1])
+
+// Bloc 1 = plus ancien ; bloc 4 = plus récent.
+float jt = na
+float jtMean = na
+float jtVariance = na
+float zScore = na
+
+if enoughData
+    int b4 = 0
+    int b3 = blockLen
+    int b2 = blockLen * 2
+    int b1 = blockLen * 3
+    jt := f_pair_score(b1, b2, blockLen) + f_pair_score(b1, b3, blockLen) + f_pair_score(b1, b4, blockLen) +
+          f_pair_score(b2, b3, blockLen) + f_pair_score(b2, b4, blockLen) + f_pair_score(b3, b4, blockLen)
+
+    float n = blockLen * 4.0
+    float sumN2 = 4.0 * blockLen * blockLen
+    float sumTerm = 4.0 * blockLen * blockLen * (2.0 * blockLen + 3.0)
+    jtMean := (n * n - sumN2) / 4.0
+    jtVariance := (n * n * (2.0 * n + 3.0) - sumTerm) / 72.0
+    zScore := (jt - jtMean) / math.sqrt(jtVariance)
+
+// Compression douce : un score lisible de -100 à +100 sans écraser la zone utile.
+f_tanh(float x) =>
+    float e = math.exp(math.min(20.0, math.max(-20.0, 2.0 * x)))
+    (e - 1.0) / (e + 1.0)
+
+float dominance = na(zScore) ? na : 100.0 * f_tanh(zScore / 3.0)
+float relMomentum = enoughData ? 100.0 * (math.exp(relCurve - relCurve[relLookback]) - 1.0) : na
+float path = math.sum(math.abs(ta.change(relCurve)), effLookback)
+float efficiency = path > 0 ? math.abs(relCurve - relCurve[effLookback]) / path : 0.0
+bool acceleratingUp = dominance > dominance[1]
+bool acceleratingDn = dominance < dominance[1]
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. MACHINE D'ÉTATS
+// ═════════════════════════════════════════════════════════════════════════════
+bool bullConfirmed = enoughData and zScore >= zConfirm and relMomentum > 0 and efficiency >= minEff and (not needAccel or acceleratingUp)
+bool bearConfirmed = enoughData and zScore <= -zConfirm and relMomentum < 0 and efficiency >= minEff and (not needAccel or acceleratingDn)
+
+int state = 0
+string stateName = "Dormant"
+color stateColor = color.rgb(126, 87, 194)
+
+if enoughData
+    if zScore >= zMature and relMomentum > 0
+        state := 4
+        stateName := "Mature"
+        stateColor := color.rgb(255, 193, 7)
+    else if bullConfirmed
+        state := 3
+        stateName := "Confirmed"
+        stateColor := color.rgb(0, 174, 255)
+    else if zScore >= zArmed and relMomentum > 0
+        state := 2
+        stateName := "Armed"
+        stateColor := color.rgb(0, 229, 255)
+    else if zScore > 0.35
+        state := 1
+        stateName := "Watch"
+        stateColor := color.rgb(72, 255, 199)
+    else if zScore <= -zConfirm and relMomentum < 0
+        state := -3
+        stateName := "Breakdown"
+        stateColor := color.rgb(255, 61, 87)
+    else if zScore < -0.35
+        state := -1
+        stateName := "Fading"
+        stateColor := color.rgb(255, 132, 53)
+
+bool firstBlue = barstate.isconfirmed and bullConfirmed and not bullConfirmed[1]
+bool firstRed  = barstate.isconfirmed and bearConfirmed and not bearConfirmed[1]
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. AURORE VISUELLE
+// ═════════════════════════════════════════════════════════════════════════════
+hline(0, "Équilibre", color=color.new(color.silver, 72))
+hline(50, "Domination +", color=color.new(color.aqua, 88))
+hline(-50, "Domination -", color=color.new(color.red, 88))
+
+float glowWide = showRibbon ? dominance : na
+float glowMid  = showRibbon ? dominance : na
+float core     = dominance
+
+pWide = plot(glowWide, "Halo large", color=color.new(stateColor, 88), linewidth=4)
+pMid  = plot(glowMid, "Halo moyen", color=color.new(stateColor, 70), linewidth=3)
+pCore = plot(core, "Stochastic Dominance", color=stateColor, linewidth=3)
+
+// Rubans de seuil : ils forment le fond discret de l'aurore.
+pTop = plot(showRibbon ? 85 : na, "Plafond Aurora", display=display.none)
+pZero = plot(showRibbon ? 0 : na, "Centre Aurora", display=display.none)
+pBot = plot(showRibbon ? -85 : na, "Plancher Aurora", display=display.none)
+fill(pTop, pZero, color=showRibbon ? color.new(color.rgb(0, 174, 255), 94) : na, title="Aurore haussière")
+fill(pZero, pBot, color=showRibbon ? color.new(color.rgb(255, 61, 87), 95) : na, title="Aurore baissière")
+
+plotshape(showSignals and firstBlue ? dominance : na, title="Premier point bleu", style=shape.circle,
+     location=location.absolute, color=color.rgb(0, 174, 255), size=size.small, text="A", textcolor=color.white)
+plotshape(showSignals and firstRed ? dominance : na, title="Premier point rouge", style=shape.circle,
+     location=location.absolute, color=color.rgb(255, 61, 87), size=size.small, text="A", textcolor=color.white)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. TABLEAU ET ALERTES
+// ═════════════════════════════════════════════════════════════════════════════
+f_position(string p) =>
+    switch p
+        "Haut gauche"    => position.top_left
+        "Haut centre"    => position.top_center
+        "Milieu gauche"  => position.middle_left
+        "Milieu droite"  => position.middle_right
+        "Bas gauche"     => position.bottom_left
+        "Bas centre"     => position.bottom_center
+        "Bas droite"     => position.bottom_right
+        => position.top_right
+
+var table dash = table.new(f_position(tablePos), 2, 5, bgcolor=color.new(color.rgb(12, 16, 28), 12), frame_color=color.new(color.white, 82), frame_width=1)
+
+if barstate.islast and showTable
+    table.cell(dash, 0, 0, "AURORA", text_color=color.white, bgcolor=color.new(stateColor, 40), text_size=size.small)
+    table.cell(dash, 1, 0, stateName, text_color=color.white, bgcolor=color.new(stateColor, 40), text_size=size.small)
+    table.cell(dash, 0, 1, "Dominance", text_color=color.silver)
+    table.cell(dash, 1, 1, na(dominance) ? "—" : str.tostring(dominance, "#.0"), text_color=stateColor)
+    table.cell(dash, 0, 2, "Z-score", text_color=color.silver)
+    table.cell(dash, 1, 2, na(zScore) ? "—" : str.tostring(zScore, "#.00"), text_color=color.white)
+    table.cell(dash, 0, 3, "Force relative", text_color=color.silver)
+    table.cell(dash, 1, 3, na(relMomentum) ? "—" : (relMomentum >= 0 ? "+" : "") + str.tostring(relMomentum, "#.00") + "%", text_color=relMomentum >= 0 ? color.aqua : color.rgb(255, 107, 129))
+    table.cell(dash, 0, 4, "Efficacité", text_color=color.silver)
+    table.cell(dash, 1, 4, str.tostring(efficiency * 100.0, "#.0") + "%", text_color=efficiency >= minEff ? color.rgb(72, 255, 199) : color.orange)
+
+if barstate.islast and not showTable
+    table.clear(dash, 0, 0, 1, 4)
+
+alertcondition(firstBlue, "Aurora — première confirmation haussière", "{{ticker}} : domination stochastique haussière confirmée à la clôture.")
+alertcondition(firstRed, "Aurora — première confirmation baissière", "{{ticker}} : domination stochastique baissière confirmée à la clôture.")
+alertcondition(barstate.isconfirmed and state == 4 and state[1] != 4, "Aurora — tendance mature", "{{ticker}} : l'Aurora entre en phase Mature.")
+
+// Fenêtre Données : valeurs utiles sans surcharger le panneau.
+plot(zScore, "Z-score JT", display=display.data_window)
+plot(relMomentum, "Force relative (%)", display=display.data_window)
+plot(efficiency * 100.0, "Efficacité (%)", display=display.data_window)

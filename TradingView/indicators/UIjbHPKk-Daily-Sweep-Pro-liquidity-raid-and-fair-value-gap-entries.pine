@@ -1,0 +1,419 @@
+//@version=6
+// =============================================================================
+//  DAILY SWEEP PRO  [Liquidity Raid + AMD + FVG]
+//
+//  ORIGINALITY AND ATTRIBUTION
+//  The concepts below are widely taught public trading methodology: daily market
+//  structure, the accumulation / manipulation / distribution session model,
+//  liquidity sweeps of prior highs and lows, fair value gaps, and opening gaps.
+//  None of them are mine and I make no claim on them. What is mine is this
+//  implementation. Every line here is written from scratch. No code in this
+//  script is copied or adapted from another author's script, on this platform
+//  or anywhere else, and no part of it reproduces a specific published
+//  indicator. Where the reading below looks familiar it is because the
+//  vocabulary is public, not because the code is borrowed.
+//
+//  WHAT THIS SCRIPT ADDS over a set of separate indicators drawing the same
+//  levels: the four ideas are wired into one state machine that will not print
+//  an entry unless they occur in the correct causal ORDER, and that abandons
+//  the setup if any precondition breaks while it waits. See the state model
+//  section below.
+//
+//  Concept map:
+//   - Daily structure = control ......... HH+HL longs only / LH+LL shorts only
+//   - Target ............................ previous day's high (longs) / low (shorts)
+//   - Power of Three (AMD) ............. weekly open line; manipulation filter
+//     requires the trap to occur on the WRONG side of the weekly open
+//     (above it in bear bias, below it in bull bias) - the Judas swing
+//   - Liquidity pools that get raided ... intraday swing (3-candle), Asian range
+//     high/low, premarket high/low, opposing previous-day level
+//   - Fakeout / trap .................... first breach of a pool AGAINST daily bias
+//   - Confirmation ...................... FVG in trend direction right after raid
+//   - Entry ............................. pullback into the FVG (edge or midpoint)
+//   - Stop .............................. sweep extreme (clear invalidation)
+//   - NWOG .............................. Friday close -> Monday open gap, drawn
+//     as reaction/target context for the week
+//
+//  NON-REPAINTING. Every higher-timeframe request is paired with either a [1]
+//  offset or a value that is fixed when its bar opens, so lookahead cannot
+//  return information the chart bar did not have. Details at each call site.
+//  All signal state advances only on barstate.isconfirmed.
+//
+//  KNOWN LIMITATIONS, stated plainly:
+//   - The daily bias is deliberately slow. A daily pivot needs "pivot strength"
+//     days either side to confirm, and the read is then taken from the last
+//     completed daily bar, so at the default the bias reflects structure up to
+//     roughly three days old. That is a design choice, not an oversight: it is
+//     a structural filter, not a timing tool. It will be late at turns.
+//   - A bar that trades through both the stop and the target is recorded as a
+//     stop. The bar alone cannot prove which came first, so the pessimistic
+//     reading is used rather than the flattering one.
+//   - The session ranges persist until the next session of the same type
+//     begins. On a symbol with no overnight data, or after a holiday, an Asian
+//     or premarket level may be older than the current day.
+//   - Nothing here is a backtest. Marks are what the rules produced on the
+//     bars loaded on your chart, entries are assumed to fill at the level, and
+//     no slippage, spread or commission is modelled.
+//
+//  Intended TF: 1H, and any intraday timeframe works. Sessions are New York.
+// =============================================================================
+indicator("Daily Sweep Pro: liquidity raid and fair value gap entries", "Daily Sweep Pro", overlay = true,
+     max_boxes_count = 150, max_lines_count = 150, max_labels_count = 300)
+
+tzNY = "America/New_York"
+
+//---------------------------- Inputs ----------------------------
+gB = "Bias Engine"
+dLen    = input.int(2, "Daily pivot strength (days each side)", minval = 1, maxval = 5, group = gB)
+useWOK  = input.bool(true, "Weekly-open manipulation filter (AMD)", group = gB,
+     tooltip = "Trap must occur on the manipulation side of the weekly open: above it for shorts, below it for longs. Textbook Power of Three. Turn off for more (lower-quality) signals.")
+
+gS = "Sessions (ET)"
+nySess  = input.session("0930-1600", "NY execution window", group = gS)
+// "2000-2400" not "2000-0000". An end time of 0000 is ambiguous as a session
+// terminator and can resolve to an empty range, which would leave the Asian
+// high and low permanently na and silently disable that liquidity pool with no
+// visible error anywhere on the chart.
+asSess  = input.session("2000-2400", "Asian range", group = gS)
+pmSess  = input.session("0400-0930", "Premarket range", group = gS)
+closeEOD = input.bool(true, "Flatten open trade at session end", group = gS)
+
+gL = "Liquidity pools eligible for the raid"
+useSwing = input.bool(true, "Intraday swing (3-candle)", group = gL)
+useAsia  = input.bool(true, "Asian range high/low", group = gL)
+usePM    = input.bool(true, "Premarket high/low", group = gL)
+usePD    = input.bool(true, "Opposing previous-day level", group = gL,
+     tooltip = "Bear bias: raid above PDH before shorting to PDL. Bull bias: raid below PDL before buying to PDH.")
+swLen    = input.int(1, "Swing strength", minval = 1, maxval = 10, group = gL,
+     tooltip = "1 uses the classic three-candle swing point: a bar whose high is above the bar either side of it. Higher values require a wider, more significant swing.")
+
+gT = "Trap -> FVG"
+// Default lowered from 12 to 5. The New York window is 6.5 hours, which is
+// about 6 bars on the intended 1H timeframe, so a 12-bar patience window could
+// never be reached there: the end-of-session reset always fired first and the
+// input did nothing at the documented timeframe. 5 makes it live on 1H and it
+// still behaves as a patience limit on lower timeframes.
+maxWait = input.int(5, "Max bars from raid to FVG", minval = 1, maxval = 100, group = gT,
+     tooltip = "How long the raid stays valid while waiting for a fair value gap. The setup is also abandoned if the session ends or the daily bias flips, whichever comes first.")
+minGapK = input.float(0.10, "Min FVG size (x ATR14)", minval = 0.0, step = 0.05, group = gT)
+entryOpt = input.string("Gap edge", "Entry level", options = ["Gap edge", "Gap midpoint"], group = gT)
+
+gR = "Risk"
+minRR   = input.float(1.0, "Min reward:risk to arm setup", minval = 0.0, step = 0.25, group = gR)
+maxDay  = input.int(2, "Max entries per day", minval = 1, maxval = 10, group = gR,
+     tooltip = "Hard circuit breaker. After this many entries in one day the indicator stops arming setups until the next day.")
+
+gU = "Display"
+showTbl  = input.bool(true, "Status table", group = gU)
+showPD   = input.bool(true, "PDH / PDL", group = gU)
+showWOK  = input.bool(true, "Weekly open", group = gU)
+showPools = input.bool(true, "Asian / premarket levels during NY", group = gU)
+showNWOG = input.bool(true, "New Week Opening Gap", group = gU)
+shadeAMD = input.bool(true, "Tint manipulation zone", group = gU)
+cBull    = input.color(color.new(#26a69a, 0), "Bull", inline = "c", group = gU)
+cBear    = input.color(color.new(#ef5350, 0), "Bear", inline = "c", group = gU)
+
+//-------------------- Daily structure bias (non-repainting) --------------------
+f_daily() =>
+    ph = ta.pivothigh(high, dLen, dLen)
+    pl = ta.pivotlow(low,  dLen, dLen)
+    var float ph1 = na
+    var float ph2 = na
+    var float pl1 = na
+    var float pl2 = na
+    if not na(ph)
+        ph2 := ph1
+        ph1 := ph
+    if not na(pl)
+        pl2 := pl1
+        pl1 := pl
+    [ph1[1], ph2[1], pl1[1], pl2[1]]
+
+// Lookahead is paired with a [1] offset in each case below, which is the
+// documented non-repainting idiom: it returns the last COMPLETED higher
+// timeframe bar rather than the one still forming. Without the offset this
+// would be look-ahead bias. With it, it is the fix for look-ahead bias.
+[dPH1, dPH2, dPL1, dPL2] = request.security(syminfo.tickerid, "D", f_daily(), lookahead = barmerge.lookahead_on)
+pdh   = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdl   = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
+// The weekly open is the one exception and it needs no offset: an open is fixed
+// the instant its bar begins, so it cannot be revised later in the week and
+// lookahead has nothing to reveal.
+wOpen = request.security(syminfo.tickerid, "W", open,    lookahead = barmerge.lookahead_on)
+
+int bias = 0
+if not na(dPH2) and not na(dPL2)
+    bias := dPH1 > dPH2 and dPL1 > dPL2 ? 1 : dPH1 < dPH2 and dPL1 < dPL2 ? -1 : 0
+
+//-------------------- Sessions & liquidity pools --------------------
+f_sessRange(s) =>
+    bool inS = not na(time(timeframe.period, s, tzNY))
+    var float hi = na
+    var float lo = na
+    if inS and not inS[1]
+        hi := high
+        lo := low
+    else if inS
+        hi := math.max(hi, high)
+        lo := math.min(lo, low)
+    [hi, lo]
+
+inNY    = not na(time(timeframe.period, nySess, tzNY))
+sessEnd = not inNY and inNY[1]
+[asiaHi, asiaLo] = f_sessRange(asSess)
+[pmHi,   pmLo]   = f_sessRange(pmSess)
+
+atr14 = ta.atr(14)
+
+iph = ta.pivothigh(high, swLen, swLen)
+ipl = ta.pivotlow(low,  swLen, swLen)
+var float lastSwHi = na
+var float lastSwLo = na
+if not na(iph)
+    lastSwHi := iph
+if not na(ipl)
+    lastSwLo := ipl
+
+f_raidLo(pool) => not na(pool) and low  < pool and low[1]  >= pool
+f_raidHi(pool) => not na(pool) and high > pool and high[1] <= pool
+
+//-------------------- New Week Opening Gap --------------------
+var box nwog = na
+if timeframe.change("W") and showNWOG and not na(close[1])
+    float gTop = math.max(close[1], open)
+    float gBot = math.min(close[1], open)
+    if gTop - gBot > syminfo.mintick
+        nwog := box.new(bar_index, gTop, bar_index, gBot,
+             border_color = color.new(color.silver, 40), bgcolor = color.new(color.silver, 88),
+             text = "NWOG", text_color = color.new(color.silver, 30), text_size = size.tiny)
+if not na(nwog)
+    box.set_right(nwog, bar_index)
+
+//-------------------- State machine --------------------
+var int    state    = 0
+var int    dir      = 0
+var float  sweepExt = na
+var int    sweepBar = na
+var string poolName = na
+var int    fvgBar   = na
+var float  fvgTop   = na
+var float  fvgBot   = na
+var box    fvgBox   = na
+var float  entryPx  = na
+var float  stopPx   = na
+var float  tgtPx    = na
+var line   lnStop   = na
+var line   lnTgt    = na
+var line   lnEnt    = na
+
+var int tradesToday = 0
+if timeframe.change("D")
+    tradesToday := 0
+
+bool evtSweep = false
+bool evtFvg   = false
+bool evtEntry = false
+bool evtStop  = false
+bool evtTgt   = false
+bool doReset  = false
+string exitTxt = na
+
+if barstate.isconfirmed
+    if state == 3
+        if dir == 1
+            if low <= stopPx
+                evtStop := true
+                exitTxt := "Stop"
+            else if high >= tgtPx
+                evtTgt := true
+                exitTxt := "Target, prior day high"
+        else
+            if high >= stopPx
+                evtStop := true
+                exitTxt := "Stop"
+            else if low <= tgtPx
+                evtTgt := true
+                exitTxt := "Target, prior day low"
+        if not evtStop and not evtTgt and sessEnd and closeEOD
+            exitTxt := "Flat at session end"
+        if not na(exitTxt)
+            doReset := true
+
+    else if state == 2
+        bool missed = dir == 1 ? high >= tgtPx : low <= tgtPx
+        if bias != dir or sessEnd or missed
+            doReset := true
+        else if bar_index > fvgBar
+            bool trig = dir == 1 ? low <= entryPx : high >= entryPx
+            if trig
+                state := 3
+                evtEntry := true
+                tradesToday += 1
+                // Entry and invalidation on the same bar: recorded as a stop,
+                // because the bar cannot prove the entry filled before the level
+                // was traded through.
+                if dir == 1 and low <= stopPx
+                    evtStop := true
+                    exitTxt := "Stop"
+                    doReset := true
+                if dir == -1 and high >= stopPx
+                    evtStop := true
+                    exitTxt := "Stop"
+                    doReset := true
+
+    else if state == 1
+        sweepExt := dir == 1 ? math.min(sweepExt, low) : math.max(sweepExt, high)
+        if bias != dir or not inNY or bar_index - sweepBar > maxWait
+            doReset := true
+        else
+            bool fvgUp = dir == 1  and low > high[2] and (low - high[2]) >= minGapK * atr14
+            bool fvgDn = dir == -1 and high < low[2] and (low[2] - high) >= minGapK * atr14
+            if fvgUp or fvgDn
+                float top = fvgUp ? low : low[2]
+                float bot = fvgUp ? high[2] : high
+                float ent = entryOpt == "Gap midpoint" ? (top + bot) / 2 : (fvgUp ? top : bot)
+                float stp = sweepExt
+                float tgt = dir == 1 ? pdh : pdl
+                float risk = math.abs(ent - stp)
+                float rew  = dir == 1 ? tgt - ent : ent - tgt
+                if risk > 0 and rew > 0 and rew / risk >= minRR
+                    state   := 2
+                    evtFvg  := true
+                    fvgBar  := bar_index
+                    fvgTop  := top
+                    fvgBot  := bot
+                    entryPx := ent
+                    stopPx  := stp
+                    tgtPx   := tgt
+                    fvgBox  := box.new(bar_index - 2, top, bar_index, bot,
+                         border_color = dir == 1 ? cBull : cBear,
+                         bgcolor = color.new(dir == 1 ? cBull : cBear, 85))
+
+    else
+        bool wokOK = not useWOK or bias == 0 ? true : bias == 1 ? close < wOpen : close > wOpen
+        if inNY and bias != 0 and wokOK and tradesToday < maxDay
+            string hitPool = na
+            if bias == 1
+                if useSwing and f_raidLo(lastSwLo)
+                    hitPool := "swing low"
+                else if useAsia and f_raidLo(asiaLo)
+                    hitPool := "Asian low"
+                else if usePM and f_raidLo(pmLo)
+                    hitPool := "premarket low"
+                else if usePD and f_raidLo(pdl)
+                    hitPool := "PDL"
+            else
+                if useSwing and f_raidHi(lastSwHi)
+                    hitPool := "swing high"
+                else if useAsia and f_raidHi(asiaHi)
+                    hitPool := "Asian high"
+                else if usePM and f_raidHi(pmHi)
+                    hitPool := "premarket high"
+                else if usePD and f_raidHi(pdh)
+                    hitPool := "PDH"
+            if not na(hitPool)
+                state    := 1
+                dir      := bias
+                sweepExt := bias == 1 ? low : high
+                sweepBar := bar_index
+                poolName := hitPool
+                evtSweep := true
+
+//-------------------- Drawing --------------------
+if barstate.isconfirmed
+    if evtSweep
+        label.new(bar_index, dir == 1 ? low : high, "Raid: " + poolName,
+             style = dir == 1 ? label.style_label_up : label.style_label_down,
+             color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+    if evtFvg
+        label.new(bar_index, dir == 1 ? fvgTop : fvgBot,
+             "Gap confirmed  E " + str.tostring(entryPx, format.mintick) + "  S " + str.tostring(stopPx, format.mintick) + "  T " + str.tostring(tgtPx, format.mintick),
+             style = dir == 1 ? label.style_label_down : label.style_label_up,
+             color = color.new(dir == 1 ? cBull : cBear, 30), textcolor = color.white, size = size.small)
+    if evtEntry
+        label.new(bar_index, entryPx, dir == 1 ? "Long" : "Short",
+             style = dir == 1 ? label.style_label_up : label.style_label_down,
+             color = dir == 1 ? cBull : cBear, textcolor = color.white, size = size.small)
+        lnEnt  := line.new(bar_index, entryPx, bar_index + 1, entryPx, color = color.gray,  width = 1)
+        lnStop := line.new(bar_index, stopPx,  bar_index + 1, stopPx,  color = cBear, width = 1, style = line.style_dashed)
+        lnTgt  := line.new(bar_index, tgtPx,   bar_index + 1, tgtPx,   color = cBull, width = 1, style = line.style_dashed)
+    if state == 3 or (evtEntry and doReset)
+        if not na(lnEnt)
+            line.set_x2(lnEnt, bar_index)
+            line.set_x2(lnStop, bar_index)
+            line.set_x2(lnTgt, bar_index)
+    if not na(fvgBox) and (state == 2 or state == 3)
+        box.set_right(fvgBox, bar_index)
+    if not na(exitTxt)
+        label.new(bar_index, evtStop ? stopPx : evtTgt ? tgtPx : close, exitTxt,
+             style = label.style_label_left, color = evtTgt ? cBull : evtStop ? cBear : color.gray,
+             textcolor = color.white, size = size.small)
+    if doReset
+        state := 0
+        dir := 0
+        sweepExt := na
+        sweepBar := na
+        poolName := na
+        fvgBar := na
+        fvgTop := na
+        fvgBot := na
+        entryPx := na
+        stopPx := na
+        tgtPx := na
+        fvgBox := na
+        lnEnt := na
+        lnStop := na
+        lnTgt := na
+
+plot(showPD ? pdh : na, "PDH", color = color.new(#26a69a, 30), style = plot.style_linebr)
+plot(showPD ? pdl : na, "PDL", color = color.new(#ef5350, 30), style = plot.style_linebr)
+plot(showWOK ? wOpen : na, "Weekly open", color = color.new(color.yellow, 20), style = plot.style_linebr, linewidth = 1)
+plot(showPools and inNY ? asiaHi : na, "Asian high", color = color.new(color.aqua, 40), style = plot.style_linebr)
+plot(showPools and inNY ? asiaLo : na, "Asian low",  color = color.new(color.aqua, 40), style = plot.style_linebr)
+plot(showPools and inNY ? pmHi : na, "Premarket high", color = color.new(color.purple, 40), style = plot.style_linebr)
+plot(showPools and inNY ? pmLo : na, "Premarket low",  color = color.new(color.purple, 40), style = plot.style_linebr)
+
+bool manipZone = bias == -1 and close > wOpen or bias == 1 and close < wOpen
+bgcolor(shadeAMD and inNY and bias != 0 and manipZone ? color.new(color.orange, 94) : na, title = "Manipulation zone")
+
+//-------------------- Status table --------------------
+// Created inside the guard rather than at top level, so switching the table off
+// does not leave an empty table object allocated on every chart.
+if showTbl and barstate.islast
+    var table tbl = table.new(position.top_right, 2, 8, border_width = 1)
+    string biasTxt = bias == 1 ? "Bullish, higher highs and lows" : bias == -1 ? "Bearish, lower highs and lows" : "Neutral, no daily control"
+    color  biasCol = bias == 1 ? cBull : bias == -1 ? cBear : color.gray
+    string stateTxt = state == 0 ? (bias == 0 ? "No trade: no daily control" : inNY ? "Scanning for raid" : "Waiting for NY session") : state == 1 ? "Raid on " + poolName + " - waiting FVG" : state == 2 ? "Armed, waiting for pullback" : "In trade"
+    string wokTxt = na(wOpen) ? "-" : str.tostring(wOpen, format.mintick) + (close > wOpen ? "  (above)" : "  (below)")
+    table.cell(tbl, 0, 0, "Daily bias", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 0, biasTxt, text_color = color.white, bgcolor = color.new(biasCol, 20), text_size = size.small)
+    table.cell(tbl, 0, 1, "State", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 1, stateTxt, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    table.cell(tbl, 0, 2, "Weekly open", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 2, wokTxt, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    table.cell(tbl, 0, 3, "PDH / PDL", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 3, str.tostring(pdh, format.mintick) + " / " + str.tostring(pdl, format.mintick), text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    table.cell(tbl, 0, 4, "Asia H/L", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 4, (na(asiaHi) ? "-" : str.tostring(asiaHi, format.mintick)) + " / " + (na(asiaLo) ? "-" : str.tostring(asiaLo, format.mintick)), text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    string entTxt = state >= 2 ? str.tostring(entryPx, format.mintick) : "-"
+    string stpTxt = state >= 2 ? str.tostring(stopPx, format.mintick) : "-"
+    string tgtTxt = state >= 2 ? str.tostring(tgtPx, format.mintick) : "-"
+    table.cell(tbl, 0, 5, "Entry", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 5, entTxt, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    table.cell(tbl, 0, 6, "Stop / Target", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 6, stpTxt + " / " + tgtTxt, text_color = color.white, bgcolor = color.new(color.black, 40), text_size = size.small)
+    bool tfBad = timeframe.isdwm or timeframe.in_seconds(timeframe.period) > 3600
+    string tfTxt = tfBad ? "Use 1H or lower" : "OK (" + timeframe.period + ")  |  trades: " + str.tostring(tradesToday) + "/" + str.tostring(maxDay)
+    table.cell(tbl, 0, 7, "TF check", text_color = color.white, bgcolor = color.new(color.black, 20), text_size = size.small)
+    table.cell(tbl, 1, 7, tfTxt, text_color = color.white, bgcolor = tfBad ? color.new(color.red, 20) : color.new(color.black, 40), text_size = size.small)
+
+//-------------------- Alerts --------------------
+alertcondition(evtSweep, "1. Liquidity raid", "Liquidity pool raided against the daily bias")
+alertcondition(evtFvg,   "2. FVG confirmed",  "Fair value gap confirmed, setup armed")
+alertcondition(evtEntry, "3. Entry triggered","Pullback into the fair value gap, entry triggered")
+alertcondition(evtTgt,   "4. Target hit",     "Prior-day level reached")
+alertcondition(evtStop,  "5. Stop hit",       "Invalidation traded through")
+alertcondition(ta.change(bias) != 0, "Daily bias changed", "Daily structure bias changed")
+// The end-of-session flat produced a chart label but no alert, so a webhook user
+// would see the entry and never see this exit. Added for parity.
+alertcondition(not na(exitTxt) and not evtStop and not evtTgt, "6. Flat at session end", "Open setup closed out at the end of the session")

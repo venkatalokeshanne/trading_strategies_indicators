@@ -1,0 +1,431 @@
+//@version=6
+// @description The ultimate institutional scalp engine. Combines custom session-reset CVD divergence detection, SMT cross-asset confirmation (ES, YM, GC), multi-stddev VWAP channels, dynamic trend engines, and neon-themed visuals to pinpoint market reversals.
+indicator("CVD + SMT DIVERGENCE VWAP ULTIMATE", "CVD SMT DIV ULTIMATE", overlay=true, max_labels_count=500, max_boxes_count=500, max_lines_count=500)
+
+// ==========================================
+// --- CUSTOM FUNCTIONS ---
+// ==========================================
+get_ma(src, length, type) =>
+    float ma = na
+    if type == "SMA"
+        ma := ta.sma(src, length)
+    else if type == "EMA"
+        ma := ta.ema(src, length)
+    else if type == "RMA"
+        ma := ta.rma(src, length)
+    else if type == "WMA"
+        ma := ta.wma(src, length)
+    else if type == "VWMA"
+        ma := ta.vwma(src, length)
+    else if type == "HMA"
+        ma := ta.hma(src, length)
+    ma
+
+// ==========================================
+// --- INPUTS & CONFIGURATION ---
+// ==========================================
+prd      = input.int(2, "Pivot Sensitivity", minval=1, tooltip="Lookback for highs/lows.")
+
+// --- THEME SELECTOR (Blood & Cyan Default) ---
+themeChoice = input.string("Blood & Cyan (Neon)", "Color Theme", options=["Blood & Cyan (Neon)", "Ocean Steel", "Matrix Terminal", "Synthwave Vapor", "Stealth Amber"], tooltip="Choose your preferred high-contrast palette.")
+
+// --- SMT DIVERGENCE ENGINE ---
+showSMT  = input.bool(true, "Show SMT Divergences", group="SMT Divergence Engine")
+symES    = input.symbol("CME_MINI:ES1!", "ES Ticker", group="SMT Divergence Engine")
+symYM    = input.symbol("CBOT_MINI:YM1!", "YM Ticker", group="SMT Divergence Engine")
+symGC    = input.symbol("COMEX:GC1!", "Gold Ticker", group="SMT Divergence Engine")
+
+// --- TREND ENGINE ---
+showTrend = input.bool(false, "Show Trend Lines", group="Trend Engine")
+maType    = input.string("SMA", "Moving Average Type", options=["SMA", "EMA", "RMA", "WMA", "VWMA", "HMA"], group="Trend Engine")
+len1      = input.int(13, "Trend Line 1 Length", group="Trend Engine")
+off1      = input.int(8,  "Trend Line 1 Offset", group="Trend Engine")
+len2      = input.int(8,  "Trend Line 2 Length", group="Trend Engine")
+off2      = input.int(5,  "Trend Line 2 Offset", group="Trend Engine")
+
+// --- STANDARD DEVIATION BANDS & FILLS ---
+showBand1 = input.bool(true, "Show Band 1 (±1 StdDev)", group="Standard Deviation Bands")
+mult1    = input.float(1.0, "Band 1 Multiplier", step=0.1, group="Standard Deviation Bands")
+
+showBand2 = input.bool(true, "Show Band 2 (±2 StdDev)", group="Standard Deviation Bands")
+mult2    = input.float(2.0, "Band 2 Multiplier", step=0.1, group="Standard Deviation Bands")
+
+showBand3 = input.bool(false, "Show Band 3 (±3 StdDev)", group="Standard Deviation Bands")
+mult3    = input.float(3.0, "Band 3 Multiplier", step=0.1, group="Standard Deviation Bands")
+
+// --- CHANNEL FILLS ---
+showMidFill    = input.bool(true, "Show Middle Fill (VWAP to ±1 StdDev)", group="Channel Fills")
+showOuterFill1 = input.bool(true, "Show Outer Fill 1 (±1 to ±2 StdDev)", group="Channel Fills")
+showOuterFill2 = input.bool(false, "Show Outer Fill 2 (±2 to ±3 StdDev)", group="Channel Fills")
+
+resetCVD = input.bool(true, "Reset CVD Every Session?", tooltip="Ensures delta starts at 0 every session open (18:00 ET).")
+
+// --- HIGHER TIMEFRAME VWAPS ---
+showWeekly  = input.bool(true, "Show Weekly VWAP", group="Higher TF VWAPS")
+showMonthly = input.bool(true, "Show Monthly VWAP", group="Higher TF VWAPS")
+
+// --- TRADING SESSIONS INPUTS ---
+grp_sess     = "Sessions Configuration (America/New_York)"
+showMidLine  = input.bool(true, "Show Session Midline", group=grp_sess)
+boxTransparency = input.int(90, "Box Fill Opacity (0-100)", minval=0, maxval=100, group=grp_sess)
+
+show_tokyo   = input.bool(true, "Tokyo", inline="tk", group=grp_sess)
+tk_ss        = input.session("1800-0000", "", inline="tk", group=grp_sess)
+tokyo_color  = input.color(color.rgb(0, 137, 123), "", inline="tk", group=grp_sess)
+
+show_london  = input.bool(true, "London", inline="lo", group=grp_sess)
+lo_ss        = input.session("0230-0500", "", inline="lo", group=grp_sess)
+london_color = input.color(#ff9900, "", inline="lo", group=grp_sess)
+
+show_ny      = input.bool(true, "New York", inline="ny", group=grp_sess)
+ny_ss        = input.session("0830-1200", "", inline="ny", group=grp_sess)
+ny_color     = input.color(#ff5252, "", inline="ny", group=grp_sess)
+
+show_si      = input.bool(true, "Opening Range", inline="or", group=grp_sess)
+si_ss        = input.session("0930-1030", "", inline="or", group=grp_sess)
+si_color     = input.color(#bd52ff, "", inline="or", group=grp_sess)
+extend_or    = input.bool(true, "Extend Opening Range to Session End", group=grp_sess)
+
+// ==========================================
+// --- ADVANCED DYNAMIC COLOR THEMES ---
+// ==========================================
+var color c_vwap  = na
+var color c_wk    = na
+var color c_mo    = na
+var color c_up1   = na
+var color c_up2   = na
+var color c_up3   = na
+var color c_dn1   = na
+var color c_dn2   = na
+var color c_dn3   = na
+var color c_bull  = na
+var color c_bear  = na
+
+if themeChoice == "Blood & Cyan (Neon)"
+    c_vwap  := color.rgb(128, 128, 128)
+    c_wk    := color.rgb(102, 38, 211)
+    c_mo    := color.rgb(250, 104, 21)
+    c_up1   := color.rgb(255, 10, 60)
+    c_up2   := color.rgb(100, 10, 10)
+    c_up3   := color.rgb(100, 0, 0)
+    c_dn1   := color.rgb(0, 243, 255)
+    c_dn2   := color.rgb(0, 150, 255)
+    c_dn3   := color.rgb(0, 50, 150)
+    c_bull  := color.rgb(0, 243, 255)
+    c_bear  := color.rgb(255, 10, 60)
+else if themeChoice == "Ocean Steel"
+    c_vwap  := color.rgb(226, 232, 210)
+    c_wk    := color.rgb(148, 163, 184)
+    c_mo    := color.rgb(244, 114, 182)
+    c_up1   := color.rgb(251, 113, 133)
+    c_up2   := color.rgb(225, 29, 72)
+    c_up3   := color.rgb(159, 18, 57)
+    c_dn1   := color.rgb(45, 212, 101)
+    c_dn2   := color.rgb(14, 116, 144)
+    c_dn3   := color.rgb(8, 51, 68)
+    c_bull  := color.rgb(45, 212, 101)
+    c_bear  := color.rgb(251, 113, 133)
+else if themeChoice == "Matrix Terminal"
+    c_vwap  := color.rgb(255, 255, 255)
+    c_wk    := color.rgb(0, 101, 255)
+    c_mo    := color.rgb(255, 215, 0)
+    c_up1   := color.rgb(255, 255, 0)
+    c_up2   := color.rgb(255, 110, 0)
+    c_up3   := color.rgb(255, 0, 0)
+    c_dn1   := color.rgb(0, 255, 102)
+    c_dn2   := color.rgb(0, 180, 50)
+    c_dn3   := color.rgb(0, 80, 10)
+    c_bull  := color.rgb(0, 255, 102)
+    c_bear  := color.rgb(255, 51, 51)
+else if themeChoice == "Synthwave Vapor"
+    c_vwap  := color.rgb(255, 0, 127)
+    c_wk    := color.rgb(100, 0, 255)
+    c_mo    := color.rgb(255, 255, 255)
+    c_up1   := color.rgb(255, 51, 102)
+    c_up2   := color.rgb(180, 0, 255)
+    c_up3   := color.rgb(75, 0, 110)
+    c_dn1   := color.rgb(0, 229, 255)
+    c_dn2   := color.rgb(57, 255, 10)
+    c_dn3   := color.rgb(0, 100, 100)
+    c_bull  := color.rgb(0, 229, 255)
+    c_bear  := color.rgb(255, 51, 102)
+else if themeChoice == "Stealth Amber"
+    c_vwap  := color.rgb(168, 162, 158)
+    c_wk    := color.rgb(229, 231, 235)
+    c_mo    := color.rgb(100, 100, 100)
+    c_up1   := color.rgb(255, 176, 0)
+    c_up2   := color.rgb(217, 110, 6)
+    c_up3   := color.rgb(180, 83, 9)
+    c_dn1   := color.rgb(166, 226, 46)
+    c_dn2   := color.rgb(101, 163, 13)
+    c_dn3   := color.rgb(63, 98, 18)
+    c_bull  := color.rgb(166, 226, 46)
+    c_bear  := color.rgb(255, 176, 0)
+
+// ==========================================
+// --- FETCH EXTERNAL SMT DATA ---
+// ==========================================
+es_l = request.security(symES, timeframe.period, low)
+es_h = request.security(symES, timeframe.period, high)
+ym_l = request.security(symYM, timeframe.period, low)
+ym_h = request.security(symYM, timeframe.period, high)
+gc_l = request.security(symGC, timeframe.period, low)
+gc_h = request.security(symGC, timeframe.period, high)
+
+// ==========================================
+// --- SESSION & CVD CALCULATIONS ---
+// ==========================================
+int   ny_yr = year(time, "America/New_York")
+int   ny_mo = month(time, "America/New_York")
+int   ny_d  = dayofmonth(time, "America/New_York")
+float t_1800 = timestamp("America/New_York", ny_yr, ny_mo, ny_d, 18, 0, 0)
+bool  isNewSession = ta.change(time >= t_1800 ? t_1800 : t_1800 - 24 * 3600 * 1000) != 0
+
+var float running_cvd = 0.0
+float delta = (close > open ? volume : close < open ? -volume : 0.0)
+if resetCVD and isNewSession
+    running_cvd := delta
+else
+    running_cvd += delta
+
+// ==========================================
+// --- ANCHORED VWAP & STDDEV CALCULATIONS ---
+// ==========================================
+var float cum_pv = 0.0
+var float cum_v = 0.0
+var float sum_v_sq_diff = 0.0
+
+var float cum_pv_w = 0.0
+var float cum_v_w = 0.0
+var float cum_pv_m = 0.0
+var float cum_v_m = 0.0
+
+int shifted_w_t = time - 18 * 3600 * 1000
+bool isNewWeek = ta.change(year(shifted_w_t, "America/New_York") * 100 + weekofyear(shifted_w_t, "America/New_York")) != 0
+bool isNewMonth = ta.change(year(shifted_w_t, "America/New_York") * 100 + month(shifted_w_t, "America/New_York")) != 0
+
+if resetCVD and isNewSession
+    cum_pv := 0.0
+    cum_v := 0.0
+    sum_v_sq_diff := 0.0
+
+if isNewWeek
+    cum_pv_w := 0.0
+    cum_v_w := 0.0
+
+if isNewMonth
+    cum_pv_m := 0.0
+    cum_v_m := 0.0
+
+float typical = hlc3
+cum_pv += typical * volume
+cum_v += volume
+float currentVwapPlot = cum_v > 0 ? cum_pv / cum_v : typical
+
+sum_v_sq_diff += volume * math.pow(typical - currentVwapPlot, 2)
+float variance = cum_v > 0 ? sum_v_sq_diff / cum_v : 0.0
+float stdevVal = math.sqrt(variance)
+
+curU1 = currentVwapPlot + (stdevVal * mult1)
+curU2 = currentVwapPlot + (stdevVal * mult2)
+curU3 = currentVwapPlot + (stdevVal * mult3)
+curL1 = currentVwapPlot - (stdevVal * mult1)
+curL2 = currentVwapPlot - (stdevVal * mult2)
+curL3 = currentVwapPlot - (stdevVal * mult3)
+
+cum_pv_w += typical * volume
+cum_v_w += volume
+float currentWeeklyVwap = cum_v_w > 0 ? cum_pv_w / cum_v_w : typical
+
+cum_pv_m += typical * volume
+cum_v_m += volume
+float currentMonthlyVwap = cum_v_m > 0 ? cum_pv_m / cum_v_m : typical
+
+// ==========================================
+// --- TREND ENGINE CALCULATIONS ---
+// ==========================================
+float ma1 = get_ma(hl2, len1, maType)
+float ma2 = get_ma(hl2, len2, maType)
+
+plot(showTrend ? ma1 : na, "Trend Line 1", color=c_vwap, offset=off1, linewidth=2)
+plot(showTrend ? ma2 : na, "Trend Line 2", color=c_up1, offset=off2, linewidth=2)
+
+// ==========================================
+// --- CORRECTED DIVERGENCE ENGINE ---
+// ==========================================
+pl = ta.pivotlow(low, prd, prd)
+ph = ta.pivothigh(high, prd, prd)
+
+// Track Main Asset Pivots & CVD
+var float prev_cvd_pl = na, var float curr_cvd_pl = na
+var float prev_price_pl = na, var float curr_price_pl = na
+
+// Track SMT Asset Pivots (Lows)
+var float prev_es_pl = na, var float curr_es_pl = na
+var float prev_ym_pl = na, var float curr_ym_pl = na
+var float prev_gc_pl = na, var float curr_gc_pl = na
+
+if not na(pl)
+    prev_cvd_pl := curr_cvd_pl
+    curr_cvd_pl := running_cvd[prd]
+    prev_price_pl := curr_price_pl
+    curr_price_pl := low[prd]
+    prev_es_pl := curr_es_pl
+    curr_es_pl := es_l[prd]
+    prev_ym_pl := curr_ym_pl
+    curr_ym_pl := ym_l[prd]
+    prev_gc_pl := curr_gc_pl
+    curr_gc_pl := gc_l[prd]
+
+var float prev_cvd_ph = na, var float curr_cvd_ph = na
+var float prev_price_ph = na, var float curr_price_ph = na
+
+// Track SMT Asset Pivots (Highs)
+var float prev_es_ph = na, var float curr_es_ph = na
+var float prev_ym_ph = na, var float curr_ym_ph = na
+var float prev_gc_ph = na, var float curr_gc_ph = na
+
+if not na(ph)
+    prev_cvd_ph := curr_cvd_ph
+    curr_cvd_ph := running_cvd[prd]
+    prev_price_ph := curr_price_ph
+    curr_price_ph := high[prd]
+    prev_es_ph := curr_es_ph
+    curr_es_ph := es_h[prd]
+    prev_ym_ph := curr_ym_ph
+    curr_ym_ph := ym_h[prd]
+    prev_gc_ph := curr_gc_ph
+    curr_gc_ph := gc_h[prd]
+
+// --- SIGNAL LOGIC ---
+bool bull_div = not na(pl) and (curr_price_pl < prev_price_pl) and (curr_cvd_pl > prev_cvd_pl)
+bool bear_div = not na(ph) and (curr_price_ph > prev_price_ph) and (curr_cvd_ph < prev_cvd_ph)
+
+// --- SMT LOGIC ---
+bool es_smt_bull = showSMT and not na(pl) and (curr_price_pl < prev_price_pl) and (curr_es_pl > prev_es_pl)
+bool ym_smt_bull = showSMT and not na(pl) and (curr_price_pl < prev_price_pl) and (curr_ym_pl > prev_ym_pl)
+bool gc_smt_bull = showSMT and not na(pl) and (curr_price_pl < prev_price_pl) and (curr_gc_pl > prev_gc_pl)
+
+bool es_smt_bear = showSMT and not na(ph) and (curr_price_ph > prev_price_ph) and (curr_es_ph < prev_es_ph)
+bool ym_smt_bear = showSMT and not na(ph) and (curr_price_ph > prev_price_ph) and (curr_ym_ph < prev_ym_ph)
+bool gc_smt_bear = showSMT and not na(ph) and (curr_price_ph > prev_price_ph) and (curr_gc_ph < prev_gc_ph)
+
+// ==========================================
+// --- SMT LABELS ---
+// ==========================================
+if es_smt_bull or ym_smt_bull or gc_smt_bull
+    string txt_bull = ""
+    if es_smt_bull
+        txt_bull += "ES "
+    if ym_smt_bull
+        txt_bull += "YM "
+    if gc_smt_bull
+        txt_bull += "GC "
+    if txt_bull != ""
+        label.new(bar_index - prd, low[prd], text=txt_bull + "\nSMT", color=color.new(c_bull, 100), textcolor=c_bull, style=label.style_label_up, size=size.normal)
+
+if es_smt_bear or ym_smt_bear or gc_smt_bear
+    string txt_bear = ""
+    if es_smt_bear
+        txt_bear += "ES "
+    if ym_smt_bear
+        txt_bear += "YM "
+    if gc_smt_bear
+        txt_bear += "GC "
+    if txt_bear != ""
+        label.new(bar_index - prd, high[prd], text=txt_bear + "\nSMT", color=color.new(c_bear, 100), textcolor=c_bear, style=label.style_label_down, size=size.normal)
+
+// ==========================================
+// --- VISUALS & PLOTTING ---
+// ==========================================
+vwapPlot = plot(currentVwapPlot, "Daily VWAP", color=c_vwap, linewidth=2)
+
+plot(showWeekly ? currentWeeklyVwap : na, "Weekly VWAP", color=c_wk, linewidth=3, style=plot.style_circles)
+plot(showMonthly ? currentMonthlyVwap : na, "Monthly VWAP", color=c_mo, linewidth=3, style=plot.style_circles)
+
+// Plot Upper Bands
+u1Plot = plot(showBand1 ? curU1 : na, "+1 StdDev", color=color.new(c_up1, 10))
+u2Plot = plot(showBand2 ? curU2 : na, "+2 StdDev", color=color.new(c_up2, 10))
+u3Plot = plot(showBand3 ? curU3 : na, "+3 StdDev", color=color.new(c_up3, 10))
+
+// Plot Lower Bands
+l1Plot = plot(showBand1 ? curL1 : na, "-1 StdDev", color=color.new(c_dn1, 10))
+l2Plot = plot(showBand2 ? curL2 : na, "-2 StdDev", color=color.new(c_dn2, 10))
+l3Plot = plot(showBand3 ? curL3 : na, "-3 StdDev", color=color.new(c_dn3, 10))
+
+// ==========================================
+// --- ADVANCED CLOUD FILLS ---
+// ==========================================
+fill(vwapPlot, u1Plot, color=showMidFill and showBand1 ? color.new(c_up1, 97) : na)
+fill(vwapPlot, l1Plot, color=showMidFill and showBand1 ? color.new(c_dn1, 97) : na)
+
+fill(u1Plot, u2Plot, color=showOuterFill1 and showBand1 and showBand2 ? color.new(c_up2, 97) : na)
+fill(l1Plot, l2Plot, color=showOuterFill1 and showBand1 and showBand2 ? color.new(c_dn2, 97) : na)
+
+fill(u2Plot, u3Plot, color=showOuterFill2 and showBand2 and showBand3 ? color.new(c_up3, 97) : na)
+fill(l2Plot, l3Plot, color=showOuterFill2 and showBand2 and showBand3 ? color.new(c_dn3, 97) : na)
+
+plotshape(bull_div, "Bullish Divergence", shape.triangleup, location.belowbar, color=c_bull, size=size.small, offset=-prd)
+plotshape(bear_div, "Bearish Divergence", shape.triangledown, location.abovebar, color=c_bear, size=size.small, offset=-prd)
+
+bgcolor(bull_div ? color.new(c_bull, 100) : bear_div ? color.new(c_bear, 100) : na, offset=-prd)
+
+// ==========================================
+// --- EXTENDABLE SESSION ENGINE ---
+// ==========================================
+process_session(session_spec, session_title, session_clr, is_enabled, extend_to_eos) =>
+    if is_enabled and timeframe.isintraday
+        bool in_session_now = not na(time(timeframe.period, session_spec + ":1234567", "America/New_York"))
+        
+        var box  b_obj = na
+        var line l_obj = na
+        var float s_hi = na
+        var float s_lo = na
+        var bool active_ext = false
+
+        if isNewSession
+            active_ext := false
+
+        // Session Start Event
+        if in_session_now and not in_session_now[1]
+            s_hi  := high
+            s_lo  := low
+            active_ext := true
+            b_obj := box.new(left=bar_index, top=s_hi, right=bar_index + 1, bottom=s_lo,
+                             border_color=session_clr, border_width=1,
+                             bgcolor=color.new(session_clr, boxTransparency),
+                             text=session_title, text_color=session_clr,
+                             text_size=size.small, text_halign=text.align_left, text_valign=text.align_top)
+            if showMidLine
+                l_obj := line.new(x1=bar_index, y1=hl2, x2=bar_index + 1, y2=hl2, color=session_clr)
+                line.set_style(l_obj, line.style_dashed)
+
+        // Session Ongoing (Updating High/Low Range)
+        else if in_session_now and not na(b_obj)
+            s_hi := math.max(s_hi, high)
+            s_lo := math.min(s_lo, low)
+            box.set_top(b_obj, s_hi)
+            box.set_bottom(b_obj, s_lo)
+            box.set_right(b_obj, bar_index + 1)
+            
+            if showMidLine and not na(l_obj)
+                mid_val = (s_hi + s_lo) / 2.0
+                line.set_xy1(l_obj, box.get_left(b_obj), mid_val)
+                line.set_xy2(l_obj, bar_index + 1, mid_val)
+
+        // Post-Session Extension (Locks Range High/Low, Extends Right Edge)
+        else if extend_to_eos and active_ext and not in_session_now and not na(b_obj)
+            box.set_right(b_obj, bar_index + 1)
+            if showMidLine and not na(l_obj)
+                line.set_xy2(l_obj, bar_index + 1, (s_hi + s_lo) / 2.0)
+
+process_session(tk_ss, "Tokyo", tokyo_color, show_tokyo, false)
+process_session(lo_ss, "London", london_color, show_london, false)
+process_session(ny_ss, "New York", ny_color, show_ny, false)
+process_session(si_ss, "Opening Range", si_color, show_si, extend_or)
+
+// ==========================================
+// --- ALERTS ---
+// ==========================================
+alertcondition(bull_div, "CVD Bullish Divergence", "Bullish Reversal Confirmed")
+alertcondition(bear_div, "CVD Bearish Divergence", "Bearish Reversal Confirmed")

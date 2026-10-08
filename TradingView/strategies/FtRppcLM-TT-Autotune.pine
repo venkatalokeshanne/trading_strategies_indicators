@@ -1,0 +1,609 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Original Lorentzian Classification logic by jdehorty.
+// TT-Autotune: public TTv fork with Sync Code paste that overrides f1-f5 / kernel / filter params
+// from TensorTrader's Python optimizer (CSV format TT1,... — see scripts/ttv_optimizer/sync_code.py).
+// Strategy shell: one TradingView strategy alert covers all entries/exits (script rotation).
+
+//@version=6
+strategy("TT-Autotune", "TTAuto", overlay=true, precision=4, max_labels_count=500, pyramiding=5, default_qty_type=strategy.cash, default_qty_value=100, process_orders_on_close=true, calc_on_every_tick=false)
+
+import jdehorty/MLExtensions/2 as ml
+
+type Settings
+    float source
+    int neighborsCount
+    int maxBarsBack
+    int featureCount
+    int colorCompression
+    bool showExits
+    bool useDynamicExits
+
+type Label
+    int long
+    int short
+    int neutral
+
+type FeatureArrays
+    array<float> f1
+    array<float> f2
+    array<float> f3
+    array<float> f4
+    array<float> f5
+
+type FeatureSeries
+    float f1
+    float f2
+    float f3
+    float f4
+    float f5
+
+type FilterSettings
+    bool useVolatilityFilter
+    bool useRegimeFilter
+    bool useAdxFilter
+    float regimeThreshold
+    int adxThreshold
+
+type Filter
+    bool volatility
+    bool regime
+    bool adx
+
+// Series-length safe helpers (sync CSV parse yields series ints; ta.*/library lengths need simple).
+tt_rma(src, length) =>
+    alpha = 1.0 / math.max(nz(length, 1.0), 1.0)
+    out = 0.0
+    out := na(src) ? na : na(out[1]) ? src : (1.0 - alpha) * out[1] + alpha * src
+    out
+
+tt_rsi(src, length) =>
+    ch = ta.change(src)
+    up = tt_rma(math.max(nz(ch, 0.0), 0.0), length)
+    down = tt_rma(-math.min(nz(ch, 0.0), 0.0), length)
+    down == 0 ? 100.0 : up == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + up / down))
+
+tt_n_rsi(src, n1, n2) =>
+    tt_rma(tt_rsi(src, n1), n2)
+
+tt_cci(src, length) =>
+    mean = tt_rma(src, length)
+    // MAD via RMA of abs deviation (series-length safe approximation of ta.cci)
+    mad = tt_rma(math.abs(src - mean), length)
+    mad == 0 ? 0.0 : (src - mean) / (0.015 * mad)
+
+tt_n_cci(src, n1, n2) =>
+    tt_rma(tt_cci(src, n1), n2)
+
+tt_wt(hlc3Src, n1, n2) =>
+    esa = tt_rma(hlc3Src, n1)
+    de = tt_rma(math.abs(hlc3Src - esa), n1)
+    ci = de == 0 ? 0.0 : (hlc3Src - esa) / (0.015 * de)
+    tt_rma(ci, n2)
+
+tt_adx(highSrc, lowSrc, closeSrc, n1) =>
+    upMove = highSrc - highSrc[1]
+    downMove = lowSrc[1] - lowSrc
+    plusDM = upMove > downMove and upMove > 0 ? upMove : 0.0
+    minusDM = downMove > upMove and downMove > 0 ? downMove : 0.0
+    tr = math.max(highSrc - lowSrc, math.max(math.abs(highSrc - closeSrc[1]), math.abs(lowSrc - closeSrc[1])))
+    atrLen = tt_rma(tr, n1)
+    plusDI = atrLen == 0 ? 0.0 : 100.0 * tt_rma(plusDM, n1) / atrLen
+    minusDI = atrLen == 0 ? 0.0 : 100.0 * tt_rma(minusDM, n1) / atrLen
+    dx = (plusDI + minusDI) == 0 ? 0.0 : 100.0 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    tt_rma(dx, n1)
+
+series_from(feature_string, _close, _high, _low, _hlc3, f_paramA, f_paramB) =>
+    switch feature_string
+        "RSI" => tt_n_rsi(_close, f_paramA, f_paramB)
+        "WT" => tt_wt(_hlc3, f_paramA, f_paramB)
+        "CCI" => tt_n_cci(_close, f_paramA, f_paramB)
+        "ADX" => tt_adx(_high, _low, _close, f_paramA)
+        => tt_n_rsi(_close, f_paramA, f_paramB)
+
+// Kernel estimate with const loop bound so lookback can be series (from sync code).
+tt_kernel_rq(src, lookback, relativeWeight, startAtBar) =>
+    currentWeight = 0.0
+    cumulativeWeight = 0.0
+    upper = math.min(1 + startAtBar, bar_index)
+    for i = 0 to 499
+        if i <= upper
+            weight = math.pow(1.0 + (i * i) / math.max(lookback * lookback * 2.0 * relativeWeight, 1e-10), -relativeWeight)
+            currentWeight += nz(src[i]) * weight
+            cumulativeWeight += weight
+    cumulativeWeight > 0 ? currentWeight / cumulativeWeight : src
+
+tt_kernel_gauss(src, lookback, startAtBar) =>
+    currentWeight = 0.0
+    cumulativeWeight = 0.0
+    upper = math.min(1 + startAtBar, bar_index)
+    for i = 0 to 499
+        if i <= upper
+            weight = math.exp(-(i * i) / math.max(2.0 * lookback * lookback, 1e-10))
+            currentWeight += nz(src[i]) * weight
+            cumulativeWeight += weight
+    cumulativeWeight > 0 ? currentWeight / cumulativeWeight : src
+
+get_lorentzian_distance(i, featureCount, FeatureSeries featureSeries, FeatureArrays featureArrays) =>
+    switch featureCount
+        5 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i))) + math.log(1 + math.abs(featureSeries.f4 - array.get(featureArrays.f4, i))) + math.log(1 + math.abs(featureSeries.f5 - array.get(featureArrays.f5, i)))
+        4 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i))) + math.log(1 + math.abs(featureSeries.f4 - array.get(featureArrays.f4, i)))
+        3 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i)))
+        2 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i)))
+        => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i)))
+// -----------------------------
+// TensorTrader alert inputs
+// -----------------------------
+ttGroup = "TensorTrader Alerts"
+runMode = input.string("ALERT", "Run mode", options=["ALERT", "BACKTEST"], group=ttGroup)
+showInitialMessage = input.bool(false, "Show Initial Message", group=ttGroup)
+baseCurrency = input.string("USDT", "Base Currency", options=["USDT", "USDC", "USD"], group=ttGroup)
+defaultOrderSizeUsd = input.float(100.0, "Default order size / Fixed amount in USD", minval=0.0, step=1.0, group=ttGroup)
+initialDate = input.time(1750291200000, "Initial date", group=ttGroup)
+finalDate = input.time(1813363200000, "Final date", group=ttGroup)
+timeSession = input.session("0000-2400", "Time session", group=ttGroup)
+
+dcaGroup = "DCA Across Timeframes"
+pyramidingOrders = input.int(3, "Pyramiding Orders", minval=1, maxval=5, group=dcaGroup)
+tfSpectrum = input.string("1,5,15,60,240,720,1440", "TF Spectrum", group=dcaGroup)
+dcaTf1 = input.timeframe("60", "Leg 1 / Base TF", group=dcaGroup)
+dcaTf2 = input.timeframe("240", "Leg 2 TF (+1 pyramid)", group=dcaGroup)
+dcaTf3 = input.timeframe("15", "Leg 3 TF (+2 pyramids)", group=dcaGroup)
+dcaTf4 = input.timeframe("720", "Leg 4 TF (+3 pyramids)", group=dcaGroup)
+dcaTf5 = input.timeframe("5", "Leg 5 TF (+4 pyramids)", group=dcaGroup)
+enforceDcaTfLegs = input.bool(false, "Require chart TF to match active DCA leg", group=dcaGroup)
+
+riskGroup = "ATR SL/TP"
+useAtrRisk = input.bool(true, "Use ATR SL/TP", group=riskGroup)
+atrLength = input.int(14, "ATR Length", minval=1, group=riskGroup)
+atrSlMult = input.float(2.0, "Stop Loss ATR Multiplier", minval=0.1, step=0.1, group=riskGroup)
+atrTpMult = input.float(3.0, "Take Profit ATR Multiplier", minval=0.1, step=0.1, group=riskGroup)
+
+syncGroup = "TT-Autotune Sync"
+// Packed format from TensorTrader: MR1|BULL_STRONG=TT1,...|BULL_WEAK=TT1,...|...
+// Outer separator is "|" because sync codes are comma-CSV. Script picks the active
+// regime's code every bar (same ADX/slope/ATR% classifier as the Python engine).
+// ponytail: KNN feature history mixes param sets across regime shifts; champions
+// were validated in isolation — upgrade path is per-regime feature buffers.
+regimeSyncCodes = input.string("", "Regime Sync Codes", group=syncGroup, tooltip="MR1|REGIME=TT1,...|... packed codes from TensorTrader. When set, the script switches sync code by live market regime.")
+syncCode = input.string("", "Sync Code", group=syncGroup, tooltip="Legacy single TT1,... CSV. Used only when Regime Sync Codes is empty.")
+// Thesis arms: DEFAULT = ML open/close (live funding sleeve). KERNEL_* force
+// entry+exit on kernel flips while still using the same regime sync codes.
+signalMode = input.string("DEFAULT", "Signal Mode", options=["DEFAULT", "KERNEL_RAW", "KERNEL_SMOOTH"], group=syncGroup, tooltip="DEFAULT = ML prediction entries/exits. KERNEL_RAW = isBullishChange/isBearishChange. KERNEL_SMOOTH = yhat2/yhat1 crossover. Regime sync codes still apply.")
+
+// --- Market-regime classifier (mirrors public_html/backend/app/engine/regime_classifier.py) ---
+tt_adx_period = 14
+tt_atr_period = 14
+tt_slope_window = 20
+tt_adx_strong = 25.0
+tt_adx_weak = 18.0
+// tf-tuned thresholds (RegimeConfig.for_tf)
+tt_is_intraday = timeframe.period == "5" or timeframe.period == "15"
+tt_is_1h = timeframe.period == "60"
+tt_is_4h = timeframe.period == "240"
+tt_slope_strong = tt_is_intraday ? 0.0005 : tt_is_1h ? 0.0012 : tt_is_4h ? 0.0020 : 0.0020
+tt_slope_weak = tt_is_intraday ? 0.00015 : tt_is_1h ? 0.00030 : tt_is_4h ? 0.00050 : 0.00050
+tt_chop_vol = tt_is_intraday ? 0.008 : tt_is_1h ? 0.012 : tt_is_4h ? 0.018 : 0.020
+tt_confirm_bars = tt_is_intraday ? 5 : tt_is_1h ? 4 : tt_is_4h ? 3 : 3
+tt_min_hold_bars = tt_is_intraday ? 10 : tt_is_1h ? 8 : tt_is_4h ? 6 : 5
+
+[tt_diplus, tt_diminus, tt_adx] = ta.dmi(tt_adx_period, tt_adx_period)
+tt_atr_pct = ta.atr(tt_atr_period) / close
+tt_lr0 = ta.linreg(close, tt_slope_window, 0)
+tt_lr1 = ta.linreg(close, tt_slope_window, 1)
+tt_slope_pct = close > 0 ? (tt_lr0 - tt_lr1) / close : na
+
+tt_raw_regime() =>
+    adx_v = tt_adx
+    slope_v = tt_slope_pct
+    vol_v = tt_atr_pct
+    if na(adx_v) or na(slope_v) or na(vol_v)
+        "UNKNOWN"
+    else if adx_v >= tt_adx_strong and slope_v >= tt_slope_strong
+        "BULL_STRONG"
+    else if adx_v >= tt_adx_strong and slope_v <= -tt_slope_strong
+        "BEAR_STRONG"
+    else if adx_v >= tt_adx_weak and slope_v >= tt_slope_weak
+        "BULL_WEAK"
+    else if adx_v >= tt_adx_weak and slope_v <= -tt_slope_weak
+        "BEAR_WEAK"
+    else if vol_v >= tt_chop_vol
+        "SIDEWAYS_CHOP"
+    else
+        "SIDEWAYS_QUIET"
+
+// Hysteresis must match _apply_hysteresis in regime_classifier.py exactly:
+// pending accumulates under min_hold; switch only when streak>=confirm AND
+// hold>=min_hold. (Earlier Pine zeroed pending under min_hold — that lagged
+// Python and made regime-switched sync codes disagree with the miner.)
+var string tt_reg_current = "UNKNOWN"
+var int tt_reg_hold = 0
+var string tt_reg_pending = "UNKNOWN"
+var int tt_reg_streak = 0
+tt_raw = tt_raw_regime()
+if tt_reg_current == "UNKNOWN"
+    tt_reg_current := tt_raw
+    tt_reg_hold := tt_raw != "UNKNOWN" ? 1 : 0
+    tt_reg_pending := "UNKNOWN"
+    tt_reg_streak := 0
+else if tt_raw == tt_reg_current or tt_raw == "UNKNOWN"
+    tt_reg_pending := "UNKNOWN"
+    tt_reg_streak := 0
+    tt_reg_hold += 1
+else
+    if tt_raw == tt_reg_pending
+        tt_reg_streak += 1
+    else
+        tt_reg_pending := tt_raw
+        tt_reg_streak := 1
+    if tt_reg_streak >= tt_confirm_bars and tt_reg_hold >= tt_min_hold_bars
+        tt_reg_current := tt_reg_pending
+        tt_reg_hold := 1
+        tt_reg_pending := "UNKNOWN"
+        tt_reg_streak := 0
+    else
+        tt_reg_hold += 1
+liveRegime = tt_reg_current
+// Numeric codes travel in alert messages via {{plot("Regime Code")}}.
+tt_regime_code = switch liveRegime
+    "BULL_STRONG" => 1
+    "BULL_WEAK" => 2
+    "BEAR_STRONG" => 3
+    "BEAR_WEAK" => 4
+    "SIDEWAYS_QUIET" => 5
+    "SIDEWAYS_CHOP" => 6
+    => 0
+plot(tt_regime_code, "Regime Code", display=display.none)
+
+// Extract REGIME=TT1,... segment from packed MR1|... string.
+tt_pick_packed(packed, regime) =>
+    string found = ""
+    segs = str.split(packed, "|")
+    prefix = regime + "="
+    if array.size(segs) >= 2 and array.get(segs, 0) == "MR1"
+        for i = 1 to array.size(segs) - 1
+            seg = array.get(segs, i)
+            if str.startswith(seg, prefix)
+                found := str.substring(seg, str.length(prefix))
+    found
+
+tt_regime_deployed(packed, regime) =>
+    str.length(tt_pick_packed(packed, regime)) > 4
+
+tt_fmt_hold(bars) =>
+    mins = timeframe.in_seconds() / 60.0 * bars
+    mins < 60 ? str.tostring(math.round(mins)) + "m" : mins < 1440 ? str.tostring(math.round(mins / 60.0 * 10) / 10.0) + "h" : str.tostring(math.round(mins / 1440.0 * 10) / 10.0) + "d"
+
+packedActive = str.length(regimeSyncCodes) > 4 and str.startswith(regimeSyncCodes, "MR1|")
+activeSyncCode = packedActive ? tt_pick_packed(regimeSyncCodes, liveRegime) : syncCode
+syncSource = packedActive ? "PACKED" : str.length(syncCode) > 0 ? "LEGACY" : "NONE"
+syncParts = str.split(activeSyncCode, ",")
+syncActive = array.size(syncParts) >= 30 and array.get(syncParts, 0) == "TT1"
+// Pine: int()/float() do not cast strings — use str.tonumber, then int() for whole numbers.
+sync_int(idx, fallback) =>
+    raw = syncActive ? str.tonumber(array.get(syncParts, idx)) : na
+    na(raw) ? fallback : int(raw)
+sync_float(idx, fallback) =>
+    raw = syncActive ? str.tonumber(array.get(syncParts, idx)) : na
+    na(raw) ? fallback : raw
+sync_bool(idx, fallback) =>
+    syncActive ? array.get(syncParts, idx) == "1" : fallback
+sync_str(idx, fallback) =>
+    syncActive ? array.get(syncParts, idx) : fallback
+
+selectedLegsText = switch pyramidingOrders
+    1 => dcaTf1
+    2 => dcaTf1 + "," + dcaTf2
+    3 => dcaTf3 + "," + dcaTf1 + "," + dcaTf2
+    4 => dcaTf3 + "," + dcaTf1 + "," + dcaTf2 + "," + dcaTf4
+    => dcaTf5 + "," + dcaTf3 + "," + dcaTf1 + "," + dcaTf2 + "," + dcaTf4
+isSelectedDcaTf = timeframe.period == dcaTf1 or (pyramidingOrders >= 2 and timeframe.period == dcaTf2) or (pyramidingOrders >= 3 and timeframe.period == dcaTf3) or (pyramidingOrders >= 4 and timeframe.period == dcaTf4) or (pyramidingOrders >= 5 and timeframe.period == dcaTf5)
+ttInDate = time >= initialDate and time <= finalDate
+ttInSession = not na(time(timeframe.period, timeSession))
+ttCanSignal = ttInDate and ttInSession and (not enforceDcaTfLegs or isSelectedDcaTf)
+
+// -----------------------------
+// Lorentzian inputs (+ Sync Code overrides)
+// -----------------------------
+srcIn = input.source(title="Source", defval=close, group="General Settings")
+neighborsIn = input.int(title="Neighbors Count", defval=8, group="General Settings", minval=1, maxval=100, step=1)
+maxBarsIn = input.int(title="Max Bars Back", defval=2000, group="General Settings")
+featureCountIn = input.int(title="Feature Count", defval=5, group="Feature Engineering", minval=2, maxval=5)
+colorCompressionIn = input.int(title="Color Compression", defval=1, group="General Settings", minval=1, maxval=10)
+showExitsIn = input.bool(title="Show Default Exits", defval=false, group="General Settings", inline="exits")
+useDynamicExitsIn = input.bool(title="Use Dynamic Exits", defval=false, group="General Settings", inline="exits")
+Settings settings = Settings.new(srcIn, sync_int(1, neighborsIn), sync_int(2, maxBarsIn), math.max(2, math.min(5, sync_int(3, featureCountIn))), colorCompressionIn, showExitsIn, useDynamicExitsIn)
+showTradeStats = input.bool(true, "Show Trade Stats", group="General Settings")
+useWorstCase = input.bool(false, "Use Worst Case Estimates", group="General Settings")
+
+useVolIn = input.bool(title="Use Volatility Filter", defval=true, group="Filters")
+useRegimeIn = input.bool(title="Use Regime Filter", defval=true, group="Filters", inline="regime")
+useAdxIn = input.bool(title="Use ADX Filter", defval=false, group="Filters", inline="adx")
+regimeThIn = input.float(title="Threshold", defval=-0.1, minval=-10, maxval=10, step=0.1, group="Filters", inline="regime")
+adxThIn = input.int(title="Threshold", defval=20, minval=0, maxval=100, step=1, group="Filters", inline="adx")
+FilterSettings filterSettings = FilterSettings.new(sync_bool(10, useVolIn), sync_bool(11, useRegimeIn), sync_bool(12, useAdxIn), sync_float(13, regimeThIn), sync_int(14, adxThIn))
+Filter filter = Filter.new(ml.filter_volatility(1, 10, filterSettings.useVolatilityFilter), ml.regime_filter(ohlc4, filterSettings.regimeThreshold, filterSettings.useRegimeFilter), ml.filter_adx(settings.source, 14, filterSettings.adxThreshold, filterSettings.useAdxFilter))
+
+f1_string_in = input.string(title="Feature 1", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", inline="01", group="Feature Engineering")
+f1_paramA_in = input.int(title="Parameter A", defval=14, inline="02", group="Feature Engineering")
+f1_paramB_in = input.int(title="Parameter B", defval=1, inline="02", group="Feature Engineering")
+f2_string_in = input.string(title="Feature 2", options=["RSI", "WT", "CCI", "ADX"], defval="WT", inline="03", group="Feature Engineering")
+f2_paramA_in = input.int(title="Parameter A", defval=10, inline="04", group="Feature Engineering")
+f2_paramB_in = input.int(title="Parameter B", defval=11, inline="04", group="Feature Engineering")
+f3_string_in = input.string(title="Feature 3", options=["RSI", "WT", "CCI", "ADX"], defval="CCI", inline="05", group="Feature Engineering")
+f3_paramA_in = input.int(title="Parameter A", defval=20, inline="06", group="Feature Engineering")
+f3_paramB_in = input.int(title="Parameter B", defval=1, inline="06", group="Feature Engineering")
+f4_string_in = input.string(title="Feature 4", options=["RSI", "WT", "CCI", "ADX"], defval="ADX", inline="07", group="Feature Engineering")
+f4_paramA_in = input.int(title="Parameter A", defval=20, inline="08", group="Feature Engineering")
+f4_paramB_in = input.int(title="Parameter B", defval=2, inline="08", group="Feature Engineering")
+f5_string_in = input.string(title="Feature 5", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", inline="09", group="Feature Engineering")
+f5_paramA_in = input.int(title="Parameter A", defval=9, inline="10", group="Feature Engineering")
+f5_paramB_in = input.int(title="Parameter B", defval=1, inline="10", group="Feature Engineering")
+f1_string = sync_str(15, f1_string_in)
+f1_paramA = sync_int(16, f1_paramA_in)
+f1_paramB = sync_int(17, f1_paramB_in)
+f2_string = sync_str(18, f2_string_in)
+f2_paramA = sync_int(19, f2_paramA_in)
+f2_paramB = sync_int(20, f2_paramB_in)
+f3_string = sync_str(21, f3_string_in)
+f3_paramA = sync_int(22, f3_paramA_in)
+f3_paramB = sync_int(23, f3_paramB_in)
+f4_string = sync_str(24, f4_string_in)
+f4_paramA = sync_int(25, f4_paramA_in)
+f4_paramB = sync_int(26, f4_paramB_in)
+f5_string = sync_str(27, f5_string_in)
+f5_paramA = sync_int(28, f5_paramA_in)
+f5_paramB = sync_int(29, f5_paramB_in)
+
+FeatureSeries featureSeries = FeatureSeries.new(series_from(f1_string, close, high, low, hlc3, f1_paramA, f1_paramB), series_from(f2_string, close, high, low, hlc3, f2_paramA, f2_paramB), series_from(f3_string, close, high, low, hlc3, f3_paramA, f3_paramB), series_from(f4_string, close, high, low, hlc3, f4_paramA, f4_paramB), series_from(f5_string, close, high, low, hlc3, f5_paramA, f5_paramB))
+
+var f1Array = array.new_float()
+var f2Array = array.new_float()
+var f3Array = array.new_float()
+var f4Array = array.new_float()
+var f5Array = array.new_float()
+array.push(f1Array, featureSeries.f1)
+array.push(f2Array, featureSeries.f2)
+array.push(f3Array, featureSeries.f3)
+array.push(f4Array, featureSeries.f4)
+array.push(f5Array, featureSeries.f5)
+FeatureArrays featureArrays = FeatureArrays.new(f1Array, f2Array, f3Array, f4Array, f5Array)
+Label direction = Label.new(long=1, short=-1, neutral=0)
+maxBarsBackIndex = last_bar_index >= settings.maxBarsBack ? last_bar_index - settings.maxBarsBack : 0
+
+useEmaFilter = input.bool(title="Use EMA Filter", defval=false, group="Filters", inline="ema")
+emaPeriod = input.int(title="Period", defval=200, minval=1, step=1, group="Filters", inline="ema")
+isEmaUptrend = useEmaFilter ? close > ta.ema(close, emaPeriod) : true
+isEmaDowntrend = useEmaFilter ? close < ta.ema(close, emaPeriod) : true
+useSmaFilter = input.bool(title="Use SMA Filter", defval=false, group="Filters", inline="sma")
+smaPeriod = input.int(title="Period", defval=200, minval=1, step=1, group="Filters", inline="sma")
+isSmaUptrend = useSmaFilter ? close > ta.sma(close, smaPeriod) : true
+isSmaDowntrend = useSmaFilter ? close < ta.sma(close, smaPeriod) : true
+
+useKernelFilterIn = input.bool(true, "Trade with Kernel", group="Kernel Settings", inline="kernel")
+showKernelEstimate = input.bool(true, "Show Kernel Estimate", group="Kernel Settings", inline="kernel")
+useKernelSmoothingIn = input.bool(false, "Enhance Kernel Smoothing", inline="1", group="Kernel Settings")
+hIn = input.int(8, "Lookback Window", minval=3, group="Kernel Settings", inline="kernel")
+rIn = input.float(8.0, "Relative Weighting", step=0.25, group="Kernel Settings", inline="kernel")
+xIn = input.int(25, "Regression Level", group="Kernel Settings", inline="kernel")
+lagIn = input.int(2, "Lag", inline="1", group="Kernel Settings")
+useKernelFilter = sync_bool(8, useKernelFilterIn)
+useKernelSmoothing = sync_bool(9, useKernelSmoothingIn)
+h = sync_int(4, hIn)
+r = sync_float(5, rIn)
+x = sync_int(6, xIn)
+lag = sync_int(7, lagIn)
+
+showBarColors = input.bool(true, "Show Bar Colors", group="Display Settings")
+showBarPredictions = input.bool(defval=true, title="Show Bar Prediction Values", group="Display Settings")
+useAtrOffset = input.bool(defval=false, title="Use ATR Offset", group="Display Settings")
+barPredictionsOffset = input.float(0, "Bar Prediction Offset", minval=0, group="Display Settings")
+showRegimeChips = input.bool(true, "Show Regime Chips", group="Display Settings", tooltip="On-chart table: GREEN = live regime (+ hold time), RED = missing from packed Regime Sync Codes, gray = deployed in pack but not active. TradingView Inputs panel cannot show live chips.")
+
+src = settings.source
+y_train_series = src[4] < src[0] ? direction.short : src[4] > src[0] ? direction.long : direction.neutral
+var y_train_array = array.new_int(0)
+var predictions = array.new_float(0)
+var prediction = 0.0
+var signal = direction.neutral
+var distances = array.new_float(0)
+array.push(y_train_array, y_train_series)
+
+lastDistance = -1.0
+size = math.min(settings.maxBarsBack - 1, array.size(y_train_array) - 1)
+sizeLoop = math.min(settings.maxBarsBack - 1, size)
+// Sliding neighbor pool: the most recent maxBarsBack bars instead of the
+// original jdehorty scan of the OLDEST maxBarsBack bars of loaded history.
+// The skip runs every 4th bar counted back from the current bar, so both the
+// pool and the skip pattern are independent of how much chart history
+// TradingView loaded (and the current bar can never match itself). Mirrors
+// the Python port's neighbor_pool="recent" mode used by the TTv optimizer —
+// keep the two implementations in lockstep.
+poolBase = math.max(0, array.size(y_train_array) - settings.maxBarsBack)
+if bar_index >= maxBarsBackIndex
+    // Const loop bound: sizeLoop is series when Sync Code overrides maxBarsBack.
+    for i = 0 to 1999
+        if i <= sizeLoop
+            idx = poolBase + i
+            d = get_lorentzian_distance(idx, settings.featureCount, featureSeries, featureArrays)
+            if d >= lastDistance and (bar_index - idx) % 4 != 0
+                lastDistance := d
+                array.push(distances, d)
+                array.push(predictions, math.round(array.get(y_train_array, idx)))
+                if array.size(predictions) > settings.neighborsCount
+                    lastDistance := array.get(distances, int(math.round(settings.neighborsCount * 3 / 4)))
+                    array.shift(distances)
+                    array.shift(predictions)
+    prediction := array.sum(predictions)
+
+filter_all = filter.volatility and filter.regime and filter.adx
+signal := prediction > 0 and filter_all ? direction.long : prediction < 0 and filter_all ? direction.short : nz(signal[1])
+
+var int barsHeld = 0
+signalChanged = ta.change(signal) != 0
+signal1Changed = ta.change(signal[1]) != 0
+signal2Changed = ta.change(signal[2]) != 0
+signal3Changed = ta.change(signal[3]) != 0
+barsHeld := signalChanged ? 0 : barsHeld + 1
+isHeldFourBars = barsHeld == 4
+isHeldLessThanFourBars = 0 < barsHeld and barsHeld < 4
+isDifferentSignalType = signalChanged
+isEarlySignalFlip = signalChanged and (signal1Changed or signal2Changed or signal3Changed)
+isBuySignal = signal == direction.long and isEmaUptrend and isSmaUptrend
+isSellSignal = signal == direction.short and isEmaDowntrend and isSmaDowntrend
+isLastSignalBuy = signal[4] == direction.long and isEmaUptrend[4] and isSmaUptrend[4]
+isLastSignalSell = signal[4] == direction.short and isEmaDowntrend[4] and isSmaDowntrend[4]
+isNewBuySignal = isBuySignal and isDifferentSignalType
+isNewSellSignal = isSellSignal and isDifferentSignalType
+
+c_green = color.new(#009988, 20)
+c_red = color.new(#CC3311, 20)
+transparent = color.new(#000000, 100)
+yhat1 = tt_kernel_rq(settings.source, h, r, x)
+yhat2 = tt_kernel_gauss(settings.source, math.max(h - lag, 1), x)
+kernelEstimate = yhat1
+bool wasBearishRate = yhat1[2] > yhat1[1]
+bool wasBullishRate = yhat1[2] < yhat1[1]
+bool isBearishRate = yhat1[1] > yhat1
+bool isBullishRate = yhat1[1] < yhat1
+isBearishChange = isBearishRate and wasBullishRate
+isBullishChange = isBullishRate and wasBearishRate
+bool isBullishCrossAlert = ta.crossover(yhat2, yhat1)
+bool isBearishCrossAlert = ta.crossunder(yhat2, yhat1)
+bool isBullishSmooth = yhat2 >= yhat1
+bool isBearishSmooth = yhat2 <= yhat1
+color colorByCross = isBullishSmooth ? c_green : c_red
+color colorByRate = isBullishRate ? c_green : c_red
+color plotColor = showKernelEstimate ? (useKernelSmoothing ? colorByCross : colorByRate) : transparent
+plot(kernelEstimate, color=plotColor, linewidth=2, title="Kernel Regression Estimate")
+bool alertBullish = useKernelSmoothing ? isBullishCrossAlert : isBullishChange
+bool alertBearish = useKernelSmoothing ? isBearishCrossAlert : isBearishChange
+isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true
+isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true
+
+startLongTradeDefault = isNewBuySignal and isBullish and isEmaUptrend and isSmaUptrend
+startShortTradeDefault = isNewSellSignal and isBearish and isEmaDowntrend and isSmaDowntrend
+barsSinceRedEntry = ta.barssince(startShortTradeDefault)
+barsSinceRedExit = ta.barssince(alertBullish)
+barsSinceGreenEntry = ta.barssince(startLongTradeDefault)
+barsSinceGreenExit = ta.barssince(alertBearish)
+isValidShortExit = barsSinceRedExit > barsSinceRedEntry
+isValidLongExit = barsSinceGreenExit > barsSinceGreenEntry
+endLongTradeDynamic = isBearishChange and isValidLongExit[1]
+endShortTradeDynamic = isBullishChange and isValidShortExit[1]
+endLongTradeStrict = ((isHeldFourBars and isLastSignalBuy) or (isHeldLessThanFourBars and isNewSellSignal and isLastSignalBuy)) and startLongTradeDefault[4]
+endShortTradeStrict = ((isHeldFourBars and isLastSignalSell) or (isHeldLessThanFourBars and isNewBuySignal and isLastSignalSell)) and startShortTradeDefault[4]
+isDynamicExitValid = not useEmaFilter and not useSmaFilter and not useKernelSmoothing
+endLongTradeDefault = settings.useDynamicExits and isDynamicExitValid ? endLongTradeDynamic : endLongTradeStrict
+endShortTradeDefault = settings.useDynamicExits and isDynamicExitValid ? endShortTradeDynamic : endShortTradeStrict
+
+// Signal Mode selects the position trigger. DEFAULT is bit-identical to the
+// pre-signalMode script (uses start*Default / end*Default above). Kernel modes
+// enter+exit on the matching kernel flip; ML/regime chips still compute.
+kernelLongTrigger = signalMode == "KERNEL_SMOOTH" ? isBullishCrossAlert : isBullishChange
+kernelShortTrigger = signalMode == "KERNEL_SMOOTH" ? isBearishCrossAlert : isBearishChange
+useKernelTriggers = signalMode == "KERNEL_RAW" or signalMode == "KERNEL_SMOOTH"
+startLongTrade = useKernelTriggers ? kernelLongTrigger : startLongTradeDefault
+startShortTrade = useKernelTriggers ? kernelShortTrigger : startShortTradeDefault
+endLongTrade = useKernelTriggers ? kernelShortTrigger : endLongTradeDefault
+endShortTrade = useKernelTriggers ? kernelLongTrigger : endShortTradeDefault
+
+// Strategy orders. One TV strategy alert covers long/short entry + exit via
+// {{strategy.order.*}} placeholders (see extension strategy_v6 template).
+ttLongEntry = startLongTrade and ttCanSignal and strategy.opentrades < pyramidingOrders
+ttShortEntry = startShortTrade and ttCanSignal and strategy.opentrades < pyramidingOrders
+atr = ta.atr(atrLength)
+qtyCash = math.max(defaultOrderSizeUsd, 1.0)
+
+if ttLongEntry
+    strategy.entry("TTLong", strategy.long, qty=qtyCash, comment="open_long")
+if ttShortEntry
+    strategy.entry("TTShort", strategy.short, qty=qtyCash, comment="open_short")
+
+if strategy.position_size > 0 and endLongTrade
+    strategy.close("TTLong", comment="close_long")
+if strategy.position_size < 0 and endShortTrade
+    strategy.close("TTShort", comment="close_short")
+
+if useAtrRisk and strategy.position_size > 0
+    strategy.exit("TTLongATR", from_entry="TTLong", stop=strategy.position_avg_price - atr * atrSlMult, limit=strategy.position_avg_price + atr * atrTpMult, comment="atr_exit")
+if useAtrRisk and strategy.position_size < 0
+    strategy.exit("TTShortATR", from_entry="TTShort", stop=strategy.position_avg_price + atr * atrSlMult, limit=strategy.position_avg_price - atr * atrTpMult, comment="atr_exit")
+
+ttLongExit = strategy.position_size[1] > 0 and strategy.position_size <= 0
+ttShortExit = strategy.position_size[1] < 0 and strategy.position_size >= 0
+
+plotshape(ttLongEntry ? low : na, "Buy", shape.labelup, location.belowbar, color=ml.color_green(prediction), size=size.small, offset=0)
+plotshape(ttShortEntry ? high : na, "Sell", shape.labeldown, location.abovebar, ml.color_red(-prediction), size=size.small, offset=0)
+plotshape(ttLongExit and settings.showExits ? high : na, "StopBuy", shape.xcross, location.absolute, color=#3AFF17, size=size.tiny, offset=0)
+plotshape(ttShortExit and settings.showExits ? low : na, "StopSell", shape.xcross, location.absolute, color=#FD1707, size=size.tiny, offset=0)
+
+atrSpaced = useAtrOffset ? ta.atr(1) : na
+compressionFactor = settings.neighborsCount / settings.colorCompression
+c_pred = prediction > 0 ? color.from_gradient(prediction, 0, compressionFactor, #787b86, #009988) : prediction <= 0 ? color.from_gradient(prediction, -compressionFactor, 0, #CC3311, #787b86) : na
+c_label = showBarPredictions ? c_pred : na
+c_bars = showBarColors ? color.new(c_pred, 50) : na
+x_val = bar_index
+y_val = useAtrOffset ? prediction > 0 ? high + atrSpaced : low - atrSpaced : prediction > 0 ? high + hl2 * barPredictionsOffset / 20 : low - hl2 * barPredictionsOffset / 30
+label.new(x_val, y_val, str.tostring(prediction), xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up, c_label, size.normal, text.align_left)
+barcolor(showBarColors ? c_bars : na)
+
+backTestStream = switch
+    ttLongEntry => 1
+    ttLongExit => 2
+    ttShortEntry => -1
+    ttShortExit => -2
+plot(backTestStream, "Backtest Stream", display=display.none)
+
+[totalWins, totalLosses, totalEarlySignalFlips, totalTrades, tradeStatsHeader, winLossRatio, winRate] = ml.backtest(high, low, open, ttLongEntry, ttLongExit, ttShortEntry, ttShortExit, isEarlySignalFlip, maxBarsBackIndex, bar_index, settings.source, useWorstCase)
+if showTradeStats
+    var tbl = ml.init_table()
+    if barstate.islast
+        ml.update_table(tbl, tradeStatsHeader, totalTrades, totalWins, totalLosses, winLossRatio, winRate, totalEarlySignalFlips)
+
+// Bottom left, under the regime chips (middle left) — TT-Lorentzian keeps its
+// info bottom_right and stats top_center, so AB charts never share a corner.
+var table ttInfo = table.new(position.bottom_left, 2, 7, bgcolor=color.new(#131722, 0), frame_color=color.new(color.gray, 40), frame_width=1)
+if barstate.islast
+    table.cell(ttInfo, 0, 0, "TT-Autotune", text_color=color.white, bgcolor=color.new(#131722, 0))
+    table.cell(ttInfo, 1, 0, syncActive ? "SYNC · " + syncSource : runMode, text_color=color.white, bgcolor=color.new(#131722, 0))
+    table.cell(ttInfo, 0, 1, "Regime", text_color=color.gray)
+    table.cell(ttInfo, 1, 1, liveRegime + " (" + str.tostring(tt_regime_code) + ")", text_color=color.white)
+    table.cell(ttInfo, 0, 2, "Base currency", text_color=color.gray)
+    table.cell(ttInfo, 1, 2, baseCurrency, text_color=color.white)
+    table.cell(ttInfo, 0, 3, "Fixed USD", text_color=color.gray)
+    table.cell(ttInfo, 1, 3, str.tostring(defaultOrderSizeUsd), text_color=color.white)
+    table.cell(ttInfo, 0, 4, "DCA legs", text_color=color.gray)
+    table.cell(ttInfo, 1, 4, selectedLegsText, text_color=color.white)
+    table.cell(ttInfo, 0, 5, "ATR SL/TP", text_color=color.gray)
+    table.cell(ttInfo, 1, 5, str.tostring(atrLength) + " / " + str.tostring(atrSlMult) + "x / " + str.tostring(atrTpMult) + "x", text_color=color.white)
+    table.cell(ttInfo, 0, 6, "Session", text_color=color.gray)
+    table.cell(ttInfo, 1, 6, timeSession, text_color=color.white)
+
+// Regime chips: which champions are in the packed sync string, which is live, hold duration.
+// TradingView Inputs/settings cannot host live chips — this table is the runtime surface.
+// Middle left — clear of trade-stats (top right), directly above Autotune info (bottom left).
+var table ttRegimeChips = table.new(position.middle_left, 3, 8, bgcolor=color.new(#131722, 0), frame_color=color.new(color.gray, 40), frame_width=1, border_width=1, border_color=color.new(color.gray, 60))
+if barstate.islast and showRegimeChips
+    c_chip_active = color.new(#009988, 15)
+    c_chip_deployed = color.new(#787b86, 55)
+    c_chip_missing = color.new(#CC3311, 25)
+    c_txt = color.white
+    table.cell(ttRegimeChips, 0, 0, "Regime", text_color=color.gray, text_size=size.small)
+    table.cell(ttRegimeChips, 1, 0, packedActive ? "Pack" : syncSource, text_color=color.gray, text_size=size.small)
+    table.cell(ttRegimeChips, 2, 0, "Hold", text_color=color.gray, text_size=size.small)
+    regimes = array.from("BULL_STRONG", "BULL_WEAK", "BEAR_STRONG", "BEAR_WEAK", "SIDEWAYS_QUIET", "SIDEWAYS_CHOP")
+    for i = 0 to 5
+        reg = array.get(regimes, i)
+        deployed = packedActive ? tt_regime_deployed(regimeSyncCodes, reg) : syncSource == "LEGACY"
+        is_live = reg == liveRegime
+        bg = is_live ? c_chip_active : deployed ? c_chip_deployed : c_chip_missing
+        status = is_live ? "LIVE" : deployed ? "IN" : "OUT"
+        hold = is_live ? str.tostring(tt_reg_hold) + "b · " + tt_fmt_hold(tt_reg_hold) : "—"
+        table.cell(ttRegimeChips, 0, i + 1, reg, bgcolor=bg, text_color=c_txt, text_size=size.small)
+        table.cell(ttRegimeChips, 1, i + 1, status, bgcolor=bg, text_color=c_txt, text_size=size.small)
+        table.cell(ttRegimeChips, 2, i + 1, hold, bgcolor=bg, text_color=c_txt, text_size=size.small)
+else if barstate.islast
+    table.clear(ttRegimeChips, 0, 0, 2, 7)
+
+if barstate.isfirst and showInitialMessage
+    label.new(bar_index, high, "TT-Autotune initialized", style=label.style_label_down, textcolor=color.white, color=color.new(color.blue, 20))

@@ -1,0 +1,450 @@
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+//
+// © Original concept by BigBeluga (Target Trend)
+// Enhanced & expanded version for public release
+// Free to use. Please keep credits if you share or modify (ShareAlike).
+//
+//@version=6
+indicator("Target Trend Pro", shorttitle = "TTP", overlay = true, 
+     max_lines_count = 100, max_labels_count = 100, max_boxes_count = 50)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Trend Detection
+grp_trend = "══════ Trend Detection ══════"
+length         = input.int(10, "Trend Length", minval = 1, group = grp_trend,
+     tooltip = "Lookback period for the SMA bands that detect trend changes. Lower = more sensitive.")
+atr_len        = input.int(14, "ATR Length", minval = 1, group = grp_trend,
+     tooltip = "Period used to calculate Average True Range for band width and target distances.")
+atr_mult_bands = input.float(0.8, "ATR Mult (Bands)", step = 0.1, group = grp_trend,
+     tooltip = "Multiplier applied to ATR when building the upper/lower trend bands.")
+use_smooth_atr = input.bool(true, "Smooth ATR", group = grp_trend,
+     tooltip = "If enabled, ATR is smoothed with an SMA of the same length for more stable bands.")
+show_bands     = input.bool(false, "Show SMA Bands", group = grp_trend,
+     tooltip = "Display the actual upper and lower SMA ± ATR bands on the chart.")
+
+// ── Targets & Stop
+grp_targets = "══════ Targets & Stop ══════"
+tp1_mult       = input.float(5.0,  "TP1 ATR Multiplier", step = 0.5, group = grp_targets,
+     tooltip = "Distance of Take Profit 1 from entry, measured in ATR units.")
+tp2_mult       = input.float(10.0, "TP2 ATR Multiplier", step = 0.5, group = grp_targets,
+     tooltip = "Distance of Take Profit 2 from entry, measured in ATR units.")
+tp3_mult       = input.float(15.0, "TP3 ATR Multiplier", step = 0.5, group = grp_targets,
+     tooltip = "Distance of Take Profit 3 from entry, measured in ATR units.")
+target_offset  = input.int(0, "Target Offset", group = grp_targets,
+     tooltip = "Extra offset added to all target multipliers (useful for fine-tuning).")
+use_trailing_sl = input.bool(false, "Trailing Stop as SL", group = grp_targets,
+     tooltip = "If enabled, the Stop Loss follows the trend band in the favorable direction only.")
+sl_buffer_atr  = input.float(0.0, "Extra SL Buffer (ATR)", step = 0.1, group = grp_targets,
+     tooltip = "Additional ATR distance added beyond the band for the initial Stop Loss.")
+
+// ── Filters
+grp_filters = "══════ Filters ══════"
+use_adx     = input.bool(true, "ADX Filter", group = grp_filters,
+     tooltip = "Only allow new signals when ADX is above the threshold (filters weak trends).")
+adx_len     = input.int(14, "ADX Length", minval = 1, group = grp_filters)
+adx_thresh  = input.float(20.0, "ADX Threshold", step = 1, group = grp_filters,
+     tooltip = "Minimum ADX value required to accept a new entry signal.")
+use_htf     = input.bool(false, "Higher Timeframe Filter", group = grp_filters,
+     tooltip = "Confirm signals with the trend direction of a higher timeframe.")
+htf_tf      = input.timeframe("60", "Higher Timeframe", group = grp_filters)
+use_volume  = input.bool(false, "Volume Filter", group = grp_filters,
+     tooltip = "Require current volume to be above its SMA before accepting a signal.")
+vol_len     = input.int(20, "Volume SMA Length", group = grp_filters)
+
+// ── Display
+grp_mgmt = "══════ Display ══════"
+line_extend_bars = input.int(25, "Line Extension (bars)", minval = 5, group = grp_mgmt,
+     tooltip = "How many bars the target / SL / Entry lines extend to the right.")
+show_dashboard   = input.bool(true, "Show Dashboard", group = grp_mgmt)
+dash_pos         = input.string("Top Right", "Dashboard Position", 
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grp_mgmt)
+show_fill        = input.bool(true, "Show Trailing Fill", group = grp_mgmt)
+show_signals     = input.bool(true, "Show Entry Triangles", group = grp_mgmt)
+hide_after_hit   = input.bool(false, "Hide Lines After Full Exit", group = grp_mgmt,
+     tooltip = "When TP3 or SL is hit, remove the lines and labels to keep the chart clean.")
+
+// ── Colors
+grp_colors = "══════ Colors ══════"
+up_color    = input.color(#06b690, "Bull Color", group = grp_colors)
+dn_color    = input.color(#b67006, "Bear Color", group = grp_colors)
+sl_color    = input.color(#db1e1e, "Stop Loss Color", group = grp_colors)
+entry_color = input.color(#1d80dd, "Entry Color", group = grp_colors)
+tp_color    = input.color(#16ac09, "Target Hit Color", group = grp_colors)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  CALCULATIONS
+// ══════════════════════════════════════════════════════════════════════════════
+
+var bool trend = false
+float trend_value = na
+
+// ATR
+float raw_atr   = ta.atr(atr_len)
+float atr_value = use_smooth_atr ? ta.sma(raw_atr, atr_len) * atr_mult_bands : raw_atr * atr_mult_bands
+
+// Bands
+float sma_high = ta.sma(high, length) + atr_value
+float sma_low  = ta.sma(low, length)  - atr_value
+
+// ADX
+[diplus, diminus, adx] = ta.dmi(adx_len, adx_len)
+bool adx_ok = not use_adx or adx >= adx_thresh
+
+// Volume
+float vol_sma = ta.sma(volume, vol_len)
+bool vol_ok   = not use_volume or volume > vol_sma
+
+// Higher Timeframe (must be called unconditionally)
+float htf_close = request.security(syminfo.tickerid, htf_tf, close, barmerge.gaps_off, barmerge.lookahead_off)
+float htf_sma_h = request.security(syminfo.tickerid, htf_tf, ta.sma(high, length), barmerge.gaps_off, barmerge.lookahead_off) + atr_value
+float htf_sma_l = request.security(syminfo.tickerid, htf_tf, ta.sma(low, length),  barmerge.gaps_off, barmerge.lookahead_off) - atr_value
+bool htf_bull   = not use_htf or htf_close > htf_sma_h
+bool htf_bear   = not use_htf or htf_close < htf_sma_l
+
+// Trend state
+if ta.crossover(close, sma_high) and barstate.isconfirmed and adx_ok and vol_ok and htf_bull
+    trend := true
+if ta.crossunder(close, sma_low) and barstate.isconfirmed and adx_ok and vol_ok and htf_bear
+    trend := false
+
+trend_value := trend ? sma_low : not trend ? sma_high : na
+color trend_color = trend ? up_color : not trend ? dn_color : na
+
+// Signals
+bool signal_up   = ta.change(trend) and trend == true  and not trend[1]
+bool signal_down = ta.change(trend) and trend == false and trend[1]
+
+// Bars in current trade
+var int bars_in_up = 0
+var int bars_in_dn = 0
+if trend
+    bars_in_up += 1
+    bars_in_dn := 0
+else if not trend
+    bars_in_dn += 1
+    bars_in_up := 0
+else
+    bars_in_up := 0
+    bars_in_dn := 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  UDT + DRAWING
+// ══════════════════════════════════════════════════════════════════════════════
+
+type TrendTargets
+    line[]  lines
+    label[] labels
+    float   entry_price
+    float   sl_price
+    float   tp1_price
+    float   tp2_price
+    float   tp3_price
+    float   signal_atr          // ATR frozen at signal time
+    bool    active
+    bool    tp1_hit
+    bool    tp2_hit
+    bool    tp3_hit
+    bool    sl_hit
+
+var TrendTargets targets_up   = TrendTargets.new(array.new_line(), array.new_label(), na, na, na, na, na, na, false, false, false, false, false)
+var TrendTargets targets_down = TrendTargets.new(array.new_line(), array.new_label(), na, na, na, na, na, na, false, false, false, false, false)
+
+clear_targets(TrendTargets t) =>
+    int sz = array.size(t.lines)
+    if sz > 0
+        for i = 0 to sz - 1
+            line.delete(array.get(t.lines, i))
+            if i < array.size(t.labels)
+                label.delete(array.get(t.labels, i))
+    array.clear(t.lines)
+    array.clear(t.labels)
+    t.active      := false
+    t.tp1_hit     := false
+    t.tp2_hit     := false
+    t.tp3_hit     := false
+    t.sl_hit      := false
+    t.entry_price := na
+    t.sl_price    := na
+    t.tp1_price   := na
+    t.tp2_price   := na
+    t.tp3_price   := na
+    t.signal_atr  := na
+
+draw_new_targets(TrendTargets t, bool is_long, float atr_at_signal) =>
+    clear_targets(t)
+
+    float base_sl = is_long ? sma_low - (sl_buffer_atr * atr_at_signal) : sma_high + (sl_buffer_atr * atr_at_signal)
+    float entry   = close
+    float mult    = is_long ? 1.0 : -1.0
+
+    float tp1 = entry + (atr_at_signal * (tp1_mult + target_offset)     * mult)
+    float tp2 = entry + (atr_at_signal * (tp2_mult + target_offset * 2) * mult)
+    float tp3 = entry + (atr_at_signal * (tp3_mult + target_offset * 3) * mult)
+
+    // Lines
+    line sl_line = line.new(bar_index, base_sl, bar_index + line_extend_bars, base_sl, color = sl_color, width = 2)
+    line en_line = line.new(bar_index, entry,   bar_index + line_extend_bars, entry,   color = entry_color, width = 2)
+    line t1_line = line.new(bar_index, tp1,     bar_index + line_extend_bars, tp1,     color = chart.fg_color, width = 1)
+    line t2_line = line.new(bar_index, tp2,     bar_index + line_extend_bars, tp2,     color = chart.fg_color, width = 1)
+    line t3_line = line.new(bar_index, tp3,     bar_index + line_extend_bars, tp3,     color = chart.fg_color, width = 1)
+
+    linefill.new(sl_line, en_line, color.new(is_long ? dn_color : up_color, 92))
+    linefill.new(en_line, t3_line, color.new(is_long ? up_color : dn_color, 93))
+
+    // Labels
+    label sl_lab = label.new(bar_index + line_extend_bars, base_sl, "SL  " + str.tostring(math.round(base_sl, 2)),
+         style = label.style_label_left, color = chart.fg_color, textcolor = chart.bg_color, size = size.small)
+    label en_lab = label.new(bar_index + line_extend_bars, entry, "◉ " + str.tostring(math.round(entry, 2)),
+         style = label.style_label_left, color = chart.fg_color, textcolor = entry_color, size = size.small)
+    label t1_lab = label.new(bar_index + line_extend_bars, tp1, "1  " + str.tostring(math.round(tp1, 2)),
+         style = label.style_label_left, color = chart.fg_color, textcolor = chart.bg_color, size = size.small)
+    label t2_lab = label.new(bar_index + line_extend_bars, tp2, "2  " + str.tostring(math.round(tp2, 2)),
+         style = label.style_label_left, color = chart.fg_color, textcolor = chart.bg_color, size = size.small)
+    label t3_lab = label.new(bar_index + line_extend_bars, tp3, "3  " + str.tostring(math.round(tp3, 2)),
+         style = label.style_label_left, color = chart.fg_color, textcolor = chart.bg_color, size = size.small)
+
+    array.push(t.lines,  sl_line)
+    array.push(t.lines,  en_line)
+    array.push(t.lines,  t1_line)
+    array.push(t.lines,  t2_line)
+    array.push(t.lines,  t3_line)
+    array.push(t.labels, sl_lab)
+    array.push(t.labels, en_lab)
+    array.push(t.labels, t1_lab)
+    array.push(t.labels, t2_lab)
+    array.push(t.labels, t3_lab)
+
+    t.entry_price := entry
+    t.sl_price    := base_sl
+    t.tp1_price   := tp1
+    t.tp2_price   := tp2
+    t.tp3_price   := tp3
+    t.signal_atr  := atr_at_signal
+    t.active      := true
+    t.tp1_hit     := false
+    t.tp2_hit     := false
+    t.tp3_hit     := false
+    t.sl_hit      := false
+
+update_targets(TrendTargets t, bool is_long, int bars_in_trade) =>
+    if t.active and array.size(t.lines) >= 5
+        line  sl_line = array.get(t.lines, 0)
+        line  en_line = array.get(t.lines, 1)
+        line  t1_line = array.get(t.lines, 2)
+        line  t2_line = array.get(t.lines, 3)
+        line  t3_line = array.get(t.lines, 4)
+        label sl_lab  = array.get(t.labels, 0)
+        label en_lab  = array.get(t.labels, 1)
+        label t1_lab  = array.get(t.labels, 2)
+        label t2_lab  = array.get(t.labels, 3)
+        label t3_lab  = array.get(t.labels, 4)
+
+        // Extend
+        int x2 = bar_index + line_extend_bars
+        line.set_x2(sl_line, x2)
+        line.set_x2(en_line, x2)
+        line.set_x2(t1_line, x2)
+        line.set_x2(t2_line, x2)
+        line.set_x2(t3_line, x2)
+        label.set_x(sl_lab, x2)
+        label.set_x(en_lab, x2)
+        label.set_x(t1_lab, x2)
+        label.set_x(t2_lab, x2)
+        label.set_x(t3_lab, x2)
+
+        // Trailing SL
+        if use_trailing_sl and bars_in_trade > 1
+            float new_sl = is_long ? sma_low - (sl_buffer_atr * atr_value) : sma_high + (sl_buffer_atr * atr_value)
+            if is_long
+                new_sl := math.max(new_sl, t.sl_price)
+            else
+                new_sl := math.min(new_sl, t.sl_price)
+            t.sl_price := new_sl
+            line.set_y1(sl_line, new_sl)
+            line.set_y2(sl_line, new_sl)
+            label.set_y(sl_lab, new_sl)
+            label.set_text(sl_lab, "SL  " + str.tostring(math.round(new_sl, 2)))
+
+        // Hit detection
+        if bars_in_trade > 1
+            if not t.tp1_hit and ((is_long and high >= t.tp1_price) or (not is_long and low <= t.tp1_price))
+                t.tp1_hit := true
+                label.set_text(t1_lab, "✔ 1")
+                label.set_textcolor(t1_lab, tp_color)
+                line.set_style(t1_line, line.style_dashed)
+                line.set_color(t1_line, color.new(chart.fg_color, 55))
+
+            if not t.tp2_hit and ((is_long and high >= t.tp2_price) or (not is_long and low <= t.tp2_price))
+                t.tp2_hit := true
+                label.set_text(t2_lab, "✔ 2")
+                label.set_textcolor(t2_lab, tp_color)
+                line.set_style(t2_line, line.style_dashed)
+                line.set_color(t2_line, color.new(chart.fg_color, 55))
+
+            if not t.tp3_hit and ((is_long and high >= t.tp3_price) or (not is_long and low <= t.tp3_price))
+                t.tp3_hit := true
+                label.set_text(t3_lab, "✔ 3")
+                label.set_textcolor(t3_lab, tp_color)
+                line.set_style(t3_line, line.style_dashed)
+                line.set_color(t3_line, color.new(chart.fg_color, 55))
+
+            if not t.sl_hit and ((is_long and low <= t.sl_price) or (not is_long and high >= t.sl_price))
+                t.sl_hit := true
+                label.set_text(sl_lab, "✖ SL")
+                label.set_textcolor(sl_lab, #ff0000)
+                line.set_style(sl_line, line.style_dashed)
+                line.set_color(sl_line, color.new(sl_color, 40))
+
+        // Optional full cleanup
+        if hide_after_hit and (t.tp3_hit or t.sl_hit)
+            clear_targets(t)
+
+// Signals → draw
+if signal_up
+    clear_targets(targets_down)
+    draw_new_targets(targets_up, true, atr_value)
+
+if signal_down
+    clear_targets(targets_up)
+    draw_new_targets(targets_down, false, atr_value)
+
+// Live update
+if targets_up.active
+    update_targets(targets_up, true, bars_in_up)
+if targets_down.active
+    update_targets(targets_down, false, bars_in_dn)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PLOTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+plotcandle(open, high, low, close, title = "Trend Candles",
+     color = trend_color, wickcolor = trend_color, bordercolor = trend_color)
+
+plot(show_bands ? sma_high : na, "Upper Band", color = color.new(dn_color, 65), style = plot.style_linebr)
+plot(show_bands ? sma_low  : na, "Lower Band", color = color.new(up_color, 65), style = plot.style_linebr)
+
+p1 = plot(trend     ? trend_value : na, "Trail Up",   style = plot.style_linebr, color = color.new(chart.fg_color, 70))
+p2 = plot(not trend ? trend_value : na, "Trail Down", style = plot.style_linebr, color = color.new(chart.fg_color, 70))
+p0 = plot(hl2, display = display.none)
+fill(p1, p0, trend_value, hl2, show_fill ? color.new(chart.fg_color, 90) : na, na)
+fill(p2, p0, trend_value, hl2, show_fill ? color.new(chart.fg_color, 90) : na, na)
+
+float sigUp = signal_up   and show_signals ? low  - atr_value * 1.8 : na
+float sigDn = signal_down and show_signals ? high + atr_value * 1.8 : na
+plotshape(sigUp, title = "Long",  style = shape.triangleup,   location = location.absolute, color = up_color, size = size.tiny)
+plotshape(sigUp, title = "Long Glow", style = shape.triangleup, location = location.absolute, color = color.new(up_color, 75), size = size.small)
+plotshape(sigDn, title = "Short", style = shape.triangledown, location = location.absolute, color = dn_color, size = size.tiny)
+plotshape(sigDn, title = "Short Glow", style = shape.triangledown, location = location.absolute, color = color.new(dn_color, 75), size = size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(
+     dash_pos == "Top Right"    ? position.top_right    :
+     dash_pos == "Top Left"     ? position.top_left     :
+     dash_pos == "Bottom Right" ? position.bottom_right : position.bottom_left,
+     2, 10, bgcolor = color.new(#0d0d0d, 10), border_width = 1, border_color = color.new(chart.fg_color, 75))
+
+if show_dashboard and barstate.islast
+    bool has_trade = targets_up.active or targets_down.active
+    TrendTargets cur = targets_up.active ? targets_up : targets_down
+    color header_bg = trend ? up_color : dn_color
+
+    // Header
+    table.cell(dash, 0, 0, "Target Trend Pro", text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(header_bg, 75))
+    table.cell(dash, 1, 0, trend ? "LONG" : "SHORT", text_color = #ffffff, text_size = size.small, bgcolor = header_bg)
+
+    // Entry
+    table.cell(dash, 0, 1, "Entry", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 1, has_trade ? str.tostring(math.round(cur.entry_price, 2)) : "—", text_color = entry_color, text_size = size.small)
+
+    // Stop Loss + distance %
+    float sl_dist_pct = has_trade ? math.abs(cur.entry_price - cur.sl_price) / cur.entry_price * 100 : na
+    table.cell(dash, 0, 2, "Stop Loss", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 2, has_trade ? str.tostring(math.round(cur.sl_price, 2)) + "  (" + str.tostring(math.round(sl_dist_pct, 2)) + "%)" : "—", 
+         text_color = sl_color, text_size = size.small)
+
+    // TP1
+    float tp1_dist_pct = has_trade ? math.abs(cur.tp1_price - cur.entry_price) / cur.entry_price * 100 : na
+    table.cell(dash, 0, 3, "TP1", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 3, has_trade ? (cur.tp1_hit ? "✔ " : "") + str.tostring(math.round(cur.tp1_price, 2)) + "  (" + str.tostring(math.round(tp1_dist_pct, 2)) + "%)" : "—", 
+         text_color = cur.tp1_hit ? tp_color : chart.fg_color, text_size = size.small)
+
+    // TP2
+    float tp2_dist_pct = has_trade ? math.abs(cur.tp2_price - cur.entry_price) / cur.entry_price * 100 : na
+    table.cell(dash, 0, 4, "TP2", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 4, has_trade ? (cur.tp2_hit ? "✔ " : "") + str.tostring(math.round(cur.tp2_price, 2)) + "  (" + str.tostring(math.round(tp2_dist_pct, 2)) + "%)" : "—", 
+         text_color = cur.tp2_hit ? tp_color : chart.fg_color, text_size = size.small)
+
+    // TP3
+    float tp3_dist_pct = has_trade ? math.abs(cur.tp3_price - cur.entry_price) / cur.entry_price * 100 : na
+    table.cell(dash, 0, 5, "TP3", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 5, has_trade ? (cur.tp3_hit ? "✔ " : "") + str.tostring(math.round(cur.tp3_price, 2)) + "  (" + str.tostring(math.round(tp3_dist_pct, 2)) + "%)" : "—", 
+         text_color = cur.tp3_hit ? tp_color : chart.fg_color, text_size = size.small)
+
+    // R:R
+    float risk   = has_trade ? math.abs(cur.entry_price - cur.sl_price) : na
+    float reward = has_trade ? math.abs(cur.tp1_price - cur.entry_price) : na
+    string rr    = has_trade and risk > 0 ? "1 : " + str.tostring(math.round(reward / risk, 2)) : "—"
+    table.cell(dash, 0, 6, "R:R (TP1)", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 6, rr, text_color = chart.fg_color, text_size = size.small)
+
+    // ADX
+    table.cell(dash, 0, 7, "ADX", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(math.round(adx, 1)) + (adx_ok ? "  ✓" : "  ✗"), 
+         text_color = adx_ok ? tp_color : sl_color, text_size = size.small)
+
+    // Bars in trade
+    table.cell(dash, 0, 8, "Bars in Trade", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 8, str.tostring(trend ? bars_in_up : bars_in_dn), text_color = chart.fg_color, text_size = size.small)
+
+    // Status
+    string status = not has_trade ? "Waiting..." : 
+         cur.sl_hit ? "SL Hit" : 
+         cur.tp3_hit ? "TP3 Hit" : 
+         cur.tp2_hit ? "TP2 Hit" : 
+         cur.tp1_hit ? "TP1 Hit" : "In Trade"
+    table.cell(dash, 0, 9, "Status", text_color = color.gray, text_size = size.tiny)
+    table.cell(dash, 1, 9, status, text_color = chart.fg_color, text_size = size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(signal_up,   title = "Long Entry",  message = "Target Trend Pro • LONG on {{ticker}} @ {{close}}")
+alertcondition(signal_down, title = "Short Entry", message = "Target Trend Pro • SHORT on {{ticker}} @ {{close}}")
+
+var bool prev_tp1 = false
+var bool prev_tp2 = false
+var bool prev_tp3 = false
+var bool prev_sl  = false
+
+bool curr_tp1 = (targets_up.active and targets_up.tp1_hit) or (targets_down.active and targets_down.tp1_hit)
+bool curr_tp2 = (targets_up.active and targets_up.tp2_hit) or (targets_down.active and targets_down.tp2_hit)
+bool curr_tp3 = (targets_up.active and targets_up.tp3_hit) or (targets_down.active and targets_down.tp3_hit)
+bool curr_sl  = (targets_up.active and targets_up.sl_hit)  or (targets_down.active and targets_down.sl_hit)
+
+bool tp1_just = curr_tp1 and not prev_tp1
+bool tp2_just = curr_tp2 and not prev_tp2
+bool tp3_just = curr_tp3 and not prev_tp3
+bool sl_just  = curr_sl  and not prev_sl
+
+prev_tp1 := curr_tp1
+prev_tp2 := curr_tp2
+prev_tp3 := curr_tp3
+prev_sl  := curr_sl
+
+alertcondition(tp1_just, title = "TP1 Hit", message = "Target Trend Pro • TP1 reached on {{ticker}}")
+alertcondition(tp2_just, title = "TP2 Hit", message = "Target Trend Pro • TP2 reached on {{ticker}}")
+alertcondition(tp3_just, title = "TP3 Hit", message = "Target Trend Pro • TP3 reached on {{ticker}}")
+alertcondition(sl_just,  title = "Stop Loss Hit", message = "Target Trend Pro • Stop Loss hit on {{ticker}}")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  END
+// ══════════════════════════════════════════════════════════════════════════════

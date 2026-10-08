@@ -1,0 +1,1763 @@
+//@version=6
+indicator("RT Day Trade Signals with Intraday and HTF Zones (1 Min)", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = 5000)
+
+/// =======================================================
+// SHARED — TIMEFRAME GATE
+// Both engines below only run on the 1-minute chart.
+// =======================================================
+bool isOneMin = timeframe.isminutes and timeframe.multiplier == 1
+
+// =========================================================================
+// ENGINE 1 — PP INTRADAY ZONES
+// =========================================================================
+grpAppearance  = "Zone Appearance"
+hideAllZones   = input.bool(false, "Hide Zones (Signals Only)", group=grpAppearance, tooltip="Hides all zone boxes/labels (both Auto and Custom) but keeps zone tracking active so Buy/Sell signals still fire.")
+zoneMultOption = input.int(2, "Intraday Zone Size Multiplier", options=[1, 2, 3, 4], group=grpAppearance, tooltip="Zone size multiplier. 4 = largest zone size.")
+float atrZoneDiv = zoneMultOption == 1 ? 90.0 : zoneMultOption == 3 ? 30.0 : zoneMultOption == 4 ? 15.0 : 60.0
+
+showZoneLabels         = input.bool(true, "Show Zone Labels", group=grpAppearance, tooltip="If OFF, no price labels are drawn on any zone (Auto or Custom).")
+zoneWidthUnit          = input.string("Ticks", "Zone Width Unit in Labels", options=["Ticks", "Points"], group=grpAppearance, tooltip="Display zone width in Ticks (e.g. 24T) or Points (e.g. 6.00P) in labels across all zones (Intraday & HT Zones).")
+pb_dynInvalidTicks   = 8
+pb_centerZoneOnTrigger = false
+zoneLeftOffsetBars = 8
+extendBars    = 14
+showZoneFill           = true
+showZoneBorder         = true
+
+grpCustom = "Custom Zones"
+customPricesText = input.text_area("", "Custom Zone Prices (one per line, up to 10)", group=grpCustom, tooltip="Enter up to 10 lines, one zone per line. Format: PRICE WIDTH (space separated), e.g. 7543.20 32 - price is the proximal edge, width is in ticks. WIDTH is optional; if omitted, the shared Intraday Zone Size Multiplier width is used instead.")
+customZoneUseRTH      = input.bool(true, "Anchor Custom Zones to RTH Session Start", group=grpCustom, tooltip="ON: always anchors to regular trading hours open, regardless of chart's extended-hours setting. OFF: anchors to whatever session type the chart is currently displaying (RTH or ETH).")
+
+grpSignalSource = "Signal Source"
+zoneSignalSource = input.string("Both", "Zone Type Used For Signals", options=["Auto Levels", "Custom Levels", "Both"], group=grpSignalSource, tooltip="Which zone type generates Buy/Sell signals. Whichever type is NOT selected is also hidden from the chart (Auto = the automatic PPR/PPS intraday zones, Custom = your manually-entered zones).")
+bool useAutoZonesForSignals   = zoneSignalSource == "Auto Levels" or zoneSignalSource == "Both"
+bool useCustomZonesForSignals = zoneSignalSource == "Custom Levels" or zoneSignalSource == "Both"
+bool effHidePPZones     = hideAllZones or not useAutoZonesForSignals
+bool effHideCustomZones = hideAllZones or not useCustomZonesForSignals
+
+grpBiasHud = "Bias HUD"
+showBiasHud = input.bool(true, "Show Bias HUD", group=grpBiasHud)
+hudPositionInput = input.string("Top Left", "HUD Position", options=["Bottom Left", "Bottom Right", "Top Left", "Top Right"], group=grpBiasHud, tooltip="Bias is derived only from Auto (PPR/PPS) intraday zones, ranked by creation order. Custom zones are not factored in.")
+
+grpDetect = "Zone Detection"
+//zoneRigidityOption = input.int(3, "Zone Rigidity", options=[1, 2, 3, 4, 5, 6, 7, 8], group=grpDetect, tooltip="Zone rigidity level (1=Flexible, 8=Rigid). Higher rigidity requires more time to be validated.")
+zoneRigidityOption = 4
+int minSepBars = zoneRigidityOption == 1 ? 4 :
+                 zoneRigidityOption == 2 ? 8 :
+                 zoneRigidityOption == 3 ? 12 :
+                 zoneRigidityOption == 4 ? 16 :
+                 zoneRigidityOption == 5 ? 20 :
+                 zoneRigidityOption == 6 ? 24 :
+                 zoneRigidityOption == 7 ? 28 : 30
+
+tolTicks = 0
+maxActiveLevels = 10
+expireBars = 900
+firstTouchOnly = false
+detectOnClose = false
+//z_closesRequired = input.int(5, "Closes Required to Flip", minval=1, maxval=10, group=grpDetect, tooltip="Number of consecutive confirmed closes outside the zone required to flip its classification (e.g., from Support to Resistance). Default is 5.")
+z_closesRequired = 5
+//invalidateFlipCount = input.int(3, "Zone Invalidation — Flips Allowed", minval=1, maxval=10, group=grpDetect, tooltip="The value represents the # of flips allowed before invalidation (zone disappears). A 'flip' is the zone's backend classification genuinely changing (e.g. Support breaking down into acting-as-Resistance, or vice versa) — the PPS/PPR label swap you see on the box is this same event. Example: set to 3 — the zone survives its first 3 flips, then disappears the moment it flips a 4th time. PPS (Support) and PPR (Resistance) zones each track their own flip count independently.")
+invalidateFlipCount = 3
+
+grpRev = "Signal Filters"
+minLenX = 8
+confirmMode = "Single Confirmation"
+volSpikeMult = 1.5
+
+// Hardcoded — reversal symbols are disabled and removed from settings UI
+bool hideReversalArrows = true
+
+grpStoch = "Stochastic Filter"
+useStochFilter = true
+kLen = 6
+kSmooth = 1
+kLen2 = 3
+kSmooth2 = 1
+
+grpDyn = "Breakout Sensitivity"
+breakoutDistMult   = 2
+z_forceEarlyBreak = false
+
+// TIMEFRAME GATE — overridden to 1-minute only
+bool tfAllowed = isOneMin
+
+// DAILY ATR SCALING
+float dAtrRaw = request.security(syminfo.tickerid, "D", ta.atr(20)[1], lookahead=barmerge.lookahead_on)
+bool  dAtrOK  = not na(dAtrRaw) and dAtrRaw > 0
+bool  atrLive = dAtrOK
+int   zoneTicksEff = atrLive ? math.max(1, math.ceil((dAtrRaw / atrZoneDiv) / syminfo.mintick)) : pb_dynInvalidTicks
+
+type RTLevel
+    float price
+    int   dir
+    int   born
+    bool  retested
+
+var array<RTLevel> ppLevels = array.new<RTLevel>()
+
+// =========================================================================
+// MULTI-ZONE POOLS (up to N resistance / N support zones live at once)
+// =========================================================================
+int maxZonesPerSide = input.int(3, "Max Intraday Zones Per Side", options=[2, 3, 4, 5, 6, 7, 8], group=grpDetect, tooltip="How many resistance (PPR) zones and support (PPS) zones can be live at once, each side counted separately. Minimum 2. Note: the Bias HUD needs at least 3 zones combined across both sides to compute a bias reading — with very low counts it may show 'Insufficient Zones'. E.g. 4 = up to 4 PPR + up to 4 PPS zones on screen.")
+
+type PPZone
+    box   b
+    label l
+    float zHigh
+    float zLow
+    float price
+    int   backendState
+    int   closesAbove
+    int   closesBelow
+    int   flipCount
+    string labelPrefix
+    int   born
+
+var array<PPZone> topZones = array.new<PPZone>()   // resistance-origin zones (PPR)
+var array<PPZone> botZones = array.new<PPZone>()   // support-origin zones (PPS)
+
+// Custom (manual) zone pools — declared here (ahead of Engine 1) so Engine 1's
+// automatic zone creation can check against them and give custom zones priority.
+var array<PPZone> customPSZones = array.new<PPZone>()   // origin support (buy)
+var array<PPZone> customPRZones = array.new<PPZone>()   // origin resistance (sell)
+
+f_deleteZone(PPZone z) =>
+    if not na(z.b)
+        box.delete(z.b)
+    if not na(z.l)
+        label.delete(z.l)
+
+f_removeOverlapping(array<PPZone> zones, float top, float bot) =>
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            PPZone z = array.get(zones, i)
+            if top >= z.zLow and z.zHigh >= bot
+                f_deleteZone(z)
+                array.remove(zones, i)
+
+f_anyOverlapsZones(array<PPZone> zones, float top, float bot) =>
+    bool ov = false
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            PPZone z = array.get(zones, i)
+            if top >= z.zLow and z.zHigh >= bot
+                ov := true
+                break
+    ov
+
+f_overlapsAnyCustomZone(float top, float bot) =>
+    f_anyOverlapsZones(customPSZones, top, bot) or f_anyOverlapsZones(customPRZones, top, bot)
+
+f_capZones(array<PPZone> zones, int maxN) =>
+    while array.size(zones) >= maxN
+        PPZone old = array.get(zones, 0)
+        f_deleteZone(old)
+        array.remove(zones, 0)
+
+f_anyZoneTouch(array<PPZone> zones) =>
+    bool touched = false
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            PPZone z = array.get(zones, i)
+            if high >= z.zLow and low <= z.zHigh
+                touched := true
+                break
+    touched
+
+f_updateZoneColor(_currentColor, _zoneHigh, _zoneLow, _closesAbove, _closesBelow, _dist, _closesRequired) =>
+    bool priceInside = close >= _zoneLow and close <= _zoneHigh
+    color newColor = _currentColor
+    int newClosesAbove = _closesAbove
+    int newClosesBelow = _closesBelow
+
+    if priceInside
+        newClosesAbove := 0
+        newClosesBelow := 0
+    else
+        if z_forceEarlyBreak
+            if high > (_zoneHigh + _dist) and close > _zoneHigh
+                newColor := color.green
+            else if low < (_zoneLow - _dist) and close < _zoneLow
+                newColor := color.red
+
+        if barstate.isconfirmed
+            bool closeAbove = close > _zoneHigh
+            bool closeBelow = close < _zoneLow
+            if closeAbove
+                newClosesAbove := newClosesAbove + 1
+                newClosesBelow := 0
+            else if closeBelow
+                newClosesBelow := newClosesBelow + 1
+                newClosesAbove := 0
+
+            if newClosesAbove >= _closesRequired
+                newColor := color.green
+            else if newClosesBelow >= _closesRequired
+                newColor := color.red
+
+    [newColor, newClosesAbove, newClosesBelow]
+
+f_zoneLabelText(_top, _bottom, _origSuffix, _anchorPrice, _widthUnit, _state, _prefix, _rank) =>
+    string _dispSuffix = _origSuffix
+    if _origSuffix == "PPS" and _state == -1
+        _dispSuffix := "PPR"
+    else if _origSuffix == "PPR" and _state == 1
+        _dispSuffix := "PPS"
+
+    float _widthVal = math.abs(_top - _bottom)
+    string _widthStr = ""
+    if _widthUnit == "Ticks"
+        int _ticks = math.round(_widthVal / syminfo.mintick)
+        _widthStr := " (" + str.tostring(_ticks) + "T)"
+    else
+        _widthStr := " (" + str.tostring(_widthVal, format.mintick) + "P)"
+
+    // Rank prefix: 1 = newest zone in its pool, counting up toward older zones.
+    string _rankStr = str.tostring(_rank) + ") "
+
+    _rankStr + _prefix + _dispSuffix + " " + str.tostring(_anchorPrice, format.mintick) + _widthStr
+
+f_globalZoneRank(array<PPZone> zonesA, array<PPZone> zonesB, int _born) =>
+    // Rank 1 = most recently created zone across BOTH pools combined.
+    // Ties (same born bar, shouldn't normally happen) keep stable order.
+    int rank = 1
+    if array.size(zonesA) > 0
+        for i = 0 to array.size(zonesA) - 1
+            PPZone zz = array.get(zonesA, i)
+            if zz.born > _born
+                rank += 1
+    if array.size(zonesB) > 0
+        for i = 0 to array.size(zonesB) - 1
+            PPZone zz = array.get(zonesB, i)
+            if zz.born > _born
+                rank += 1
+    rank
+
+f_updateZonesArr(array<PPZone> zones, array<PPZone> siblingZones, string origSuffix, float dist) =>
+    int nZonesArr = array.size(zones)
+    if nZonesArr > 0
+        for i = nZonesArr - 1 to 0
+            PPZone z = array.get(zones, i)
+            // Rank reflects true creation order across BOTH the PPR and PPS
+            // pools combined (via z.born), not just position within this
+            // one pool — so numbering is unique and strictly chronological
+            // across the whole chart, never duplicated between PPR/PPS.
+            int zoneRank = f_globalZoneRank(zones, siblingZones, z.born)
+            color currentColor = color.yellow
+            [newColor, newAbove, newBelow] = f_updateZoneColor(currentColor, z.zHigh, z.zLow, z.closesAbove, z.closesBelow, dist, z_closesRequired)
+
+            int prevBackend = z.backendState
+            int newBackend = z.backendState
+            if newColor == color.green
+                newBackend := 1
+            else if newColor == color.red
+                newBackend := -1
+
+            int newFlip = z.flipCount
+            if newBackend != prevBackend and newBackend != 0
+                newFlip += 1
+
+            z.backendState := newBackend
+            z.closesAbove := newAbove
+            z.closesBelow := newBelow
+            z.flipCount := newFlip
+
+            if z.flipCount > invalidateFlipCount
+                f_deleteZone(z)
+                array.remove(zones, i)
+                continue
+
+            if not pb_centerZoneOnTrigger and newBackend != prevBackend and newBackend != 0
+                float invalTicksZ = zoneTicksEff * syminfo.mintick
+                if newBackend == 1
+                    z.zHigh := z.price
+                    z.zLow  := z.price - invalTicksZ
+                else
+                    z.zLow  := z.price
+                    z.zHigh := z.price + invalTicksZ
+                box.set_top(z.b, z.zHigh)
+                box.set_bottom(z.b, z.zLow)
+                z.closesAbove := 0
+                z.closesBelow := 0
+
+            color zColor = newBackend == -1 ? color.red : newBackend == 1 ? color.green : (origSuffix == "PPR" ? color.red : color.green)
+
+            bool isCustomZone = z.labelPrefix != ""
+            bool zHide       = isCustomZone ? effHideCustomZones : effHidePPZones
+            bool zShowLabels = showZoneLabels
+
+            float zCenter = (z.zHigh + z.zLow) / 2.0
+            label.set_x(z.l, bar_index + extendBars)
+            label.set_y(z.l, zCenter)
+            label.set_text(z.l, (zShowLabels and not zHide) ? f_zoneLabelText(z.zHigh, z.zLow, origSuffix, z.price, zoneWidthUnit, newBackend, z.labelPrefix, zoneRank) : "")
+            label.set_textcolor(z.l, zColor)
+            label.set_style(z.l, (zShowLabels and not zHide) ? label.style_label_left : label.style_none)
+
+            color zFill = zHide ? color.new(zColor, 100) : (showZoneFill ? color.new(zColor, 60) : color.new(zColor, 100))
+            color zBorder = zHide ? color.new(zColor, 100) : (showZoneBorder ? color.new(zColor, 0) : color.new(zColor, 100))
+            box.set_bgcolor(z.b, zFill)
+            box.set_border_color(z.b, zBorder)
+            box.set_border_width(z.b, 1)
+
+float zoneWidthPrice = zoneTicksEff * syminfo.mintick
+float dist = zoneWidthPrice * breakoutDistMult
+
+float _tick = syminfo.mintick
+float h1 = high[1], l1 = low[1], o1 = open[1], c1 = close[1]
+float rng1 = h1 - l1
+bool  lenOK = rng1 >= minLenX * _tick
+
+float upW1 = h1 - math.max(o1, c1)
+float dnW1 = math.min(o1, c1) - l1
+
+bool nbBull = low[1]  <= math.min(low[2],  low[3])
+bool nbBear = high[1] >= math.max(high[2], high[3])
+
+float engulfFrac = 0.65
+float wickPct    = 0.70
+
+float tBull = l1 + rng1 * engulfFrac
+float tBear = h1 - rng1 * engulfFrac
+
+bool bullWickOK   = (rng1 > 0 and dnW1 >= wickPct * rng1)
+bool bearWickOK   = (rng1 > 0 and upW1 >= wickPct * rng1)
+bool bullEngulfOK = (c1 >= tBull)
+bool bearEngulfOK = (c1 <= tBear)
+
+bool bullPriceOK = bullWickOK or bullEngulfOK
+bool bearPriceOK = bearWickOK or bearEngulfOK
+
+bool bull_raw = nbBull and bullPriceOK and lenOK
+bool bear_raw = nbBear and bearPriceOK and lenOK
+
+// Dual stochastic filter
+llk1 = ta.lowest(low, kLen)
+hhk1 = ta.highest(high, kLen)
+den1 = math.max(hhk1 - llk1, syminfo.mintick)
+kRaw1 = 100.0 * (close - llk1) / den1
+zK1 = ta.sma(kRaw1, kSmooth)
+
+llk2 = ta.lowest(low, kLen2)
+hhk2 = ta.highest(high, kLen2)
+den2 = math.max(hhk2 - llk2, syminfo.mintick)
+kRaw2 = 100.0 * (close - llk2) / den2
+zK2 = ta.sma(kRaw2, kSmooth2)
+
+bool bullStochOK = (zK1[2] <= 20) or (zK2[1] <= 20)
+bool bearStochOK = (zK1[2] >= 80) or (zK2[1] >= 80)
+
+bool raw_bull_breach   = (high > h1)
+bool raw_bear_breach   = (low  < l1)
+bool raw_bull_momentum = (c1 > high[2])
+bool raw_bear_momentum = (c1 < low[2])
+bool raw_volSpike      = volume[1] > volume[2] * volSpikeMult
+
+int bullPassCt = (raw_bull_breach ? 1 : 0) + (raw_bull_momentum ? 1 : 0) + (raw_volSpike ? 1 : 0)
+int bearPassCt = (raw_bear_breach ? 1 : 0) + (raw_bear_momentum ? 1 : 0) + (raw_volSpike ? 1 : 0)
+
+bool bullConfirmOK = confirmMode == "Double Confirmation" ? (bullPassCt >= 2) : (bullPassCt >= 1)
+bool bearConfirmOK = confirmMode == "Double Confirmation" ? (bearPassCt >= 2) : (bearPassCt >= 1)
+
+bool bullWicked_prev = bull_raw and bullConfirmOK
+bool bearWicked_prev = bear_raw and bearConfirmOK
+
+bool bullSignal = tfAllowed and bullWicked_prev and (not useStochFilter or bullStochOK)
+bool bearSignal = tfAllowed and bearWicked_prev and (not useStochFilter or bearStochOK)
+
+f_pp_add_level(_p, _dir, _born) =>
+    int n = array.size(ppLevels)
+    if n >= maxActiveLevels
+        bool removed = false
+        for idx = 0 to n - 1
+            RTLevel t = array.get(ppLevels, idx)
+            if t.retested
+                array.remove(ppLevels, idx)
+                removed := true
+                break
+        if not removed and n > 0
+            array.remove(ppLevels, 0)
+    array.push(ppLevels, RTLevel.new(_p, _dir, _born, false))
+
+if barstate.isconfirmed
+    if bullSignal
+        f_pp_add_level(low[1], 1, bar_index - 1)
+    if bearSignal
+        f_pp_add_level(high[1], -1, bar_index - 1)
+
+float _ppTol = tolTicks * _tick
+var int   hitDir   = 0
+var float hitPrice = na
+var int   hitBorn  = na
+hitDir := 0
+hitPrice := na
+hitBorn := na
+
+bool dtbGateNow = detectOnClose ? barstate.isconfirmed : true
+
+int nDT = array.size(ppLevels)
+if nDT > 0
+    for i = nDT - 1 to 0
+        RTLevel L = array.get(ppLevels, i)
+        if (bar_index - L.born) > expireBars
+            array.remove(ppLevels, i)
+
+    int sizeNow = array.size(ppLevels)
+    if sizeNow > 0
+        for j = sizeNow - 1 to 0
+            if j >= array.size(ppLevels)
+                continue
+            RTLevel L2 = array.get(ppLevels, j)
+
+            int sepBars = bar_index - L2.born
+            bool sepCountOK = sepBars >= minSepBars
+            int spanBetween = sepBars - 1
+
+            int lookbackBetween = math.min(math.max(spanBetween, 1), bar_index - 1)
+            float intraMaxBetween = ta.highest(high[1], lookbackBetween)
+            float intraMinBetween = ta.lowest(low[1], lookbackBetween)
+
+            bool noTouchBetween = spanBetween <= 0 ? true :
+                 (L2.dir == -1 ? (intraMaxBetween < (L2.price - _ppTol)) : (intraMinBetween > (L2.price + _ppTol)))
+
+            if not (sepCountOK and noTouchBetween)
+                continue
+
+            bool touchNow = (L2.dir == -1 ? (high >= L2.price - _ppTol) : (low <= L2.price + _ppTol))
+            if dtbGateNow and touchNow
+                hitDir := L2.dir
+                hitPrice := L2.price
+                hitBorn := L2.born
+                L2.retested := true
+                array.set(ppLevels, j, L2)
+                if firstTouchOnly
+                    array.remove(ppLevels, j)
+                break
+
+if hitDir != 0
+    int leftX  = math.max((na(hitBorn) ? bar_index : hitBorn) - zoneLeftOffsetBars, 0)
+    int rightX = bar_index + extendBars
+    float invalTicks = zoneTicksEff * syminfo.mintick
+    float zoneTop = na
+    float zoneBottom = na
+
+    if hitDir == 1
+        if pb_centerZoneOnTrigger
+            zoneTop    := hitPrice + invalTicks / 2
+            zoneBottom := hitPrice - invalTicks / 2
+        else
+            zoneTop    := hitPrice
+            zoneBottom := hitPrice - invalTicks
+    else if hitDir == -1
+        if pb_centerZoneOnTrigger
+            zoneTop    := hitPrice + invalTicks / 2
+            zoneBottom := hitPrice - invalTicks / 2
+        else
+            zoneBottom := hitPrice
+            zoneTop    := hitPrice + invalTicks
+
+    if hitDir == -1 and not f_overlapsAnyCustomZone(zoneTop, zoneBottom)
+        // New resistance (PPR) zone — newer replaces any overlapping existing PPR zone
+        f_removeOverlapping(topZones, zoneTop, zoneBottom)
+        f_removeOverlapping(botZones, zoneTop, zoneBottom)
+        f_capZones(topZones, maxZonesPerSide)
+
+        box newTopBox = box.new(leftX, zoneTop, rightX, zoneBottom,
+             border_color=effHidePPZones ? color.new(color.red, 100) : (showZoneBorder ? color.new(color.red, 0) : color.new(color.red, 100)),
+             bgcolor=effHidePPZones ? color.new(color.red, 100) : (showZoneFill ? color.new(color.red, 60) : color.new(color.red, 100)),
+             border_width=1)
+
+        float newTopCenter = (zoneTop + zoneBottom) / 2.0
+        label newTopLabel = label.new(rightX, newTopCenter, (showZoneLabels and not effHidePPZones) ? f_zoneLabelText(zoneTop, zoneBottom, "PPR", hitPrice, zoneWidthUnit, 0, "", 1) : "",
+             xloc=xloc.bar_index, yloc=yloc.price, textcolor=color.red, color=color.new(color.black, 100), style=(showZoneLabels and not effHidePPZones) ? label.style_label_left : label.style_none)
+
+        array.push(topZones, PPZone.new(b=newTopBox, l=newTopLabel, zHigh=zoneTop, zLow=zoneBottom, price=hitPrice, backendState=0, closesAbove=0, closesBelow=0, flipCount=0, labelPrefix="", born=bar_index))
+
+    else if hitDir == 1 and not f_overlapsAnyCustomZone(zoneTop, zoneBottom)
+        // New support (PPS) zone — newer replaces any overlapping existing PPS zone
+        f_removeOverlapping(botZones, zoneTop, zoneBottom)
+        f_removeOverlapping(topZones, zoneTop, zoneBottom)
+        f_capZones(botZones, maxZonesPerSide)
+
+        box newBotBox = box.new(leftX, zoneTop, rightX, zoneBottom,
+             border_color=effHidePPZones ? color.new(color.green, 100) : (showZoneBorder ? color.new(color.green, 0) : color.new(color.green, 100)),
+             bgcolor=effHidePPZones ? color.new(color.green, 100) : (showZoneFill ? color.new(color.green, 60) : color.new(color.green, 100)),
+             border_width=1)
+
+        float newBotCenter = (zoneTop + zoneBottom) / 2.0
+        label newBotLabel = label.new(rightX, newBotCenter, (showZoneLabels and not effHidePPZones) ? f_zoneLabelText(zoneTop, zoneBottom, "PPS", hitPrice, zoneWidthUnit, 0, "", 1) : "",
+             xloc=xloc.bar_index, yloc=yloc.price, textcolor=color.green, color=color.new(color.black, 100), style=(showZoneLabels and not effHidePPZones) ? label.style_label_left : label.style_none)
+
+        array.push(botZones, PPZone.new(b=newBotBox, l=newBotLabel, zHigh=zoneTop, zLow=zoneBottom, price=hitPrice, backendState=0, closesAbove=0, closesBelow=0, flipCount=0, labelPrefix="", born=bar_index))
+
+if array.size(topZones) > 0
+    for i = 0 to array.size(topZones) - 1
+        box.set_right(array.get(topZones, i).b, bar_index + extendBars)
+if array.size(botZones) > 0
+    for i = 0 to array.size(botZones) - 1
+        box.set_right(array.get(botZones, i).b, bar_index + extendBars)
+
+f_updateZonesArr(botZones, topZones, "PPS", dist)
+f_updateZonesArr(topZones, botZones, "PPR", dist)
+
+/// REVERSAL ARROWS (⬆/⬇) — DISABLED BY DEFAULT
+if bullSignal[1] and not hideReversalArrows
+    label.new(bar_index - 1, low[1], "⬆", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_none, textcolor=color.green, size=size.normal)
+if bearSignal[1] and not hideReversalArrows
+    label.new(bar_index - 1, high[1], "⬇", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_none, textcolor=color.red, size=size.normal)
+
+alertcondition(hitDir != 0, title="PP Retest", message="{{ticker}} {{interval}} Retest of Intraday Zone at {{close}}.")
+alertcondition(bullSignal or bearSignal, title="Signal Bar", message="{{ticker}} {{interval}} Signal at {{close}}.")
+
+// =========================================================================
+// ENGINE 2 — DAY TRADE SIGNALS  (stochastic alignment + footprint delta)
+// =========================================================================
+int lookback_period1 = 12
+int st1_m1           = 3
+
+int lookback_period2 = 24
+int st2_m1            = 6
+
+int lookback_period3 = 60
+int st3_m1            = 15
+
+//showDots   = input.bool(true, "Show Alignment Dots")
+showDots   = false
+
+//onlyInZone = input.bool(false, "Only Show S/B In Corresponding Zone", tooltip="If ON: a Long (B) signal only prints while price is touching the PPS (support) zone. A Short (S) signal only prints while price is touching the PPR (resistance) zone.")
+onlyInZone = true
+//useRBTrigger = input.bool(false, "Also Show B/S Off Reversal Bar In Zone", tooltip="If ON, an additional B or S marker prints whenever a bullish/bearish Reversal Bar pattern occurs while price is touching the PPS/PPR zone — independent of the stochastic+delta signal above. Shown in blue to distinguish from the green (3-way) / yellow (2-way) delta signals.")
+useRBTrigger = true
+
+grpSigLimit = "Signal Limiting"
+//maxSignalsPerZone = input.int(3, "Max Signals Per Zone Streak", minval=1, group=grpSigLimit, tooltip="Caps consecutive Buy/Sell signals while price keeps touching the same zone.")
+maxSignalsPerZone = 3
+//resetBarsNoTouch  = input.int(3, "Bars Not Touching Zone to Reset", minval=1, group=grpSigLimit, tooltip="Consecutive bars price must NOT touch the zone before the signal count resets.")
+resetBarsNoTouch = 3
+
+k1 = ta.sma(ta.stoch(close, high, low, lookback_period1), st1_m1)
+k2 = ta.sma(ta.stoch(close, high, low, lookback_period2), st2_m1)
+k3 = ta.sma(ta.stoch(close, high, low, lookback_period3), st3_m1)
+
+color green  = #00E676
+color red    = #FF5252
+color yellow = #FFEB3B
+color blue   = #2196F3
+
+int ticksPerRow     = 4
+int imbalancePct    = 70
+int minImbalanceVol = 400
+
+var int delta_lastCandle = 0
+footprint fp = na
+if isOneMin
+    fp := request.footprint(ticksPerRow, imbalancePct, minImbalanceVol)
+if isOneMin and barstate.isconfirmed and not na(fp)
+    array<volume_row> deltaRows = footprint.rows(fp)
+    int buyVol  = 0
+    int sellVol = 0
+    if array.size(deltaRows) > 0
+        for i = 0 to array.size(deltaRows) - 1
+            volume_row dRow = array.get(deltaRows, i)
+            buyVol  += int(dRow.buy_volume())
+            sellVol += int(dRow.sell_volume())
+    delta_lastCandle := buyVol - sellVol
+
+bool deltaRed   = delta_lastCandle < 0
+bool deltaGreen = delta_lastCandle > 0
+
+bool Long  = k3 < 21 and k2 <= 20 and k1 <= 20
+bool Long2 = k3 > 21 and k2 <= 20 and k1 <= 20
+bool oversoldYG = Long or Long2
+
+// OVERSOLD ALIGNMENT DOTS
+if oversoldYG and showDots and isOneMin
+    label.new(bar_index, low, "●", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_none, textcolor=Long ? green : yellow, size=size.small)
+
+bool Short  = k3 > 79 and k2 >= 80 and k1 >= 80
+bool Short2 = k3 < 79 and k2 >= 80 and k1 >= 80
+bool overboughtYG = Short or Short2
+
+// OVERBOUGHT ALIGNMENT DOTS
+if overboughtYG and showDots and isOneMin
+    label.new(bar_index, high, "●", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_none, textcolor=Short ? green : yellow, size=size.small)
+
+bool RB1 = high[2] <= high and high[1] <= high and close > open and close <= (high - ((high - low) * 0.5)) and k1 > 75
+bool RB2 = high[2] <= high and high[1] <= high and close < open and open <= (high - ((high - low) * 0.5)) and k1 > 75
+bool RB3 = high[2] <= high and high[1] <= high and close <= (high - ((high - low) * 0.55)) and open > (high - ((high - low) * 0.45)) and open > close and k1 > 75
+bool bearishRB = RB1 or RB2 or RB3
+
+// BEARISH REVERSAL BAR SYMBOLS (▼) — DISABLED BY DEFAULT
+if bearishRB and isOneMin and not hideReversalArrows
+    label.new(bar_index, high, "▼", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_none, textcolor=red, size=size.small)
+
+bool RB4 = low[2] >= low and low[1] >= low and close > open and open >= (high - ((high - low) * 0.5)) and k1 < 30
+bool RB5 = low[2] >= low and low[1] >= low and close > open and open < (high - ((high - low) * 0.55)) and close > (high - ((high - low) * 0.45)) and k1 < 30
+bool RB6 = low[2] >= low and low[1] >= low and open > close and close >= (high - ((high - low) * 0.5)) and k1 < 30
+bool bullishRB = RB4 or RB5 or RB6
+
+// BULLISH REVERSAL BAR SYMBOLS (▲) — DISABLED BY DEFAULT
+if bullishRB and isOneMin and not hideReversalArrows
+    label.new(bar_index, low, "▲", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_none, textcolor=green, size=size.small)
+
+// Zone-match check for the entry diamonds (topZones/botZones come from
+// Engine 1 above, computed earlier this same bar).
+bool inTopPPZone = f_anyZoneTouch(topZones)
+bool inBtmPPZone = f_anyZoneTouch(botZones)
+
+// --- Per-zone signal streak limiter ---
+var int  btmSignalCount   = 0
+var int  topSignalCount   = 0
+var int  btmNoTouchStreak = 0
+var int  topNoTouchStreak = 0
+var int  prevBotZoneCount = 0
+var int  prevTopZoneCount = 0
+
+bool dbNewZone = array.size(botZones) > prevBotZoneCount
+bool dtNewZone = array.size(topZones) > prevTopZoneCount
+
+if dbNewZone
+    btmSignalCount   := 0
+    btmNoTouchStreak := 0
+if dtNewZone
+    topSignalCount   := 0
+    topNoTouchStreak := 0
+
+if inBtmPPZone
+    btmNoTouchStreak := 0
+else
+    btmNoTouchStreak += 1
+    if btmNoTouchStreak >= resetBarsNoTouch
+        btmSignalCount := 0
+
+if inTopPPZone
+    topNoTouchStreak := 0
+else
+    topNoTouchStreak += 1
+    if topNoTouchStreak >= resetBarsNoTouch
+        topSignalCount := 0
+
+prevBotZoneCount := array.size(botZones)
+prevTopZoneCount := array.size(topZones)
+
+bool btmCountOK = btmSignalCount < maxSignalsPerZone
+bool topCountOK = topSignalCount < maxSignalsPerZone
+
+bool finalB_3way = Long   and deltaGreen and isOneMin and (not onlyInZone or inBtmPPZone)
+bool finalB_2way = Long2  and deltaGreen and isOneMin and (not onlyInZone or inBtmPPZone)
+bool finalS_3way = Short  and deltaRed   and isOneMin and (not onlyInZone or inTopPPZone)
+bool finalS_2way = Short2 and deltaRed   and isOneMin and (not onlyInZone or inTopPPZone)
+
+bool finalB_RB = useRBTrigger and isOneMin and bullishRB and inBtmPPZone
+bool finalS_RB = useRBTrigger and isOneMin and bearishRB and inTopPPZone
+
+bool anyB = (finalB_3way or finalB_2way or finalB_RB) and btmCountOK and useAutoZonesForSignals
+bool anyS = (finalS_3way or finalS_2way or finalS_RB) and topCountOK and useAutoZonesForSignals
+
+// =======================================================
+// ZONE-TIED SIGNAL MARKERS
+// Only shown while their exact anchor price still falls inside a currently
+// live zone in the same pool — checked fresh every bar (hardwired on, not
+// a toggle). This is a tight point-in-zone test, not a loose bar-range
+// overlap test, so an unrelated zone elsewhere on the bar's wick can't
+// falsely keep a stale label alive.
+// =======================================================
+var array<label> bSigLbls  = array.new<label>()
+var array<float> bSigPrice = array.new<float>()
+
+var array<label> sSigLbls  = array.new<label>()
+var array<float> sSigPrice = array.new<float>()
+
+f_pruneZoneSignals(array<label> lbls, array<float> anchorPrices, array<PPZone> zones) =>
+    if array.size(lbls) > 0
+        for i = array.size(lbls) - 1 to 0
+            bool keep = false
+            float p = array.get(anchorPrices, i)
+            if array.size(zones) > 0
+                for j = 0 to array.size(zones) - 1
+                    PPZone z = array.get(zones, j)
+                    if p <= z.zHigh and p >= z.zLow
+                        keep := true
+                        break
+            if not keep
+                label.delete(array.get(lbls, i))
+                array.remove(lbls, i)
+                array.remove(anchorPrices, i)
+
+f_pruneZoneSignals(bSigLbls, bSigPrice, botZones)
+f_pruneZoneSignals(sSigLbls, sSigPrice, topZones)
+
+if anyB
+    btmSignalCount += 1
+    label lb = label.new(bar_index, low, "Buy", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up, textcolor=green, color=color.new(color.black, 100), size=size.normal)
+    if inBtmPPZone
+        array.push(bSigLbls, lb)
+        array.push(bSigPrice, low)
+
+if anyS
+    topSignalCount += 1
+    label ls = label.new(bar_index, high, "Sell", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_down, textcolor=red, color=color.new(color.black, 100), size=size.normal)
+    if inTopPPZone
+        array.push(sSigLbls, ls)
+        array.push(sSigPrice, high)
+
+// =========================================================================
+// ENGINE 1.5 — CUSTOM MANUAL ZONES (up to 10, flip like PP zones)
+// Entered price = PROXIMAL edge (the edge nearest price at creation), not
+// the zone center. The zone extends the full width AWAY from price toward
+// the distal edge — same convention Engine 1 uses for its own PP zones.
+// Width is optional per zone (see f_parseCustomLine): if given, it overrides
+// the shared "Intraday Zone Size Multiplier" width for that specific zone.
+// (Custom Zones inputs are declared earlier in the script, near Zone
+// Appearance, since f_updateZonesArr references them.)
+// =========================================================================
+
+var bool custZonesInit = false
+
+int maxCustomZones = 10
+
+// Track the most recent session-start bar every bar, so a zone created
+// mid-session can still be left-anchored back to that session's open.
+bool custZoneNewSession = customZoneUseRTH ? session.isfirstbar_regular : session.isfirstbar
+var int custSessionStartBar = na
+if custZoneNewSession
+    custSessionStartBar := bar_index
+
+// Parses one line of the Custom Zone Prices text box.
+// Accepted formats: "PRICE" or "PRICE WIDTH" (space/tab separated, any amount
+// of whitespace between tokens is fine).
+// Returns [price, widthTicks, valid]. widthTicks is na when not given on
+// that line, signaling the caller should fall back to the shared zoneTicksEff.
+f_parseCustomLine(string line) =>
+    float price = na
+    float widthTicks = na
+    bool valid = false
+    string trimmed = str.trim(line)
+    if str.length(trimmed) > 0
+        string normalized = str.replace_all(trimmed, "\t", " ")
+        array<string> rawToks = str.split(normalized, " ")
+        array<string> toks = array.new<string>()
+        if array.size(rawToks) > 0
+            for i = 0 to array.size(rawToks) - 1
+                string t = str.trim(array.get(rawToks, i))
+                if str.length(t) > 0
+                    array.push(toks, t)
+
+        if array.size(toks) >= 1
+            float p = str.tonumber(array.get(toks, 0))
+            if not na(p)
+                price := p
+                valid := true
+        if valid and array.size(toks) >= 2
+            float w = str.tonumber(array.get(toks, 1))
+            if not na(w)
+                widthTicks := w
+    [price, widthTicks, valid]
+
+f_initCustomZone(float price, int widthTicks) =>
+    bool  isSupportOrigin = price < close
+    float widthPrice = widthTicks * _tick
+    // Proximal edge = entered price. Zone extends full width toward the distal side.
+    float top = isSupportOrigin ? price : price + widthPrice
+    float bot = isSupportOrigin ? price - widthPrice : price
+    color col = isSupportOrigin ? color.green : color.red
+    string origSuffix = isSupportOrigin ? "PPS" : "PPR"
+
+    // Newer zone replaces any existing custom zone it overlaps, same side.
+    if isSupportOrigin
+        f_removeOverlapping(customPSZones, top, bot)
+    else
+        f_removeOverlapping(customPRZones, top, bot)
+
+    // Custom zone priority: clear any existing automatic PP zones it overlaps.
+    f_removeOverlapping(topZones, top, bot)
+    f_removeOverlapping(botZones, top, bot)
+
+    int leftX = na(custSessionStartBar) ? bar_index : custSessionStartBar
+
+    box b = box.new(leftX, top, bar_index + extendBars, bot,
+         border_color = effHideCustomZones ? color.new(col, 100) : color.new(col, 0),
+         bgcolor      = effHideCustomZones ? color.new(col, 100) : color.new(col, 60),
+         border_width = 1)
+    label l = label.new(bar_index + extendBars, (top + bot) / 2.0,
+         (showZoneLabels and not effHideCustomZones) ? f_zoneLabelText(top, bot, origSuffix, price, zoneWidthUnit, 0, "HC ", 1) : "",
+         xloc = xloc.bar_index, yloc = yloc.price,
+         style = (showZoneLabels and not effHideCustomZones) ? label.style_label_left : label.style_none,
+         textcolor = col, color = color.new(color.black, 100))
+
+    PPZone z = PPZone.new(b=b, l=l, zHigh=top, zLow=bot, price=price, backendState=0, closesAbove=0, closesBelow=0, flipCount=0, labelPrefix="HC ", born=bar_index)
+    if isSupportOrigin
+        array.push(customPSZones, z)
+    else
+        array.push(customPRZones, z)
+
+if not custZonesInit and barstate.islast
+    if str.length(customPricesText) > 0
+        string cleanTxt = str.replace_all(customPricesText, "\r", "")
+        array<string> lines = str.split(cleanTxt, "\n")
+        int nLines = math.min(array.size(lines), maxCustomZones)
+        for i = 0 to nLines - 1
+            [lnPrice, lnWidth, lnValid] = f_parseCustomLine(array.get(lines, i))
+            if lnValid
+                int effWidthTicks = na(lnWidth) ? zoneTicksEff : math.max(1, math.round(lnWidth))
+                f_initCustomZone(lnPrice, effWidthTicks)
+    custZonesInit := true
+
+f_maintainCustomZones(array<PPZone> zones) =>
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            PPZone z = array.get(zones, i)
+            if custZoneNewSession
+                box.set_left(z.b, bar_index)
+            box.set_right(z.b, bar_index + extendBars)
+            label.set_x(z.l, bar_index + extendBars)
+
+f_maintainCustomZones(customPSZones)
+f_maintainCustomZones(customPRZones)
+
+// Live flip logic — same distance/closes-required/invalidation rules as the PP engine.
+// Note: f_updateZonesArr's own flip-recenter step also uses z.price as the proximal
+// edge when a zone flips, so this stays consistent through the zone's whole lifetime.
+f_updateZonesArr(customPSZones, customPRZones, "PPS", dist)
+f_updateZonesArr(customPRZones, customPSZones, "PPR", dist)
+
+// =======================================================
+// SIGNALS — role comes from CURRENT backendState, not origin
+// backendState == 1  -> acting as support -> Buy logic
+// backendState == -1 -> acting as resistance -> Sell logic
+// backendState == 0  -> untested since creation -> falls back to origin
+// =======================================================
+var array<int> custPSSignalCount   = array.new_int(0)
+var array<int> custPSNoTouchStreak = array.new_int(0)
+var array<int> custPRSignalCount   = array.new_int(0)
+var array<int> custPRNoTouchStreak = array.new_int(0)
+
+// Tracked custom-zone Buy/Sell labels, pruned every bar via a tight
+// point-in-zone check against currently live custom zones — hardwired on.
+var array<label> custBSigLbls  = array.new<label>()
+var array<float> custBSigPrice = array.new<float>()
+var array<label> custSSigLbls  = array.new<label>()
+var array<float> custSSigPrice = array.new<float>()
+
+f_syncCounterArr(array<int> counts, array<int> streaks, int targetSize) =>
+    while array.size(counts) < targetSize
+        array.push(counts, 0)
+        array.push(streaks, 0)
+
+var bool anyCustSignalThisBar = false
+anyCustSignalThisBar := false
+
+f_customZoneSignals(array<PPZone> zones, string origSuffix, array<int> sigCounts, array<int> noTouchStreaks) =>
+    bool firedAny = false
+    f_syncCounterArr(sigCounts, noTouchStreaks, array.size(zones))
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            PPZone z = array.get(zones, i)
+            bool inZone = high >= z.zLow and low <= z.zHigh
+            int effRole = z.backendState != 0 ? z.backendState : (origSuffix == "PPS" ? 1 : -1)
+
+            int cnt = array.get(sigCounts, i)
+            int streak = array.get(noTouchStreaks, i)
+            if inZone
+                streak := 0
+            else
+                streak += 1
+                if streak >= resetBarsNoTouch
+                    cnt := 0
+
+            bool countOK = cnt < maxSignalsPerZone
+
+            if effRole == 1
+                bool finB3  = Long   and deltaGreen and isOneMin and inZone
+                bool finB2  = Long2  and deltaGreen and isOneMin and inZone
+                bool finBRB = useRBTrigger and isOneMin and bullishRB and inZone
+                if (finB3 or finB2 or finBRB) and countOK
+                    cnt += 1
+                    firedAny := true
+                    label custLb = label.new(bar_index, low, "Buy", xloc=xloc.bar_index, yloc=yloc.belowbar,
+                         style=label.style_label_up, textcolor=green, color=color.new(color.black,100), size=size.normal)
+                    array.push(custBSigLbls, custLb)
+                    array.push(custBSigPrice, low)
+            else
+                bool finS3  = Short  and deltaRed and isOneMin and inZone
+                bool finS2  = Short2 and deltaRed and isOneMin and inZone
+                bool finSRB = useRBTrigger and isOneMin and bearishRB and inZone
+                if (finS3 or finS2 or finSRB) and countOK
+                    cnt += 1
+                    firedAny := true
+                    label custLs = label.new(bar_index, high, "Sell", xloc=xloc.bar_index, yloc=yloc.abovebar,
+                         style=label.style_label_down, textcolor=red, color=color.new(color.black,100), size=size.normal)
+                    array.push(custSSigLbls, custLs)
+                    array.push(custSSigPrice, high)
+
+            array.set(sigCounts, i, cnt)
+            array.set(noTouchStreaks, i, streak)
+
+    firedAny
+
+f_pruneZoneSignals(custBSigLbls, custBSigPrice, customPSZones)
+f_pruneZoneSignals(custSSigLbls, custSSigPrice, customPRZones)
+
+bool custPSFired = false
+bool custPRFired = false
+if useCustomZonesForSignals
+    custPSFired := f_customZoneSignals(customPSZones, "PPS", custPSSignalCount, custPSNoTouchStreak)
+    custPRFired := f_customZoneSignals(customPRZones, "PPR", custPRSignalCount, custPRNoTouchStreak)
+anyCustSignalThisBar := custPSFired or custPRFired
+
+alertcondition(anyCustSignalThisBar, title="Custom Zone Signal", message="{{ticker}} {{interval}} Custom zone signal at {{close}}.")
+
+// =========================================================================
+// ENGINE 3 — MTF HT ZONES (4H / 1H)
+// =========================================================================
+grpHT = "MTF HT Zones (4H / 1H)"
+bool show4H        = input.bool(true, "Show 4H HT Zones", group=grpHT)
+bool show1H        = input.bool(true, "Show 1H HT Zones", group=grpHT)
+bool showHtLabels  = input.bool(true, "Show HT Zones Labels", group=grpHT)
+int  closestN_HT   = input.int(4, "HT Zones Shown Per Side", options=[1, 2, 3, 4, 5, 6, 7, 8], group=grpHT, tooltip="How many of the closest-to-price demand zones and closest-to-price supply zones to display at once (each side counted separately).")
+
+bool htShortLabels = false
+// Hardcoded settings for HT Zones
+color color4H           = #9c27b0
+color color1H           = color.aqua
+int   htAtrLen          = 3
+float htImpulseMult     = 1.0
+bool  htUseMultibar     = true
+int   htMultibarLen     = 3
+bool  htRequireVolume   = true
+float htVolMult         = 1.5
+bool  htRequireClearClose = true
+int   htConsecCloses    = 5
+int   htMaxActiveZones  = 20
+int   hlProjBars        = 14
+int   hlLabelOffsetBars = 5
+
+f_htBody(i) => math.abs(close[i] - open[i])
+
+f_htMono(bullish, len) =>
+    ok = true
+    for i = 0 to len - 1
+        cond = bullish ? close[i] > open[i] : close[i] < open[i]
+        ok := ok and cond
+    ok
+
+f_htOverlapsArr(array<float> tops, array<float> bots, int cnt, float newTop, float newBot) =>
+    bool ov = false
+    if cnt > 0
+        for i = 0 to cnt - 1
+            if newTop >= array.get(bots, i) and array.get(tops, i) >= newBot
+                ov := true
+                break
+    ov
+
+f_htEngine(int atrLen, float impulseMult, bool useMultibar, int multibarLen, bool requireVolume, float volMult, bool requireClearClose, int consecCloses, int maxZones) =>
+    var array<float> htTop        = array.new<float>(maxZones, na)
+    var array<float> htBot        = array.new<float>(maxZones, na)
+    var array<float> htDir        = array.new<float>(maxZones, na)
+    var array<int>   htInside     = array.new<int>(maxZones, 0)
+    var array<int>   htCreated    = array.new<int>(maxZones, 0)
+    var array<int>   htAnchorTime = array.new<int>(maxZones, na)
+    var int          htCount      = 0
+
+    float atrVal          = ta.atr(atrLen)
+    bool  strongBullSingle = (close > open) and f_htBody(0) > atrVal * impulseMult
+    bool  strongBearSingle = (close < open) and f_htBody(0) > atrVal * impulseMult
+    bool  mbBull = useMultibar and f_htMono(true, multibarLen)  and (close - open[multibarLen - 1]) > atrVal * impulseMult
+    bool  mbBear = useMultibar and f_htMono(false, multibarLen) and (open[multibarLen - 1] - close) > atrVal * impulseMult
+    bool  impulseBull = strongBullSingle or mbBull
+    bool  impulseBear = strongBearSingle or mbBear
+    bool  volOk = not requireVolume or (volume > volume[1] * volMult)
+    bool  isMultibarTrig = useMultibar and ((mbBull and not strongBullSingle) or (mbBear and not strongBearSingle))
+    int   baseOffset = isMultibarTrig ? multibarLen : 1
+
+    float zTop = na
+    float zBot = na
+    int   zAnchorT = na
+    if impulseBull or impulseBear
+        zTop     := high[baseOffset]
+        zBot     := low[baseOffset]
+        zAnchorT := time[baseOffset]
+
+    bool clearedUp   = not requireClearClose or close > zTop
+    bool clearedDown = not requireClearClose or close < zBot
+    bool demandOk = impulseBull and volOk and clearedUp
+    bool supplyOk = impulseBear and volOk and clearedDown
+
+    if barstate.isconfirmed and demandOk and not f_htOverlapsArr(htTop, htBot, htCount, zTop, zBot)
+        int slotD = htCount < maxZones ? htCount : bar_index % maxZones
+        array.set(htTop, slotD, zTop)
+        array.set(htBot, slotD, zBot)
+        array.set(htDir, slotD, 1.0)
+        array.set(htInside, slotD, 0)
+        array.set(htCreated, slotD, bar_index)
+        array.set(htAnchorTime, slotD, zAnchorT)
+        if htCount < maxZones
+            htCount += 1
+    if barstate.isconfirmed and supplyOk and not f_htOverlapsArr(htTop, htBot, htCount, zTop, zBot)
+        int slotS = htCount < maxZones ? htCount : bar_index % maxZones
+        array.set(htTop, slotS, zTop)
+        array.set(htBot, slotS, zBot)
+        array.set(htDir, slotS, -1.0)
+        array.set(htInside, slotS, 0)
+        array.set(htCreated, slotS, bar_index)
+        array.set(htAnchorTime, slotS, zAnchorT)
+        if htCount < maxZones
+            htCount += 1
+
+    if htCount > 0
+        for i = htCount - 1 to 0
+            float t = array.get(htTop, i)
+            float b = array.get(htBot, i)
+            bool  isDemand = array.get(htDir, i) == 1.0
+            bool  bodyThru = isDemand ? close < b : close > t
+            bool  inside   = close <= t and close >= b
+            bool  remove = false
+            if barstate.isconfirmed and bar_index > array.get(htCreated, i)
+                if bodyThru
+                    remove := true
+                else if inside
+                    int ic = array.get(htInside, i) + 1
+                    array.set(htInside, i, ic)
+                    if ic >= consecCloses
+                        remove := true
+                else
+                    array.set(htInside, i, 0)
+            if remove and htCount > 0
+                int last = htCount - 1
+                array.set(htTop, i, array.get(htTop, last))
+                array.set(htBot, i, array.get(htBot, last))
+                array.set(htDir, i, array.get(htDir, last))
+                array.set(htInside, i, array.get(htInside, last))
+                array.set(htCreated, i, array.get(htCreated, last))
+                array.set(htAnchorTime, i, array.get(htAnchorTime, last))
+                htCount -= 1
+
+    [htTop, htBot, htDir, htAnchorTime, htCount]
+
+[t4h, b4h, d4h, at4h, n4h] = request.security(syminfo.tickerid, "240", f_htEngine(htAtrLen, htImpulseMult, htUseMultibar, htMultibarLen, htRequireVolume, htVolMult, htRequireClearClose, htConsecCloses, htMaxActiveZones), lookahead = barmerge.lookahead_off, calc_bars_count = 500)
+[t1h, b1h, d1h, at1h, n1h] = request.security(syminfo.tickerid, "60",  f_htEngine(htAtrLen, htImpulseMult, htUseMultibar, htMultibarLen, htRequireVolume, htVolMult, htRequireClearClose, htConsecCloses, htMaxActiveZones), lookahead = barmerge.lookahead_off, calc_bars_count = 500)
+
+color clearColor = color.new(color.white, 100)
+
+var array<box>   box4h = array.new<box>()
+var array<label> lbl4h = array.new<label>()
+var array<box>   box1h = array.new<box>()
+var array<label> lbl1h = array.new<label>()
+
+f_ensurePool(array<box> boxes, array<label> labels, int n, color txtCol) =>
+    while array.size(boxes) < n
+        array.push(boxes, box.new(na, na, na, na, xloc = xloc.bar_time, border_width = 0, bgcolor = clearColor, border_color = clearColor))
+        array.push(labels, label.new(na, na, "", xloc = xloc.bar_time, style = label.style_label_left, color = color.new(color.black, 100), textcolor = txtCol, size = size.normal))
+
+f_htLabelText(tf, top, bot, widthUnit) =>
+    float  center = (top + bot) / 2.0
+    float  widthVal = math.abs(top - bot)
+    string widthStr = ""
+    if widthUnit == "Ticks"
+        int ticks = math.round(widthVal / syminfo.mintick)
+        widthStr := " (" + str.tostring(ticks) + "T)"
+    else
+        widthStr := " (" + str.tostring(widthVal, format.mintick) + "P)"
+
+    string idTxt = "HT(" + tf + ")"
+    htShortLabels ? idTxt : idTxt + ": " + str.tostring(top, format.mintick) + " H / " + str.tostring(bot, format.mintick) + " L" + widthStr
+
+f_renderTF(array<float> tops, array<float> bots, array<float> dirs, array<int> anchorTimes, int cnt, array<box> boxes, array<label> labels, bool showTF, string tfLabel, int closestN, color zoneCol, int chartTfMs) =>
+    int n = cnt
+    color fillCol = color.new(zoneCol, 60)
+    color txtCol  = color.new(zoneCol, 0)
+    f_ensurePool(boxes, labels, math.max(n, array.size(boxes)), txtCol)
+    int poolSize = array.size(boxes)
+
+    array<bool> vis = array.new<bool>(n, true)
+    if showTF and closestN > 0 and n > 0
+        array<float> distDemand = array.new<float>()
+        array<int>   idxDemand  = array.new<int>()
+        array<float> distSupply = array.new<float>()
+        array<int>   idxSupply  = array.new<int>()
+        for i = 0 to n - 1
+            float distVal = math.abs(((array.get(tops, i) + array.get(bots, i)) / 2.0) - close)
+            if array.get(dirs, i) == 1.0
+                array.push(distDemand, distVal), array.push(idxDemand, i)
+            else
+                array.push(distSupply, distVal), array.push(idxSupply, i)
+        if array.size(distDemand) > 0
+            array<int> ordD = array.sort_indices(distDemand, order.ascending)
+            if closestN < array.size(ordD)
+                for k = closestN to array.size(ordD) - 1
+                    array.set(vis, array.get(idxDemand, array.get(ordD, k)), false)
+        if array.size(distSupply) > 0
+            array<int> ordS = array.sort_indices(distSupply, order.ascending)
+            if closestN < array.size(ordS)
+                for k = closestN to array.size(ordS) - 1
+                    array.set(vis, array.get(idxSupply, array.get(ordS, k)), false)
+
+    int rightT = time + hlProjBars * chartTfMs
+    int labelT = time + (hlProjBars + hlLabelOffsetBars) * chartTfMs
+    for i = 0 to poolSize - 1
+        box   b = array.get(boxes, i)
+        label l = array.get(labels, i)
+        if showTF and i < n and array.get(vis, i)
+            float t = array.get(tops, i)
+            float bt = array.get(bots, i)
+            int   anchorT = array.get(anchorTimes, i)
+            box.set_lefttop(b, na(anchorT) ? rightT - hlProjBars * chartTfMs : anchorT, t)
+            box.set_rightbottom(b, rightT, bt)
+            box.set_bgcolor(b, fillCol)
+            box.set_border_color(b, color.new(color.white, 100))
+            box.set_extend(b, extend.none)
+            string txt = f_htLabelText(tfLabel, t, bt, zoneWidthUnit)
+            label.set_xy(l, labelT, (t + bt) / 2.0)
+            label.set_text(l, showHtLabels ? txt : "")
+            label.set_style(l, showHtLabels ? label.style_label_left : label.style_none)
+            label.set_textcolor(l, txtCol)
+        else
+            box.set_bgcolor(b, clearColor)
+            box.set_border_color(b, clearColor)
+            box.set_extend(b, extend.none)
+            label.style_none
+            label.set_text(l, "")
+
+int chartTfMs = timeframe.in_seconds() * 1000
+
+if barstate.islast
+    f_renderTF(t4h, b4h, d4h, at4h, n4h, box4h, lbl4h, show4H, "4H", closestN_HT, color4H, chartTfMs)
+    f_renderTF(t1h, b1h, d1h, at1h, n1h, box1h, lbl1h, show1H, "1H", closestN_HT, color1H, chartTfMs)
+
+// =========================================================================
+// ENGINE 4 — HISTORICAL & CUSTOM LEVELS
+// Previous Day/Week/Month High-Low, Current Week High-Low, and up to 16
+// free-ranging custom levels, each drawn as an ATR-scaled zone. Merged in
+// from the standalone "Historical & Custom Levels Engine" indicator.
+// A handful of its internal variables were renamed with an "hl_" prefix
+// (hl_zoneTicksEff, hl_atrZoneDiv, hl_zoneTicks, hl_dAtrRaw, hl_dAtrOK,
+// hl_atrLive, hl_rightX, hl_labelX) to avoid colliding with this script's
+// own identically-named variables from Engine 1. Everything else — every
+// input, every calculation, every render call — is unchanged from the
+// original standalone script (aside from removing its own now-redundant
+// //@version and indicator() lines, since this script already has one).
+// =========================================================================
+
+// =======================================================
+/// INPUTS — DISPLAY
+// =======================================================
+gL            = "Labels & Table"
+showZones     = input.bool(true,  "Show Zones (Visuals)", tooltip = "Toggle off to hide all chart drawings (boxes, lines, labels).", group = gL)
+showAllLabels = input.bool(true,  "Show Labels", group = gL, tooltip = "Master switch for ALL on-chart text labels. Boxes and table are unaffected.")
+shortLabels   = input.bool(false, "Short Labels (ID only)", group = gL)
+labelSzOpt    = input.string("Normal", "Label Size", options = ["Tiny", "Small", "Normal", "Large"], group = gL)
+
+txtSize = labelSzOpt == "Tiny" ? size.tiny : labelSzOpt == "Normal" ? size.normal : labelSzOpt == "Large" ? size.large : size.small
+
+// =======================================================
+/// INPUTS — GENERAL ZONE SETTINGS
+// =======================================================
+g               = "General Zone Settings"
+useAtrScaling   = input.bool(true, "Use Daily ATR Scaling", group = g, tooltip = "ON: zone width derives from previous daily ATR(20), so settings transfer across tickers (ES/NQ/CL/GC...) and adapt to volatility regimes. Zone width = Daily ATR ÷ divisor, rounded UP to whole ticks. OFF: the fixed-tick input below is used instead. If daily ATR data is unavailable the fixed-tick value is the automatic fallback.")
+hl_atrZoneDiv      = input.float(15.0, "Daily ATR ÷", minval = 1.0, step = 0.5, group = g, tooltip = "Zone width in price = previous daily ATR divided by this, rounded UP to whole ticks. Example: 65-point ES daily ATR ÷ 18 = 3.6 pts = 14.4 ticks → 15-tick zones. Larger divisor = tighter zones.")
+hl_zoneTicks       = input.int(24, "Zone Size (Ticks, Fallback)", minval = 1, group = g, tooltip = "Fixed-tick zone width. Used when Daily ATR Scaling is OFF, or as automatic fallback if daily ATR data is unavailable.")
+projBars        = input.int(14, "Projection Bars Right", minval = 0, maxval = 200, group = g, tooltip = "How far to the right to extend zones.")
+labelOffsetBars = input.int(5,  "Label Offset (bars from right edge)", minval = 0, maxval = 50, group = g)
+//extendLeft      = input.bool(true, "Extend Zones Left", group = g, tooltip = "Extend boxes / center lines leftward across history.")
+extendLeft = true
+zoneColor       = input.color(color.aqua, "Zone Color", group = g)
+zoneOpac        = input.int(85, "Zone Fill Opacity (0=solid, 100=invisible)", minval = 0, maxval = 100, group = g)
+showRangeorMid = input.bool(true, "Show Zone Range in Labels", group = g, tooltip = "ON: labels show the zone's HIGH and LOW range (top and bottom edges). OFF: labels show only the zone centerline level. When zones overlap, the range shows the extremes (highest high / lowest low) of all zones in the cluster.")
+showMidLines    = not showRangeorMid
+showRangeLabels = showRangeorMid
+
+// =======================================================
+// INPUTS — CUSTOM LEVELS (up to 16, free-ranging)
+// =======================================================
+grpCust    = "Custom Levels (up to 16)"
+enableCust = input.bool(true, "Enable Custom Levels (Master)", group = grpCust)
+showC1  = input.bool(true, "",  group = grpCust, inline = "c1")
+cn1     = input.string("C1",  "", group = grpCust, inline = "c1")
+cz1     = input.float(0.0,    "", group = grpCust, inline = "c1", tooltip = "Name | value. Leave value 0.0 to keep unused. Blank name falls back to default ID. Only levels with a value appear in the HUD.")
+showC2  = input.bool(true, "",  group = grpCust, inline = "c2")
+cn2     = input.string("C2",  "", group = grpCust, inline = "c2")
+cz2     = input.float(0.0,    "", group = grpCust, inline = "c2")
+showC3  = input.bool(true, "",  group = grpCust, inline = "c3")
+cn3     = input.string("C3",  "", group = grpCust, inline = "c3")
+cz3     = input.float(0.0,    "", group = grpCust, inline = "c3")
+showC4  = input.bool(true, "",  group = grpCust, inline = "c4")
+cn4     = input.string("C4",  "", group = grpCust, inline = "c4")
+cz4     = input.float(0.0,    "", group = grpCust, inline = "c4")
+showC5  = input.bool(true, "",  group = grpCust, inline = "c5")
+cn5     = input.string("C5",  "", group = grpCust, inline = "c5")
+cz5     = input.float(0.0,    "", group = grpCust, inline = "c5")
+showC6  = input.bool(true, "",  group = grpCust, inline = "c6")
+cn6     = input.string("C6",  "", group = grpCust, inline = "c6")
+cz6     = input.float(0.0,    "", group = grpCust, inline = "c6")
+showC7  = input.bool(true, "",  group = grpCust, inline = "c7")
+cn7     = input.string("C7",  "", group = grpCust, inline = "c7")
+cz7     = input.float(0.0,    "", group = grpCust, inline = "c7")
+showC8  = input.bool(true, "",  group = grpCust, inline = "c8")
+cn8     = input.string("C8",  "", group = grpCust, inline = "c8")
+cz8     = input.float(0.0,    "", group = grpCust, inline = "c8")
+showC9  = input.bool(true, "",  group = grpCust, inline = "c9")
+cn9     = input.string("C9",  "", group = grpCust, inline = "c9")
+cz9     = input.float(0.0,    "", group = grpCust, inline = "c9")
+showC10 = input.bool(true, "",  group = grpCust, inline = "c10")
+cn10    = input.string("C10", "", group = grpCust, inline = "c10")
+cz10    = input.float(0.0,    "", group = grpCust, inline = "c10")
+showC11 = input.bool(true, "",  group = grpCust, inline = "c11")
+cn11    = input.string("C11", "", group = grpCust, inline = "c11")
+cz11    = input.float(0.0,    "", group = grpCust, inline = "c11")
+showC12 = input.bool(true, "",  group = grpCust, inline = "c12")
+cn12    = input.string("C12", "", group = grpCust, inline = "c12")
+cz12    = input.float(0.0,    "", group = grpCust, inline = "c12")
+showC13 = input.bool(true, "",  group = grpCust, inline = "c13")
+cn13    = input.string("C13", "", group = grpCust, inline = "c13")
+cz13    = input.float(0.0,    "", group = grpCust, inline = "c13")
+showC14 = input.bool(true, "",  group = grpCust, inline = "c14")
+cn14    = input.string("C14", "", group = grpCust, inline = "c14")
+cz14    = input.float(0.0,    "", group = grpCust, inline = "c14")
+showC15 = input.bool(true, "",  group = grpCust, inline = "c15")
+cn15    = input.string("C15", "", group = grpCust, inline = "c15")
+cz15    = input.float(0.0,    "", group = grpCust, inline = "c15")
+showC16 = input.bool(true, "",  group = grpCust, inline = "c16")
+cn16    = input.string("C16", "", group = grpCust, inline = "c16")
+cz16    = input.float(0.0,    "", group = grpCust, inline = "c16")
+
+// =======================================================
+// INPUTS — HISTORICAL LEVELS
+// =======================================================
+grpHist     = "Historical Levels"
+showHistGrp = input.bool(true, "Enable Historical Levels (Master)", group = grpHist)
+showPMH = input.bool(true, "Previous Month High (PMH)", group = grpHist)
+showPML = input.bool(true, "Previous Month Low (PML)",  group = grpHist)
+showPWH = input.bool(true, "Prev Week High (PWH)",      group = grpHist)
+showPWL = input.bool(true, "Prev Week Low (PWL)",       group = grpHist)
+showCWH = input.bool(true, "Current Week High (CWH)",   group = grpHist)
+showCWL = input.bool(true, "Current Week Low (CWL)",    group = grpHist)
+showPDH = input.bool(true, "Prev Day High (PDH)",       group = grpHist)
+showPDL = input.bool(true, "Prev Day Low (PDL)",        group = grpHist)
+
+// =======================================================
+// FIXED CONFIG & TIMEFRAME
+// =======================================================
+bool is4H    = timeframe.isintraday and timeframe.multiplier == 240
+bool okTF    = timeframe.isintraday or timeframe.isdaily
+bool runCalc = okTF   // runs on ALL intraday + daily timeframes
+
+// =======================================================
+// DAILY ATR SCALING
+// =======================================================
+float hl_dAtrRaw = request.security(syminfo.tickerid, "D", ta.atr(20)[1], lookahead=barmerge.lookahead_on)
+bool  hl_dAtrOK  = not na(hl_dAtrRaw) and hl_dAtrRaw > 0
+bool  hl_atrLive = useAtrScaling and hl_dAtrOK
+
+int   hl_zoneTicksEff = hl_atrLive ? math.max(1, math.ceil((hl_dAtrRaw / hl_atrZoneDiv) / syminfo.mintick)) : hl_zoneTicks
+float halfW        = (hl_zoneTicksEff * syminfo.mintick) / 2.0
+
+// =======================================================
+// HISTORICAL LEVELS — CALCULATION (unchanged)
+// =======================================================
+string pd_tzNY       = "America/New_York"
+string pd_rthSessStr = "0930-1700"
+
+// ---- RTH AGGREGATORS ----
+pd_f_prevRTH_end(_sess, _tz) =>
+    pd_inSess   = not na(time("5", _sess, _tz))
+    pd_startSes = pd_inSess and not pd_inSess[1]
+    pd_endSes   = not pd_inSess and pd_inSess[1]
+    var float pd_curH  = na
+    var float pd_curL  = na
+    var float pd_prevH = na
+    var float pd_prevL = na
+    if pd_startSes
+        pd_curH := high
+        pd_curL := low
+    if pd_inSess
+        pd_curH := na(pd_curH) ? high : math.max(pd_curH, high)
+        pd_curL := na(pd_curL) ? low  : math.min(pd_curL, low)
+    if pd_endSes
+        pd_prevH := pd_curH
+        pd_prevL := pd_curL
+        pd_curH := na
+        pd_curL := na
+    [pd_prevH, pd_prevL]
+
+pd_f_prevWEEK_RTH(_sess, _tz) =>
+    pd_inSess    = not na(time("5", _sess, _tz))
+    pd_newWeekNY = ta.change(time("W", "0000-2359", _tz)) != 0
+    var float pd_curH  = na
+    var float pd_curL  = na
+    var float pd_prevH = na
+    var float pd_prevL = na
+    if pd_inSess
+        pd_curH := na(pd_curH) ? high : math.max(pd_curH, high)
+        pd_curL := na(pd_curL) ? low  : math.min(pd_curL, low)
+    if pd_newWeekNY
+        pd_prevH := pd_curH
+        pd_prevL := pd_curL
+        pd_curH := na
+        pd_curL := na
+    [pd_prevH, pd_prevL]
+
+pd_f_prevMONTH_RTH(_sess, _tz) =>
+    pd_inSess     = not na(time("5", _sess, _tz))
+    pd_newMonthNY = ta.change(time("M", "0000-2359", _tz)) != 0
+    var float pd_curH  = na
+    var float pd_curL  = na
+    var float pd_prevH = na
+    var float pd_prevL = na
+    if pd_inSess
+        pd_curH := na(pd_curH) ? high : math.max(pd_curH, high)
+        pd_curL := na(pd_curL) ? low  : math.min(pd_curL, low)
+    if pd_newMonthNY
+        pd_prevH := pd_curH
+        pd_prevL := pd_curL
+        pd_curH := na
+        pd_curL := na
+    [pd_prevH, pd_prevL]
+
+int pd_calcBars = 5000
+[pd_prevDayHigh,   pd_prevDayLow]   = request.security(syminfo.tickerid, "5", pd_f_prevRTH_end(pd_rthSessStr, pd_tzNY),  gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = pd_calcBars)
+[pd_prevWeekHigh,  pd_prevWeekLow]  = request.security(syminfo.tickerid, "5", pd_f_prevWEEK_RTH(pd_rthSessStr, pd_tzNY), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, calc_bars_count = pd_calcBars)
+[pd_prevMonthHigh, pd_prevMonthLow] = request.security(syminfo.tickerid, is4H ? "5" : "", pd_f_prevMONTH_RTH(pd_rthSessStr, pd_tzNY), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+float pd_pdHigh = pd_prevDayHigh
+float pd_pdLow  = pd_prevDayLow
+float pd_pwHigh = pd_prevWeekHigh
+float pd_pwLow  = pd_prevWeekLow
+float pd_pmHigh = pd_prevMonthHigh
+float pd_pmLow  = pd_prevMonthLow
+
+pd_inRTHSession = not na(time(timeframe.period, pd_rthSessStr, pd_tzNY))
+var float pd_cwHigh    = na
+var float pd_cwLow     = na
+var float pd_todayHigh = na
+var float pd_todayLow  = na
+bool pd_isNewWeek = ta.change(time("W", "0000-2359", pd_tzNY)) != 0
+bool pd_isNewDay  = ta.change(time("D", "0000-2359", pd_tzNY)) != 0
+
+if pd_isNewWeek
+    pd_cwHigh := na
+    pd_cwLow  := na
+    pd_todayHigh := na
+    pd_todayLow  := na
+
+if pd_inRTHSession
+    pd_todayHigh := nz(pd_todayHigh, high)
+    pd_todayLow  := nz(pd_todayLow,  low)
+    pd_todayHigh := math.max(pd_todayHigh, high)
+    pd_todayLow  := math.min(pd_todayLow,  low)
+if pd_isNewDay and not na(pd_todayHigh)
+    pd_cwHigh := na(pd_cwHigh) ? pd_todayHigh : math.max(pd_cwHigh, pd_todayHigh)
+    pd_cwLow  := na(pd_cwLow)  ? pd_todayLow  : math.min(pd_cwLow,  pd_todayLow)
+    pd_todayHigh := na
+    pd_todayLow  := na
+
+// =======================================================
+// DRAWING POOLS
+// =======================================================
+var array<box>   histBox = array.new<box>()
+var array<line>  histMid = array.new<line>()
+var array<label> histLbl = array.new<label>()
+if array.size(histBox) == 0
+    for k = 0 to 7
+        array.push(histBox, box.new(na, na, na, na, border_width = 1, bgcolor = na, border_color = na))
+        array.push(histMid, line.new(na, na, na, na, style = line.style_dotted, width = 1, color = na))
+        array.push(histLbl, label.new(na, na, "", style = label.style_label_left, color = color.new(color.black, 100), size = txtSize))
+
+var array<box>   custBox = array.new<box>()
+var array<line>  custMid = array.new<line>()
+var array<label> custLbl = array.new<label>()
+if array.size(custBox) == 0
+    for k = 0 to 15
+        array.push(custBox, box.new(na, na, na, na, border_width = 1, bgcolor = na, border_color = na))
+        array.push(custMid, line.new(na, na, na, na, style = line.style_dotted, width = 1, color = na))
+        array.push(custLbl, label.new(na, na, "", style = label.style_label_left, color = color.new(color.black, 100), size = txtSize))
+
+// =======================================================
+// RENDER — LAST BAR ONLY
+// =======================================================
+if barstate.islast
+    if runCalc
+        int hl_rightX = bar_index + projBars
+        int hl_labelX = bar_index + projBars + labelOffsetBars
+        extMode    = extendLeft ? extend.left : extend.none
+        color clear = color.new(color.gray, 100)
+
+        // =======================================================
+        // BUILD HISTORICAL CANDIDATES
+        // (individual toggle gates BOTH chart and HUD)
+        // =======================================================
+        array<float>  hPrice = array.new<float>()
+        array<string> hLabel = array.new<string>()
+        if showHistGrp
+            if showPMH and not na(pd_pmHigh)
+                array.push(hPrice, pd_pmHigh), array.push(hLabel, "PMH")
+            if showPML and not na(pd_pmLow)
+                array.push(hPrice, pd_pmLow),  array.push(hLabel, "PML")
+            if showPWH and not na(pd_pwHigh)
+                array.push(hPrice, pd_pwHigh), array.push(hLabel, "PWH")
+            if showPWL and not na(pd_pwLow)
+                array.push(hPrice, pd_pwLow),  array.push(hLabel, "PWL")
+            if showCWH and not na(pd_cwHigh)
+                array.push(hPrice, pd_cwHigh), array.push(hLabel, "CWH")
+            if showCWL and not na(pd_cwLow)
+                array.push(hPrice, pd_cwLow),  array.push(hLabel, "CWL")
+            if showPDH and not na(pd_pdHigh)
+                array.push(hPrice, pd_pdHigh), array.push(hLabel, "PDH")
+            if showPDL and not na(pd_pdLow)
+                array.push(hPrice, pd_pdLow),  array.push(hLabel, "PDL")
+        int hn = array.size(hPrice)
+
+// =======================================================
+        // BUILD CUSTOM CANDIDATES
+        // (value > 0 gates HUD; individual toggle gates chart only)
+        // (blank name field falls back to default Cn ID)
+        // =======================================================
+        array<float>  cPrice = array.new<float>()
+        array<string> cLabel = array.new<string>()
+        if enableCust
+            if cz1  > 0.0 and showC1
+                array.push(cPrice, cz1),  array.push(cLabel, cn1  == "" ? "C1"  : cn1)
+            if cz2  > 0.0 and showC2
+                array.push(cPrice, cz2),  array.push(cLabel, cn2  == "" ? "C2"  : cn2)
+            if cz3  > 0.0 and showC3
+                array.push(cPrice, cz3),  array.push(cLabel, cn3  == "" ? "C3"  : cn3)
+            if cz4  > 0.0 and showC4
+                array.push(cPrice, cz4),  array.push(cLabel, cn4  == "" ? "C4"  : cn4)
+            if cz5  > 0.0 and showC5
+                array.push(cPrice, cz5),  array.push(cLabel, cn5  == "" ? "C5"  : cn5)
+            if cz6  > 0.0 and showC6
+                array.push(cPrice, cz6),  array.push(cLabel, cn6  == "" ? "C6"  : cn6)
+            if cz7  > 0.0 and showC7
+                array.push(cPrice, cz7),  array.push(cLabel, cn7  == "" ? "C7"  : cn7)
+            if cz8  > 0.0 and showC8
+                array.push(cPrice, cz8),  array.push(cLabel, cn8  == "" ? "C8"  : cn8)
+            if cz9  > 0.0 and showC9
+                array.push(cPrice, cz9),  array.push(cLabel, cn9  == "" ? "C9"  : cn9)
+            if cz10 > 0.0 and showC10
+                array.push(cPrice, cz10), array.push(cLabel, cn10 == "" ? "C10" : cn10)
+            if cz11 > 0.0 and showC11
+                array.push(cPrice, cz11), array.push(cLabel, cn11 == "" ? "C11" : cn11)
+            if cz12 > 0.0 and showC12
+                array.push(cPrice, cz12), array.push(cLabel, cn12 == "" ? "C12" : cn12)
+            if cz13 > 0.0 and showC13
+                array.push(cPrice, cz13), array.push(cLabel, cn13 == "" ? "C13" : cn13)
+            if cz14 > 0.0 and showC14
+                array.push(cPrice, cz14), array.push(cLabel, cn14 == "" ? "C14" : cn14)
+            if cz15 > 0.0 and showC15
+                array.push(cPrice, cz15), array.push(cLabel, cn15 == "" ? "C15" : cn15)
+            if cz16 > 0.0 and showC16
+                array.push(cPrice, cz16), array.push(cLabel, cn16 == "" ? "C16" : cn16)
+        int cn = array.size(cPrice)
+        
+        // =======================================================
+        // COMBINED LEVEL LIST (historical [0..hn-1] then custom [hn..hn+cn-1])
+        // =======================================================
+        array<float>  allCenter = array.new<float>()
+        array<string> allId     = array.new<string>()
+        if hn > 0
+            for i = 0 to hn - 1
+                array.push(allCenter, array.get(hPrice, i))
+                array.push(allId,     array.get(hLabel, i))
+        if cn > 0
+            for i = 0 to cn - 1
+                array.push(allCenter, array.get(cPrice, i))
+                array.push(allId,     array.get(cLabel, i))
+        int N = array.size(allCenter)
+
+        // DRAW HISTORICAL ZONES (boxes only; center lines handled per-group below)
+        // Track which box slot each zone ends up in
+        array<int> histSlot = array.new<int>(hn, -1)
+        int hslot = 0
+        if hn > 0
+            for i = 0 to hn - 1
+                if hslot <= 7
+                    float cC  = array.get(hPrice, i)
+                    bool  vis = showZones
+                    color fill = vis ? color.new(zoneColor, zoneOpac) : clear
+                    color brd  = vis ? color.new(zoneColor, 100) : clear
+                    box   b = array.get(histBox, hslot)
+                    line  m = array.get(histMid, hslot)
+                    box.set_lefttop(b, bar_index, cC + halfW)
+                    box.set_rightbottom(b, hl_rightX, cC - halfW)
+                    box.set_bgcolor(b, fill)
+                    box.set_border_color(b, brd)
+                    box.set_extend(b, extMode)
+                    // Center lines drawn per-group below based on grouping
+                    line.set_color(m, color.new(color.gray, 100))
+                    array.set(histSlot, i, hslot)
+                    hslot += 1
+        if hslot <= 7
+            for k = hslot to 7
+                box.set_bgcolor(array.get(histBox, k), clear)
+                box.set_border_color(array.get(histBox, k), clear)
+                box.set_extend(array.get(histBox, k), extend.none)
+                line.set_color(array.get(histMid, k), clear)
+                line.set_extend(array.get(histMid, k), extend.none)
+                label.set_text(array.get(histLbl, k), "")
+
+        // DRAW CUSTOM ZONES (boxes only; center lines handled per-group below)
+        // Track which box slot each zone ends up in
+        array<int> custSlot = array.new<int>(cn, -1)
+        int cslot = 0
+        if cn > 0
+            for i = 0 to cn - 1
+                if cslot <= 15
+                    float cC  = array.get(cPrice, i)
+                    bool  vis = showZones
+                    color fill = vis ? color.new(zoneColor, zoneOpac) : clear
+                    color brd  = vis ? color.new(zoneColor, 100) : clear
+                    box   b = array.get(custBox, cslot)
+                    line  m = array.get(custMid, cslot)
+                    box.set_lefttop(b, bar_index, cC + halfW)
+                    box.set_rightbottom(b, hl_rightX, cC - halfW)
+                    box.set_bgcolor(b, fill)
+                    box.set_border_color(b, brd)
+                    box.set_extend(b, extMode)
+                    // Center lines drawn per-group below based on grouping
+                    line.set_color(m, color.new(color.gray, 100))
+                    array.set(custSlot, i, cslot)
+                    cslot += 1
+        if cslot <= 15
+            for k = cslot to 15
+                box.set_bgcolor(array.get(custBox, k), clear)
+                box.set_border_color(array.get(custBox, k), clear)
+                box.set_extend(array.get(custBox, k), extend.none)
+                line.set_color(array.get(custMid, k), clear)
+                line.set_extend(array.get(custMid, k), extend.none)
+                label.set_text(array.get(custLbl, k), "")
+
+        // =======================================================
+        // CLUSTERING + CONSOLIDATION + LABELS
+        // Clustering and box consolidation run whenever zones are shown,
+        // so overlapping zones always merge into ONE box (no stacked/blended
+        // shading). Label TEXT alone is gated by showAllLabels.
+        // =======================================================
+        // Blank every active label first
+        if hn > 0
+            for i = 0 to hn - 1
+                label.set_text(array.get(histLbl, i), "")
+        if cn > 0
+            for i = 0 to cn - 1
+                label.set_text(array.get(custLbl, i), "")
+
+        if N > 0 and showZones
+            // 1D cluster by sorted center; new group when gap >= one zone height
+            array<int> sIdx  = array.sort_indices(allCenter, order.ascending)
+            array<int> grpOf = array.new<int>(N, -1)
+            int gCount = 0
+            for k = 0 to N - 1
+                int gi = array.get(sIdx, k)
+                if k == 0
+                    array.set(grpOf, gi, 0)
+                    gCount := 1
+                else
+                    int pgi = array.get(sIdx, k - 1)
+                    if (array.get(allCenter, gi) - array.get(allCenter, pgi)) < (2.0 * halfW)
+                        array.set(grpOf, gi, gCount - 1)
+                    else
+                        array.set(grpOf, gi, gCount)
+                        gCount += 1
+
+            // Per-group aggregates
+            array<int>   grpSize = array.new<int>(gCount, 0)
+            array<float> grpMinC = array.new<float>(gCount, na)
+            array<float> grpMaxC = array.new<float>(gCount, na)
+            array<int>   grpLead = array.new<int>(gCount, -1)
+            for i = 0 to N - 1
+                int grp = array.get(grpOf, i)
+                float c = array.get(allCenter, i)
+                array.set(grpSize, grp, array.get(grpSize, grp) + 1)
+                array.set(grpMinC, grp, na(array.get(grpMinC, grp)) ? c : math.min(array.get(grpMinC, grp), c))
+                array.set(grpMaxC, grp, na(array.get(grpMaxC, grp)) ? c : math.max(array.get(grpMaxC, grp), c))
+                if array.get(grpLead, grp) == -1
+                    array.set(grpLead, grp, i)
+
+            // Build merged text per group, ordered top-to-bottom (descending center)
+            // Also track group extremes (min/max) for consolidated center lines
+            array<string> grpText = array.new<string>(gCount, "")
+            array<string> grpIds = array.new<string>(gCount, "")
+            array<float> grpExtMinY = array.new<float>(gCount, na)
+            array<float> grpExtMaxY = array.new<float>(gCount, na)
+            for k = N - 1 to 0
+                int gi = array.get(sIdx, k)
+                int grp = array.get(grpOf, gi)
+                string id = array.get(allId, gi)
+                float  c  = array.get(allCenter, gi)
+                float  zH = c + halfW
+                float  zL = c - halfW
+                
+                // Accumulate IDs for this group
+                string curIds = array.get(grpIds, grp)
+                array.set(grpIds, grp, curIds == "" ? id : id + " / " + curIds)
+                
+                // Track extreme high/low for the group
+                if na(array.get(grpExtMaxY, grp))
+                    array.set(grpExtMaxY, grp, zH)
+                    array.set(grpExtMinY, grp, zL)
+                else
+                    array.set(grpExtMaxY, grp, math.max(array.get(grpExtMaxY, grp), zH))
+                    array.set(grpExtMinY, grp, math.min(array.get(grpExtMinY, grp), zL))
+
+            // CONSOLIDATE ZONE BOXES FOR GROUPS:
+            // For each group with multiple overlapping zones, show ONE box at the
+            // group's extremes (highest high / lowest low) with unified shading.
+            // Single-zone groups keep their individual boxes unchanged.
+            for grp = 0 to gCount - 1
+                int sz = array.get(grpSize, grp)
+                if sz > 1
+                    int lead = array.get(grpLead, grp)
+                    float extMaxY = array.get(grpExtMaxY, grp)
+                    float extMinY = array.get(grpExtMinY, grp)
+                    bool  vis = showZones
+                    color fill = vis ? color.new(zoneColor, zoneOpac) : clear
+                    color brd  = vis ? color.new(zoneColor, 100) : clear
+                    
+                    // Get box slot for the lead zone
+                    int leadSlot = -1
+                    if lead < hn
+                        leadSlot := array.get(histSlot, lead)
+                    else
+                        leadSlot := array.get(custSlot, lead - hn)
+                    
+                    if leadSlot >= 0
+                        // Consolidate to the lead zone's box at group extremes
+                        box b = lead < hn ? array.get(histBox, leadSlot) : array.get(custBox, leadSlot)
+                        box.set_lefttop(b, bar_index, extMaxY)
+                        box.set_rightbottom(b, hl_rightX, extMinY)
+                        box.set_bgcolor(b, fill)
+                        box.set_border_color(b, brd)
+                        box.set_extend(b, extMode)
+                        
+                        // Hide all other individual zones in this group
+                        for i = 0 to N - 1
+                            if array.get(grpOf, i) == grp and i != lead
+                                int otherSlot = -1
+                                if i < hn
+                                    otherSlot := array.get(histSlot, i)
+                                else
+                                    otherSlot := array.get(custSlot, i - hn)
+                                
+                                if otherSlot >= 0
+                                    box bHide = i < hn ? array.get(histBox, otherSlot) : array.get(custBox, otherSlot)
+                                    box.set_bgcolor(bHide, clear)
+                                    box.set_border_color(bHide, clear)
+
+            // Format labels: show extremes of the group with all IDs
+            // (label TEXT gated by showAllLabels; center lines always drawn
+            //  when zones are visible and center-only mode is selected)
+            for grp = 0 to gCount - 1
+                int sz = array.get(grpSize, grp)
+                float extMaxY = array.get(grpExtMaxY, grp)
+                float extMinY = array.get(grpExtMinY, grp)
+                string ids = array.get(grpIds, grp)
+                
+                string labelText = ""
+                if shortLabels
+                    labelText := ids
+                else if showRangeLabels and sz > 1
+                    // Multiple zones: show all IDs then the group extremes
+                    labelText := ids + " : " + str.tostring(extMaxY, format.mintick) + " H / " + str.tostring(extMinY, format.mintick) + " L"
+                else if showRangeLabels and sz == 1
+                    // Single zone: show ID and its range
+                    labelText := ids + " : " + str.tostring(extMaxY, format.mintick) + " H / " + str.tostring(extMinY, format.mintick) + " L"
+                else
+                    // Center-only mode
+                    float centerY = (extMaxY + extMinY) / 2.0
+                    labelText := ids + ": " + str.tostring(centerY, format.mintick)
+                
+                int lead = array.get(grpLead, grp)
+                float midY = (array.get(grpMinC, grp) + array.get(grpMaxC, grp)) / 2.0
+                label lbl = lead < hn ? array.get(histLbl, lead) : array.get(custLbl, lead - hn)
+                if showAllLabels
+                    label.set_xy(lbl, hl_labelX, midY)
+                    label.set_text(lbl, labelText)
+                    label.set_textcolor(lbl, color.new(zoneColor, 0))
+                
+                // Draw one consolidated center line per group at the midpoint of the group's extremes
+                if showMidLines
+                    float extMidY = (array.get(grpExtMaxY, grp) + array.get(grpExtMinY, grp)) / 2.0
+                    color midC = color.new(zoneColor, 0)
+                    line  m = lead < hn ? array.get(histMid, lead) : array.get(custMid, lead - hn)
+                    line.set_xy1(m, bar_index, extMidY)
+                    line.set_xy2(m, hl_rightX, extMidY)
+                    line.set_color(m, midC)
+                    line.set_extend(m, extMode)
+
+    else
+        // not a valid timeframe — clear everything
+        color clr = color.new(color.gray, 100)
+        for k = 0 to 7
+            box.set_bgcolor(array.get(histBox, k), clr)
+            box.set_border_color(array.get(histBox, k), clr)
+            box.set_extend(array.get(histBox, k), extend.none)
+            line.set_color(array.get(histMid, k), clr)
+            line.set_extend(array.get(histMid, k), extend.none)
+            label.set_text(array.get(histLbl, k), "")
+        for k = 0 to 15
+            box.set_bgcolor(array.get(custBox, k), clr)
+            box.set_border_color(array.get(custBox, k), clr)
+            box.set_extend(array.get(custBox, k), extend.none)
+            line.set_color(array.get(custMid, k), clr)
+            line.set_extend(array.get(custMid, k), extend.none)
+            label.set_text(array.get(custLbl, k), "")
+
+
+// =========================================================================
+// BIAS HUD
+// Ranks all Auto (PPR/PPS) zones — combined, both pools — by creation order.
+// Custom zones never factor into this. The newest zone is always excluded;
+// bias is read off the next two most recent zones.
+// =========================================================================
+f_zoneBiasColor(PPZone z, bool isTopOrigin) =>
+    // 1 = green (bullish-acting), -1 = red (bearish-acting).
+    // backendState 0 (never flipped) falls back to the zone's origin default:
+    // PPR (topZones) defaults red, PPS (botZones) defaults green.
+    z.backendState == 1 ? 1 : z.backendState == -1 ? -1 : (isTopOrigin ? -1 : 1)
+
+f_computeBias() =>
+    array<int> borns  = array.new<int>()
+    array<int> colors = array.new<int>()
+    if array.size(topZones) > 0
+        for i = 0 to array.size(topZones) - 1
+            PPZone z = array.get(topZones, i)
+            array.push(borns, z.born)
+            array.push(colors, f_zoneBiasColor(z, true))
+    if array.size(botZones) > 0
+        for i = 0 to array.size(botZones) - 1
+            PPZone z = array.get(botZones, i)
+            array.push(borns, z.born)
+            array.push(colors, f_zoneBiasColor(z, false))
+
+    string bias = "Insufficient Zones"
+    if array.size(borns) >= 3
+        // Composite sort key: born as the primary key, insertion index as a
+        // stable tie-break (so same-bar PPR/PPS zones don't land in
+        // ambiguous/arbitrary order — the one pushed later, i.e. processed
+        // after in the topZones-then-botZones pass above, counts as newer).
+        array<int> sortKeys = array.new<int>()
+        for i = 0 to array.size(borns) - 1
+            array.push(sortKeys, array.get(borns, i) * 1000 + i)
+        array<int> ord = array.sort_indices(sortKeys, order.descending)
+        int c1 = array.get(colors, array.get(ord, 1))   // 2nd most recent (most recent, excluding newest)
+        int c2 = array.get(colors, array.get(ord, 2))   // 3rd most recent (the one before that)
+        if c1 == 1 and c2 == 1
+            bias := "Bullish"
+        else if c1 == -1 and c2 == -1
+            bias := "Bearish"
+        else if c1 == 1 and c2 == -1
+            bias := "Range: Bearish to Bullish"
+        else if c1 == -1 and c2 == 1
+            bias := "Range: Bullish to Bearish"
+    bias
+
+f_hudPosition(string p) =>
+    p == "Bottom Left" ? position.bottom_left : p == "Top Left" ? position.top_left : p == "Top Right" ? position.top_right : position.bottom_right
+
+var table biasHudTable = na
+
+if showBiasHud and barstate.islast
+    if not na(biasHudTable)
+        table.delete(biasHudTable)
+    string biasText = f_computeBias()
+    color biasColor = biasText == "Bullish" ? color.green : biasText == "Bearish" ? color.red : biasText == "Insufficient Zones" ? color.gray : color.orange
+    biasHudTable := table.new(f_hudPosition(hudPositionInput), 1, 1)
+    table.cell(biasHudTable, 0, 0, "Bias: " + biasText, bgcolor=color.new(color.black, 15), text_color=biasColor, text_size=size.normal)

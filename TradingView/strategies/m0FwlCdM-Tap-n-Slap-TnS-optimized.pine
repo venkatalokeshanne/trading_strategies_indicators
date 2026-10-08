@@ -1,0 +1,317 @@
+//@version=6
+// ============================================================
+// Tap'n'Slap (TnS) Strategy — v22
+//
+// Matches the real TnS indicator exactly:
+//   Entry : market order bar after tap candle detected
+//   SL    : fixed 25pts below fill price
+//   TP    : nearest swing HIGH/LOW left of tap candle (OG TP)
+//   BE    : once +15pts profit → SL moves to fill+3pts (one time, no trail)
+//   EOD   : close position at session end to prevent gap risk
+// ============================================================
+strategy("Tap'n'Slap (TnS) v22", shorttitle="TnS v22",
+     overlay=true, max_boxes_count=200, max_lines_count=200,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.62,
+     slippage=2)
+
+// ─── INPUTS ──────────────────────────────────────────────────────────────────
+grp_s = "Settings"
+preset    = input.bool(true,  "1m Preset (25pt SL + V2 mode)",     group=grp_s)
+slPts     = input.float(35.0, "Stop Loss (Points)",                 group=grp_s, minval=5.0)
+fvgOff    = input.float(3.0,  "FVG Edge Offset (Points)",          group=grp_s)
+v2        = input.bool(true,  "V2 Entry Mode",                     group=grp_s)
+fvgAge    = input.int(30,     "FVG max age (bars)",                 group=grp_s, minval=5, maxval=200)
+
+grp_f = "Filters"
+filterWk  = input.bool(true,  "Filter weak SL (SL inside FVG)",   group=grp_f)
+minRR     = input.float(1.5,  "Min R:R (0 = off)",                 group=grp_f, minval=0.0)
+maxDay    = input.int(3,      "Max trades per day",                 group=grp_f, minval=1, maxval=10)
+
+grp_sess = "Session"
+useSess   = input.bool(true,  "Session Filter",                    group=grp_sess)
+sessStr   = input.session("0930-1600", "Session (ET)",             group=grp_sess)
+eodClose  = input.bool(true,  "Close at session end (no gap risk)",group=grp_sess)
+noLate    = input.bool(true,  "No new entries after 15:30 ET",     group=grp_sess)
+
+grp_be = "Breakeven"
+beOn      = input.bool(true,  "Enable Breakeven",                  group=grp_be)
+beTrig    = input.float(20.0, "Trigger (pts in profit)",           group=grp_be)
+beOff     = input.float(5.0,  "Lock-in (pts above entry)",         group=grp_be)
+
+grp_tbl = "Table"
+showTbl   = input.bool(true,  "Show table",                        group=grp_tbl)
+ptVal     = input.float(20.0, "$/pt/contract (NQ=20, MNQ=2)",      group=grp_tbl)
+
+// ─── DERIVED ─────────────────────────────────────────────────────────────────
+effSL  = preset ? 25.0 : slPts
+effV2  = preset ? true  : v2
+
+inSess     = not useSess or not na(time(timeframe.period, sessStr, "America/New_York"))
+lateSess   = not na(time(timeframe.period, "1530-1600", "America/New_York"))
+entryOk    = inSess and (not noLate or not lateSess)
+prevInSess = not useSess or not na(time(timeframe.period, sessStr, "America/New_York")[1])
+sessEnd    = prevInSess and not inSess
+
+// ─── DAILY COUNTER ───────────────────────────────────────────────────────────
+var int dayTrades  = 0
+var int tradeCount = 0
+if dayofmonth != dayofmonth[1]
+    dayTrades := 0
+
+// ─── PIVOT CACHE (OG TP) ─────────────────────────────────────────────────────
+swLB = 8
+ph   = ta.pivothigh(high, swLB, swLB)
+pl   = ta.pivotlow (low,  swLB, swLB)
+
+var int[]   ph_bi = array.new_int()
+var float[] ph_px = array.new_float()
+var int[]   pl_bi = array.new_int()
+var float[] pl_px = array.new_float()
+
+if not na(ph)
+    array.push(ph_bi, bar_index - swLB)
+    array.push(ph_px, ph)
+    if array.size(ph_bi) > 500
+        array.shift(ph_bi)
+        array.shift(ph_px)
+if not na(pl)
+    array.push(pl_bi, bar_index - swLB)
+    array.push(pl_px, pl)
+    if array.size(pl_bi) > 500
+        array.shift(pl_bi)
+        array.shift(pl_px)
+
+f_pH(absBar) =>
+    res = float(na)
+    best = int(na)
+    n = array.size(ph_bi)
+    if n > 0
+        for k = 0 to n - 1
+            if k >= 0 and k < n
+                b = array.get(ph_bi, k)
+                if b < absBar
+                    d = absBar - b
+                    if na(best) or d < best
+                        best := d
+                        res  := array.get(ph_px, k)
+    res
+
+f_pL(absBar) =>
+    res = float(na)
+    best = int(na)
+    n = array.size(pl_bi)
+    if n > 0
+        for k = 0 to n - 1
+            if k >= 0 and k < n
+                b = array.get(pl_bi, k)
+                if b < absBar
+                    d = absBar - b
+                    if na(best) or d < best
+                        best := d
+                        res  := array.get(pl_px, k)
+    res
+
+// ─── FVG DETECTION ───────────────────────────────────────────────────────────
+var int[]   fbi   = array.new_int()
+var float[] ftop  = array.new_float()
+var float[] fbot  = array.new_float()
+var bool[]  fbull = array.new_bool()
+var bool[]  fdone = array.new_bool()
+
+if barstate.isconfirmed and inSess
+    if low > high[2]
+        array.push(fbi,  bar_index)
+        array.push(ftop, low)
+        array.push(fbot, high[2])
+        array.push(fbull, true)
+        array.push(fdone, false)
+    if high < low[2]
+        array.push(fbi,  bar_index)
+        array.push(ftop, low[2])
+        array.push(fbot, high)
+        array.push(fbull, false)
+        array.push(fdone, false)
+    nf = array.size(fbi)
+    if nf > 0
+        for k = 0 to nf - 1
+            if k >= 0 and k < array.size(fbi) and not array.get(fdone, k)
+                if (bar_index - array.get(fbi, k)) > fvgAge
+                    array.set(fdone, k, true)
+
+// ─── PENDING SETUP ───────────────────────────────────────────────────────────
+var bool  pendActive = false
+var bool  pendBull   = true
+var float pendEntry  = na   // tap candle HIGH (long) or LOW (short)
+var float pendTP     = na
+var int   pendBar    = -1
+
+// ─── SCAN: FIND TAP CANDLE ON BAR CLOSE ──────────────────────────────────────
+if barstate.isconfirmed and entryOk and not pendActive and strategy.position_size == 0
+    nf = array.size(fbi)
+    if nf > 0
+        for k = 0 to nf - 1
+            if k >= 0 and k < array.size(fbi) and not array.get(fdone, k)
+                ft   = array.get(ftop,  k)
+                fb   = array.get(fbot,  k)
+                bull = array.get(fbull, k)
+                fmBI = array.get(fbi,   k)
+                age  = bar_index - fmBI
+                if age < 3
+                    continue
+
+                if bull
+                    // Bull FVG: bearish tap candle (V2), HIGH inside FVG
+                    colorOk = effV2 ? (close < open) : true
+                    inFVG   = high > (fb + fvgOff) and high < (ft - fvgOff)
+                    if colorOk and inFVG
+                        entryPx = high
+                        slPx    = entryPx - effSL
+                        if not filterWk or slPx < fb
+                            // OG TP: nearest confirmed swing HIGH left of tap candle
+                            tpPx = f_pH(bar_index)
+                            if na(tpPx) or tpPx <= entryPx
+                                tpPx := ft + effSL   // fallback
+                            if tpPx > entryPx
+                                rr = (tpPx - entryPx) / effSL
+                                if minRR <= 0 or rr >= minRR
+                                    pendActive := true
+                                    pendBull   := true
+                                    pendEntry  := entryPx
+                                    pendTP     := tpPx
+                                    pendBar    := bar_index
+                                    array.set(fdone, k, true)
+                                    break
+                else
+                    // Bear FVG: bullish tap candle (V2), LOW inside FVG
+                    colorOk = effV2 ? (close > open) : true
+                    inFVG   = low > (fb + fvgOff) and low < (ft - fvgOff)
+                    if colorOk and inFVG
+                        entryPx = low
+                        slPx    = entryPx + effSL
+                        if not filterWk or slPx > ft
+                            // OG TP: nearest confirmed swing LOW left of tap candle
+                            tpPx = f_pL(bar_index)
+                            if na(tpPx) or tpPx >= entryPx
+                                tpPx := fb - effSL   // fallback
+                            if tpPx < entryPx
+                                rr = (entryPx - tpPx) / effSL
+                                if minRR <= 0 or rr >= minRR
+                                    pendActive := true
+                                    pendBull   := false
+                                    pendEntry  := entryPx
+                                    pendTP     := tpPx
+                                    pendBar    := bar_index
+                                    array.set(fdone, k, true)
+                                    break
+
+// ─── EXECUTE: MARKET ORDER NEXT BAR ──────────────────────────────────────────
+if pendActive and bar_index > pendBar and strategy.position_size == 0
+    if dayTrades < maxDay and entryOk
+        tradeCount := tradeCount + 1
+        tid = "TnS_" + str.tostring(tradeCount)
+        if pendBull
+            strategy.entry(tid, strategy.long,  qty=1, comment="TnS L")
+        else
+            strategy.entry(tid, strategy.short, qty=1, comment="TnS S")
+    pendActive := false
+
+if sessEnd
+    pendActive := false
+
+// ─── TRADE STATE ─────────────────────────────────────────────────────────────
+var float pFill  = na
+var float pSL    = na   // current stop (moves once to BE level)
+var float pTP    = na
+var bool  pBull  = true
+var bool  pBE    = false  // has BE triggered?
+var string pTID  = ""
+
+if strategy.position_size == 0
+    pFill := na
+    pSL   := na
+    pTP   := na
+    pBull := true
+    pBE   := false
+    pTID  := ""
+
+// On fill: set state from actual fill price
+if strategy.position_size != 0 and na(pFill)
+    pFill     := strategy.position_avg_price
+    pBull     := strategy.position_size > 0
+    pSL       := pBull ? (pFill - effSL) : (pFill + effSL)
+    pTP       := pendTP
+    pTID      := "TnS_" + str.tostring(tradeCount)
+    dayTrades := dayTrades + 1
+
+// ─── BREAKEVEN (one-time SL move, no trail) ───────────────────────────────────
+// Once price reaches fill+15pts → move SL to fill+3pts. Never moves again.
+if barstate.isconfirmed and strategy.position_size != 0 and not na(pFill) and beOn and not pBE
+    if pBull and (high - pFill) >= beTrig
+        pSL := pFill + beOff
+        pBE := true
+    if not pBull and (pFill - low) >= beTrig
+        pSL := pFill - beOff
+        pBE := true
+
+// ─── EXIT: re-issued every bar so SL is always live ──────────────────────────
+if eodClose and sessEnd and strategy.position_size != 0
+    strategy.close_all(comment="EOD")
+
+if strategy.position_size != 0 and not na(pFill) and pTID != "" and not na(pSL) and not na(pTP)
+    strategy.exit(pTID + "_X", from_entry=pTID, qty=1,
+         stop=pSL, limit=pTP,
+         comment_loss=pBE ? "BE" : "SL", comment_profit="TP")
+
+// ─── VISUALS ─────────────────────────────────────────────────────────────────
+plot(strategy.position_size != 0 ? pFill : na, "Entry", color=color.blue,  style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? pSL   : na, "SL",    color=color.red,   style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? pTP   : na, "TP",    color=color.lime,  style=plot.style_linebr, linewidth=2)
+plot(pendActive ? pendEntry : na, "Pending", color=color.new(color.blue,60), style=plot.style_linebr, linewidth=1)
+
+// ─── TABLE ───────────────────────────────────────────────────────────────────
+var table tbl = table.new(position.bottom_right, 2, 9,
+     border_color=color.gray, border_width=1, bgcolor=color.new(color.black,70))
+
+if showTbl and strategy.position_size != 0 and not na(pFill)
+    slP  = math.abs(pFill - pSL)
+    tpP  = math.abs(pTP   - pFill)
+    rr   = slP > 0 ? tpP / slP : float(na)
+    dir  = pBull ? "▲ LONG" : "▼ SHORT"
+    dCol = pBull ? color.new(color.green,20) : color.new(color.red,20)
+    bg   = color.new(color.black,80)
+    beStr = pBE ? " ✓ BE active" : ""
+    table.cell(tbl,0,0,"TnS v22",   text_color=color.white,               bgcolor=dCol, text_size=size.small)
+    table.cell(tbl,1,0,dir,         text_color=color.white,               bgcolor=dCol, text_size=size.small)
+    table.cell(tbl,0,1,"Fill",      text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,1,str.tostring(pFill,"#.##"),          text_color=color.blue,  bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,2,"Stop",      text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,2,str.tostring(pSL,"#.##")+"  ("+str.tostring(slP,"#.#")+"pts)"+beStr,
+         text_color=pBE?color.orange:color.red, bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,3,"Target",    text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,3,str.tostring(pTP,"#.##")+"  (+"+str.tostring(tpP,"#.#")+"pts  +$"+str.tostring(tpP*ptVal,"#")+")",
+         text_color=color.lime, bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,4,"R:R",       text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,4,str.tostring(rr,"#.##")+" : 1",
+         text_color=rr>=1.5?color.green:color.orange, bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,5,"BE",        text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,5,"@+"+str.tostring(beTrig,"#")+"pts → lock +"+str.tostring(beOff,"#")+"pts",
+         text_color=color.new(color.yellow,10), bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,6,"Max Risk",  text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,6,"$"+str.tostring(effSL*ptVal,"#")+"  ("+str.tostring(effSL,"#")+"pt SL)",
+         text_color=color.new(color.orange,10), bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,7,"Size",      text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,7,"1 NQ  ($"+str.tostring(ptVal,"#")+"/pt)", text_color=color.white, bgcolor=bg, text_size=size.small)
+    table.cell(tbl,0,8,"Session",   text_color=color.gray,  bgcolor=bg,   text_size=size.small)
+    table.cell(tbl,1,8,useSess?sessStr+" ET":"All hours",
+         text_color=inSess?color.green:color.red, bgcolor=bg, text_size=size.small)
+
+// ─── ALERTS ──────────────────────────────────────────────────────────────────
+alertcondition(strategy.position_size > strategy.position_size[1] and strategy.position_size > 0,
+     "TnS Long",  "TnS ▲ LONG | Fill:{{plot_0}} SL:{{plot_1}} TP:{{plot_2}}")
+alertcondition(strategy.position_size < strategy.position_size[1] and strategy.position_size < 0,
+     "TnS Short", "TnS ▼ SHORT | Fill:{{plot_0}} SL:{{plot_1}} TP:{{plot_2}}")
+alertcondition(strategy.position_size == 0 and strategy.position_size[1] != 0,
+     "TnS Closed", "TnS: Closed at {{close}}")

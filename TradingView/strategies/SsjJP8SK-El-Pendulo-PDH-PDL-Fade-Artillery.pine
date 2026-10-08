@@ -1,0 +1,405 @@
+//@version=6
+// El Pendulo - PDH/PDL fade with VWAP confluence, evening-session mean reversion.
+// Canonical republication (title made ASCII/English-first, version suffix dropped).
+// Educational tool. Not financial advice.
+// [Artillery Trades] — free tool. Brand colors: c_bull=#00dcb4 c_bear=#ff4976 c_gold=#f0b90b
+//
+// CONCEPT: Fades tests of the Previous Day's RTH High/Low during the evening session.
+// When price probes PDH or PDL (institutional liquidity levels) and shows a reversal
+// candle, we enter expecting mean reversion toward the midpoint. VWAP acts as a
+// directional filter — only short above VWAP, only long below VWAP.
+//
+// TIMEZONE: 6pm-10pm Mountain (Denver) = 8pm-midnight ET
+// Wait:   8-9PM ET (observe, let VWAP develop)
+// Trades: 9PM-midnight ET (after context is established)
+// Symbol: MNQ1! 5-min (primary)
+// NOTE: Do NOT use fill_orders_on_standard_ohlc or max_bars_back — causes TV server crash
+strategy("El Pendulo PDH PDL Fade [Artillery]", shorttitle="El Pendulo", overlay=true,
+  initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+  commission_type=strategy.commission.cash_per_contract, commission_value=0.62,
+  slippage=1, pyramiding=0, calc_on_every_tick=false,
+  process_orders_on_close=true,
+  margin_long=5, margin_short=5)
+
+// ──────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────
+
+// PDH/PDL Source — RTH session hours
+int   rthStartH  = input.int(9,  "RTH Start Hour (ET)",   minval=0, maxval=23, group="RTH Session")
+int   rthStartM  = input.int(30, "RTH Start Minute",      minval=0, maxval=59, group="RTH Session")
+int   rthEndH    = input.int(16, "RTH End Hour (ET)",     minval=0, maxval=23, group="RTH Session")
+int   rthEndM    = input.int(0,  "RTH End Minute",        minval=0, maxval=59, group="RTH Session")
+
+// Trade Window
+int   twStartH   = input.int(21, "Trade Start Hour (ET)", minval=0, maxval=23, group="Trade Window")
+int   twStartM   = input.int(0,  "Trade Start Minute",    minval=0, maxval=59, group="Trade Window")
+int   twEndH     = input.int(23, "Trade End Hour (ET)",   minval=0, maxval=23, group="Trade Window")
+int   twEndM     = input.int(55, "Trade End Minute",      minval=0, maxval=59, group="Trade Window")
+int   noEntryH   = input.int(23, "No Entry After Hour",   minval=0, maxval=23, group="Trade Window")
+int   noEntryM   = input.int(0,  "No Entry After Minute", minval=0, maxval=59, group="Trade Window")
+
+// PDH/PDL Test Detection
+float touchZone   = input.float(5.0,  "Touch Zone (pts from PDH/PDL)", minval=1, step=1, group="Detection")
+float minBody     = input.float(2.0,  "Min Reversal Body (pts)",       minval=0.5, step=0.5, group="Detection")
+float closeTol    = input.float(2.0,  "Close Tolerance Past Level (pts)", minval=0, step=0.5, group="Detection")
+int   entryGrace  = input.int(3,      "Entry Grace Bars After Signal", minval=0, maxval=6, group="Detection")
+
+// VWAP Filter
+bool  useVwap     = input.bool(true,  "Use VWAP Directional Filter",   group="VWAP")
+
+// Risk Management
+float slBuffer    = input.float(4.0,  "SL Beyond Extreme (pts)",       minval=1, step=1,    group="Risk")
+float maxSlDist   = input.float(25.0, "Max SL Distance (pts)",         minval=10, step=5,   group="Risk")
+float rrTarget    = input.float(1.0,  "R:R Target",                    minval=0.25, maxval=3.0, step=0.25, group="Risk")
+bool  useMidTP    = input.bool(true,  "Use PDH/PDL Midpoint as TP",    group="Risk")
+int   maxTrades   = input.int(2,      "Max Trades/Session",            minval=1, maxval=5,  group="Risk")
+int   timeStopBars = input.int(24,    "Time Stop (bars)",              minval=6, maxval=60, group="Risk")
+
+// ──────────────────────────────────────────────────────────
+// TIME FUNCTIONS
+// ──────────────────────────────────────────────────────────
+
+etH    = hour(time, "America/New_York")
+etM    = minute(time, "America/New_York")
+etTime = etH * 60 + etM
+
+f_inWindow(_sH, _sM, _eH, _eM) =>
+    int sM = _sH * 60 + _sM
+    int eM = _eH * 60 + _eM
+    int nM = etH * 60 + etM
+    sM <= eM ? (nM >= sM and nM < eM) : (nM >= sM or nM < eM)
+
+bool inRTH      = f_inWindow(rthStartH, rthStartM, rthEndH, rthEndM)
+bool inTrade    = f_inWindow(twStartH, twStartM, twEndH, twEndM)
+bool noEntry    = etTime >= noEntryH * 60 + noEntryM
+
+// Detect new evening session (8PM ET = hour 20)
+bool newEvening = etH == 20 and etM == 0 and not (etH[1] == 20 and etM[1] == 0)
+
+// ──────────────────────────────────────────────────────────
+// PDH / PDL CALCULATION (from RTH session)
+// ──────────────────────────────────────────────────────────
+
+var float rthHigh    = na
+var float rthLow     = na
+var float rthHighPD  = na   // Previous Day RTH High
+var float rthLowPD   = na   // Previous Day RTH Low
+var float rthMidPD   = na   // Previous Day Midpoint
+var bool  rthBuilding = false
+
+// RTH session start — begin tracking new day's high/low
+bool rthStart = inRTH and not inRTH[1]
+if rthStart
+    // Save yesterday's RTH levels before resetting
+    if not na(rthHigh) and not na(rthLow)
+        rthHighPD := rthHigh
+        rthLowPD  := rthLow
+        rthMidPD  := (rthHigh + rthLow) / 2.0
+    rthHigh     := high
+    rthLow      := low
+    rthBuilding := true
+
+// Track RTH high/low during the session
+if inRTH and rthBuilding
+    rthHigh := math.max(nz(rthHigh, high), high)
+    rthLow  := math.min(nz(rthLow, low), low)
+
+// RTH session end — finalize today's levels
+bool rthEnd = not inRTH and inRTH[1] and rthBuilding
+if rthEnd
+    rthHighPD   := rthHigh
+    rthLowPD    := rthLow
+    rthMidPD    := (rthHigh + rthLow) / 2.0
+    rthBuilding := false
+
+// ──────────────────────────────────────────────────────────
+// VWAP (built-in, resets at session boundary)
+// ──────────────────────────────────────────────────────────
+
+float vwapVal = ta.vwap
+
+// ──────────────────────────────────────────────────────────
+// PDH/PDL TEST DETECTION
+// ──────────────────────────────────────────────────────────
+
+// Check if PDH/PDL levels are available
+bool levelsReady = not na(rthHighPD) and not na(rthLowPD) and rthHighPD > rthLowPD
+
+// PDH Test: price high reaches within touchZone of PDH (or above)
+bool pdhTest = levelsReady and inTrade and high >= rthHighPD - touchZone
+
+// PDL Test: price low reaches within touchZone of PDL (or below)
+bool pdlTest = levelsReady and inTrade and low <= rthLowPD + touchZone
+
+// Reversal candle detection
+float bodySize = math.abs(close - open)
+bool  bullBody = close > open and bodySize >= minBody
+bool  bearBody = close < open and bodySize >= minBody
+
+// Track test state across bars
+var int   testDir       = 0      // 1 = PDH test (look for short), -1 = PDL test (look for long)
+var float testExtreme   = na     // The extreme price reached during the test
+var int   testStartBar  = na
+var bool  signalReady   = false  // Reversal candle confirmed
+var int   signalBar     = na
+
+if newEvening
+    testDir := 0, testExtreme := na, testStartBar := na
+    signalReady := false, signalBar := na
+
+// Detect new PDH test (only if no active test)
+if pdhTest and testDir != 1 and not signalReady
+    testDir      := 1
+    testExtreme  := high
+    testStartBar := bar_index
+
+// Detect new PDL test (only if no active test)
+if pdlTest and testDir != -1 and not signalReady
+    testDir      := -1
+    testExtreme  := low
+    testStartBar := bar_index
+
+// Update extreme while test is active
+if testDir == 1
+    testExtreme := math.max(nz(testExtreme, high), high)
+if testDir == -1
+    testExtreme := math.min(nz(testExtreme, low), low)
+
+// Look for reversal candle after test
+// PDH test → need bearish candle closing back below PDH (or within tolerance)
+if testDir == 1 and not signalReady
+    if bearBody and close <= rthHighPD + closeTol
+        signalReady := true
+        signalBar   := bar_index
+
+// PDL test → need bullish candle closing back above PDL (or within tolerance)
+if testDir == -1 and not signalReady
+    if bullBody and close >= rthLowPD - closeTol
+        signalReady := true
+        signalBar   := bar_index
+
+// Expire test if no reversal within 10 bars
+if testDir != 0 and not signalReady and not na(testStartBar)
+    if bar_index - testStartBar > 10
+        testDir := 0, testExtreme := na, testStartBar := na
+
+// ──────────────────────────────────────────────────────────
+// ENTRY LOGIC
+// ──────────────────────────────────────────────────────────
+
+var int sessionN = 0
+var int entryBar = na
+
+if newEvening
+    sessionN := 0
+
+bool flat   = strategy.position_size == 0
+bool canGo  = flat and levelsReady and inTrade and not noEntry and sessionN < maxTrades and signalReady
+
+// Grace window for entry
+bool inGrace = not na(signalBar) and bar_index >= signalBar and bar_index <= signalBar + entryGrace
+
+// VWAP filter: long only below VWAP, short only above VWAP
+bool vwapLongOk  = not useVwap or (not na(vwapVal) and close < vwapVal)
+bool vwapShortOk = not useVwap or (not na(vwapVal) and close > vwapVal)
+
+bool goLong  = canGo and testDir == -1 and inGrace and vwapLongOk
+bool goShort = canGo and testDir == 1  and inGrace and vwapShortOk
+
+if goLong and not na(testExtreme)
+    float sl     = testExtreme - slBuffer
+    float slDist = close - sl
+    if slDist > 0 and slDist <= maxSlDist
+        // TP: use midpoint if enabled and closer, else use R:R
+        float rrTP  = close + slDist * rrTarget
+        float midTP = useMidTP and not na(rthMidPD) ? rthMidPD : rrTP
+        float tp    = useMidTP and midTP > close ? math.min(midTP, rrTP) : rrTP
+        // Ensure TP is above entry
+        if tp <= close
+            tp := rrTP
+        strategy.entry("Long", strategy.long)
+        strategy.exit("LX", "Long", limit=tp, stop=sl)
+        sessionN += 1, entryBar := bar_index
+        // Reset test state
+        testDir := 0, testExtreme := na, testStartBar := na
+        signalReady := false, signalBar := na
+        label.new(bar_index, low - 5, "LONG\nPDL Fade", color=color.new(#00e676, 20),
+          textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if goShort and not na(testExtreme)
+    float sl     = testExtreme + slBuffer
+    float slDist = sl - close
+    if slDist > 0 and slDist <= maxSlDist
+        // TP: use midpoint if enabled and closer, else use R:R
+        float rrTP  = close - slDist * rrTarget
+        float midTP = useMidTP and not na(rthMidPD) ? rthMidPD : rrTP
+        float tp    = useMidTP and midTP < close ? math.max(midTP, rrTP) : rrTP
+        // Ensure TP is below entry
+        if tp >= close
+            tp := rrTP
+        strategy.entry("Short", strategy.short)
+        strategy.exit("SX", "Short", limit=tp, stop=sl)
+        sessionN += 1, entryBar := bar_index
+        // Reset test state
+        testDir := 0, testExtreme := na, testStartBar := na
+        signalReady := false, signalBar := na
+        label.new(bar_index, high + 5, "SHORT\nPDH Fade", color=color.new(#ff1744, 20),
+          textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// ──────────────────────────────────────────────────────────
+// EXIT MANAGEMENT
+// ──────────────────────────────────────────────────────────
+
+// Time stop
+if strategy.position_size != 0 and not na(entryBar)
+    if bar_index - entryBar >= timeStopBars
+        strategy.close_all(comment="Time Stop")
+
+// Session close
+if strategy.position_size != 0 and not inTrade
+    strategy.close_all(comment="Session Close")
+
+// Midnight hard close
+if strategy.position_size != 0 and etH == 0 and etM == 0
+    strategy.close_all(comment="Midnight Close")
+
+// Grace window expired without entry → reset
+if signalReady and not na(signalBar) and bar_index > signalBar + entryGrace and flat
+    testDir := 0, testExtreme := na, testStartBar := na
+    signalReady := false, signalBar := na
+
+// ──────────────────────────────────────────────────────────
+// VISUALS
+// ──────────────────────────────────────────────────────────
+
+color colAmber  = color.new(#ffd740, 0)
+color colCyan   = color.new(#00bcd4, 0)
+
+// PDH/PDL lines (extend through evening)
+var line pdhLine = na, var line pdlLine = na, var line pdmLine = na
+
+if newEvening and levelsReady
+    // Clean old lines
+    if not na(pdhLine)
+        line.delete(pdhLine)
+    if not na(pdlLine)
+        line.delete(pdlLine)
+    if not na(pdmLine)
+        line.delete(pdmLine)
+    // Draw new
+    pdhLine := line.new(bar_index, rthHighPD, bar_index + 60, rthHighPD,
+      color=color.new(#ff5252, 30), width=2, style=line.style_solid)
+    pdlLine := line.new(bar_index, rthLowPD, bar_index + 60, rthLowPD,
+      color=color.new(#00e676, 30), width=2, style=line.style_solid)
+    pdmLine := line.new(bar_index, rthMidPD, bar_index + 60, rthMidPD,
+      color=color.new(#ffd740, 50), width=1, style=line.style_dotted)
+
+// Extend lines
+if not na(pdhLine) and inTrade
+    line.set_x2(pdhLine, bar_index + 3)
+if not na(pdlLine) and inTrade
+    line.set_x2(pdlLine, bar_index + 3)
+if not na(pdmLine) and inTrade
+    line.set_x2(pdmLine, bar_index + 3)
+
+// PDH/PDL labels
+var label pdhLbl = na, var label pdlLbl = na, var label pdmLbl = na
+if newEvening and levelsReady
+    if not na(pdhLbl)
+        label.delete(pdhLbl)
+    if not na(pdlLbl)
+        label.delete(pdlLbl)
+    if not na(pdmLbl)
+        label.delete(pdmLbl)
+    pdhLbl := label.new(bar_index, rthHighPD, "PDH " + str.tostring(rthHighPD, "#.##"),
+      color=color.new(color.black, 100), textcolor=color.new(#ff5252, 40), style=label.style_label_left, size=size.tiny)
+    pdlLbl := label.new(bar_index, rthLowPD, "PDL " + str.tostring(rthLowPD, "#.##"),
+      color=color.new(color.black, 100), textcolor=color.new(#00e676, 40), style=label.style_label_left, size=size.tiny)
+    pdmLbl := label.new(bar_index, rthMidPD, "MID",
+      color=color.new(color.black, 100), textcolor=color.new(#ffd740, 50), style=label.style_label_left, size=size.tiny)
+
+// Test markers
+plotshape(pdhTest and testDir == 1 and testStartBar == bar_index, "PDH Test",
+  shape.xcross, location.abovebar, color.new(#ff5252, 0), size=size.small)
+plotshape(pdlTest and testDir == -1 and testStartBar == bar_index, "PDL Test",
+  shape.xcross, location.belowbar, color.new(#00e676, 0), size=size.small)
+
+// Signal markers
+plotshape(signalReady and signalBar == bar_index and testDir == 1, "Short Signal",
+  shape.diamond, location.abovebar, color.new(#ffd740, 0), size=size.tiny)
+plotshape(signalReady and signalBar == bar_index and testDir == -1, "Long Signal",
+  shape.diamond, location.belowbar, color.new(#ffd740, 0), size=size.tiny)
+
+// VWAP plot
+plot(useVwap ? vwapVal : na, "VWAP", color=color.new(colCyan, 50), linewidth=1)
+
+// Entry price
+bool inPos = strategy.position_size != 0
+plot(inPos and not na(entryBar) ? strategy.position_avg_price : na, "Entry",
+  color.new(colAmber, 40), 1, plot.style_linebr)
+
+// Background colors
+bgcolor(inTrade ? color.new(#00e676, 97) : na, title="Trade Window BG")
+
+// ──────────────────────────────────────────────────────────
+// DASHBOARD
+// ──────────────────────────────────────────────────────────
+
+var table dash = table.new(position.top_right, 2, 12,
+  bgcolor=color.new(#0d1117, 10), border_width=1, border_color=color.new(colCyan, 40))
+
+if barstate.islast
+    int totalT = strategy.closedtrades
+    int wins = 0
+    for i = 0 to (totalT > 0 ? totalT - 1 : 0)
+        if totalT > 0 and strategy.closedtrades.profit(i) > 0
+            wins += 1
+    float winPct = totalT > 0 ? wins / totalT * 100.0 : 0.0
+    float pf = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0.0
+
+    table.cell(dash, 0, 0, "EL PENDULO",  text_color=colCyan,    text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "ARTILLERY",    text_color=color.gray, text_size=size.tiny,  text_halign=text.align_right)
+
+    table.cell(dash, 0, 1, "PDH",   text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 1, levelsReady ? str.tostring(rthHighPD, "#.##") : "---",
+      text_color=#ff5252, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 2, "PDL",   text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 2, levelsReady ? str.tostring(rthLowPD, "#.##") : "---",
+      text_color=#00e676, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 3, "Range",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 3, levelsReady ? str.tostring(rthHighPD - rthLowPD, "#.#") + "pts" : "---",
+      text_color=colCyan, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 4, "VWAP",  text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 4, not na(vwapVal) ? str.tostring(vwapVal, "#.##") : "---",
+      text_color=colCyan, text_size=size.tiny, text_halign=text.align_right)
+
+    string testStr = testDir == 1 ? "PDH" : (testDir == -1 ? "PDL" : "...")
+    color  testCol = testDir != 0 ? colAmber : color.gray
+    table.cell(dash, 0, 5, "Test",   text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 5, testStr,   text_color=testCol,   text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 6, "Signal", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 6, signalReady ? "READY" : "...",
+      text_color=signalReady ? #00e676 : color.gray, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 7, "────",   text_color=color.new(colCyan, 60), text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 7, "────",   text_color=color.new(colCyan, 60), text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 8, "Trades", text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 8, str.tostring(totalT), text_color=colAmber, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 9, "Win%",   text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 9, str.tostring(winPct, "#.##") + "%",
+      text_color=winPct >= 70 ? #00e676 : (winPct >= 50 ? #ffd740 : #ff5252), text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 10, "PnL",   text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 10, "$" + str.tostring(strategy.netprofit, "#.##"),
+      text_color=strategy.netprofit >= 0 ? #00e676 : #ff5252, text_size=size.tiny, text_halign=text.align_right)
+
+    table.cell(dash, 0, 11, "PF",    text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 11, str.tostring(pf, "#.###"),
+      text_color=pf >= 2.0 ? #00e676 : (pf >= 1.0 ? #ffd740 : #ff5252), text_size=size.tiny, text_halign=text.align_right)

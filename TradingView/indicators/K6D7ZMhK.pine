@@ -1,0 +1,998 @@
+// This Pine Script™ v6 indicator is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// (c) Viprasol  — core "Change in State of Delivery (CISD)" method.
+// Original components credited in the Viprasol publication description.
+//
+// TuraTuru merge (additions, kept minimal to avoid noise):
+//   + Noise tuning defaults (min confluence score + cooldown) for 5m indices/gold
+//   + Killzone boxes (Asia / London / New York) ported from GOGO SCALPER
+//   + Preparation (gray) Entry/SL/TP preview for forming candidate signals
+//   + Calon CISD projected from origin + Buy/Sell Stop AT ENTRY (expires after N candles)
+//     -> garis ABU-ABU "CALON CISD" real-time dari candle asal sampai sisi kanan
+//   + Market structure mapper: BOS / CHoCH / MSS
+//   + Supply & Demand zones
+//   + Trade-history zones (SL merah / TP hijau) per sinyal valid
+//
+// FUNDED EDITION (mesin risiko untuk prop-firm challenge):
+//   + Position sizing presisi per sinyal (akun + risk% + jarak SL + point value)
+//   + Daily risk-budget planner ("jatah trade" = floor(limit DD harian / risk/trade))
+//     -> tint background + alert saat jatah habis (guardrail tanpa perlu panel)
+//   + News / Avoid windows (buang sinyal di jam rilis / jam terlarang firm)
+//   + Filter volatility regime (ATR percentile) — skip pasar mati / ekstrem
+//   + Spread-aware sizing (lot tidak kebesaran; R lebih realistis)
+//   + Risk Engine HUD ringkas (OPSIONAL, default MATI)
+//   + FVG Full-Body Break Entry: CISD ber-FVG -> ditembus full-body searah = entry
+//     (mode FVG-Only menyembunyikan level CISD biasa & menyetir funded engine)
+//   CATATAN: indikator tidak bisa membaca P&L akun asli. "Jatah trade" = alat
+//   disiplin/perencanaan, bukan tracker saldo. Validasi edge pakai strategy()+biaya.
+// Disetel untuk US100 / US500 / US30 / XAUUSD @ 5 menit.
+
+//@version=6
+indicator(
+    title            = "TuraTuruOpitlo-CISD",
+    shorttitle       = "TuraTuru-CISD",
+    overlay          = true,
+    max_lines_count  = 500,
+    max_labels_count = 500,
+    max_boxes_count  = 500,
+    behind_chart     = false
+)
+
+// ══════════════════════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════════════════════
+
+const color BULL_SIGNATURE  = #00ffaa
+const color BEAR_SIGNATURE  = #ff3d71
+const color TP_LABEL_COL     = #22c55e
+const color ENTRY_LABEL_COL  = #00bcd4
+const color SL_LABEL_COL     = #ef4444
+
+const int MAX_LEG       = 500
+const int MAX_POTENTIAL = 60
+
+// ══════════════════════════════════════════════════════════════
+// Inputs
+// ══════════════════════════════════════════════════════════════
+
+string GRP_CALC    = "Calculations"
+string GRP_FILTERS = "Signal Filters"
+string GRP_QUALITY = "Confluence & Quality"
+string GRP_RISK    = "Risk / Lot"
+string GRP_STRUCT  = "Market Structure (BOS/CHoCH/MSS)"
+string GRP_SD      = "Supply & Demand"
+string GRP_APPEAR  = "Appearance"
+string GRP_KZ      = "Killzones"
+
+noiseFilterInput       = input.float(0.7, "Noise Filter", group = GRP_CALC, maxval = 1, minval = 0, step = 0.1,
+     tooltip = "Rasio displacement minimum agar sebuah leg dianggap CISD valid. Lebih besar = lebih sedikit noise.")
+swingPeriodInput       = input.int(12, "Swing Period", group = GRP_CALC,
+     tooltip = "Periode pivot untuk deteksi swing/likuiditas (juga dipakai struktur & Supply/Demand).")
+expiryBarsInput        = input.int(100, "Expiry Bars", group = GRP_CALC)
+liquidityLookbackInput = input.int(10, "Liquidity Lookback", group = GRP_CALC)
+
+// — Signal filters
+cooldownInput     = input.int(3, "Signal Cooldown (bars)", minval = 0, maxval = 200, group = GRP_FILTERS,
+     tooltip = "Jarak minimum antar sinyal valid (kurangi sinyal beruntun). 0 = nonaktif.")
+useVolFilterInput = input.bool(false, "Require Volume Surge", group = GRP_FILTERS)
+volLenInput       = input.int(20, "Volume Avg Length", minval = 2, maxval = 200, group = GRP_FILTERS, active = useVolFilterInput)
+volMultInput      = input.float(1.5, "Volume Surge Multiplier", minval = 1.0, maxval = 5.0, step = 0.1, group = GRP_FILTERS, active = useVolFilterInput)
+useHtfInput       = input.bool(false, "Require HTF EMA Bias", group = GRP_FILTERS)
+htfResInput       = input.timeframe("60", "HTF Resolution", group = GRP_FILTERS, active = useHtfInput)
+htfEmaLenInput    = input.int(50, "HTF EMA Length", minval = 5, maxval = 400, group = GRP_FILTERS, active = useHtfInput)
+useAdxInput       = input.bool(true, "Filter Tren ADX (anti-sideways)", group = GRP_FILTERS,
+     tooltip = "Sinyal hanya lolos saat pasar trending. ADX rendah = sideways -> sinyal dibuang.")
+adxLenInput       = input.int(14, "ADX Length", minval = 2, maxval = 100, group = GRP_FILTERS, active = useAdxInput)
+adxThreshInput    = input.float(20, "ADX Minimum (>= dianggap trending)", minval = 5, maxval = 60, step = 1, group = GRP_FILTERS, active = useAdxInput)
+useSessInput      = input.bool(true, "Filter Sesi (anti jam sepi)", group = GRP_FILTERS,
+     tooltip = "Sinyal hanya saat sesi aktif. Default sesi US (UTC) - paling ramai untuk US100/US500/US30.")
+sessStrInput      = input.session("1300-2000", "Jam Sesi (UTC)", group = GRP_FILTERS, active = useSessInput,
+     tooltip = "Default sesi US. Untuk XAUUSD yang juga aktif sesi London, lebarkan ke 0800-2000.")
+
+// — Confluence & quality
+showGradeInput = input.bool(true, "Show Quality Grade on CISD", group = GRP_QUALITY,
+     tooltip = "Beri grade A / B / C dari skor konfluensi (displacement, sweep, HTF, [volume]).")
+useVolInScoreInput = input.bool(false, "Sertakan Volume dalam Skor", group = GRP_QUALITY,
+     tooltip = "Matikan untuk CFD indeks/gold (US100/US500/US30/XAUUSD) karena data volume sering kurang andal.")
+minScoreInput  = input.int(2, "Minimum Confluence Score", minval = 0, maxval = 4, group = GRP_QUALITY,
+     tooltip = "Ambang skor. Dipakai sinyal qualified DAN syarat munculnya calon Buy/Sell Stop. Calon di bawah skor ini tidak dipasangi stop.")
+
+// — FVG Full-Body Break Entry
+string GRP_FVG = "FVG Full-Body Break Entry"
+useFvgEntryInput = input.bool(true, "Aktifkan FVG Full-Body Break Entry", group = GRP_FVG,
+     tooltip = "Entry: CISD yang leg displacement-nya meninggalkan FVG searah, lalu FVG itu DITEMBUS candle full-body (body engulf penuh zona FVG, close di sisi jauh).")
+fvgOnlyInput     = input.bool(false, "FVG-Only Focus (sembunyikan level CISD biasa)", group = GRP_FVG,
+     tooltip = "Tampilkan hanya entry FVG-break. Jatah trade harian & position sizing funded mengikuti entry FVG.")
+fvgScanInput     = input.int(10, "FVG Scan dari CISD (bars)", minval = 3, maxval = 60, group = GRP_FVG,
+     tooltip = "Seberapa jauh ke belakang dari candle CISD mencari FVG searah pada leg displacement.")
+fvgExpiryInput   = input.int(20, "Setup Expiry (bars)", minval = 1, maxval = 200, group = GRP_FVG,
+     tooltip = "Setup batal bila FVG belum ditembus full-body dalam N bar (atau bila FVG ter-invalidasi lebih dulu).")
+fvgMinAtrInput   = input.float(0.0, "Min Ukuran FVG (ATR)", minval = 0, maxval = 5, step = 0.1, group = GRP_FVG,
+     tooltip = "Saring FVG terlalu kecil. 0 = semua ukuran FVG diterima.")
+fvgShowBoxInput  = input.bool(true, "Gambar Zona FVG", group = GRP_FVG)
+fvgBoxColorInput = input.color(#7c5cff, "Warna Zona FVG", group = GRP_FVG, active = fvgShowBoxInput)
+
+// — Risk / Lot
+showLevelsInput      = input.bool(true, "Show SL/TP on Qualified CISD", group = GRP_RISK)
+showPriceLabelsInput = input.bool(true, "Show Price Labels (TP/Entry/SL)", group = GRP_RISK, active = showLevelsInput)
+showPrepInput        = input.bool(true, "Show Preparation (gray) Levels", group = GRP_RISK,
+     tooltip = "Saat calon sinyal sudah memenuhi semua syarat tapi bar belum close, tampilkan Entry/SL/TP abu-abu sebagai persiapan eksekusi. Hilang/diganti saat bar close.")
+prepColorInput       = input.color(color.gray, "Preparation Color", group = GRP_RISK, active = showPrepInput)
+showStopPrepInput    = input.bool(true, "Show Calon CISD + Buy/Sell Stop", group = GRP_RISK,
+     tooltip = "Tampilkan level origin calon CISD (yang menunggu di-break) sebagai garis abu-abu 'CALON CISD' + pending Buy/Sell Stop di area entry. HANYA muncul bila skor konfluensi calon >= Minimum Confluence Score.")
+calonColorInput      = input.color(color.gray, "Warna Garis Calon CISD", group = GRP_RISK, active = showStopPrepInput,
+     tooltip = "Garis abu-abu + label 'CALON CISD' digambar REAL-TIME dari candle asal calon sampai sisi kanan chart, selama calon masih aktif (belum ter-break dan belum expired).")
+stopBufInput         = input.float(0.0, "Stop Offset dari Entry (ATR)", minval = 0, maxval = 2, step = 0.05, group = GRP_RISK, active = showStopPrepInput,
+     tooltip = "0 = Buy/Sell Stop pas di area entry (origin). >0 = geser sedikit di luar entry untuk konfirmasi tambahan.")
+stopArmBarsInput     = input.int(15, "Calon Expiry (candle)", minval = 1, maxval = 200, group = GRP_RISK, active = showStopPrepInput,
+     tooltip = "Calon CISD hilang bila belum ter-break dalam N candle.")
+atrPeriodInput       = input.int(14, "ATR Period (SL buffer)", minval = 2, maxval = 100, group = GRP_RISK)
+slBufferAtrInput     = input.float(0.5, "SL ATR Buffer", minval = 0.0, maxval = 5.0, step = 0.1, group = GRP_RISK)
+rrRatioInput         = input.float(2.0, "Risk : Reward", minval = 0.5, maxval = 10.0, step = 0.1, group = GRP_RISK)
+showTradesInput      = input.bool(true, "Riwayat Trade (zona SL merah / TP hijau)", group = GRP_RISK,
+     tooltip = "Gambar zona tiap trade & simpan beberapa trade terakhir (tidak terhapus).")
+histCountInput       = input.int(10, "Simpan N Trade Terakhir", minval = 1, maxval = 30, group = GRP_RISK, active = showTradesInput)
+
+// — Market structure
+showStructInput  = input.bool(true, "Show BOS / CHoCH / MSS", group = GRP_STRUCT)
+useMssLabelInput = input.bool(false, "Pakai label 'MSS' (ganti 'CHoCH')", group = GRP_STRUCT,
+     tooltip = "Break struktur LAWAN arah tren ditandai CHoCH (potensi reversal). Aktifkan untuk memberi label 'MSS'. Break SEARAH tren = BOS (continuation).")
+bosColorInput    = input.color(#2962ff, "BOS Color", group = GRP_STRUCT)
+chochColorInput  = input.color(#ff6d00, "CHoCH / MSS Color", group = GRP_STRUCT)
+
+// — Supply & Demand
+sdShowInput      = input.bool(true, "Show Supply & Demand Zones", group = GRP_SD)
+supplyColorInput = input.color(#ef4444, "Supply Color", group = GRP_SD)
+demandColorInput = input.color(#22c55e, "Demand Color", group = GRP_SD)
+sdTranspInput    = input.int(85, "Zone Transparency", minval = 0, maxval = 100, group = GRP_SD)
+sdMaxZonesInput  = input.int(5, "Max Zones (tiap sisi)", minval = 1, maxval = 20, group = GRP_SD)
+sdHideMitInput   = input.bool(true, "Hide Mitigated Zones", group = GRP_SD)
+
+// — Appearance
+bullColorInput     = input.color(BULL_SIGNATURE, "Bullish Colour", group = GRP_APPEAR)
+bearColorInput     = input.color(BEAR_SIGNATURE, "Bearish Colour", group = GRP_APPEAR)
+hideExpiredInput   = input.bool(true, "Hide Expired Levels", group = GRP_APPEAR)
+hideMitigatedInput = input.bool(false, "Hide Mitigated Levels", group = GRP_APPEAR)
+
+// — Killzones (port dari GOGO SCALPER)
+show_kz    = input.bool(true, "Show Killzone Boxes", group = GRP_KZ)
+kz_tz      = input.string("America/New_York", "Killzone Timezone", group = GRP_KZ,
+     tooltip = "Sesi di bawah memakai waktu ini. Default New York (jam ICT standar).")
+
+use_asia   = input.bool(true,  "", inline = "ASIA", group = GRP_KZ)
+as_txt     = input.string("Asia", "", inline = "ASIA", group = GRP_KZ)
+asia       = input.session("2000-0101", "", inline = "ASIA", group = GRP_KZ)
+as_color   = input.color(color.blue, "", inline = "ASIA", group = GRP_KZ)
+
+use_london = input.bool(true, "", inline = "LON", group = GRP_KZ)
+lo_txt     = input.string("London", "", inline = "LON", group = GRP_KZ)
+london     = input.session("0200-0601", "", inline = "LON", group = GRP_KZ)
+lo_color   = input.color(color.red, "", inline = "LON", group = GRP_KZ)
+
+use_nyam   = input.bool(true, "", inline = "NYAM", group = GRP_KZ)
+na_txt     = input.string("NY AM", "", inline = "NYAM", group = GRP_KZ)
+nyam       = input.session("0700-1201", "", inline = "NYAM", group = GRP_KZ)
+na_color   = input.color(#089981, "", inline = "NYAM", group = GRP_KZ)
+
+use_nypm   = input.bool(true, "", inline = "NYPM", group = GRP_KZ)
+np_txt     = input.string("NY PM", "", inline = "NYPM", group = GRP_KZ)
+nypm       = input.session("1300-1701", "", inline = "NYPM", group = GRP_KZ)
+np_color   = input.color(color.purple, "", inline = "NYPM", group = GRP_KZ)
+
+showKzText = input.bool(false, "Show Killzone Label", group = GRP_KZ)
+boxTransp  = input.int(95, "Box Transparency", minval = 0, maxval = 100, group = GRP_KZ)
+textTransp = input.int(50, "Text Transparency", minval = 0, maxval = 100, group = GRP_KZ)
+kzMaxDays  = input.int(3, "Keep N Days per Session", minval = 1, maxval = 30, group = GRP_KZ)
+
+// — Funded / Risk Engine
+string GRP_FUND = "Funded / Risk Engine"
+
+fundBalanceInput   = input.float(100000, "Account Size (USD)", minval = 0, group = GRP_FUND,
+     tooltip = "Ukuran akun funded untuk hitung lot & risiko dalam USD.")
+fundRiskPctInput   = input.float(0.5, "Risk per Trade (%)", minval = 0, maxval = 100, step = 0.1, group = GRP_FUND)
+fundDailyDdInput   = input.float(4.0, "Daily Loss Limit (%)", minval = 0.1, maxval = 100, step = 0.1, group = GRP_FUND,
+     tooltip = "Batas drawdown harian dari prop firm. Jatah trade harian = floor(limit / risk per trade).")
+spreadTicksInput   = input.float(0, "Typical Spread (ticks)", minval = 0, group = GRP_FUND,
+     tooltip = "Spread tipikal instrumen (dalam tick). Dipakai agar sizing lebih konservatif & R lebih realistis.")
+showSizeInput      = input.bool(true, "Show Position Size on Signal", group = GRP_FUND)
+
+useNewsAvoidInput  = input.bool(false, "Aktifkan News / Avoid Windows", group = GRP_FUND,
+     tooltip = "Buang sinyal pada jendela waktu tertentu (rilis news high-impact / jam terlarang prop firm).")
+fundTzInput        = input.string("America/New_York", "Avoid Window Timezone", group = GRP_FUND, active = useNewsAvoidInput)
+avoid1OnInput      = input.bool(true,  "", inline = "AV1", group = GRP_FUND, active = useNewsAvoidInput)
+avoid1Input        = input.session("0828-0833", "Avoid #1", inline = "AV1", group = GRP_FUND, active = useNewsAvoidInput)
+avoid2OnInput      = input.bool(true,  "", inline = "AV2", group = GRP_FUND, active = useNewsAvoidInput)
+avoid2Input        = input.session("0958-1003", "Avoid #2", inline = "AV2", group = GRP_FUND, active = useNewsAvoidInput)
+avoid3OnInput      = input.bool(false, "", inline = "AV3", group = GRP_FUND, active = useNewsAvoidInput)
+avoid3Input        = input.session("1328-1333", "Avoid #3", inline = "AV3", group = GRP_FUND, active = useNewsAvoidInput)
+
+useVolRegimeInput  = input.bool(true, "Filter Volatility Regime (ATR percentile)", group = GRP_FUND,
+     tooltip = "Buang sinyal saat volatilitas terlalu mati / terlalu ekstrem.")
+volRegimeLenInput  = input.int(100, "Vol Regime Lookback", minval = 20, maxval = 500, group = GRP_FUND, active = useVolRegimeInput)
+volMinPctInput     = input.float(20, "ATR percentile min", minval = 0, maxval = 100, group = GRP_FUND, active = useVolRegimeInput)
+volMaxPctInput     = input.float(95, "ATR percentile max", minval = 0, maxval = 100, group = GRP_FUND, active = useVolRegimeInput)
+
+fundResetHourInput = input.int(0, "Daily Reset Hour (exch. tz)", minval = 0, maxval = 23, group = GRP_FUND,
+     tooltip = "Jam reset 'jatah trade' harian mengikuti zona waktu bursa. Sesuaikan dgn jam reset prop firm.")
+fundShowTintInput  = input.bool(true, "Tint Background saat Jatah Habis", group = GRP_FUND)
+fundShowHudInput   = input.bool(false, "Show Risk Engine HUD", group = GRP_FUND,
+     tooltip = "Panel kecil ringkas (default MATI). Guardrail tetap jalan via tint + alert tanpa panel ini.")
+fundHudPosInput    = input.string("Bottom Left", "HUD Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_FUND, active = fundShowHudInput)
+
+// ══════════════════════════════════════════════════════════════
+// Functions
+// ══════════════════════════════════════════════════════════════
+
+gradeOf(int score) =>
+    score >= 3 ? "A" : score == 2 ? "B" : "C"
+
+// ══════════════════════════════════════════════════════════════
+// Swing liquidity lines
+// ══════════════════════════════════════════════════════════════
+
+float pivotHigh = ta.pivothigh(swingPeriodInput, swingPeriodInput)
+float pivotLow  = ta.pivotlow(swingPeriodInput, swingPeriodInput)
+
+var array<line> swingHighLines = array.new_line()
+var array<line> swingLowLines  = array.new_line()
+
+if not na(pivotHigh)
+    swingHighLines.unshift(line.new(bar_index - swingPeriodInput, high[swingPeriodInput], bar_index, high[swingPeriodInput], color = color.new(chart.fg_color, 50)))
+if not na(pivotLow)
+    swingLowLines.unshift(line.new(bar_index - swingPeriodInput, low[swingPeriodInput], bar_index, low[swingPeriodInput], color = color.new(chart.fg_color, 50)))
+
+var float lastWickedHigh = na
+var float lastWickedLow  = na
+
+bool wickedHigh = false
+bool wickedLow  = false
+
+if swingHighLines.size() > 0
+    for i = swingHighLines.size() - 1 to 0
+        if i < swingHighLines.size()
+            line l = swingHighLines.get(i)
+            if bar_index - line.get_x1(l) < expiryBarsInput
+                float lvl = line.get_y1(l)
+                line.set_x2(l, bar_index)
+                if high >= lvl and barstate.isconfirmed
+                    if hideMitigatedInput
+                        line.delete(l)
+                    swingHighLines.remove(i)
+                    wickedHigh := true
+                    lastWickedHigh := lvl
+            else
+                if hideExpiredInput
+                    line.delete(l)
+                    swingHighLines.remove(i)
+
+if swingLowLines.size() > 0
+    for i = swingLowLines.size() - 1 to 0
+        if i < swingLowLines.size()
+            line l = swingLowLines.get(i)
+            if bar_index - line.get_x1(l) < expiryBarsInput
+                float lvl = line.get_y1(l)
+                line.set_x2(l, bar_index)
+                if low <= lvl and barstate.isconfirmed
+                    if hideMitigatedInput
+                        line.delete(l)
+                    swingLowLines.remove(i)
+                    wickedLow := true
+                    lastWickedLow := lvl
+            else
+                if hideExpiredInput
+                    line.delete(l)
+                    swingLowLines.remove(i)
+
+while swingHighLines.size() > 100
+    line.delete(swingHighLines.pop())
+while swingLowLines.size() > 100
+    line.delete(swingLowLines.pop())
+
+int barsSinceHigh = ta.barssince(wickedHigh)
+int barsSinceLow  = ta.barssince(wickedLow)
+
+// ══════════════════════════════════════════════════════════════
+// CISD detection
+// ══════════════════════════════════════════════════════════════
+
+var array<float> bearPotential = array.new_float()
+var array<float> bullPotential = array.new_float()
+
+if close[1] < open[1] and close > open
+    bearPotential.unshift(bar_index)
+    bearPotential.unshift(open)
+
+if close[1] > open[1] and close < open
+    bullPotential.unshift(bar_index)
+    bullPotential.unshift(open)
+
+while bearPotential.size() > MAX_POTENTIAL
+    bearPotential.pop()
+    bearPotential.pop()
+while bullPotential.size() > MAX_POTENTIAL
+    bullPotential.pop()
+    bullPotential.pop()
+
+int   cisdState  = 0
+float originLevel = 0.0
+float originIndex = 0.0
+
+float capturedRatio   = na
+float capturedExtreme = na
+
+// Bearish CISD scan
+if bearPotential.size() > 0
+    bool scanning = true
+    int scanGuard = 0
+    while scanning and scanGuard <= MAX_POTENTIAL
+        scanGuard += 1
+        if close < bearPotential.first()
+            int legLen = math.max(0, math.min(int(bar_index - bearPotential.get(1)), MAX_LEG))
+            float highestClose = 0.0
+            for i = 0 to legLen
+                if close[i] > highestClose
+                    highestClose := close[i]
+            bool walking = true
+            int walkIdx = math.max(1, int(bar_index - bearPotential.get(1) + 1))
+            int walkGuard = 0
+            float legTop = 0.0
+            while walking and walkGuard < MAX_LEG
+                walkGuard += 1
+                if close[walkIdx] < open[walkIdx]
+                    legTop := open[walkIdx]
+                    walkIdx += 1
+                else
+                    walking := false
+            float ratioVal = (highestClose - bearPotential.first()) / (legTop - bearPotential.first())
+            if ratioVal > noiseFilterInput
+                originLevel := bearPotential.first()
+                originIndex := bearPotential.get(1)
+                capturedRatio := ratioVal
+                capturedExtreme := highestClose
+                bearPotential.clear()
+                cisdState := 1
+                scanning := false
+            else
+                bearPotential.shift()
+                bearPotential.shift()
+                if bearPotential.size() == 0
+                    scanning := false
+        else
+            scanning := false
+
+// Bullish CISD scan
+if bullPotential.size() > 0
+    bool scanning = true
+    int scanGuard = 0
+    while scanning and scanGuard <= MAX_POTENTIAL
+        scanGuard += 1
+        if close > bullPotential.first()
+            int legLen = math.max(0, math.min(int(bar_index - bullPotential.get(1)), MAX_LEG))
+            float lowestClose = close
+            for i = 0 to legLen
+                if close[i] < lowestClose
+                    lowestClose := close[i]
+            bool walking = true
+            int walkIdx = math.max(1, int(bar_index - bullPotential.get(1) + 1))
+            int walkGuard = 0
+            float legBottom = 0.0
+            while walking and walkGuard < MAX_LEG
+                walkGuard += 1
+                if close[walkIdx] > open[walkIdx]
+                    legBottom := open[walkIdx]
+                    walkIdx += 1
+                else
+                    walking := false
+            float ratioVal = (bullPotential.first() - lowestClose) / (bullPotential.first() - legBottom)
+            if ratioVal > noiseFilterInput
+                originLevel := bullPotential.first()
+                originIndex := bullPotential.get(1)
+                capturedRatio := ratioVal
+                capturedExtreme := lowestClose
+                bullPotential.clear()
+                cisdState := 2
+                scanning := false
+            else
+                bullPotential.shift()
+                bullPotential.shift()
+                if bullPotential.size() == 0
+                    scanning := false
+
+// ══════════════════════════════════════════════════════════════
+// Trend, liquidity sweep, HTF, volume
+// ══════════════════════════════════════════════════════════════
+
+bool bearishSweep = false
+bool bullishSweep = false
+
+if cisdState == 1
+    line.new(int(originIndex), originLevel, bar_index, originLevel, color = bearColorInput, width = 3)
+    if barsSinceHigh <= liquidityLookbackInput and close < lastWickedHigh
+        bearishSweep := true
+
+if cisdState == 2
+    line.new(int(originIndex), originLevel, bar_index, originLevel, color = bullColorInput, width = 3)
+    if barsSinceLow <= liquidityLookbackInput and close > lastWickedLow
+        bullishSweep := true
+
+float htfEma     = nz(request.security(syminfo.tickerid, htfResInput, ta.ema(close, htfEmaLenInput), lookahead = barmerge.lookahead_off), close)
+bool  htfBullRaw = close > htfEma
+bool  htfBearRaw = close < htfEma
+
+float volAvg   = ta.sma(volume, volLenInput)
+bool  volSurge = volume > volAvg * volMultInput
+
+float atrVal = ta.atr(atrPeriodInput)
+
+[adxDiP, adxDiM, adxVal] = ta.dmi(adxLenInput, adxLenInput)
+bool  adxOk = not useAdxInput or adxVal >= adxThreshInput
+bool  inSession = not na(time(timeframe.period, sessStrInput, "UTC"))
+bool  sessOk    = not useSessInput or inSession
+
+// — Funded / Risk Engine filters (ikut menyaring sinyal)
+float spreadPrice = spreadTicksInput * syminfo.mintick
+bool  inAvoid     = useNewsAvoidInput and ((avoid1OnInput and not na(time(timeframe.period, avoid1Input, fundTzInput))) or (avoid2OnInput and not na(time(timeframe.period, avoid2Input, fundTzInput))) or (avoid3OnInput and not na(time(timeframe.period, avoid3Input, fundTzInput))))
+bool  avoidOk     = not inAvoid
+float atrPctRank  = ta.percentrank(atrVal, volRegimeLenInput)
+bool  volRegimeOk = not useVolRegimeInput or (atrPctRank >= volMinPctInput and atrPctRank <= volMaxPctInput)
+
+// ══════════════════════════════════════════════════════════════
+// Confluence score & qualified signals
+// ══════════════════════════════════════════════════════════════
+
+bool dispStrong  = not na(capturedRatio) and capturedRatio >= noiseFilterInput + (1 - noiseFilterInput) * 0.5
+bool sweepNow    = bearishSweep or bullishSweep
+bool htfAlignNow = cisdState == 2 ? htfBullRaw : cisdState == 1 ? htfBearRaw : false
+int  volScore    = (useVolInScoreInput and volSurge) ? 1 : 0
+int  maxScore    = useVolInScoreInput ? 4 : 3
+int  cisdScore   = (dispStrong ? 1 : 0) + (sweepNow ? 1 : 0) + (htfAlignNow ? 1 : 0) + volScore
+
+bool volOk     = not useVolFilterInput or volSurge
+bool htfBullOk = not useHtfInput or htfBullRaw
+bool htfBearOk = not useHtfInput or htfBearRaw
+var int lastCisdBar = -100000
+bool coolOk    = cooldownInput == 0 or (bar_index - lastCisdBar) >= cooldownInput
+bool scoreOk   = cisdScore >= minScoreInput
+
+bool baseBull = cisdState == 2 and volOk and htfBullOk and adxOk and sessOk and scoreOk and avoidOk and volRegimeOk
+bool baseBear = cisdState == 1 and volOk and htfBearOk and adxOk and sessOk and scoreOk and avoidOk and volRegimeOk
+bool qualifiedBull = baseBull and coolOk and barstate.isconfirmed
+bool qualifiedBear = baseBear and coolOk and barstate.isconfirmed
+if qualifiedBull or qualifiedBear
+    lastCisdBar := bar_index
+
+// Calon sinyal (sama syarat, tapi bar belum close) -> dipakai untuk preparation levels
+bool candBull = baseBull and coolOk and not barstate.isconfirmed
+bool candBear = baseBear and coolOk and not barstate.isconfirmed
+
+// FVG-Only focus: bila aktif, level CISD biasa disembunyikan & funded engine ikut entry FVG
+bool fvgFocus = useFvgEntryInput and fvgOnlyInput
+
+// ══════════════════════════════════════════════════════════════
+// Visuals — sweep shapes, swing dots
+// ══════════════════════════════════════════════════════════════
+
+plotshape(bearishSweep ? high : na, "Bearish CISD with Liquidity Sweep", shape.labeldown, location.abovebar, bearColorInput, size = size.small, text = "▼", textcolor = chart.fg_color)
+plotshape(bullishSweep ? low  : na, "Bullish CISD with Liquidity Sweep", shape.labelup,   location.belowbar, bullColorInput, size = size.small, text = "▲", textcolor = chart.fg_color)
+
+plotchar(not na(pivotHigh) ? high[swingPeriodInput] : na, "Swing High", "●", location.absolute, bearColorInput, size = size.tiny, offset = -swingPeriodInput)
+plotchar(not na(pivotLow)  ? low[swingPeriodInput]  : na, "Swing Low",  "●", location.absolute, bullColorInput, size = size.tiny, offset = -swingPeriodInput)
+
+// ══════════════════════════════════════════════════════════════
+// Visuals — Quality grade label
+// ══════════════════════════════════════════════════════════════
+
+if (qualifiedBull or qualifiedBear) and showGradeInput and not fvgFocus
+    color gradeCol = cisdState == 2 ? bullColorInput : bearColorInput
+    label.new(bar_index, originLevel, gradeOf(cisdScore) + " " + str.tostring(cisdScore) + "/" + str.tostring(maxScore),
+         style = cisdState == 2 ? label.style_label_up : label.style_label_down,
+         color = color.new(gradeCol, 20), textcolor = color.white, size = size.small)
+
+// ══════════════════════════════════════════════════════════════
+// Visuals — Risk overlay on qualified CISD (level final, berwarna)
+// ══════════════════════════════════════════════════════════════
+
+var line  enLine = na
+var line  slLine = na
+var line  tpLine = na
+var label enLbl  = na
+var label slLbl  = na
+var label tpLbl  = na
+
+if (qualifiedBull or qualifiedBear) and showLevelsInput and not na(capturedExtreme) and not fvgFocus
+    float entry = originLevel
+    float sl    = qualifiedBull ? capturedExtreme - atrVal * slBufferAtrInput : capturedExtreme + atrVal * slBufferAtrInput
+    float risk  = math.abs(entry - sl)
+    float tp    = qualifiedBull ? entry + risk * rrRatioInput : entry - risk * rrRatioInput
+    float riskDist = risk + spreadPrice
+    float riskUsd  = fundBalanceInput * fundRiskPctInput / 100
+    float posSize  = (syminfo.pointvalue > 0 and riskDist > 0) ? riskUsd / (riskDist * syminfo.pointvalue) : na
+    int x2 = bar_index + 16
+    line.delete(enLine)
+    line.delete(slLine)
+    line.delete(tpLine)
+    label.delete(enLbl)
+    label.delete(slLbl)
+    label.delete(tpLbl)
+    enLine := line.new(bar_index, entry, x2, entry, color = color.new(ENTRY_LABEL_COL, 10), width = 1)
+    slLine := line.new(bar_index, sl,    x2, sl,    color = color.new(SL_LABEL_COL, 10), width = 1, style = line.style_dashed)
+    tpLine := line.new(bar_index, tp,    x2, tp,    color = color.new(TP_LABEL_COL, 10), width = 1, style = line.style_dashed)
+    if showPriceLabelsInput
+        enLbl := label.new(x2, entry, "ENTRY " + str.tostring(entry, format.mintick) + (showSizeInput and not na(posSize) ? "  ·  " + str.tostring(posSize, "#.##") + " lot/ctr  ·  $" + str.tostring(riskUsd, "#.##") : ""), style = label.style_label_left, color = ENTRY_LABEL_COL, textcolor = color.white, size = size.small)
+        slLbl := label.new(x2, sl,    "SL "    + str.tostring(sl,    format.mintick), style = label.style_label_left, color = SL_LABEL_COL,    textcolor = color.white, size = size.small)
+        tpLbl := label.new(x2, tp,    "TP "    + str.tostring(tp,    format.mintick), style = label.style_label_left, color = TP_LABEL_COL,    textcolor = color.white, size = size.small)
+
+// ══════════════════════════════════════════════════════════════
+// [FITUR 1] Preparation (gray) Entry/SL/TP — calon sinyal qualified, bar belum close
+// ══════════════════════════════════════════════════════════════
+
+var line  prepEn  = na
+var line  prepSl  = na
+var line  prepTp  = na
+var label prepLbl = na
+
+if showPrepInput and (candBull or candBear) and not na(capturedExtreme)
+    float pe = originLevel
+    float ps = candBull ? capturedExtreme - atrVal * slBufferAtrInput : capturedExtreme + atrVal * slBufferAtrInput
+    float pr = math.abs(pe - ps)
+    float pt = candBull ? pe + pr * rrRatioInput : pe - pr * rrRatioInput
+    int px2  = bar_index + 16
+    line.delete(prepEn)
+    line.delete(prepSl)
+    line.delete(prepTp)
+    label.delete(prepLbl)
+    prepEn  := line.new(bar_index, pe, px2, pe, color = color.new(prepColorInput, 0),  width = 1, style = line.style_dotted)
+    prepSl  := line.new(bar_index, ps, px2, ps, color = color.new(prepColorInput, 25), width = 1, style = line.style_dotted)
+    prepTp  := line.new(bar_index, pt, px2, pt, color = color.new(prepColorInput, 25), width = 1, style = line.style_dotted)
+    prepLbl := label.new(px2, pe, "PREP " + (candBull ? "BUY" : "SELL"), style = label.style_label_left, color = color.new(prepColorInput, 0), textcolor = color.white, size = size.small)
+else
+    line.delete(prepEn)
+    line.delete(prepSl)
+    line.delete(prepTp)
+    label.delete(prepLbl)
+    prepEn  := na
+    prepSl  := na
+    prepTp  := na
+    prepLbl := na
+
+// ══════════════════════════════════════════════════════════════
+// [FITUR 4] Calon CISD (level origin yang menunggu break) + Buy/Sell Stop di AREA ENTRY
+//   - Muncul sejak flip candle (tidak menunggu break), REAL-TIME (digambar tiap tick)
+//   - Garis ABU-ABU "CALON CISD" ditarik dari candle asal calon sampai sisi kanan
+//   - Hilang bila ter-break (jadi sinyal) atau setelah N candle (default 15)
+//   - Buy Stop = origin bull (break ke atas) ; Sell Stop = origin bear (break ke bawah)
+//   - HANYA tampil bila skor konfluensi preview >= Minimum Confluence Score
+// ══════════════════════════════════════════════════════════════
+
+var float  buyCandLvl   = na
+var int    buyCandBar   = na
+var int    buyCandScore = na
+var bool   buyCandOn    = false
+
+var float  sellCandLvl   = na
+var int    sellCandBar   = na
+var int    sellCandScore = na
+var bool   sellCandOn    = false
+
+var line   buyLine  = na
+var label  buyLbl   = na
+var line   sellLine = na
+var label  sellLbl  = na
+
+bool armBuyStop  = false
+bool armSellStop = false
+
+// skor konfluensi preview (tanpa komponen displacement yang baru diketahui saat break)
+int previewMax  = useVolInScoreInput ? 3 : 2
+int buyPreview  = (htfBullRaw ? 1 : 0) + (barsSinceLow  <= liquidityLookbackInput ? 1 : 0) + ((useVolInScoreInput and volSurge) ? 1 : 0)
+int sellPreview = (htfBearRaw ? 1 : 0) + (barsSinceHigh <= liquidityLookbackInput ? 1 : 0) + ((useVolInScoreInput and volSurge) ? 1 : 0)
+
+if showStopPrepInput
+    // calon BULL hanya bila skor preview >= Minimum Confluence Score
+    if close[1] > open[1] and close < open and buyPreview >= minScoreInput
+        buyCandLvl   := open + atrVal * stopBufInput
+        buyCandBar   := bar_index
+        buyCandScore := buyPreview
+        buyCandOn    := true
+        armBuyStop   := true
+    // calon BEAR hanya bila skor preview >= Minimum Confluence Score
+    if close[1] < open[1] and close > open and sellPreview >= minScoreInput
+        sellCandLvl   := open - atrVal * stopBufInput
+        sellCandBar   := bar_index
+        sellCandScore := sellPreview
+        sellCandOn    := true
+        armSellStop   := true
+    // trigger / expiry BULL
+    if buyCandOn
+        if close > buyCandLvl
+            buyCandOn := false
+        else if bar_index - buyCandBar >= stopArmBarsInput
+            buyCandOn := false
+    // trigger / expiry BEAR
+    if sellCandOn
+        if close < sellCandLvl
+            sellCandOn := false
+        else if bar_index - sellCandBar >= stopArmBarsInput
+            sellCandOn := false
+
+// gambar garis ABU-ABU "CALON CISD" dari candle asal calon ke sisi kanan — real-time
+// (dieksekusi tiap tick di bar terakhir, jadi muncul/hilang tanpa telat)
+if barstate.islast
+    line.delete(buyLine)
+    label.delete(buyLbl)
+    line.delete(sellLine)
+    label.delete(sellLbl)
+    buyLine  := na
+    buyLbl   := na
+    sellLine := na
+    sellLbl  := na
+    if showStopPrepInput and buyCandOn
+        buyLine := line.new(buyCandBar, buyCandLvl, bar_index + 20, buyCandLvl, color = color.new(calonColorInput, 0), width = 2, style = line.style_dashed)
+        buyLbl  := label.new(bar_index + 20, buyCandLvl, "CALON CISD ▲ · BUY STOP " + str.tostring(buyCandLvl, format.mintick) + " (" + str.tostring(buyCandScore) + "/" + str.tostring(previewMax) + ")", style = label.style_label_left, color = color.new(calonColorInput, 0), textcolor = color.white, size = size.small)
+    if showStopPrepInput and sellCandOn
+        sellLine := line.new(sellCandBar, sellCandLvl, bar_index + 20, sellCandLvl, color = color.new(calonColorInput, 0), width = 2, style = line.style_dashed)
+        sellLbl  := label.new(bar_index + 20, sellCandLvl, "CALON CISD ▼ · SELL STOP " + str.tostring(sellCandLvl, format.mintick) + " (" + str.tostring(sellCandScore) + "/" + str.tostring(previewMax) + ")", style = label.style_label_left, color = color.new(calonColorInput, 0), textcolor = color.white, size = size.small)
+
+// ══════════════════════════════════════════════════════════════
+// [FITUR 5] FVG Full-Body Break Entry
+//   1) CISD valid yang leg displacement-nya meninggalkan FVG searah CISD.
+//   2) ENTRY saat ada candle FULL BODY yang body-nya engulf PENUH zona FVG
+//      dan close di sisi jauh (searah CISD) -> "tembus langsung".
+//   SL = sisi jauh FVG (± ATR buffer), TP = RR. Position size mengikuti funded.
+// ══════════════════════════════════════════════════════════════
+
+var float fvgTop    = na
+var float fvgBot    = na
+var int   fvgDir    = 0
+var int   fvgArmBar = na
+var bool  fvgActive = false
+var box   fvgBoxId  = na
+var float lastRiskDist = na  // jarak SL (+spread) sinyal terakhir — utk sizing HUD
+
+bool fvgEntryBull = false
+bool fvgEntryBear = false
+
+if useFvgEntryInput
+    // ARM: cari FVG searah di leg displacement saat CISD baru terkonfirmasi
+    if barstate.isconfirmed and (baseBull or baseBear)
+        int   fdir = baseBull ? 1 : -1
+        float ft   = na
+        float fb   = na
+        int   fi   = na
+        for i = 1 to fvgScanInput
+            if fdir == 1 and na(ft) and low[i] > high[i + 2]
+                fb := high[i + 2]
+                ft := low[i]
+                fi := i
+            if fdir == -1 and na(ft) and high[i] < low[i + 2]
+                ft := low[i + 2]
+                fb := high[i]
+                fi := i
+        bool sizeOk = not na(ft) and (fvgMinAtrInput <= 0 or (ft - fb) >= atrVal * fvgMinAtrInput)
+        if not na(ft) and sizeOk
+            fvgTop    := ft
+            fvgBot    := fb
+            fvgDir    := fdir
+            fvgArmBar := bar_index
+            fvgActive := true
+            if fvgShowBoxInput
+                if not na(fvgBoxId)
+                    box.delete(fvgBoxId)
+                fvgBoxId := box.new(bar_index - fi - 2, ft, bar_index + 6, fb, bgcolor = color.new(fvgBoxColorInput, 80), border_color = color.new(fvgBoxColorInput, 30), border_width = 1)
+
+    // TRIGGER / EXPIRY / INVALIDASI (saat bar confirmed)
+    if fvgActive and barstate.isconfirmed
+        float bodyTop = math.max(open, close)
+        float bodyBot = math.min(open, close)
+        bool  fullBull = fvgDir == 1  and close > open and bodyBot <= fvgBot and close >= fvgTop
+        bool  fullBear = fvgDir == -1 and close < open and bodyTop >= fvgTop and close <= fvgBot
+        if fullBull
+            fvgEntryBull := true
+            fvgActive    := false
+        else if fullBear
+            fvgEntryBear := true
+            fvgActive    := false
+        else if bar_index - fvgArmBar >= fvgExpiryInput
+            fvgActive := false
+        else if fvgDir == 1 and close < fvgBot
+            fvgActive := false
+        else if fvgDir == -1 and close > fvgTop
+            fvgActive := false
+        if not fvgActive and fvgShowBoxInput and not na(fvgBoxId)
+            box.set_right(fvgBoxId, bar_index)
+
+// Visual entry FVG-break: marker, Entry/SL/TP, label + size
+var line  fEn  = na
+var line  fSl  = na
+var line  fTp  = na
+var label fLbl = na
+
+if fvgEntryBull or fvgEntryBear
+    float fe   = close
+    float fs   = fvgEntryBull ? fvgBot - atrVal * slBufferAtrInput : fvgTop + atrVal * slBufferAtrInput
+    float frsk = math.abs(fe - fs)
+    float ftp  = fvgEntryBull ? fe + frsk * rrRatioInput : fe - frsk * rrRatioInput
+    float frd  = frsk + spreadPrice
+    float fru  = fundBalanceInput * fundRiskPctInput / 100
+    float fps  = (syminfo.pointvalue > 0 and frd > 0) ? fru / (frd * syminfo.pointvalue) : na
+    int   fx2  = bar_index + 16
+    line.delete(fEn)
+    line.delete(fSl)
+    line.delete(fTp)
+    label.delete(fLbl)
+    fEn  := line.new(bar_index, fe,  fx2, fe,  color = color.new(ENTRY_LABEL_COL, 0), width = 2)
+    fSl  := line.new(bar_index, fs,  fx2, fs,  color = color.new(SL_LABEL_COL, 0),    width = 1, style = line.style_dashed)
+    fTp  := line.new(bar_index, ftp, fx2, ftp, color = color.new(TP_LABEL_COL, 0),    width = 1, style = line.style_dashed)
+    fLbl := label.new(fx2, fe, "FVG " + (fvgEntryBull ? "BUY" : "SELL") + " " + str.tostring(fe, format.mintick) + (showSizeInput and not na(fps) ? "  ·  " + str.tostring(fps, "#.##") + " lot/ctr  ·  $" + str.tostring(fru, "#.##") : ""), style = label.style_label_left, color = ENTRY_LABEL_COL, textcolor = color.white, size = size.small)
+    lastRiskDist := frd
+
+plotshape(fvgEntryBull ? low  : na, "FVG Break Buy",  shape.triangleup,   location.belowbar, ENTRY_LABEL_COL, size = size.small, text = "FVG", textcolor = color.white)
+plotshape(fvgEntryBear ? high : na, "FVG Break Sell", shape.triangledown, location.abovebar, SL_LABEL_COL,    size = size.small, text = "FVG", textcolor = color.white)
+
+// ══════════════════════════════════════════════════════════════
+// [FITUR 2] Market Structure — BOS / CHoCH / MSS
+// ══════════════════════════════════════════════════════════════
+
+var float  msHigh       = na
+var int    msHighIdx    = na
+var float  msLow        = na
+var int    msLowIdx     = na
+var bool   msHighBroken = false
+var bool   msLowBroken  = false
+var int    msBias       = 0
+
+if not na(pivotHigh)
+    msHigh       := pivotHigh
+    msHighIdx    := bar_index - swingPeriodInput
+    msHighBroken := false
+if not na(pivotLow)
+    msLow        := pivotLow
+    msLowIdx     := bar_index - swingPeriodInput
+    msLowBroken  := false
+
+bool brokeUp = showStructInput and not na(msHigh) and not msHighBroken and close > msHigh and barstate.isconfirmed
+bool brokeDn = showStructInput and not na(msLow)  and not msLowBroken  and close < msLow  and barstate.isconfirmed
+
+if brokeUp
+    msHighBroken := true
+    string lbl = msBias <= 0 ? (useMssLabelInput ? "MSS" : "CHoCH") : "BOS"
+    color  c   = msBias <= 0 ? chochColorInput : bosColorInput
+    line.new(msHighIdx, msHigh, bar_index, msHigh, color = c, style = line.style_dashed, width = 1)
+    label.new(bar_index, msHigh, lbl, style = label.style_label_down, color = color.new(c, 20), textcolor = color.white, size = size.tiny)
+    msBias := 1
+
+if brokeDn
+    msLowBroken := true
+    string lbl = msBias >= 0 ? (useMssLabelInput ? "MSS" : "CHoCH") : "BOS"
+    color  c   = msBias >= 0 ? chochColorInput : bosColorInput
+    line.new(msLowIdx, msLow, bar_index, msLow, color = c, style = line.style_dashed, width = 1)
+    label.new(bar_index, msLow, lbl, style = label.style_label_up, color = color.new(c, 20), textcolor = color.white, size = size.tiny)
+    msBias := -1
+
+// ══════════════════════════════════════════════════════════════
+// [FITUR 3] Supply & Demand zones
+// ══════════════════════════════════════════════════════════════
+
+var array<box> supplyZones = array.new<box>()
+var array<box> demandZones = array.new<box>()
+
+if sdShowInput and not na(pivotHigh)
+    float sTop = high[swingPeriodInput]
+    float sBot = math.min(open[swingPeriodInput], close[swingPeriodInput])
+    supplyZones.unshift(box.new(bar_index - swingPeriodInput, sTop, bar_index, sBot, bgcolor = color.new(supplyColorInput, sdTranspInput), border_color = color.new(supplyColorInput, 40), border_width = 1))
+    while supplyZones.size() > sdMaxZonesInput
+        box.delete(supplyZones.pop())
+
+if sdShowInput and not na(pivotLow)
+    float dBot = low[swingPeriodInput]
+    float dTop = math.max(open[swingPeriodInput], close[swingPeriodInput])
+    demandZones.unshift(box.new(bar_index - swingPeriodInput, dTop, bar_index, dBot, bgcolor = color.new(demandColorInput, sdTranspInput), border_color = color.new(demandColorInput, 40), border_width = 1))
+    while demandZones.size() > sdMaxZonesInput
+        box.delete(demandZones.pop())
+
+if supplyZones.size() > 0
+    for i = supplyZones.size() - 1 to 0
+        if i < supplyZones.size()
+            box b = supplyZones.get(i)
+            box.set_right(b, bar_index)
+            if close > box.get_top(b)
+                if sdHideMitInput
+                    box.delete(b)
+                    supplyZones.remove(i)
+                else
+                    box.set_bgcolor(b, color.new(color.gray, 92))
+                    box.set_border_color(b, color.new(color.gray, 70))
+
+if demandZones.size() > 0
+    for i = demandZones.size() - 1 to 0
+        if i < demandZones.size()
+            box b = demandZones.get(i)
+            box.set_right(b, bar_index)
+            if close < box.get_bottom(b)
+                if sdHideMitInput
+                    box.delete(b)
+                    demandZones.remove(i)
+                else
+                    box.set_bgcolor(b, color.new(color.gray, 92))
+                    box.set_border_color(b, color.new(color.gray, 70))
+
+// ══════════════════════════════════════════════════════════════
+// [TuraTuru] Riwayat Trade — zona SL (merah) / TP (hijau) per sinyal valid
+// ══════════════════════════════════════════════════════════════
+
+var int   pDir = 0           // paper-trade aktif: 0 flat, 1 long, -1 short
+var float pSL  = na
+var float pTP  = na
+
+// riwayat gambar trade (zona) — simpan N terakhir, tidak dihapus
+var array<box>  tradeRiskZone   = array.new<box>()
+var array<box>  tradeRewardZone = array.new<box>()
+var array<line> tradeEntryLn    = array.new<line>()
+
+// resolve paper-trade berjalan -> bekukan zona saat SL/TP tersentuh
+bool pJustClosed = false
+if pDir == 1 and (low <= pSL or high >= pTP)
+    pDir := 0
+    pJustClosed := true
+if pDir == -1 and (high >= pSL or low <= pTP)
+    pDir := 0
+    pJustClosed := true
+
+// sinyal valid -> buka paper-trade & gambar zona
+if (qualifiedBull or qualifiedBear) and not na(capturedExtreme) and not fvgFocus
+    float e = originLevel
+    float s = qualifiedBull ? capturedExtreme - atrVal * slBufferAtrInput : capturedExtreme + atrVal * slBufferAtrInput
+    float r = math.abs(e - s)
+    lastRiskDist := r + spreadPrice
+    if pDir == 0 and r > 0
+        pSL := s
+        pTP := qualifiedBull ? e + r * rrRatioInput : e - r * rrRatioInput
+        pDir := qualifiedBull ? 1 : -1
+        if showTradesInput
+            box  rz = box.new(bar_index, math.max(e, s), bar_index, math.min(e, s), bgcolor = color.new(SL_LABEL_COL, 84), border_color = color.new(SL_LABEL_COL, 35), border_width = 1)
+            box  gz = box.new(bar_index, math.max(e, pTP), bar_index, math.min(e, pTP), bgcolor = color.new(TP_LABEL_COL, 84), border_color = color.new(TP_LABEL_COL, 35), border_width = 1)
+            line el = line.new(bar_index, e, bar_index, e, color = color.new(ENTRY_LABEL_COL, 15), width = 1)
+            tradeRiskZone.push(rz)
+            tradeRewardZone.push(gz)
+            tradeEntryLn.push(el)
+            if tradeRiskZone.size() > histCountInput
+                box.delete(tradeRiskZone.shift())
+                box.delete(tradeRewardZone.shift())
+                line.delete(tradeEntryLn.shift())
+
+// perpanjang zona trade aktif sampai bar kini; bekukan saat SL/TP kena
+if tradeRiskZone.size() > 0 and (pDir != 0 or pJustClosed)
+    box.set_right(tradeRiskZone.last(), bar_index)
+    box.set_right(tradeRewardZone.last(), bar_index)
+    line.set_x2(tradeEntryLn.last(), bar_index)
+
+// ══════════════════════════════════════════════════════════════
+// Killzones — boxes Asia / London / New York (port dari GOGO SCALPER)
+// ══════════════════════════════════════════════════════════════
+
+type KZ
+    box[] boxes
+
+kzInTime(string sess) => not na(time(timeframe.period, sess, kz_tz))
+
+var KZ as_kz = KZ.new(array.new_box())
+var KZ lo_kz = KZ.new(array.new_box())
+var KZ na_kz = KZ.new(array.new_box())
+var KZ np_kz = KZ.new(array.new_box())
+
+kzManage(KZ k, bool useS, bool inS, color c, string txt) =>
+    if useS and show_kz
+        if inS and not inS[1]
+            color bgc = color.new(c, boxTransp)
+            color txc = color.new(c, textTransp)
+            k.boxes.unshift(box.new(time, high, time, low, xloc = xloc.bar_time,
+                 border_color = bgc, bgcolor = bgc,
+                 text = showKzText ? txt : "", text_color = txc, text_size = size.small))
+            while k.boxes.size() > kzMaxDays
+                box.delete(k.boxes.pop())
+        if inS and k.boxes.size() > 0
+            box b = k.boxes.first()
+            box.set_right(b, time)
+            box.set_top(b,    math.max(box.get_top(b),    high))
+            box.set_bottom(b, math.min(box.get_bottom(b), low))
+
+bool t_as = use_asia   and kzInTime(asia)
+bool t_lo = use_london and kzInTime(london)
+bool t_na = use_nyam   and kzInTime(nyam)
+bool t_np = use_nypm   and kzInTime(nypm)
+
+kzManage(as_kz, use_asia,   t_as, as_color, as_txt)
+kzManage(lo_kz, use_london, t_lo, lo_color, lo_txt)
+kzManage(na_kz, use_nyam,   t_na, na_color, na_txt)
+kzManage(np_kz, use_nypm,   t_np, np_color, np_txt)
+
+// ══════════════════════════════════════════════════════════════
+// [TuraTuru] FUNDED RISK ENGINE — jatah trade harian, tint, HUD
+//   Indikator TIDAK bisa membaca P&L akun asli. "Jatah trade" = alat disiplin:
+//   floor(Daily Loss Limit % / Risk per Trade %). Berkurang tiap sinyal qualified.
+// ══════════════════════════════════════════════════════════════
+
+int  dayId         = dayofmonth(time - fundResetHourInput * 3600000, syminfo.timezone)
+bool newTradingDay = ta.change(dayId) != 0
+
+var int tradesToday = 0
+if newTradingDay
+    tradesToday := 0
+bool tookTrade = fvgFocus ? (fvgEntryBull or fvgEntryBear) : (qualifiedBull or qualifiedBear)
+if tookTrade
+    tradesToday += 1
+
+int  maxTradesDay    = fundRiskPctInput > 0 ? int(math.max(1, math.floor(fundDailyDdInput / fundRiskPctInput))) : 99
+int  tradesLeft      = int(math.max(0, maxTradesDay - tradesToday))
+bool budgetBlown     = tradesToday >= maxTradesDay
+bool budgetJustBlown = budgetBlown and not budgetBlown[1]
+bool avoidJustOn     = inAvoid and not inAvoid[1]
+
+bgcolor(fundShowTintInput and budgetBlown ? color.new(color.red, 88) : (fundShowTintInput and tradesLeft == 1 ? color.new(color.orange, 93) : na))
+
+float hudRiskUsd = fundBalanceInput * fundRiskPctInput / 100
+float hudPosSize = (not na(lastRiskDist) and lastRiskDist > 0 and syminfo.pointvalue > 0) ? hudRiskUsd / (lastRiskDist * syminfo.pointvalue) : na
+
+fundHudPos = switch fundHudPosInput
+    "Top Right"    => position.top_right
+    "Top Left"     => position.top_left
+    "Bottom Right" => position.bottom_right
+    => position.bottom_left
+
+var table hud = table.new(fundHudPos, 2, 7, bgcolor = color.new(#0b0f1a, 8), border_color = color.new(#000000, 0), border_width = 1)
+
+if barstate.islast and fundShowHudInput
+    color okC  = #00ffaa
+    color warC = #f59e0b
+    color badC = #ff3d71
+    color txtC = #e6e9f0
+    color labC = #8a93a6
+
+    string budTxt = budgetBlown ? "HABIS — STOP" : str.tostring(tradesLeft) + " / " + str.tostring(maxTradesDay)
+    color  budCol = budgetBlown ? badC : (tradesLeft <= 1 ? warC : okC)
+    string regTxt = not useVolRegimeInput ? "Off" : (volRegimeOk ? "OK (" + str.tostring(atrPctRank, "#") + "%)" : "Skip (" + str.tostring(atrPctRank, "#") + "%)")
+    color  regCol = not useVolRegimeInput ? labC : (volRegimeOk ? okC : warC)
+    string avTxt  = not useNewsAvoidInput ? "Off" : (inAvoid ? "BLACKOUT" : "Clear")
+    color  avCol  = not useNewsAvoidInput ? labC : (inAvoid ? badC : okC)
+
+    table.cell(hud, 0, 0, "RISK ENGINE", text_color = txtC, text_size = size.small, bgcolor = color.new(#18233a, 0))
+    table.cell(hud, 1, 0, budgetBlown ? "LOCK" : "Live", text_color = budgetBlown ? badC : okC, text_size = size.small, bgcolor = color.new(#18233a, 0))
+
+    table.cell(hud, 0, 1, "Trades left", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 1, budTxt, text_color = budCol, text_size = size.small)
+
+    table.cell(hud, 0, 2, "Risk / trade", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 2, str.tostring(fundRiskPctInput, "#.#") + "%  ·  $" + str.tostring(hudRiskUsd, "#.##"), text_color = txtC, text_size = size.small)
+
+    table.cell(hud, 0, 3, "Est. size (last)", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 3, na(hudPosSize) ? "—" : str.tostring(hudPosSize, "#.##") + " lot/ctr", text_color = okC, text_size = size.small)
+
+    table.cell(hud, 0, 4, "Spread", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 4, str.tostring(spreadTicksInput, "#.#") + " tick", text_color = txtC, text_size = size.small)
+
+    table.cell(hud, 0, 5, "Vol regime", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 5, regTxt, text_color = regCol, text_size = size.small)
+
+    table.cell(hud, 0, 6, "News window", text_color = labC, text_size = size.small)
+    table.cell(hud, 1, 6, avTxt, text_color = avCol, text_size = size.small)
+
+// ══════════════════════════════════════════════════════════════
+// Alerts
+// ══════════════════════════════════════════════════════════════
+
+alertcondition(wickedHigh, "VP CISD Swing High Mitigation", "CISD: swing-high liquidity mitigated on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(wickedLow,  "VP CISD Swing Low Mitigation",  "CISD: swing-low liquidity mitigated on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(cisdState == 1, "VP CISD Bearish", "CISD: bearish change in state of delivery on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(cisdState == 2, "VP CISD Bullish", "CISD: bullish change in state of delivery on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(bearishSweep, "VP CISD Strong Bearish (Sweep)", "CISD: strong bearish CISD with liquidity sweep on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(bullishSweep, "VP CISD Strong Bullish (Sweep)", "CISD: strong bullish CISD with liquidity sweep on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(qualifiedBull, "VP CISD Qualified Bull", "CISD: qualified BULL signal on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(qualifiedBear, "VP CISD Qualified Bear", "CISD: qualified BEAR signal on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(brokeUp, "VP Structure Break Up", "Structure break UP (BOS/CHoCH) on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(brokeDn, "VP Structure Break Down", "Structure break DOWN (BOS/CHoCH) on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(armBuyStop,  "VP Buy Stop Prep",  "Calon CISD BULL: siapkan BUY STOP on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(armSellStop, "VP Sell Stop Prep", "Calon CISD BEAR: siapkan SELL STOP on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(budgetJustBlown, "VP Funded Daily Budget Reached", "Funded: jatah trade harian HABIS — STOP trading {{ticker}} ({{interval}})")
+alertcondition(avoidJustOn,     "VP News/Avoid Window",            "Funded: masuk jendela hindari-trading (news/blackout) {{ticker}} ({{interval}})")
+alertcondition(fvgEntryBull, "VP FVG Break Buy",  "FVG full-body break BUY (CISD) on {{ticker}} ({{interval}}) at {{close}}")
+alertcondition(fvgEntryBear, "VP FVG Break Sell", "FVG full-body break SELL (CISD) on {{ticker}} ({{interval}}) at {{close}}")

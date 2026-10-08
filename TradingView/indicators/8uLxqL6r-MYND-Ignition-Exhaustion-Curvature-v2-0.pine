@@ -1,0 +1,465 @@
+//@version=6
+indicator("MYND Ignition/Exhaustion Curvature v2.0", shorttitle="MYND IEC v2.0", overlay=false, max_labels_count=500, max_lines_count=500)
+
+// =====================================================================================
+// MYND IGNITION / EXHAUSTION CURVATURE v2.0
+// Second-derivative ("curvature") analysis of smoothed momentum. The same curvature
+// spike event is disambiguated into an IGNITION signal (new move starting, momentum
+// still in the neutral zone) or an EXHAUSTION signal (existing move running out of
+// steam, momentum already in an overbought/oversold extreme) purely by checking the
+// momentum LEVEL at the moment the spike occurs. Tool #7 of the MYND swing-trading
+// suite - this is a full upgrade of the original v1.0 (built 2026-08-11), retrofitted
+// to every standard adopted since, plus a genuine "full sweep" review.
+//
+// WHAT'S NEW IN v2.0 (full sweep, 2026-08-13):
+// - Optional Confirmation Mode (off by default, preserving exact v1.0 instant-fire
+//   behavior): instead of firing the instant a curvature threshold is crossed, a
+//   crossing opens a PENDING state that must see genuine momentum continuation within
+//   a configurable window to CONFIRM - or is marked INVALIDATED if the window elapses
+//   with no follow-through. This is the same confirm-or-invalidate pattern already
+//   established in Climax Reversal Scanner, applied here because a single-bar Z-score
+//   spike is exactly the kind of noisy, pending-confirmation-window event that pattern
+//   was designed for - and an invalidated ignition/exhaustion attempt is itself a real,
+//   useful read (a failed breakout or a failed reversal attempt), not just noise to
+//   discard silently.
+// - Extreme Curvature tier: an optional 3rd, higher Z-score threshold that additionally
+//   flags an Ignition/Exhaustion signal as "Extreme" (unusually violent spike) with its
+//   own marker and alert - purely informational, does not gate the underlying signal.
+//   Correctly uses the Z-score AT THE ORIGINAL SPIKE, not at confirmation time (which
+//   would have already decayed back toward zero), when Confirmation Mode is on.
+// - Live Signal Accuracy, split by category (Ignition vs. Exhaustion) rather than one
+//   combined stat - since these are two structurally different bets (a new move
+//   starting vs. an existing move ending), tracking them separately answers "which of
+//   this tool's two jobs is actually working on this symbol right now," which a single
+//   blended number would hide.
+// - Momentum Zone background shading is now theme-aware, adjustable, and toggleable
+//   (was a hardcoded fixed-opacity red/green in v1.0).
+// =====================================================================================
+
+// ---------------------------- INPUTS: MOMENTUM ----------------------------
+rsiLen    = input.int(14, "RSI Length", minval=1, group="Momentum", tooltip="RSI length used to build the base momentum line before smoothing.")
+smoothLen = input.int(5, "Momentum Smoothing (EMA)", minval=1, group="Momentum", tooltip="EMA length applied to RSI to build the base momentum line.")
+
+// ---------------------------- INPUTS: CURVATURE ----------------------------
+velSmoothLen   = input.int(3, "Velocity Smoothing (EMA)", minval=1, group="Curvature", tooltip="Smooths the 1st derivative (velocity) of momentum.")
+accelSmoothLen = input.int(3, "Acceleration Smoothing (EMA)", minval=1, group="Curvature", tooltip="Smooths the 2nd derivative (acceleration/curvature) of momentum.")
+zLen           = input.int(50, "Z-Score Lookback", minval=5, group="Curvature", tooltip="Bars used to compute the rolling mean/stdev that normalizes acceleration into a z-score.")
+
+// ---------------------------- INPUTS: THRESHOLDS ----------------------------
+ignitionZThreshold   = input.float(1.5, "Ignition Z-Score Threshold", minval=0.1, step=0.1, group="Thresholds", tooltip="Acceleration z-score level that qualifies as a curvature spike for an Ignition read (momentum still in the neutral zone).")
+exhaustionZThreshold = input.float(2.0, "Exhaustion Z-Score Threshold", minval=0.1, step=0.1, group="Thresholds", tooltip="Typically set higher than the ignition threshold - exhaustion spikes tend to be sharper. Same acceleration z-score, but only counts as Exhaustion when momentum is already at an overbought/oversold extreme.")
+extremeZThreshold = input.float(3.0, "Extreme Curvature Z-Score Threshold", minval=0.1, step=0.1, group="Thresholds", tooltip="Optional 3rd tier - set higher than both thresholds above. When a signal's own curvature spike clears this, it's additionally flagged 'Extreme' (an unusually violent spike) with a distinct marker and alert. Purely informational - does not gate the underlying signal.")
+oversoldLevel    = input.float(35, "Momentum Oversold Level", group="Thresholds", tooltip="Momentum at or below this level qualifies the Oversold zone (required for Exhaustion Bottom, blocks Ignition Short).")
+overboughtLevel  = input.float(65, "Momentum Overbought Level", group="Thresholds", tooltip="Momentum at or above this level qualifies the Overbought zone (required for Exhaustion Top, blocks Ignition Long).")
+priorTrendBars   = input.int(5, "Prior Trend Bars Required (Exhaustion)", minval=1, group="Thresholds", tooltip="Momentum must have been rising/falling for at least this many bars before an exhaustion signal is considered valid.")
+
+// ---------------------------- INPUTS: CONFIRMATION ----------------------------
+useConfirmation = input.bool(false, "Require Confirmation Before Signaling", group="Confirmation", tooltip="Off (default): matches v1.0 - Ignition/Exhaustion signals fire instantly the bar the curvature threshold is crossed. On: a crossing instead opens a PENDING state that must see at least one bar of genuine momentum continuation within the Confirmation Window to actually fire (CONFIRMED) - reduces false positives from single-bar noise spikes, at the cost of a small delay. A pending setup that sees no follow-through before the window elapses is marked INVALIDATED instead of silently disappearing - a failed ignition/exhaustion attempt is itself a useful read.")
+confirmWindowBars = input.int(3, "Confirmation Window (bars)", minval=1, maxval=10, group="Confirmation", tooltip="Only used when Require Confirmation is on. How many bars a pending setup has to show genuine momentum continuation before it's marked Invalidated.")
+
+// ---------------------------- INPUTS: QUALITY FILTERS ----------------------------
+requireHTFAgreement = input.bool(true, "Require HTF Momentum Agreement", group="Quality Filters", tooltip="Ignition: HTF must NOT already be extended against the new move. Exhaustion: HTF must confirm the same extreme.")
+htfTF = input.timeframe("240", "HTF Timeframe", group="Quality Filters", tooltip="Higher timeframe checked for momentum agreement. Always read from its own most recently CLOSED bar, never the still-forming one, to avoid repainting.")
+requireVolumeClimax = input.bool(true, "Require Volume Climax (Exhaustion only)", group="Quality Filters", tooltip="When on, Exhaustion signals additionally require current volume to clear the multiple of average volume below - a genuine capitulation/blow-off read tends to come with a volume spike.")
+volAvgLen    = input.int(20, "Volume Average Length", minval=1, group="Quality Filters", tooltip="Average volume length used for the climax check. Only applies when Require Volume Climax is on.")
+volClimaxMult = input.float(1.5, "Volume Climax Multiplier", minval=1.0, step=0.1, group="Quality Filters", tooltip="Volume must be at least this multiple of the average to count as a climax. Only applies when Require Volume Climax is on.")
+
+// ---------------------------- INPUTS: ACCURACY TRACKING ----------------------------
+evalForwardBars = input.int(5, "Evaluation Forward Bars", minval=1, group="Accuracy Tracking", tooltip="How many bars forward each signal's outcome is measured over when grading rolling accuracy - should roughly match your intended holding period.")
+rollingWindow = input.int(20, "Accuracy Rolling Window (signals)", minval=5, group="Accuracy Tracking", tooltip="How many of each category's (Ignition / Exhaustion) most recent graded signals its accuracy % is based on - a rolling, not all-time, window.")
+accuracyWarnLevel = input.float(45, "Accuracy Warning Level (%)", minval=1, maxval=99, group="Accuracy Tracking", tooltip="If either category's Live Accuracy falls below this, the Live Accuracy Warning alert fires.")
+minTrackedForAlert = input.int(10, "Minimum Tracked Signals for Accuracy Alert", minval=1, group="Accuracy Tracking", tooltip="The accuracy alert stays silent until a category has at least this many graded signals, to avoid an unreliable early read.")
+
+// ---------------------------- INPUTS: THEME & ACCESSIBILITY ----------------------------
+themeMode = input.string("Light", "Theme Preset", options=["Light", "Dark", "Custom"], group="Theme & Accessibility", tooltip="Light and Dark apply a curated color palette suited to that chart background. Custom uses the individual color pickers in Display instead - Theme Preset overrides them unless set to Custom.")
+colorblindMode = input.bool(false, "Colorblind-Safe Signal Colors", group="Theme & Accessibility", tooltip="When on, collapses the 4 distinct Ignition/Exhaustion colors to a colorblind-safe blue/orange palette (Okabe-Ito) by direction - marker shape and the IGN/EXH text label still distinguish the category. Overrides Theme Preset or Custom colors.")
+
+// ---------------------------- INPUTS: DISPLAY ----------------------------
+showTable  = input.bool(true, "Show Dashboard Table", group="Display")
+tablePosIn = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group="Display")
+tableSizeIn = input.string("Normal", "Table Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="Display")
+showZoneShading = input.bool(true, "Show Momentum Zone Shading", group="Display")
+zoneShadingOpacity = input.int(92, "Zone Shading Transparency", minval=50, maxval=98, group="Display", tooltip="Pine's transparency scale (0=opaque, 100=invisible) for the Overbought/Oversold background zone shading. Higher = subtler.")
+headerBgColorCustom = input.color(color.new(color.navy, 0), "Custom Table Header Background", group="Display", tooltip="Only applied when Theme Preset is set to Custom.")
+headerTextColorCustom = input.color(color.new(color.white, 0), "Custom Table Header Text", group="Display", tooltip="Only applied when Theme Preset is set to Custom.")
+colIgnitionLongCustom  = input.color(color.new(color.lime, 0), "Custom Ignition Long Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+colIgnitionShortCustom = input.color(color.new(color.red, 0), "Custom Ignition Short Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+colExhaustionTopCustom = input.color(color.new(color.orange, 0), "Custom Exhaustion Top Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+colExhaustionBotCustom = input.color(color.new(color.aqua, 0), "Custom Exhaustion Bottom Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+
+// =====================================================================================
+// THEME RESOLUTION (Light/Dark/Custom base palette, then Colorblind-Safe override on top)
+// =====================================================================================
+lightHeaderBg = color.new(color.navy, 0)
+lightHeaderText = color.new(color.white, 0)
+lightIgnitionLong = color.new(color.lime, 0)
+lightIgnitionShort = color.new(color.red, 0)
+lightExhaustionTop = color.new(color.orange, 0)
+lightExhaustionBottom = color.new(color.aqua, 0)
+lightNeutral = color.new(color.gray, 0)
+
+darkHeaderBg = color.new(#1A1F2E, 0)
+darkHeaderText = color.new(#E0E0E0, 0)
+darkIgnitionLong = color.new(#00E676, 0)
+darkIgnitionShort = color.new(#FF5252, 0)
+darkExhaustionTop = color.new(#FFA726, 0)
+darkExhaustionBottom = color.new(#40C4FF, 0)
+darkNeutral = color.new(#787B86, 0)
+
+cbBullish = color.new(#0072B2, 0)
+cbBearish = color.new(#E69F00, 0)
+
+headerBgColor = themeMode == "Custom" ? headerBgColorCustom : themeMode == "Dark" ? darkHeaderBg : lightHeaderBg
+headerTextColor = themeMode == "Custom" ? headerTextColorCustom : themeMode == "Dark" ? darkHeaderText : lightHeaderText
+neutralColor = themeMode == "Dark" ? darkNeutral : lightNeutral
+
+baseIgnitionLongColor = themeMode == "Custom" ? colIgnitionLongCustom : themeMode == "Dark" ? darkIgnitionLong : lightIgnitionLong
+baseIgnitionShortColor = themeMode == "Custom" ? colIgnitionShortCustom : themeMode == "Dark" ? darkIgnitionShort : lightIgnitionShort
+baseExhaustionTopColor = themeMode == "Custom" ? colExhaustionTopCustom : themeMode == "Dark" ? darkExhaustionTop : lightExhaustionTop
+baseExhaustionBottomColor = themeMode == "Custom" ? colExhaustionBotCustom : themeMode == "Dark" ? darkExhaustionBottom : lightExhaustionBottom
+
+ignitionLongColor = colorblindMode ? cbBullish : baseIgnitionLongColor
+ignitionShortColor = colorblindMode ? cbBearish : baseIgnitionShortColor
+exhaustionTopColor = colorblindMode ? cbBearish : baseExhaustionTopColor
+exhaustionBottomColor = colorblindMode ? cbBullish : baseExhaustionBottomColor
+
+// =====================================================================================
+// CORE MATH
+// =====================================================================================
+momBase    = ta.rsi(close, rsiLen)
+momSmooth  = ta.ema(momBase, smoothLen)
+
+velocityRaw    = momSmooth - momSmooth[1]
+velocitySmooth = ta.ema(velocityRaw, velSmoothLen)
+
+accelRaw    = velocitySmooth - velocitySmooth[1]
+accelSmooth = ta.ema(accelRaw, accelSmoothLen)
+
+accelMean  = ta.sma(accelSmooth, zLen)
+accelStdev = ta.stdev(accelSmooth, zLen)
+accelZ     = accelStdev > 0 ? (accelSmooth - accelMean) / accelStdev : 0.0
+
+wasRisingIntoNow  = ta.rising(momSmooth, priorTrendBars)
+wasFallingIntoNow = ta.falling(momSmooth, priorTrendBars)
+
+accelCrossUpIgnition    = ta.crossover(accelZ, ignitionZThreshold)
+accelCrossDownIgnition  = ta.crossunder(accelZ, -ignitionZThreshold)
+accelCrossUpExhaustion  = ta.crossover(accelZ, exhaustionZThreshold)
+accelCrossDownExhaustion = ta.crossunder(accelZ, -exhaustionZThreshold)
+
+// HTF momentum agreement - previous CLOSED bar only, lookahead disabled (repaint-safe fix)
+htfMomRaw    = request.security(syminfo.tickerid, htfTF, ta.ema(ta.rsi(close, rsiLen), smoothLen)[1], lookahead=barmerge.lookahead_off)
+htfOverbought = htfMomRaw >= overboughtLevel
+htfOversold   = htfMomRaw <= oversoldLevel
+
+// Volume climax (unconditional call)
+avgVol      = ta.sma(volume, volAvgLen)
+volClimaxOk = volume >= volClimaxMult * avgVol
+
+// =====================================================================================
+// SIGNAL LOGIC - RAW threshold crossings (v1.0 behavior) + optional Confirmation Mode
+// =====================================================================================
+
+// ---- Ignition Long ----
+var bool pendIgnitionLong = false
+var int pendIgnitionLongBar = na
+var float pendIgnitionLongZ = na
+
+ignitionLongConfirmedNow = false
+ignitionLongInvalidatedNow = false
+if pendIgnitionLong
+    if velocityRaw > 0
+        ignitionLongConfirmedNow := true
+        pendIgnitionLong := false
+    else if bar_index - pendIgnitionLongBar >= confirmWindowBars
+        ignitionLongInvalidatedNow := true
+        pendIgnitionLong := false
+
+ignitionLongRaw = accelCrossUpIgnition and velocityRaw > 0 and momSmooth > oversoldLevel and momSmooth < overboughtLevel and (not requireHTFAgreement or not htfOverbought)
+if useConfirmation and ignitionLongRaw and not pendIgnitionLong
+    pendIgnitionLong := true
+    pendIgnitionLongBar := bar_index
+    pendIgnitionLongZ := accelZ
+
+// ---- Ignition Short ----
+var bool pendIgnitionShort = false
+var int pendIgnitionShortBar = na
+var float pendIgnitionShortZ = na
+
+ignitionShortConfirmedNow = false
+ignitionShortInvalidatedNow = false
+if pendIgnitionShort
+    if velocityRaw < 0
+        ignitionShortConfirmedNow := true
+        pendIgnitionShort := false
+    else if bar_index - pendIgnitionShortBar >= confirmWindowBars
+        ignitionShortInvalidatedNow := true
+        pendIgnitionShort := false
+
+ignitionShortRaw = accelCrossDownIgnition and velocityRaw < 0 and momSmooth > oversoldLevel and momSmooth < overboughtLevel and (not requireHTFAgreement or not htfOversold)
+if useConfirmation and ignitionShortRaw and not pendIgnitionShort
+    pendIgnitionShort := true
+    pendIgnitionShortBar := bar_index
+    pendIgnitionShortZ := accelZ
+
+// ---- Exhaustion Top ----
+var bool pendExhaustionTop = false
+var int pendExhaustionTopBar = na
+var float pendExhaustionTopZ = na
+
+exhaustionTopConfirmedNow = false
+exhaustionTopInvalidatedNow = false
+if pendExhaustionTop
+    if velocityRaw < 0
+        exhaustionTopConfirmedNow := true
+        pendExhaustionTop := false
+    else if bar_index - pendExhaustionTopBar >= confirmWindowBars
+        exhaustionTopInvalidatedNow := true
+        pendExhaustionTop := false
+
+exhaustionTopRaw = accelCrossDownExhaustion and momSmooth >= overboughtLevel and wasRisingIntoNow[1] and (not requireHTFAgreement or htfOverbought) and (not requireVolumeClimax or volClimaxOk)
+if useConfirmation and exhaustionTopRaw and not pendExhaustionTop
+    pendExhaustionTop := true
+    pendExhaustionTopBar := bar_index
+    pendExhaustionTopZ := accelZ
+
+// ---- Exhaustion Bottom ----
+var bool pendExhaustionBottom = false
+var int pendExhaustionBottomBar = na
+var float pendExhaustionBottomZ = na
+
+exhaustionBottomConfirmedNow = false
+exhaustionBottomInvalidatedNow = false
+if pendExhaustionBottom
+    if velocityRaw > 0
+        exhaustionBottomConfirmedNow := true
+        pendExhaustionBottom := false
+    else if bar_index - pendExhaustionBottomBar >= confirmWindowBars
+        exhaustionBottomInvalidatedNow := true
+        pendExhaustionBottom := false
+
+exhaustionBottomRaw = accelCrossUpExhaustion and momSmooth <= oversoldLevel and wasFallingIntoNow[1] and (not requireHTFAgreement or htfOversold) and (not requireVolumeClimax or volClimaxOk)
+if useConfirmation and exhaustionBottomRaw and not pendExhaustionBottom
+    pendExhaustionBottom := true
+    pendExhaustionBottomBar := bar_index
+    pendExhaustionBottomZ := accelZ
+
+// ---- Final signals (mode-dependent) ----
+ignitionLong  = useConfirmation ? ignitionLongConfirmedNow  : ignitionLongRaw
+ignitionShort = useConfirmation ? ignitionShortConfirmedNow : ignitionShortRaw
+exhaustionTop = useConfirmation ? exhaustionTopConfirmedNow : exhaustionTopRaw
+exhaustionBottom = useConfirmation ? exhaustionBottomConfirmedNow : exhaustionBottomRaw
+
+ignitionLongInvalidated  = useConfirmation and ignitionLongInvalidatedNow
+ignitionShortInvalidated = useConfirmation and ignitionShortInvalidatedNow
+exhaustionTopInvalidated = useConfirmation and exhaustionTopInvalidatedNow
+exhaustionBottomInvalidated = useConfirmation and exhaustionBottomInvalidatedNow
+anyInvalidated = ignitionLongInvalidated or ignitionShortInvalidated or exhaustionTopInvalidated or exhaustionBottomInvalidated
+
+// ---- Extreme Curvature tagging - uses the Z-score AT THE ORIGINAL SPIKE, not at
+// confirmation time (which would already have decayed back toward zero) ----
+ignitionLongSignalZ = useConfirmation ? pendIgnitionLongZ : accelZ
+ignitionShortSignalZ = useConfirmation ? pendIgnitionShortZ : accelZ
+exhaustionTopSignalZ = useConfirmation ? pendExhaustionTopZ : accelZ
+exhaustionBottomSignalZ = useConfirmation ? pendExhaustionBottomZ : accelZ
+
+isExtremeIgnitionLong  = ignitionLong  and math.abs(ignitionLongSignalZ)  >= extremeZThreshold
+isExtremeIgnitionShort = ignitionShort and math.abs(ignitionShortSignalZ) >= extremeZThreshold
+isExtremeExhaustionTop = exhaustionTop and math.abs(exhaustionTopSignalZ) >= extremeZThreshold
+isExtremeExhaustionBottom = exhaustionBottom and math.abs(exhaustionBottomSignalZ) >= extremeZThreshold
+extremeAny = isExtremeIgnitionLong or isExtremeIgnitionShort or isExtremeExhaustionTop or isExtremeExhaustionBottom
+
+// Momentum zone classification (for table + background shading)
+momZone = momSmooth >= overboughtLevel ? "Overbought" : momSmooth <= oversoldLevel ? "Oversold" : "Neutral"
+
+// =====================================================================================
+// LAST SIGNAL / LAST INVALIDATED TRACKING
+// =====================================================================================
+var string lastSignalType = "None"
+var int lastSignalBar = na
+
+if ignitionLong
+    lastSignalType := "Ignition Long" + (isExtremeIgnitionLong ? " (Extreme)" : "")
+    lastSignalBar := bar_index
+if ignitionShort
+    lastSignalType := "Ignition Short" + (isExtremeIgnitionShort ? " (Extreme)" : "")
+    lastSignalBar := bar_index
+if exhaustionTop
+    lastSignalType := "Exhaustion Top" + (isExtremeExhaustionTop ? " (Extreme)" : "")
+    lastSignalBar := bar_index
+if exhaustionBottom
+    lastSignalType := "Exhaustion Bottom" + (isExtremeExhaustionBottom ? " (Extreme)" : "")
+    lastSignalBar := bar_index
+
+barsSinceSignal = na(lastSignalBar) ? na : bar_index - lastSignalBar
+
+var string lastInvalidType = "None"
+var int lastInvalidBar = na
+if ignitionLongInvalidated
+    lastInvalidType := "Ignition Long"
+    lastInvalidBar := bar_index
+if ignitionShortInvalidated
+    lastInvalidType := "Ignition Short"
+    lastInvalidBar := bar_index
+if exhaustionTopInvalidated
+    lastInvalidType := "Exhaustion Top"
+    lastInvalidBar := bar_index
+if exhaustionBottomInvalidated
+    lastInvalidType := "Exhaustion Bottom"
+    lastInvalidBar := bar_index
+barsSinceInvalid = na(lastInvalidBar) ? na : bar_index - lastInvalidBar
+
+// =====================================================================================
+// LIVE SIGNAL ACCURACY - split by category (Ignition vs. Exhaustion)
+// =====================================================================================
+var array<float> ignitionResults = array.new_float(0)
+var array<float> exhaustionResults = array.new_float(0)
+
+hasHistory = bar_index >= evalForwardBars
+ignitionLongToGrade  = hasHistory ? ignitionLong[evalForwardBars]  : false
+ignitionShortToGrade = hasHistory ? ignitionShort[evalForwardBars] : false
+exhaustionTopToGrade = hasHistory ? exhaustionTop[evalForwardBars] : false
+exhaustionBottomToGrade = hasHistory ? exhaustionBottom[evalForwardBars] : false
+
+if ignitionLongToGrade or ignitionShortToGrade
+    priorCloseIgn = close[evalForwardBars]
+    outcomeReturnIgn = priorCloseIgn > 0 ? (close - priorCloseIgn) / priorCloseIgn : 0.0
+    wasCorrectIgn = ignitionLongToGrade ? outcomeReturnIgn > 0 : outcomeReturnIgn < 0
+    array.push(ignitionResults, wasCorrectIgn ? 1.0 : 0.0)
+    if array.size(ignitionResults) > rollingWindow
+        array.shift(ignitionResults)
+
+if exhaustionTopToGrade or exhaustionBottomToGrade
+    priorCloseExh = close[evalForwardBars]
+    outcomeReturnExh = priorCloseExh > 0 ? (close - priorCloseExh) / priorCloseExh : 0.0
+    wasCorrectExh = exhaustionBottomToGrade ? outcomeReturnExh > 0 : outcomeReturnExh < 0
+    array.push(exhaustionResults, wasCorrectExh ? 1.0 : 0.0)
+    if array.size(exhaustionResults) > rollingWindow
+        array.shift(exhaustionResults)
+
+ignitionAccPct = array.size(ignitionResults) > 0 ? array.avg(ignitionResults) * 100 : na
+exhaustionAccPct = array.size(exhaustionResults) > 0 ? array.avg(exhaustionResults) * 100 : na
+ignitionTrackedN = array.size(ignitionResults)
+exhaustionTrackedN = array.size(exhaustionResults)
+
+ignitionAccLow = ignitionTrackedN >= minTrackedForAlert and not na(ignitionAccPct) and ignitionAccPct < accuracyWarnLevel
+exhaustionAccLow = exhaustionTrackedN >= minTrackedForAlert and not na(exhaustionAccPct) and exhaustionAccPct < accuracyWarnLevel
+accuracyLowAlert = ignitionAccLow or exhaustionAccLow
+
+pendingCount = (pendIgnitionLong ? 1 : 0) + (pendIgnitionShort ? 1 : 0) + (pendExhaustionTop ? 1 : 0) + (pendExhaustionBottom ? 1 : 0)
+
+// =====================================================================================
+// PLOTS
+// =====================================================================================
+plot(accelZ, "Acceleration Z-Score", color=accelZ >= 0 ? color.new(color.teal, 20) : color.new(color.maroon, 20), style=plot.style_columns)
+
+hline(0, "Zero", color=color.new(color.gray, 40))
+hline(ignitionZThreshold, "Ignition Threshold +", color=color.new(color.lime, 60), linestyle=hline.style_dotted)
+hline(-ignitionZThreshold, "Ignition Threshold -", color=color.new(color.red, 60), linestyle=hline.style_dotted)
+hline(exhaustionZThreshold, "Exhaustion Threshold +", color=color.new(color.orange, 40), linestyle=hline.style_dashed)
+hline(-exhaustionZThreshold, "Exhaustion Threshold -", color=color.new(color.aqua, 40), linestyle=hline.style_dashed)
+
+// NOTE: plotshape()'s "size" argument must be a compile-time constant (const string) - it
+// cannot vary per bar like color can. So each signal is split into 2 calls (normal-size vs.
+// Extreme-size) rather than one call with a ternary size, which fails to compile.
+plotshape(ignitionLong and not isExtremeIgnitionLong ? accelZ : na, title="Ignition Long", style=shape.triangleup, location=location.absolute, color=ignitionLongColor, text="IGN", size=size.small)
+plotshape(ignitionLong and isExtremeIgnitionLong ? accelZ : na, title="Ignition Long (Extreme)", style=shape.triangleup, location=location.absolute, color=ignitionLongColor, text="IGN", size=size.normal)
+plotshape(ignitionShort and not isExtremeIgnitionShort ? accelZ : na, title="Ignition Short", style=shape.triangledown, location=location.absolute, color=ignitionShortColor, text="IGN", size=size.small)
+plotshape(ignitionShort and isExtremeIgnitionShort ? accelZ : na, title="Ignition Short (Extreme)", style=shape.triangledown, location=location.absolute, color=ignitionShortColor, text="IGN", size=size.normal)
+plotshape(exhaustionTop and not isExtremeExhaustionTop ? accelZ : na, title="Exhaustion Top", style=shape.triangledown, location=location.absolute, color=exhaustionTopColor, text="EXH", size=size.small)
+plotshape(exhaustionTop and isExtremeExhaustionTop ? accelZ : na, title="Exhaustion Top (Extreme)", style=shape.triangledown, location=location.absolute, color=exhaustionTopColor, text="EXH", size=size.normal)
+plotshape(exhaustionBottom and not isExtremeExhaustionBottom ? accelZ : na, title="Exhaustion Bottom", style=shape.triangleup, location=location.absolute, color=exhaustionBottomColor, text="EXH", size=size.small)
+plotshape(exhaustionBottom and isExtremeExhaustionBottom ? accelZ : na, title="Exhaustion Bottom (Extreme)", style=shape.triangleup, location=location.absolute, color=exhaustionBottomColor, text="EXH", size=size.normal)
+
+plotshape(extremeAny ? accelZ : na, title="Extreme Curvature Marker", style=shape.diamond, location=location.absolute, color=color.new(color.yellow, 30), size=size.tiny)
+
+plotshape(anyInvalidated ? 0.0 : na, title="Setup Invalidated", style=shape.xcross, location=location.absolute, color=color.new(neutralColor, 20), size=size.tiny)
+
+bgcolor(showZoneShading and momZone == "Overbought" ? color.new(ignitionShortColor, zoneShadingOpacity) : showZoneShading and momZone == "Oversold" ? color.new(ignitionLongColor, zoneShadingOpacity) : na, title="Momentum Zone Shading")
+
+// =====================================================================================
+// DASHBOARD TABLE
+// =====================================================================================
+tablePosConst = tablePosIn == "Top Left" ? position.top_left : tablePosIn == "Top Right" ? position.top_right : tablePosIn == "Bottom Left" ? position.bottom_left : position.bottom_right
+tableSizeConst = tableSizeIn == "Tiny" ? size.tiny : tableSizeIn == "Small" ? size.small : tableSizeIn == "Normal" ? size.normal : tableSizeIn == "Large" ? size.large : size.huge
+
+var table dash = table.new(tablePosConst, 2, 11, border_width=1)
+
+f_cell(_col, _row, _txt, _bg, _txtcol) =>
+    table.cell(dash, _col, _row, _txt, bgcolor=_bg, text_color=_txtcol, text_size=tableSizeConst)
+
+if showTable and barstate.islast
+    f_cell(0, 0, "MYND IEC v2.0", headerBgColor, headerTextColor)
+    f_cell(1, 0, "Status", headerBgColor, headerTextColor)
+
+    momColor = momZone == "Overbought" ? color.new(ignitionShortColor, 70) : momZone == "Oversold" ? color.new(ignitionLongColor, 70) : color.new(color.gray, 80)
+    f_cell(0, 1, "Momentum", color.new(color.gray, 85), color.black)
+    f_cell(1, 1, str.tostring(momSmooth, "#.##") + " (" + momZone + ")", momColor, color.black)
+
+    velTxt = velocityRaw > 0 ? "Rising" : velocityRaw < 0 ? "Falling" : "Flat"
+    velColor = velocityRaw > 0 ? color.new(color.green, 70) : velocityRaw < 0 ? color.new(color.red, 70) : color.new(color.gray, 80)
+    f_cell(0, 2, "Velocity", color.new(color.gray, 85), color.black)
+    f_cell(1, 2, str.tostring(velocityRaw, "#.###") + " (" + velTxt + ")", velColor, color.black)
+
+    zColor = math.abs(accelZ) >= extremeZThreshold ? color.new(color.yellow, 50) : math.abs(accelZ) >= exhaustionZThreshold ? color.new(color.orange, 60) : math.abs(accelZ) >= ignitionZThreshold ? color.new(color.yellow, 70) : color.new(color.gray, 85)
+    f_cell(0, 3, "Acceleration Z", color.new(color.gray, 85), color.black)
+    f_cell(1, 3, str.tostring(accelZ, "#.##"), zColor, color.black)
+
+    htfTxt = requireHTFAgreement ? (htfOverbought ? "Overbought" : htfOversold ? "Oversold" : "Neutral") : "Filter Off"
+    htfColor = requireHTFAgreement ? (htfOverbought ? color.new(color.red, 70) : htfOversold ? color.new(color.green, 70) : color.new(color.gray, 85)) : color.new(color.gray, 90)
+    f_cell(0, 4, "HTF Momentum", color.new(color.gray, 85), color.black)
+    f_cell(1, 4, htfTxt, htfColor, color.black)
+
+    volTxt = requireVolumeClimax ? (volClimaxOk ? "Climax" : "Normal") : "Filter Off"
+    volColor = requireVolumeClimax ? (volClimaxOk ? color.new(color.yellow, 60) : color.new(color.gray, 85)) : color.new(color.gray, 90)
+    f_cell(0, 5, "Volume", color.new(color.gray, 85), color.black)
+    f_cell(1, 5, volTxt, volColor, color.black)
+
+    pendTxt = not useConfirmation ? "Confirmation Off" : pendingCount == 0 ? "None" : str.tostring(pendingCount) + " pending"
+    f_cell(0, 6, "Pending Setups", color.new(color.gray, 85), color.black)
+    f_cell(1, 6, pendTxt, color.new(color.gray, 88), color.black)
+
+    ignAccTxt = na(ignitionAccPct) ? "Building..." : str.tostring(ignitionAccPct, "#.#") + "% (" + str.tostring(ignitionTrackedN) + " tracked)"
+    ignAccColor = na(ignitionAccPct) ? color.new(color.gray, 85) : ignitionAccPct < accuracyWarnLevel ? color.new(color.red, 70) : color.new(color.green, 80)
+    f_cell(0, 7, "Ignition Accuracy", color.new(color.gray, 85), color.black)
+    f_cell(1, 7, ignAccTxt, ignAccColor, color.black)
+
+    exhAccTxt = na(exhaustionAccPct) ? "Building..." : str.tostring(exhaustionAccPct, "#.#") + "% (" + str.tostring(exhaustionTrackedN) + " tracked)"
+    exhAccColor = na(exhaustionAccPct) ? color.new(color.gray, 85) : exhaustionAccPct < accuracyWarnLevel ? color.new(color.red, 70) : color.new(color.green, 80)
+    f_cell(0, 8, "Exhaustion Accuracy", color.new(color.gray, 85), color.black)
+    f_cell(1, 8, exhAccTxt, exhAccColor, color.black)
+
+    sigTxt = na(barsSinceSignal) ? "None yet" : lastSignalType + " (" + str.tostring(barsSinceSignal) + " bars ago)"
+    sigColor = str.contains(lastSignalType, "Ignition Long") or str.contains(lastSignalType, "Exhaustion Bottom") ? color.new(color.green, 70) : str.contains(lastSignalType, "Ignition Short") or str.contains(lastSignalType, "Exhaustion Top") ? color.new(color.red, 70) : color.new(color.gray, 85)
+    f_cell(0, 9, "Last Signal", color.new(color.gray, 85), color.black)
+    f_cell(1, 9, sigTxt, sigColor, color.black)
+
+    lastInvalidTxt = not useConfirmation ? "N/A (Confirmation Off)" : na(barsSinceInvalid) ? "None yet" : lastInvalidType + " (" + str.tostring(barsSinceInvalid) + " bars ago)"
+    f_cell(0, 10, "Last Invalidated", color.new(color.gray, 85), color.black)
+    f_cell(1, 10, lastInvalidTxt, color.new(neutralColor, 85), color.black)
+
+// =====================================================================================
+// ALERTS - INDIVIDUAL
+// =====================================================================================
+alertcondition(ignitionLong, title="Ignition Long", message="MYND IEC: Ignition Long on {{ticker}} ({{interval}})")
+alertcondition(ignitionShort, title="Ignition Short", message="MYND IEC: Ignition Short on {{ticker}} ({{interval}})")
+alertcondition(exhaustionTop, title="Exhaustion Top", message="MYND IEC: Exhaustion Top on {{ticker}} ({{interval}})")
+alertcondition(exhaustionBottom, title="Exhaustion Bottom", message="MYND IEC: Exhaustion Bottom on {{ticker}} ({{interval}})")
+alertcondition(extremeAny, title="Extreme Curvature Spike", message="MYND IEC: EXTREME curvature spike on {{ticker}} ({{interval}}) - check dashboard for direction/category")
+alertcondition(anyInvalidated, title="Setup Invalidated", message="MYND IEC: A pending setup was invalidated (no follow-through) on {{ticker}} ({{interval}})")
+alertcondition(accuracyLowAlert, title="Live Accuracy Warning", message="MYND IEC: Ignition or Exhaustion Live Accuracy has dropped below your warning level on {{ticker}} ({{interval}})")
+
+// =====================================================================================
+// ALERTS - COMBO BUNDLES (see MYND_Project_Notes.md for the standing convention)
+// =====================================================================================
+allSignals    = ignitionLong or ignitionShort or exhaustionTop or exhaustionBottom
+allIgnition   = ignitionLong or ignitionShort
+allExhaustion = exhaustionTop or exhaustionBottom
+allBullish    = ignitionLong or exhaustionBottom
+allBearish    = ignitionShort or exhaustionTop
+
+alertcondition(allSignals, title="ALL Signals", message="MYND IEC: Signal on {{ticker}} ({{interval}}) - check chart")
+alertcondition(allIgnition, title="ALL Ignition", message="MYND IEC: Ignition signal (Long or Short) on {{ticker}} ({{interval}})")
+alertcondition(allExhaustion, title="ALL Exhaustion", message="MYND IEC: Exhaustion signal (Top or Bottom) on {{ticker}} ({{interval}})")
+alertcondition(allBullish, title="ALL Bullish", message="MYND IEC: Bullish signal (Ignition Long or Exhaustion Bottom) on {{ticker}} ({{interval}})")
+alertcondition(allBearish, title="ALL Bearish", message="MYND IEC: Bearish signal (Ignition Short or Exhaustion Top) on {{ticker}} ({{interval}})")

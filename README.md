@@ -67,9 +67,9 @@ exports instead (`reference/08-validation.md`, level 4).
 
 | Folder | Holds | In git |
 |---|---|---|
-| `TradingView/indicators/` | original Pine indicators (924) | no — local only, see below |
-| `TradingView/strategies/` | original Pine strategies (1,053) | no — local only |
-| `TradingView/_meta/` | the extractor's title/author/URL records | no — local only |
+| `TradingView/indicators/` | original Pine indicators (924) | yes |
+| `TradingView/strategies/` | original Pine strategies (1,053) | yes |
+| `TradingView/_meta/` | the extractor's title/author/URL records | yes |
 | `TrendSpider/indicators/` | converted indicators, `<id>-<slug>.trendspider.js` | **yes** |
 | `TrendSpider/strategies/` | converted strategies | **yes** |
 
@@ -79,15 +79,13 @@ TradingView listing it was collected from. A conversion keeps the original's id 
 ## What is — and is not — in this repository
 
 This repository is **public**. It contains the skill, references, templates, tools, the
-progress log and **every conversion** (`TrendSpider/`). Each converted file credits the
-original author and carries the licence the source declared. Every conversion is also
-saved in the owner's TrendSpider account under the same `<Title>_TV` name.
-
-The original Pine sources (`TradingView/`) are other authors' work — 75 % declare no
-licence and only 23 % are MPL 2.0 — so they are kept locally and listed in `.gitignore`.
-To version them here, make the repository private first, then remove `TradingView/` from
-`.gitignore`. Another session or account without the local copy can still find every
-source: `progress/progress.json` records each script's TradingView URL.
+progress log, the original Pine sources (`TradingView/`) and every conversion
+(`TrendSpider/`). The sources were published openly on TradingView by their authors;
+each one's author and URL are in `TradingView/_meta/` and `progress/progress.json`, and
+every conversion credits its author and the licence the source declared. 75 % of the
+sources declare no licence, so their authors' rights apply — they are kept here as the
+reference for the conversions. Every conversion is also saved in the owner's TrendSpider
+account under the same `<Title>_TV` name.
 
 The validation outputs and market-data fixtures are excluded too, as is TrendSpider's
 proprietary engine bundle (only the list of names and limits extracted from it,

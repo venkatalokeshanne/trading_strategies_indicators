@@ -1,0 +1,289 @@
+//@version=6
+indicator("MYND KNN Pattern Match Classifier v1.1", shorttitle="MYND KNN v1.1", overlay=false)
+
+// =====================================================================================
+// MYND KNN PATTERN MATCH CLASSIFIER v1.1
+// The "predictive" tool from the LLM/ML discussion - genuine k-Nearest-Neighbor pattern
+// matching, not a literal language model (Pine can't run one). Every bar, a normalized
+// feature vector (RSI, Rate of Change, Volume, ATR% - each z-scored so they're on a
+// comparable scale) is compared via weighted Euclidean distance against a rolling buffer
+// of historical bars whose OUTCOME is already known (what price actually did N bars
+// later). The K closest historical analogs vote on a 0-100 Bullish Probability Score -
+// "have I seen this setup before, and how did it typically resolve."
+//
+// Ships with a self-tracking accuracy dashboard with TWO separate stats: Directional Lean
+// Accuracy (grades every bar's raw >50/<50 lean, a broad continuous health check) and
+// Signal Accuracy (grades ONLY bars where an actual Bullish/Bearish threshold crossing
+// fired - the number that answers "how good have the alerts I'd actually act on really
+// been"). The Live Accuracy Warning alert is driven by Signal Accuracy specifically.
+//
+// Honesty note on sample size: a new labeled historical entry is added every bar, each
+// covering a Prediction Horizon-bar-forward outcome - consecutive entries therefore overlap
+// heavily (e.g. with the default 10-bar horizon, 9 of every 10 bars are shared with the
+// previous entry). The dashboard's "Historical Sample Size" is a nominal count, not a count
+// of fully independent observations - treat larger sample requirements as the safer default
+// (see Minimum Sample Size tooltip).
+//
+// Built to the "Total Control" customization standard (see MYND_Project_Notes.md).
+// v1.1 (2026-08-13): pre-publish review pass - added the Signal Accuracy tracker and its
+// overlap/sample-size disclosure, made Avg Neighbor Fwd Return distance-weighted to match
+// the Probability Score's own weighting, and expanded tooltip coverage across the inputs
+// that benefit from it (see MYND_Project_Notes.md for the new standing convention).
+// =====================================================================================
+
+// ---------------------------- INPUTS: FEATURE ENGINEERING ----------------------------
+rsiLen = input.int(14, "RSI Length", minval=2, group="Feature Engineering", tooltip="RSI length feeding the momentum component of the feature vector - independent of RSI used elsewhere in the MYND suite.")
+rocLen = input.int(10, "Rate of Change Length", minval=1, group="Feature Engineering", tooltip="Rate-of-change length for the momentum feature, deliberately on a separate horizon from RSI Length - together they capture both a levels-based and a rate-based read on momentum.")
+atrLen = input.int(14, "ATR Length", minval=1, group="Feature Engineering", tooltip="ATR length behind the volatility-regime feature, expressed as ATR% of price so it's comparable across symbols.")
+normLookback = input.int(100, "Feature Normalization Lookback (bars)", minval=20, group="Feature Engineering", tooltip="Window used to z-score each raw feature (RSI, ROC, Volume, ATR%) before distance comparison, so all four sit on a comparable scale regardless of symbol or units.")
+
+// ---------------------------- INPUTS: KNN SETTINGS ----------------------------
+forwardBars = input.int(10, "Prediction Horizon (bars forward)", minval=1, group="KNN Settings", tooltip="How many bars ahead each historical match's outcome is measured, and how far ahead the current probability score is implicitly forecasting. Note: a new labeled entry is added every bar, so consecutive entries overlap heavily when this is set higher - the historical sample is not made up of fully independent observations.")
+kNeighbors = input.int(20, "K Nearest Neighbors", minval=3, group="KNN Settings", tooltip="How many of the closest historical matches vote on the score. More neighbors smooths the read but can blur genuinely distinct setups together; fewer neighbors reacts sharper but is noisier and more sensitive to a single odd historical match.")
+maxHistorySize = input.int(300, "Max Historical Sample Size (rolling)", minval=50, group="KNN Settings", tooltip="Rolling cap on how many labeled historical bars are kept for comparison - oldest drop off as new ones are added. Values much above 500 can slow chart loading, since the full distance search re-runs every bar.")
+minSampleSize = input.int(100, "Minimum Sample Size Before Signaling", minval=10, group="KNN Settings", tooltip="Below this many labeled historical bars, the score defaults to neutral (50) rather than an unreliable low-confidence read. Because consecutive labeled entries overlap heavily (see Prediction Horizon), the true independent information behind this count is meaningfully smaller than the raw number suggests - it's worth setting this generously rather than to the bare minimum.")
+weightByDistance = input.bool(true, "Weight Neighbor Votes by Distance", group="KNN Settings", tooltip="Closer historical matches count more toward the score than more distant ones, rather than every one of the K neighbors voting equally. Also applies to the Avg Neighbor Fwd Return stat on the dashboard.")
+
+// ---------------------------- INPUTS: FEATURE WEIGHTS ----------------------------
+rsiWeight = input.float(1.0, "RSI Weight", minval=0, group="Feature Weights", tooltip="Raise to make RSI similarity matter more when searching for historical matches; lower toward 0 to nearly ignore it.")
+rocWeight = input.float(1.0, "Rate of Change Weight", minval=0, group="Feature Weights", tooltip="Raise to make rate-of-change similarity matter more when searching for historical matches; lower toward 0 to nearly ignore it.")
+volWeight = input.float(1.0, "Volume Weight", minval=0, group="Feature Weights", tooltip="Raise to make volume similarity matter more when searching for historical matches; lower toward 0 to nearly ignore it.")
+atrWeight = input.float(1.0, "ATR% Weight", minval=0, group="Feature Weights", tooltip="Raise to make volatility-regime similarity matter more when searching for historical matches; lower toward 0 to nearly ignore it.")
+
+// ---------------------------- INPUTS: THRESHOLDS ----------------------------
+bullishThreshold = input.float(60, "Bullish Signal Threshold", minval=50, maxval=100, group="Thresholds", tooltip="Probability Score level that triggers a Bullish Signal - raise for fewer, higher-conviction signals.")
+bearishThreshold = input.float(40, "Bearish Signal Threshold", minval=0, maxval=50, group="Thresholds", tooltip="Probability Score level that triggers a Bearish Signal - lower for fewer, higher-conviction signals.")
+accuracyWarnThreshold = input.float(45, "Live Accuracy Warning Level (%)", minval=0, maxval=100, group="Thresholds", tooltip="If Signal Accuracy (the accuracy of actual Bullish/Bearish alerts, not the raw score lean) falls below this, an alert fires - a self-check on whether current conditions still fit the historical pattern set well.")
+accuracyMinCount = input.int(30, "Minimum Tracked Predictions for Accuracy Alert", minval=5, group="Thresholds", tooltip="Accuracy alert stays silent until at least this many actual signals have been graded. Since this tracks Signal Accuracy specifically (not every bar's raw lean), it can take noticeably longer to reach this count than a raw-lean-based tracker would - that's expected.")
+
+// ---------------------------- INPUTS: DISPLAY ----------------------------
+showTable = input.bool(true, "Show Dashboard Table", group="Display")
+tablePosIn = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group="Display")
+tableSizeIn = input.string("Normal", "Table Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="Display")
+headerBgColor = input.color(color.new(color.navy, 0), "Table Header Background", group="Display")
+headerTextColor = input.color(color.new(color.white, 0), "Table Header Text", group="Display")
+probPlotStyle = input.string("Line", "Probability Score Plot Style", options=["Line", "Columns", "Area", "Circles"], group="Display")
+probLineWidth = input.int(2, "Probability Score Line Width", minval=1, maxval=5, group="Display")
+bullishColor = input.color(color.new(color.lime, 0), "Bullish Zone / Signal Color", group="Display")
+bearishColor = input.color(color.new(color.red, 0), "Bearish Zone / Signal Color", group="Display")
+neutralColor = input.color(color.new(color.gray, 0), "Neutral Zone Color", group="Display")
+
+// =====================================================================================
+// FEATURE ENGINEERING (this bar's query vector)
+// =====================================================================================
+f_zscore(src, len) =>
+    m = ta.sma(src, len)
+    sd = ta.stdev(src, len)
+    sd > 0 ? (src - m) / sd : 0.0
+
+rsiRaw = ta.rsi(close, rsiLen)
+rocRaw = ta.roc(close, rocLen)
+atrPctRaw = ta.atr(atrLen) / close * 100
+volRaw = volume
+
+qRsi = f_zscore(rsiRaw, normLookback)
+qRoc = f_zscore(rocRaw, normLookback)
+qVol = f_zscore(volRaw, normLookback)
+qAtr = f_zscore(atrPctRaw, normLookback)
+
+// =====================================================================================
+// HISTORICAL LABELED SAMPLE (rolling buffer of resolved feature-vector -> outcome pairs)
+// =====================================================================================
+var array<float> histRsi = array.new_float(0)
+var array<float> histRoc = array.new_float(0)
+var array<float> histVol = array.new_float(0)
+var array<float> histAtr = array.new_float(0)
+var array<float> histOutcome = array.new_float(0)
+var array<float> histReturn = array.new_float(0)
+
+sampleSize = array.size(histOutcome)
+hasEnoughHistory = sampleSize >= minSampleSize
+
+// =====================================================================================
+// KNN PREDICTION - uses history as it stood BEFORE this bar's new label is appended below
+// =====================================================================================
+float probabilityScore = 50.0
+float avgNeighborReturn = 0.0
+int actualK = 0
+
+if sampleSize > 0
+    distances = array.new_float(sampleSize)
+    for i = 0 to sampleSize - 1
+        dRsi = qRsi - array.get(histRsi, i)
+        dRoc = qRoc - array.get(histRoc, i)
+        dVol = qVol - array.get(histVol, i)
+        dAtr = qAtr - array.get(histAtr, i)
+        d = math.sqrt(rsiWeight * dRsi * dRsi + rocWeight * dRoc * dRoc + volWeight * dVol * dVol + atrWeight * dAtr * dAtr)
+        array.set(distances, i, d)
+    sortedIdx = array.sort_indices(distances, order.ascending)
+    kUse = math.min(kNeighbors, sampleSize)
+    weightedSum = 0.0
+    weightSum = 0.0
+    returnWeightedSum = 0.0
+    for j = 0 to kUse - 1
+        idx = array.get(sortedIdx, j)
+        outcomeVal = array.get(histOutcome, idx)
+        distVal = array.get(distances, idx)
+        wgt = weightByDistance ? 1.0 / (1.0 + distVal) : 1.0
+        weightedSum := weightedSum + outcomeVal * wgt
+        weightSum := weightSum + wgt
+        returnWeightedSum := returnWeightedSum + array.get(histReturn, idx) * wgt
+    probabilityScore := weightSum > 0 ? (weightedSum / weightSum) * 100 : 50.0
+    avgNeighborReturn := weightSum > 0 ? returnWeightedSum / weightSum : 0.0
+    actualK := kUse
+
+// =====================================================================================
+// SIGNAL LOGIC (computed before the accuracy section below, since Signal Accuracy needs
+// to look back at whether a signal fired forwardBars bars ago)
+// =====================================================================================
+bullishCross = ta.crossover(probabilityScore, bullishThreshold)
+bearishCross = ta.crossunder(probabilityScore, bearishThreshold)
+
+bullishSignal = bullishCross and hasEnoughHistory
+bearishSignal = bearishCross and hasEnoughHistory
+
+var string lastEventType = "None"
+var int lastEventBar = na
+if bullishSignal
+    lastEventType := "Bullish Signal"
+    lastEventBar := bar_index
+if bearishSignal
+    lastEventType := "Bearish Signal"
+    lastEventBar := bar_index
+barsSinceEvent = na(lastEventBar) ? na : bar_index - lastEventBar
+
+// =====================================================================================
+// RESOLVE THIS BAR'S OUTCOME (used both for accuracy tracking and for labeling history)
+// =====================================================================================
+fwdReturn = bar_index >= forwardBars ? (close - close[forwardBars]) / close[forwardBars] * 100 : na
+outcomeUp = bar_index >= forwardBars ? (close > close[forwardBars] ? 1.0 : 0.0) : na
+
+// =====================================================================================
+// SELF-TRACKING ACCURACY - two separate trackers:
+//   1) Directional Lean Accuracy - grades EVERY bar's raw >50/<50 lean, whether or not it
+//      ever became an actual signal. A broad, continuously-updating health check.
+//   2) Signal Accuracy - grades ONLY the bars where an actual Bullish/Bearish threshold
+//      crossing fired - the number that answers "how good have the alerts I'd actually act
+//      on really been." This is the metric that drives the Live Accuracy Warning alert.
+// =====================================================================================
+var float leanCorrectCount = 0.0
+var float leanTotalCount = 0.0
+var float sigCorrectCount = 0.0
+var float sigTotalCount = 0.0
+
+hasPriorPrediction = bar_index >= forwardBars and hasEnoughHistory[forwardBars] and not na(outcomeUp)
+hadPriorSignal = hasPriorPrediction and (bullishSignal[forwardBars] or bearishSignal[forwardBars])
+
+if hasPriorPrediction
+    predictedBullish = probabilityScore[forwardBars] > 50
+    actualBullish = outcomeUp == 1.0
+    if predictedBullish == actualBullish
+        leanCorrectCount := leanCorrectCount + 1
+    leanTotalCount := leanTotalCount + 1
+
+if hadPriorSignal
+    predictedBullishSig = bullishSignal[forwardBars]
+    actualBullishSig = outcomeUp == 1.0
+    if predictedBullishSig == actualBullishSig
+        sigCorrectCount := sigCorrectCount + 1
+    sigTotalCount := sigTotalCount + 1
+
+leanAccuracyPct = leanTotalCount > 0 ? leanCorrectCount / leanTotalCount * 100 : 50.0
+sigAccuracyPct = sigTotalCount > 0 ? sigCorrectCount / sigTotalCount * 100 : 50.0
+
+accuracyCrossBelow = ta.crossunder(sigAccuracyPct, accuracyWarnThreshold)
+accuracyLowAlert = accuracyCrossBelow and sigTotalCount >= accuracyMinCount
+
+// =====================================================================================
+// LABEL & APPEND NEW HISTORICAL ENTRY (features from forwardBars ago + now-known outcome)
+// =====================================================================================
+canLabel = bar_index >= forwardBars and not na(qRsi[forwardBars]) and not na(qRoc[forwardBars]) and not na(qVol[forwardBars]) and not na(qAtr[forwardBars]) and not na(outcomeUp)
+
+if canLabel
+    array.push(histRsi, qRsi[forwardBars])
+    array.push(histRoc, qRoc[forwardBars])
+    array.push(histVol, qVol[forwardBars])
+    array.push(histAtr, qAtr[forwardBars])
+    array.push(histOutcome, outcomeUp)
+    array.push(histReturn, fwdReturn)
+    if array.size(histOutcome) > maxHistorySize
+        array.shift(histRsi)
+        array.shift(histRoc)
+        array.shift(histVol)
+        array.shift(histAtr)
+        array.shift(histOutcome)
+        array.shift(histReturn)
+
+// =====================================================================================
+// PLOTS
+// =====================================================================================
+plotStyleConst = probPlotStyle == "Columns" ? plot.style_columns : probPlotStyle == "Area" ? plot.style_area : probPlotStyle == "Circles" ? plot.style_circles : plot.style_line
+probColor = probabilityScore >= bullishThreshold ? bullishColor : probabilityScore <= bearishThreshold ? bearishColor : neutralColor
+plot(probabilityScore, title="KNN Bullish Probability Score", color=probColor, linewidth=probLineWidth, style=plotStyleConst)
+midLine = hline(50, title="Neutral (50)", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+bullLine = hline(bullishThreshold, title="Bullish Threshold", color=color.new(bullishColor, 60), linestyle=hline.style_dashed)
+bearLine = hline(bearishThreshold, title="Bearish Threshold", color=color.new(bearishColor, 60), linestyle=hline.style_dashed)
+fill(bullLine, bearLine, color=color.new(color.gray, 94), title="Neutral Zone Fill")
+plotshape(bullishSignal, title="Bullish Signal", style=shape.triangleup, location=location.bottom, color=bullishColor, size=size.small)
+plotshape(bearishSignal, title="Bearish Signal", style=shape.triangledown, location=location.top, color=bearishColor, size=size.small)
+
+// =====================================================================================
+// DASHBOARD TABLE
+// =====================================================================================
+tablePosConst = tablePosIn == "Top Left" ? position.top_left : tablePosIn == "Top Right" ? position.top_right : tablePosIn == "Bottom Left" ? position.bottom_left : position.bottom_right
+tableSizeConst = tableSizeIn == "Tiny" ? size.tiny : tableSizeIn == "Small" ? size.small : tableSizeIn == "Large" ? size.large : tableSizeIn == "Huge" ? size.huge : size.normal
+
+var table dash = table.new(tablePosConst, 2, 9, border_width=1)
+
+f_cell(_col, _row, _txt, _bg, _txtcol) =>
+    table.cell(dash, _col, _row, _txt, bgcolor=_bg, text_color=_txtcol, text_size=tableSizeConst)
+
+if showTable and barstate.islast
+    f_cell(0, 0, "MYND KNN v1.1", headerBgColor, headerTextColor)
+    f_cell(1, 0, "Status", headerBgColor, headerTextColor)
+
+    zoneTxt = probabilityScore >= bullishThreshold ? "Bullish" : probabilityScore <= bearishThreshold ? "Bearish" : "Neutral"
+    zoneColor = probabilityScore >= bullishThreshold ? color.new(bullishColor, 70) : probabilityScore <= bearishThreshold ? color.new(bearishColor, 70) : color.new(neutralColor, 85)
+    f_cell(0, 1, "Probability Score", color.new(color.gray, 85), color.black)
+    f_cell(1, 1, str.tostring(probabilityScore, "#.#") + " (" + zoneTxt + ")", zoneColor, color.black)
+
+    f_cell(0, 2, "Historical Sample Size", color.new(color.gray, 85), color.black)
+    f_cell(1, 2, str.tostring(sampleSize) + " / " + str.tostring(maxHistorySize) + (hasEnoughHistory ? "" : " (below minimum)"), color.new(color.gray, 88), color.black)
+
+    f_cell(0, 3, "Neighbors Used (K)", color.new(color.gray, 85), color.black)
+    f_cell(1, 3, str.tostring(actualK), color.new(color.gray, 88), color.black)
+
+    f_cell(0, 4, "Avg Neighbor Fwd Return", color.new(color.gray, 85), color.black)
+    f_cell(1, 4, str.tostring(avgNeighborReturn, "#.##") + "%", color.new(color.gray, 88), color.black)
+
+    leanTxt = leanTotalCount > 0 ? str.tostring(leanAccuracyPct, "#.#") + "%" : "Building sample..."
+    f_cell(0, 5, "Directional Lean Accuracy", color.new(color.gray, 85), color.black)
+    f_cell(1, 5, leanTxt + " (" + str.tostring(int(leanTotalCount)) + " tracked)", color.new(color.gray, 88), color.black)
+
+    sigTxt = sigTotalCount >= accuracyMinCount ? str.tostring(sigAccuracyPct, "#.#") + "%" : "Building sample..."
+    f_cell(0, 6, "Signal Accuracy", color.new(color.gray, 85), color.black)
+    f_cell(1, 6, sigTxt + " (" + str.tostring(int(sigTotalCount)) + " tracked)", color.new(color.gray, 88), color.black)
+
+    f_cell(0, 7, "Prediction Horizon", color.new(color.gray, 85), color.black)
+    f_cell(1, 7, str.tostring(forwardBars) + " bars", color.new(color.gray, 88), color.black)
+
+    lastColor = lastEventType == "Bullish Signal" ? color.new(bullishColor, 70) : lastEventType == "Bearish Signal" ? color.new(bearishColor, 70) : color.new(color.gray, 85)
+    lastTxt = na(barsSinceEvent) ? "None yet" : lastEventType + " (" + str.tostring(barsSinceEvent) + " bars ago)"
+    f_cell(0, 8, "Last Signal", color.new(color.gray, 85), color.black)
+    f_cell(1, 8, lastTxt, lastColor, color.black)
+
+// =====================================================================================
+// ALERTS - INDIVIDUAL
+// =====================================================================================
+alertcondition(bullishSignal, title="Bullish Signal", message="MYND KNN: Bullish probability signal on {{ticker}} ({{interval}}) - historical analogs favor upside over the next bars")
+alertcondition(bearishSignal, title="Bearish Signal", message="MYND KNN: Bearish probability signal on {{ticker}} ({{interval}}) - historical analogs favor downside over the next bars")
+alertcondition(accuracyLowAlert, title="Live Accuracy Warning", message="MYND KNN: Signal Accuracy on {{ticker}} ({{interval}}) has dropped below your warning threshold - the actual Bullish/Bearish alerts have been running colder than your comfort level, current conditions may not fit the historical pattern set well")
+
+// =====================================================================================
+// ALERTS - COMBO BUNDLES (see MYND_Project_Notes.md for the standing convention)
+// =====================================================================================
+allSignals = bullishSignal or bearishSignal or accuracyLowAlert
+allDirectional = bullishSignal or bearishSignal
+
+alertcondition(allSignals, title="ALL Signals", message="MYND KNN: Signal on {{ticker}} ({{interval}}) - check chart")
+alertcondition(allDirectional, title="ALL Directional Signals", message="MYND KNN: Directional signal (Bullish or Bearish) on {{ticker}} ({{interval}})")

@@ -1,0 +1,1252 @@
+//@version=6
+indicator("Smart Support & Resistance Probability Zones", overlay=true, max_boxes_count=100)
+
+//=====================================================================
+// INPUTS
+//=====================================================================
+
+// --- Zone Detection
+groupZones = "Zone Detection"
+
+pivotLen = input.int(
+     5,
+     "Pivot Strength",
+     minval=2,
+     maxval=30,
+     group=groupZones,
+     tooltip="Higher = fewer but stronger Support/Resistance zones"
+)
+
+atrLen = input.int(
+     14,
+     "ATR Length",
+     minval=5,
+     group=groupZones
+)
+
+zoneAtr = input.float(
+     0.30,
+     "Zone Width ATR",
+     minval=0.05,
+     maxval=2.0,
+     step=0.05,
+     group=groupZones
+)
+
+mergeAtr = input.float(
+     0.50,
+     "Merge Nearby Zones ATR",
+     minval=0.10,
+     maxval=3.0,
+     step=0.10,
+     group=groupZones,
+     tooltip="Nearby zones are combined into one stronger zone."
+)
+
+maxZones = input.int(
+     10,
+     "Maximum Zones",
+     minval=2,
+     maxval=30,
+     group=groupZones
+)
+
+maxAge = input.int(
+     1500,
+     "Maximum Zone Age (Bars)",
+     minval=100,
+     maxval=5000,
+     group=groupZones
+)
+
+
+// --- Invalidation
+groupBreak = "Zone Invalidation"
+
+breakATR = input.float(
+     0.10,
+     "Break Confirmation ATR",
+     minval=0.0,
+     maxval=1.0,
+     step=0.05,
+     group=groupBreak,
+     tooltip="Price must close this far beyond the zone before the zone is deleted."
+)
+
+
+// --- Probability
+groupProb = "Reaction Score"
+
+alertScore = input.int(
+     75,
+     "High Probability Threshold",
+     minval=50,
+     maxval=95,
+     group=groupProb
+)
+
+showPercent = input.bool(
+     true,
+     "Show Reaction Score",
+     group=groupProb
+)
+
+showTests = input.bool(
+     true,
+     "Show Retest Count",
+     group=groupProb
+)
+
+
+// --- Display
+groupDisplay = "Display"
+
+showDashboard = input.bool(
+     true,
+     "Show Dashboard",
+     group=groupDisplay
+)
+
+
+//=====================================================================
+// CALCULATIONS
+//=====================================================================
+
+atr = ta.atr(atrLen)
+volMA = ta.sma(volume, 20)
+
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+
+
+//=====================================================================
+// ARRAYS
+//=====================================================================
+
+var array<box> zoneBoxes = array.new<box>()
+
+// 1 = Support
+// -1 = Resistance
+var array<int> zoneType = array.new<int>()
+
+var array<float> zoneTop = array.new<float>()
+var array<float> zoneBottom = array.new<float>()
+
+var array<float> zoneBaseStrength = array.new<float>()
+
+var array<int> zoneConfirmations = array.new<int>()
+var array<int> zoneTouches = array.new<int>()
+
+var array<int> zoneBorn = array.new<int>()
+var array<int> zoneLastTouch = array.new<int>()
+
+var array<float> zoneReaction = array.new<float>()
+
+
+//=====================================================================
+// FUNCTIONS
+//=====================================================================
+
+f_clamp(float value, float minValue, float maxValue) =>
+    math.max(minValue, math.min(maxValue, value))
+
+
+//---------------------------------------------------------------------
+// Retest score
+//---------------------------------------------------------------------
+
+f_retestScore(int touches) =>
+    float result = 0.0
+
+    if touches == 0
+        result := 20.0
+    else if touches == 1
+        result := 24.0
+    else if touches == 2
+        result := 20.0
+    else if touches == 3
+        result := 14.0
+    else if touches == 4
+        result := 8.0
+    else
+        result := 4.0
+
+    result
+
+
+//---------------------------------------------------------------------
+// Reaction probability / quality score
+//---------------------------------------------------------------------
+
+f_score(int index) =>
+
+    float base =
+         array.get(zoneBaseStrength, index)
+
+    int confirmations =
+         array.get(zoneConfirmations, index)
+
+    int touches =
+         array.get(zoneTouches, index)
+
+    int born =
+         array.get(zoneBorn, index)
+
+    float reaction =
+         array.get(zoneReaction, index)
+
+    //--------------------------------------------------
+    // Multiple swing confirmations
+    //--------------------------------------------------
+
+    float confirmationScore =
+         math.min(confirmations * 5.0, 15.0)
+
+    //--------------------------------------------------
+    // Retests
+    //--------------------------------------------------
+
+    float retestScore =
+         f_retestScore(touches)
+
+    //--------------------------------------------------
+    // Historical rejection
+    //--------------------------------------------------
+
+    float reactionScore =
+         touches > 0
+         ? reaction * 10.0
+         : 5.0
+
+    //--------------------------------------------------
+    // Freshness
+    //--------------------------------------------------
+
+    float age =
+         bar_index - born
+
+    float freshness =
+         10.0 *
+         math.max(
+             0.0,
+             1.0 - age / maxAge
+         )
+
+    //--------------------------------------------------
+    // Final
+    //--------------------------------------------------
+
+    float score =
+         base +
+         confirmationScore +
+         retestScore +
+         reactionScore +
+         freshness
+
+    f_clamp(score, 5.0, 95.0)
+
+
+//---------------------------------------------------------------------
+// Rating text
+//---------------------------------------------------------------------
+
+f_rating(float score) =>
+
+    string rating = ""
+
+    if score >= 85
+        rating := "VERY HIGH"
+
+    else if score >= 75
+        rating := "HIGH"
+
+    else if score >= 65
+        rating := "GOOD"
+
+    else if score >= 50
+        rating := "MEDIUM"
+
+    else
+        rating := "WEAK"
+
+    rating
+
+
+//---------------------------------------------------------------------
+// Delete zone
+//---------------------------------------------------------------------
+
+f_deleteZone(int index) =>
+
+    box zoneBox =
+         array.get(zoneBoxes, index)
+
+    box.delete(zoneBox)
+
+    array.remove(zoneBoxes, index)
+    array.remove(zoneType, index)
+
+    array.remove(zoneTop, index)
+    array.remove(zoneBottom, index)
+
+    array.remove(zoneBaseStrength, index)
+
+    array.remove(zoneConfirmations, index)
+    array.remove(zoneTouches, index)
+
+    array.remove(zoneBorn, index)
+    array.remove(zoneLastTouch, index)
+
+    array.remove(zoneReaction, index)
+
+    0
+
+
+//---------------------------------------------------------------------
+// Add / merge zone
+//---------------------------------------------------------------------
+
+f_addZone(
+     int type,
+     float price,
+     float pivotATR,
+     float strength,
+     int leftBar) =>
+
+    float tolerance =
+         pivotATR * mergeAtr
+
+    int found =
+         -1
+
+    //--------------------------------------------------
+    // Find nearby zone
+    //--------------------------------------------------
+
+    if array.size(zoneBoxes) > 0
+
+        for i = 0 to array.size(zoneBoxes) - 1
+
+            if array.get(zoneType, i) == type
+
+                float oldTop =
+                     array.get(zoneTop, i)
+
+                float oldBottom =
+                     array.get(zoneBottom, i)
+
+                float oldMiddle =
+                     (oldTop + oldBottom) / 2.0
+
+                if math.abs(oldMiddle - price) <= tolerance
+
+                    found := i
+                    break
+
+
+    //--------------------------------------------------
+    // Merge
+    //--------------------------------------------------
+
+    if found >= 0
+
+        int confirmations =
+             array.get(zoneConfirmations, found) + 1
+
+        float oldTop =
+             array.get(zoneTop, found)
+
+        float oldBottom =
+             array.get(zoneBottom, found)
+
+        float oldMiddle =
+             (oldTop + oldBottom) / 2.0
+
+        float newMiddle =
+             (
+                 oldMiddle * (confirmations - 1) +
+                 price
+             ) / confirmations
+
+        float oldHalf =
+             (oldTop - oldBottom) / 2.0
+
+        float newHalf =
+             math.max(
+                 oldHalf,
+                 pivotATR * zoneAtr
+             )
+
+        float newTop =
+             newMiddle + newHalf
+
+        float newBottom =
+             newMiddle - newHalf
+
+        float oldStrength =
+             array.get(zoneBaseStrength, found)
+
+        float newStrength =
+             (
+                 oldStrength * (confirmations - 1) +
+                 strength
+             ) / confirmations
+
+        array.set(
+             zoneTop,
+             found,
+             newTop
+        )
+
+        array.set(
+             zoneBottom,
+             found,
+             newBottom
+        )
+
+        array.set(
+             zoneBaseStrength,
+             found,
+             newStrength
+        )
+
+        array.set(
+             zoneConfirmations,
+             found,
+             confirmations
+        )
+
+        box existingBox =
+             array.get(zoneBoxes, found)
+
+        box.set_top(
+             existingBox,
+             newTop
+        )
+
+        box.set_bottom(
+             existingBox,
+             newBottom
+        )
+
+
+    //--------------------------------------------------
+    // Create new zone
+    //--------------------------------------------------
+
+    else
+
+        float halfWidth =
+             pivotATR * zoneAtr
+
+        float top =
+             price + halfWidth
+
+        float bottom =
+             price - halfWidth
+
+        color borderColor =
+             type == 1
+             ? color.lime
+             : color.red
+
+        color backgroundColor =
+             type == 1
+             ? color.new(color.lime, 82)
+             : color.new(color.red, 82)
+
+        box newBox =
+             box.new(
+                 left=leftBar,
+                 top=top,
+                 right=bar_index + 1,
+                 bottom=bottom,
+                 border_color=borderColor,
+                 border_width=1,
+                 bgcolor=backgroundColor,
+                 text="",
+                 text_color=color.white,
+                 text_size=size.tiny,
+                 text_halign=text.align_right,
+                 text_valign=text.align_center
+             )
+
+        array.push(
+             zoneBoxes,
+             newBox
+        )
+
+        array.push(
+             zoneType,
+             type
+        )
+
+        array.push(
+             zoneTop,
+             top
+        )
+
+        array.push(
+             zoneBottom,
+             bottom
+        )
+
+        array.push(
+             zoneBaseStrength,
+             strength
+        )
+
+        array.push(
+             zoneConfirmations,
+             1
+        )
+
+        array.push(
+             zoneTouches,
+             0
+        )
+
+        array.push(
+             zoneBorn,
+             leftBar
+        )
+
+        array.push(
+             zoneLastTouch,
+             -100000
+        )
+
+        array.push(
+             zoneReaction,
+             0.0
+        )
+
+
+    //--------------------------------------------------
+    // Remove oldest zone
+    //--------------------------------------------------
+
+    if array.size(zoneBoxes) > maxZones
+
+        int oldestIndex =
+             0
+
+        int oldestBar =
+             array.get(zoneBorn, 0)
+
+        for j = 1 to array.size(zoneBoxes) - 1
+
+            int testBar =
+                 array.get(zoneBorn, j)
+
+            if testBar < oldestBar
+
+                oldestBar := testBar
+                oldestIndex := j
+
+        f_deleteZone(oldestIndex)
+
+    0
+
+
+//=====================================================================
+// CREATE SUPPORT
+//=====================================================================
+
+if not na(pivotLow)
+
+    float pivotATR =
+         atr[pivotLen]
+
+    float lowerWick =
+         math.max(
+             0.0,
+             math.min(
+                 open[pivotLen],
+                 close[pivotLen]
+             ) - low[pivotLen]
+         )
+
+    float wickRatio =
+         not na(pivotATR) and pivotATR > 0
+         ? lowerWick / pivotATR
+         : 0.0
+
+    float wickScore =
+         math.min(
+             wickRatio,
+             1.0
+         ) * 25.0
+
+    float volumeRatio =
+         not na(volume[pivotLen]) and
+         not na(volMA[pivotLen]) and
+         volMA[pivotLen] > 0
+         ? volume[pivotLen] / volMA[pivotLen]
+         : 1.0
+
+    float volumeScore =
+         math.min(
+             volumeRatio / 2.0,
+             1.0
+         ) * 15.0
+
+    float baseStrength =
+         15.0 +
+         wickScore +
+         volumeScore
+
+    f_addZone(
+         1,
+         pivotLow,
+         pivotATR,
+         baseStrength,
+         bar_index - pivotLen
+    )
+
+
+//=====================================================================
+// CREATE RESISTANCE
+//=====================================================================
+
+if not na(pivotHigh)
+
+    float pivotATR =
+         atr[pivotLen]
+
+    float upperWick =
+         math.max(
+             0.0,
+             high[pivotLen] -
+             math.max(
+                 open[pivotLen],
+                 close[pivotLen]
+             )
+         )
+
+    float wickRatio =
+         not na(pivotATR) and pivotATR > 0
+         ? upperWick / pivotATR
+         : 0.0
+
+    float wickScore =
+         math.min(
+             wickRatio,
+             1.0
+         ) * 25.0
+
+    float volumeRatio =
+         not na(volume[pivotLen]) and
+         not na(volMA[pivotLen]) and
+         volMA[pivotLen] > 0
+         ? volume[pivotLen] / volMA[pivotLen]
+         : 1.0
+
+    float volumeScore =
+         math.min(
+             volumeRatio / 2.0,
+             1.0
+         ) * 15.0
+
+    float baseStrength =
+         15.0 +
+         wickScore +
+         volumeScore
+
+    f_addZone(
+         -1,
+         pivotHigh,
+         pivotATR,
+         baseStrength,
+         bar_index - pivotLen
+    )
+
+
+//=====================================================================
+// UPDATE ZONES
+//=====================================================================
+
+bool highScoreSupportTouch =
+     false
+
+bool highScoreResistanceTouch =
+     false
+
+
+int zoneIndex =
+     array.size(zoneBoxes) - 1
+
+
+while zoneIndex >= 0
+
+    box currentBox =
+         array.get(zoneBoxes, zoneIndex)
+
+    int type =
+         array.get(zoneType, zoneIndex)
+
+    float top =
+         array.get(zoneTop, zoneIndex)
+
+    float bottom =
+         array.get(zoneBottom, zoneIndex)
+
+    float middle =
+         (top + bottom) / 2.0
+
+    int born =
+         array.get(zoneBorn, zoneIndex)
+
+
+    //--------------------------------------------------
+    // Invalidation
+    //--------------------------------------------------
+
+    bool brokenSupport =
+         type == 1 and
+         close <
+         bottom - atr * breakATR
+
+    bool brokenResistance =
+         type == -1 and
+         close >
+         top + atr * breakATR
+
+    bool expired =
+         bar_index - born >
+         maxAge
+
+
+    if brokenSupport or brokenResistance or expired
+
+        f_deleteZone(zoneIndex)
+
+
+    else
+
+        //--------------------------------------------------
+        // Extend box
+        //--------------------------------------------------
+
+        box.set_right(
+             currentBox,
+             bar_index + 1
+        )
+
+
+        //--------------------------------------------------
+        // Detect zone touch
+        //--------------------------------------------------
+
+        bool touching =
+             high >= bottom and
+             low <= top
+
+        bool previouslyTouching =
+             not na(high[1]) and
+             high[1] >= bottom and
+             low[1] <= top
+
+
+        bool newTouch =
+             touching and
+             not previouslyTouching and
+             bar_index > born + pivotLen
+
+
+        if newTouch
+
+            int touches =
+                 array.get(zoneTouches, zoneIndex) + 1
+
+            array.set(
+                 zoneTouches,
+                 zoneIndex,
+                 touches
+            )
+
+            //--------------------------------------------------
+            // Measure rejection candle quality
+            //--------------------------------------------------
+
+            float currentLowerWick =
+                 math.max(
+                     0.0,
+                     math.min(open, close) - low
+                 )
+
+            float currentUpperWick =
+                 math.max(
+                     0.0,
+                     high - math.max(open, close)
+                 )
+
+            float wickReaction =
+                 type == 1
+                 ? currentLowerWick
+                 : currentUpperWick
+
+            float wickReactionNormalized =
+                 not na(atr) and atr > 0
+                 ? math.min(
+                     wickReaction / atr * 1.5,
+                     1.0
+                 )
+                 : 0.0
+
+            bool goodClose =
+                 type == 1
+                 ? close >= middle
+                 : close <= middle
+
+            float rejectionValue =
+                 math.min(
+                     wickReactionNormalized +
+                     (goodClose ? 0.35 : 0.0),
+                     1.0
+                 )
+
+            float oldReaction =
+                 array.get(
+                     zoneReaction,
+                     zoneIndex
+                 )
+
+            float newReaction =
+                 (
+                     oldReaction * (touches - 1) +
+                     rejectionValue
+                 ) / touches
+
+            array.set(
+                 zoneReaction,
+                 zoneIndex,
+                 newReaction
+            )
+
+            array.set(
+                 zoneLastTouch,
+                 zoneIndex,
+                 bar_index
+            )
+
+
+        //--------------------------------------------------
+        // Score
+        //--------------------------------------------------
+
+        float score =
+             f_score(zoneIndex)
+
+        string rating =
+             f_rating(score)
+
+
+        //--------------------------------------------------
+        // Dynamic transparency
+        //--------------------------------------------------
+
+        int transparency =
+             int(
+                 math.round(
+                     90.0 -
+                     score * 0.50
+                 )
+             )
+
+        transparency :=
+             math.max(
+                 38,
+                 math.min(
+                     82,
+                     transparency
+                 )
+             )
+
+
+        color zoneColor =
+             type == 1
+             ? color.lime
+             : color.red
+
+        box.set_bgcolor(
+             currentBox,
+             color.new(
+                 zoneColor,
+                 transparency
+             )
+        )
+
+        box.set_border_color(
+             currentBox,
+             zoneColor
+        )
+
+
+        //--------------------------------------------------
+        // Text
+        //--------------------------------------------------
+
+        string typeText =
+             type == 1
+             ? "SUPPORT"
+             : "RESISTANCE"
+
+        string scoreText =
+             showPercent
+             ? "\nReaction: " +
+               str.tostring(
+                   math.round(score)
+               ) +
+               "%"
+             : ""
+
+        string testText =
+             showTests
+             ? "\nTests: " +
+               str.tostring(
+                   array.get(
+                       zoneTouches,
+                       zoneIndex
+                   )
+               )
+             : ""
+
+        string finalText =
+             typeText +
+             scoreText +
+             "\n" +
+             rating +
+             testText
+
+        box.set_text(
+             currentBox,
+             finalText
+        )
+
+
+        //--------------------------------------------------
+        // Alert
+        //--------------------------------------------------
+
+        if newTouch and score >= alertScore
+
+            if type == 1
+
+                highScoreSupportTouch :=
+                     true
+
+            if type == -1
+
+                highScoreResistanceTouch :=
+                     true
+
+
+    zoneIndex -= 1
+
+
+//=====================================================================
+// FIND NEAREST SUPPORT / RESISTANCE
+//=====================================================================
+
+int nearestSupport =
+     na
+
+int nearestResistance =
+     na
+
+float supportDistance =
+     100000000000.0
+
+float resistanceDistance =
+     100000000000.0
+
+
+if array.size(zoneBoxes) > 0
+
+    for i = 0 to array.size(zoneBoxes) - 1
+
+        int type =
+             array.get(zoneType, i)
+
+        float top =
+             array.get(zoneTop, i)
+
+        float bottom =
+             array.get(zoneBottom, i)
+
+        float middle =
+             (top + bottom) / 2.0
+
+
+        if type == 1
+
+            bool validSupport =
+                 middle <= close or
+                 (
+                     close >= bottom and
+                     close <= top
+                 )
+
+            float distance =
+                 math.abs(
+                     close - middle
+                 )
+
+            if validSupport and
+               distance < supportDistance
+
+                supportDistance :=
+                     distance
+
+                nearestSupport :=
+                     i
+
+
+        if type == -1
+
+            bool validResistance =
+                 middle >= close or
+                 (
+                     close >= bottom and
+                     close <= top
+                 )
+
+            float distance =
+                 math.abs(
+                     close - middle
+                 )
+
+            if validResistance and
+               distance < resistanceDistance
+
+                resistanceDistance :=
+                     distance
+
+                nearestResistance :=
+                     i
+
+
+//=====================================================================
+// DASHBOARD
+//=====================================================================
+
+var table dashboard =
+     table.new(
+         position.top_right,
+         2,
+         5,
+         bgcolor=color.new(
+             color.black,
+             20
+         ),
+         border_width=1
+     )
+
+
+if barstate.islast and showDashboard
+
+    //--------------------------------------------------
+    // Header
+    //--------------------------------------------------
+
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "S/R ANALYZER",
+         text_color=color.white,
+         bgcolor=color.new(
+             color.blue,
+             50
+         )
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         0,
+         "VALUE",
+         text_color=color.white,
+         bgcolor=color.new(
+             color.blue,
+             50
+         )
+    )
+
+
+    //--------------------------------------------------
+    // Active zones
+    //--------------------------------------------------
+
+    table.cell(
+         dashboard,
+         0,
+         1,
+         "Active Zones",
+         text_color=color.white
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         1,
+         str.tostring(
+             array.size(zoneBoxes)
+         ),
+         text_color=color.white
+    )
+
+
+    //--------------------------------------------------
+    // Support
+    //--------------------------------------------------
+
+    string supportText =
+         "NONE"
+
+    if not na(nearestSupport)
+
+        float supportScore =
+             f_score(
+                 nearestSupport
+             )
+
+        float supportPrice =
+             (
+                 array.get(
+                     zoneTop,
+                     nearestSupport
+                 ) +
+                 array.get(
+                     zoneBottom,
+                     nearestSupport
+                 )
+             ) / 2.0
+
+        supportText :=
+             str.tostring(
+                 supportPrice,
+                 format.mintick
+             ) +
+             "\n" +
+             str.tostring(
+                 math.round(
+                     supportScore
+                 )
+             ) +
+             "%"
+
+
+    table.cell(
+         dashboard,
+         0,
+         2,
+         "Nearest Support",
+         text_color=color.lime
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         2,
+         supportText,
+         text_color=color.lime
+    )
+
+
+    //--------------------------------------------------
+    // Resistance
+    //--------------------------------------------------
+
+    string resistanceText =
+         "NONE"
+
+    if not na(nearestResistance)
+
+        float resistanceScore =
+             f_score(
+                 nearestResistance
+             )
+
+        float resistancePrice =
+             (
+                 array.get(
+                     zoneTop,
+                     nearestResistance
+                 ) +
+                 array.get(
+                     zoneBottom,
+                     nearestResistance
+                 )
+             ) / 2.0
+
+        resistanceText :=
+             str.tostring(
+                 resistancePrice,
+                 format.mintick
+             ) +
+             "\n" +
+             str.tostring(
+                 math.round(
+                     resistanceScore
+                 )
+             ) +
+             "%"
+
+
+    table.cell(
+         dashboard,
+         0,
+         3,
+         "Nearest Resistance",
+         text_color=color.red
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         3,
+         resistanceText,
+         text_color=color.red
+    )
+
+
+    //--------------------------------------------------
+    // Threshold
+    //--------------------------------------------------
+
+    table.cell(
+         dashboard,
+         0,
+         4,
+         "Strong Zone",
+         text_color=color.white
+    )
+
+    table.cell(
+         dashboard,
+         1,
+         4,
+         "≥ " +
+         str.tostring(alertScore) +
+         "%",
+         text_color=color.white
+    )
+
+
+//=====================================================================
+// ALERTS
+//=====================================================================
+
+alertcondition(
+     highScoreSupportTouch,
+     title="High Probability Support",
+     message="Price entered a high-score SUPPORT zone."
+)
+
+alertcondition(
+     highScoreResistanceTouch,
+     title="High Probability Resistance",
+     message="Price entered a high-score RESISTANCE zone."
+)

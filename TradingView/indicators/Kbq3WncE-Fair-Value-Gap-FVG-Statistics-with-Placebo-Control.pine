@@ -1,0 +1,542 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Algolego
+
+//@version=6
+indicator("Fair Value Gap (FVG) Statistics with Placebo Control", "FVG Stats", overlay = true,
+     max_bars_back = 5000, max_boxes_count = 500)
+
+// =============================================================================
+// Measures what actually happens after price returns to a fair value gap.
+//
+// Every zone is measured from the bar it became knowable on -- never earlier.
+// Every confirmed zone is counted, including ones that fail immediately.
+// Exits are evaluated from the bar AFTER entry: within the entry bar, OHLC
+// cannot tell you whether the extreme came before or after the fill.
+//
+// The baseline for "no edge" is NOT 50%. Any rule that enters when price
+// reaches a level inherits a baseline from path and drift. The placebo -- same
+// size, same direction, same distance from price, anchored at bars where
+// nothing happened -- measures that baseline. Real minus placebo is the
+// statistic that matters.
+//
+// The fill price and the price measurement starts from must be the SAME price.
+// A touch trigger fires on "low <= edge", not "low == edge", so the touch bar
+// breaches the edge by an unknown amount. Filling at the edge but starting the
+// barrier race on the next bar begins it already displaced toward the stop.
+// Entering at the touch bar's close removes that displacement.
+//
+// SELF-TEST: on a driftless random walk, entry at a price with symmetric
+// barriers resolves upward exactly 50% of the time (optional stopping theorem).
+// Turn on Synthetic mode and both hit rates MUST bracket 50%, less about half
+// the ambiguous rate. Anything else is a measurement bug, with no market
+// interpretation available. Re-run this after every change to the measurement
+// path.
+// =============================================================================
+
+// ---------------------------------------------------------------- inputs ----
+grpM = "Measurement"
+rMode   = input.string("ATR", "Risk unit (R)", options = ["ATR", "Zone height"], group = grpM)
+atrLen  = input.int(14, "ATR length", minval = 1, group = grpM)
+// Defaults match the settings the published results were measured with, so a
+// reader who changes nothing reproduces the documented figures.
+kR      = input.float(2.0, "Barrier size (R)", minval = 0.1, step = 0.1, group = grpM)
+maxBars = input.int(100, "Time limit after entry (bars)", minval = 1, group = grpM)
+entryMode = input.string("Bar close", "Entry price",
+     options = ["Bar close", "Zone edge (biased)"], group = grpM)
+entryBarExits = input.bool(false, "Evaluate exits on the entry bar (biased)", group = grpM)
+minHgt  = input.float(0.0, "Minimum zone height (ATR)", minval = 0, step = 0.1, group = grpM)
+dedupe  = input.bool(true, "Exclude overlapping same-direction zones", group = grpM)
+dupWin  = input.int(20, "Overlap lookback (bars)", minval = 1, group = grpM)
+
+// Explicit y/m/d rather than input.time: the date picker clamps to loaded data
+// and silently reverts, which would make a published sample unreproducible.
+grpR = "Sample"
+useRange = input.bool(false, "Limit to date range", group = grpR)
+startY = input.int(2025, "Start   year", minval = 1970, group = grpR, inline = "s")
+startM = input.int(1,    "month", minval = 1, maxval = 12, group = grpR, inline = "s")
+startD = input.int(1,    "day",   minval = 1, maxval = 31, group = grpR, inline = "s")
+endY   = input.int(2026, "End     year", minval = 1970, group = grpR, inline = "e")
+endM   = input.int(8,    "month", minval = 1, maxval = 12, group = grpR, inline = "e")
+endD   = input.int(1,    "day",   minval = 1, maxval = 31, group = grpR, inline = "e")
+
+startT = timestamp(startY, startM, startD, 0, 0)
+endT   = timestamp(endY, endM, endD, 0, 0)
+
+grpN = "Placebo control"
+useNull = input.bool(true, "Run placebo control", group = grpN)
+nPlac   = input.int(3, "Placebos per real zone", minval = 1, maxval = 10, group = grpN)
+offBase = input.int(211, "Placebo offset (bars)", minval = 10, group = grpN)
+
+grpS = "Validation (synthetic data)"
+synth    = input.bool(false, "Replace price with a random walk", group = grpS)
+synSeed  = input.int(12345, "Seed", group = grpS)
+synVol   = input.float(1.0, "Sub-step size", minval = 0.01, step = 0.1, group = grpS)
+synDrift = input.float(0.0, "Drift per bar (0 = driftless null)", step = 0.05, group = grpS)
+
+grpD = "Display"
+compact   = input.bool(true, "Compact panel", group = grpD)
+showZones = input.bool(true, "Draw real zones", group = grpD)
+
+// ------------------------------------------------------- synthetic series ---
+// Four sub-steps per bar so synthetic bars carry a real intrabar path: the
+// high and low are extremes of a walk, not decorations around the close. That
+// matters because the bugs this test is built to catch all live in the
+// relationship between a bar's extremes and its close.
+var float synPrev = 10000.0
+
+r1 = math.random(-1.0, 1.0, synSeed)
+r2 = math.random(-1.0, 1.0, synSeed + 1)
+r3 = math.random(-1.0, 1.0, synSeed + 2)
+r4 = math.random(-1.0, 1.0, synSeed + 3)
+
+d4     = synDrift / 4.0
+sOpen  = synPrev
+sp1    = sOpen + r1 * synVol + d4
+sp2    = sp1   + r2 * synVol + d4
+sp3    = sp2   + r3 * synVol + d4
+sClose = sp3   + r4 * synVol + d4
+sHigh  = math.max(math.max(sOpen, sp1), math.max(math.max(sp2, sp3), sClose))
+sLow   = math.min(math.min(sOpen, sp1), math.min(math.min(sp2, sp3), sClose))
+
+if synth
+    synPrev := sClose
+
+_high  = synth ? sHigh  : high
+_low   = synth ? sLow   : low
+_close = synth ? sClose : close
+
+// True range from the routed series, so ATR is correct in both modes.
+_tr = na(_close[1]) ? _high - _low :
+     math.max(_high - _low, math.max(math.abs(_high - _close[1]), math.abs(_low - _close[1])))
+atr = ta.rma(_tr, atrLen)
+
+// ----------------------------------------------------------------- types ----
+type Zone
+    bool  isBull
+    bool  isReal
+    bool  isDup    = false
+    int   confBar  = 0
+    float top
+    float bot
+    float rUnit
+    bool  touched  = false
+    float entry    = na
+    float target   = na
+    float stopP    = na
+    int   entryBar = na
+    float mfe      = 0.0
+    float mae      = 0.0
+    int   outcome  = 0        // 0 pending, 1 target, 2 stop, 3 ambiguous, 4 censored
+    box   bx       = na       // drawn zone, extended rightwards until touched
+
+type Pending
+    int   dueBar
+    bool  isBull
+    float heightAtr
+    float standoffAtr
+
+type Stats
+    int nConf   = 0
+    int nTouch  = 0
+    int nTarget = 0
+    int nStop   = 0
+    int nAmbig  = 0
+    int nCens   = 0
+    float sumMfe = 0.0
+    float sumMae = 0.0
+    array<int> resBars
+
+// ------------------------------------------------------------- functions ----
+// All declarations live at global scope. Pine cannot declare a function
+// inside an if/for block -- it parses it as a call and rejects the types.
+newStats() => Stats.new(resBars = array.new<int>())
+
+inRange  = not useRange or (time >= startT and time <= endT)
+edgeMode = entryMode == "Zone edge (biased)"
+
+var array<Zone>    active  = array.new<Zone>()
+var array<Zone>    recentZ = array.new<Zone>()   // overlap cache, real zones
+var array<Zone>    recentP = array.new<Zone>()   // overlap cache, placebos
+var array<Pending> queued  = array.new<Pending>()
+var array<Zone>    drawnZ  = array.new<Zone>()   // zones holding a live box
+var Stats sReal    = newStats()
+var Stats sPlac    = newStats()
+var int   nConfRaw = 0
+var int   nDup     = 0
+var int   firstT   = na
+var int   lastT    = na
+
+// Diagnostics: a blank/empty Sample row is ambiguous between "the date inputs
+// resolved wrong" and "the chart has no data that far back". These separate the
+// two without guessing.
+var int chartFirstT = na
+var int nBarsAll    = 0
+var int nBarsRange  = 0
+if na(chartFirstT)
+    chartFirstT := time
+nBarsAll += 1
+
+// Directional splits. Drift lifts long-side barrier hits and depresses
+// short-side ones; a measurement bug inflates both in their own direction.
+// Splitting the counts is what tells those two apart.
+var int rBullT = 0
+var int rBullD = 0
+var int rBearT = 0
+var int rBearD = 0
+var int pBullT = 0
+var int pBullD = 0
+var int pBearT = 0
+var int pBearD = 0
+
+// Compare against every zone from the last dupWin bars, whatever its state.
+// Comparing only against still-open zones misses almost everything when zones
+// are touched immediately.
+overlapsIn(array<Zone> arr, float t, float b, bool isBull) =>
+    bool found = false
+    for z in arr
+        if z.isBull == isBull and t >= z.bot and b <= z.top
+            found := true
+    found
+
+pruneTo(array<Zone> arr, int win) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            if bar_index - array.get(arr, i).confBar > win
+                array.remove(arr, i)
+    array.size(arr)
+
+makeZone(bool isBull, float t, float b, bool isReal) =>
+    unit = rMode == "ATR" ? atr : t - b
+    Zone.new(isBull = isBull, isReal = isReal, top = t, bot = b, rUnit = unit,
+         confBar = bar_index)
+
+record(Stats s, Zone z) =>
+    s.nTouch := s.nTouch + 1
+    s.sumMfe := s.sumMfe + z.mfe
+    s.sumMae := s.sumMae + z.mae
+    if z.outcome == 1
+        s.nTarget := s.nTarget + 1
+    else if z.outcome == 2
+        s.nStop := s.nStop + 1
+    else if z.outcome == 3
+        s.nAmbig := s.nAmbig + 1
+    else if z.outcome == 4
+        s.nCens := s.nCens + 1
+    if z.outcome != 4
+        array.push(s.resBars, bar_index - z.entryBar)
+
+// Ambiguous bars count against the hit rate. Censored zones leave the
+// denominator entirely -- they never resolved, so they are not evidence.
+hitRate(Stats s) =>
+    d = s.nTarget + s.nStop + s.nAmbig
+    d > 0 ? float(s.nTarget) / d : na
+
+hr2(int x, int n) => n > 0 ? float(x) / n : na
+
+wilson(int x, int n) =>
+    float lo = na
+    float hi = na
+    if n > 0
+        zc = 1.96
+        p  = float(x) / n
+        c  = (p + zc * zc / (2 * n)) / (1 + zc * zc / n)
+        h  = zc / (1 + zc * zc / n) * math.sqrt(p * (1 - p) / n + zc * zc / (4 * n * n))
+        lo := c - h
+        hi := c + h
+    [lo, hi]
+
+twoProp(int x1, int n1, int x2, int n2) =>
+    float z = na
+    if n1 > 0 and n2 > 0
+        p  = float(x1 + x2) / (n1 + n2)
+        se = math.sqrt(p * (1 - p) * (1.0 / n1 + 1.0 / n2))
+        z := se > 0 ? (float(x1) / n1 - float(x2) / n2) / se : na
+    z
+
+// Theme-aware palette. chart.fg_color follows the viewer's light/dark setting,
+// and the accents are mid-tone so they stay legible on either background --
+// color.maroon in particular is almost invisible on a dark chart.
+COL_TXT  = color.new(chart.fg_color, 35)   // row labels
+COL_VAL  = chart.fg_color                  // neutral values
+COL_UP   = #26A69A
+COL_DOWN = #EF5350
+COL_WARN = #FFA726
+
+zoneCol(bool isBull) => isBull ? COL_UP : COL_DOWN
+
+pct(float v) => na(v) ? "--" : str.tostring(v * 100, "#.#") + "%"
+num(float v) => na(v) ? "--" : str.tostring(v, "#.##")
+dat(int t) => na(t) ? "--" : str.format_time(t, "yyyy-MM-dd", syminfo.timezone)
+
+var table tb = table.new(position.top_right, 2, 22, border_width = 1,
+     frame_color = color.new(chart.fg_color, 65), frame_width = 1)
+
+// Rows are queued rather than written at fixed indices, so compact mode can
+// omit any of them without renumbering the rest.
+var array<string> tk = array.new<string>()
+var array<string> tv = array.new<string>()
+var array<color>  tc = array.new<color>()
+
+addRow(string k, string v, color c) =>
+    array.push(tk, k)
+    array.push(tv, v)
+    array.push(tc, c)
+    array.size(tk)
+
+// ------------------------------------------------------- zone construction --
+// Detection uses only closed bars. The 3-bar pattern completes on bar [1], so
+// the zone becomes active here, on the bar after completion. Nothing repaints.
+bullFvg = not na(_low[1]) and not na(_high[3]) and _low[1] > _high[3]
+bearFvg = not na(_high[1]) and not na(_low[3]) and _high[1] < _low[3]
+
+if inRange
+    firstT := na(firstT) ? time : firstT
+    lastT  := time
+    nBarsRange += 1
+
+if (bullFvg or bearFvg) and not na(atr) and atr > 0 and inRange
+    isBull = bullFvg
+    t = isBull ? _low[1]  : _low[3]
+    b = isBull ? _high[3] : _high[1]
+
+    if (t - b) / atr >= minHgt
+        pruneTo(recentZ, dupWin)
+        z = makeZone(isBull, t, b, true)
+        z.isDup := dedupe and overlapsIn(recentZ, t, b, isBull)
+        array.push(active, z)
+        array.push(recentZ, z)
+
+        nConfRaw += 1
+        if z.isDup
+            nDup += 1
+        else
+            sReal.nConf := sReal.nConf + 1
+
+        // Open zones are drawn solid and keep extending. Once price reaches
+        // one it freezes and fades to dotted, so the chart shows at a glance
+        // what the script is tracking and how long each gap stayed open.
+        if showZones and not synth and not z.isDup
+            z.bx := box.new(bar_index, t, bar_index + 1, b,
+                 border_color = color.new(zoneCol(isBull), 10),
+                 bgcolor      = color.new(zoneCol(isBull), 70))
+            // Retire the oldest box by hand, below Pine's 500-object limit, and
+            // clear the owner's reference. An unfilled zone can then keep
+            // extending for as long as it stays unfilled, with no time cap and
+            // no risk of writing to a box that has already been discarded.
+            array.push(drawnZ, z)
+            if array.size(drawnZ) > 400
+                old = array.shift(drawnZ)
+                if not na(old.bx)
+                    box.delete(old.bx)
+                    old.bx := na
+
+        // Matched placebos: same height, same standoff, same direction, but
+        // anchored at a bar where no structural event occurred.
+        if useNull and not z.isDup
+            proximal = isBull ? t : b
+            standoff = math.abs(_close - proximal) / atr
+            height   = (t - b) / atr
+            for k = 1 to nPlac
+                array.push(queued, Pending.new(bar_index + offBase * k, isBull, height, standoff))
+
+// -------------------------------------------------- placebo activation ------
+if array.size(queued) > 0 and not na(atr[1]) and atr[1] > 0
+    for i = array.size(queued) - 1 to 0
+        p = array.get(queued, i)
+        if bar_index >= p.dueBar
+            // Anchor on the previous bar's close: the zone must be fully
+            // defined before the bar we test for a touch, or the placebo
+            // selects itself onto bars that moved its way late in the session.
+            h  = p.heightAtr * atr[1]
+            so = p.standoffAtr * atr[1]
+            float t = na
+            float b = na
+            if p.isBull
+                t := _close[1] - so
+                b := t - h
+            else
+                b := _close[1] + so
+                t := b + h
+            if h > 0
+                // Placebos get the same overlap treatment as real zones, or
+                // the control is not matched and its interval is too narrow.
+                pruneTo(recentP, dupWin)
+                if not (dedupe and overlapsIn(recentP, t, b, p.isBull))
+                    pz = makeZone(p.isBull, t, b, false)
+                    array.push(active, pz)
+                    array.push(recentP, pz)
+                    sPlac.nConf := sPlac.nConf + 1
+            array.remove(queued, i)
+
+// ------------------------------------------------------------ evaluation ----
+if array.size(active) > 0
+    for i = array.size(active) - 1 to 0
+        z = array.get(active, i)
+        bool justEntered = false
+
+        // Grow the drawn zone rightwards until price reaches it, which is how
+        // these are normally displayed and also shows how long a gap stayed open.
+        if showZones and not na(z.bx) and not z.touched
+            box.set_right(z.bx, bar_index + 1)
+
+        if not z.touched
+            prox = z.isBull ? z.top : z.bot      // side price must come back to
+            hit  = z.isBull ? _low <= prox : _high >= prox
+            if hit
+                z.touched  := true
+                // Fill where measurement starts. The touch bar breached the
+                // edge by an unknown amount, so anchoring the barriers at the
+                // edge while starting the race on the next bar begins it
+                // already displaced toward the stop -- a symmetric bias that
+                // depresses both directions equally.
+                z.entry    := edgeMode ? prox : _close
+                z.entryBar := bar_index
+                r = z.rUnit * kR
+                z.target   := z.isBull ? z.entry + r : z.entry - r
+                z.stopP    := z.isBull ? z.entry - r : z.entry + r
+                justEntered := true
+
+                // Freeze and fade the drawn zone at the moment price reaches it.
+                if showZones and not na(z.bx)
+                    box.set_border_color(z.bx, color.new(zoneCol(z.isBull), 45))
+                    box.set_border_style(z.bx, line.style_dotted)
+                    box.set_bgcolor(z.bx, color.new(zoneCol(z.isBull), 85))
+
+        // Nothing is left of the entry bar once you fill at its close. In edge
+        // mode the bar's extreme may have printed before the fill, so it is
+        // skipped there too unless you deliberately ask for the biased view.
+        if z.touched and z.outcome == 0 and (not justEntered or (entryBarExits and edgeMode))
+            r = z.rUnit * kR
+            z.mfe := math.max(z.mfe, (z.isBull ? _high - z.entry : z.entry - _low)  / r)
+            z.mae := math.max(z.mae, (z.isBull ? z.entry - _low  : _high - z.entry) / r)
+
+            hitT = z.isBull ? _high >= z.target : _low  <= z.target
+            hitS = z.isBull ? _low  <= z.stopP  : _high >= z.stopP
+
+            // One bar containing both barriers cannot be ordered from OHLC.
+            z.outcome := hitT and hitS ? 3 : hitT ? 1 : hitS ? 2 :
+                 bar_index - z.entryBar >= maxBars ? 4 : 0
+
+            if z.outcome != 0
+                won = z.outcome == 1
+                if z.isReal and not z.isDup
+                    record(sReal, z)
+                    if z.outcome != 4
+                        if z.isBull
+                            rBullD := rBullD + 1
+                            rBullT := rBullT + (won ? 1 : 0)
+                        else
+                            rBearD := rBearD + 1
+                            rBearT := rBearT + (won ? 1 : 0)
+                else if not z.isReal
+                    record(sPlac, z)
+                    if z.outcome != 4
+                        if z.isBull
+                            pBullD := pBullD + 1
+                            pBullT := pBullT + (won ? 1 : 0)
+                        else
+                            pBearD := pBearD + 1
+                            pBearT := pBearT + (won ? 1 : 0)
+                array.remove(active, i)
+
+// ---------------------------------------------------------------- readout ---
+if barstate.islast
+    dR       = sReal.nTarget + sReal.nStop + sReal.nAmbig
+    dP       = sPlac.nTarget + sPlac.nStop + sPlac.nAmbig
+    hr       = hitRate(sReal)
+    hrP      = hitRate(sPlac)
+    [lo, hi]   = wilson(sReal.nTarget, dR)
+    [plo, phi] = wilson(sPlac.nTarget, dP)
+    zScore   = dR > 0 ? (hr - 0.5) * 2 * math.sqrt(dR) : na
+    medBars  = array.size(sReal.resBars) > 0 ? array.median(sReal.resBars) : na
+    touchPc  = sReal.nConf > 0 ? float(sReal.nTouch) / sReal.nConf : na
+    mfeAvg   = sReal.nTouch > 0 ? sReal.sumMfe / sReal.nTouch : na
+    maeAvg   = sReal.nTouch > 0 ? sReal.sumMae / sReal.nTouch : na
+    degen    = not na(medBars) and medBars <= 2
+
+    float dlt = na
+    if not na(hr) and not na(hrP)
+        dlt := hr - hrP
+    zd = twoProp(sReal.nTarget, dR, sPlac.nTarget, dP)
+
+    // On a driftless walk both intervals must contain 50%. They will not if
+    // the measurement path leaks information across a bar boundary.
+    selfPass = not na(lo) and not na(plo) and lo <= 0.5 and hi >= 0.5 and
+         plo <= 0.5 and phi >= 0.5
+    hdr = synth ? (synDrift != 0 ? "DRIFT TEST" :
+         (selfPass ? "VALIDATION PASS" : "VALIDATION FAIL")) : timeframe.period
+    hdrC = not synth ? COL_VAL :
+         synDrift != 0 ? COL_WARN : selfPass ? COL_UP : COL_DOWN
+
+    empty = useRange and nBarsRange == 0
+
+    array.clear(tk)
+    array.clear(tv)
+    array.clear(tc)
+
+    addRow("FVG STATISTICS", hdr, hdrC)
+    addRow(synth ? "SYNTHETIC  seed " + str.tostring(synSeed) : "Sample",
+         synth ? "drift " + str.tostring(synDrift, "#.##") :
+         empty ? "NO BARS IN RANGE" : dat(firstT) + "  " + dat(lastT),
+         synth ? COL_WARN : empty ? COL_DOWN : COL_VAL)
+
+    if not compact
+        // What the date inputs resolved to, versus what the chart actually has.
+        addRow("Range set", useRange ? dat(startT) + "  " + dat(endT) : "off",
+             useRange ? COL_VAL : COL_TXT)
+        addRow("Chart loaded", dat(chartFirstT) + "   " + str.tostring(nBarsAll) + "b",
+             COL_VAL)
+        addRow("Bars in range", str.tostring(nBarsRange), empty ? COL_DOWN : COL_VAL)
+
+    addRow("Confirmed zones", str.tostring(nConfRaw) +
+         (dedupe ? "  (-" + str.tostring(nDup) + " overlap)" : ""), COL_VAL)
+    addRow("Returned to zone", str.tostring(sReal.nTouch) + "  " + pct(touchPc), COL_VAL)
+
+    if not compact
+        addRow("  -> target first",  str.tostring(sReal.nTarget), COL_UP)
+        addRow("  -> stop first",    str.tostring(sReal.nStop),   COL_DOWN)
+        addRow("  -> ambiguous bar", str.tostring(sReal.nAmbig),  COL_WARN)
+        addRow("  -> unresolved",    str.tostring(sReal.nCens),   COL_VAL)
+
+    addRow("Hit rate (n=" + str.tostring(dR) + ")", pct(hr),
+         na(hr) ? COL_VAL : hr > 0.5 ? COL_UP : COL_DOWN)
+    addRow("  95% interval", na(lo) ? "--" : pct(lo) + " - " + pct(hi), COL_VAL)
+
+    if not compact
+        addRow("  z vs coinflip", num(zScore), COL_VAL)
+        addRow("  bull / bear", pct(hr2(rBullT, rBullD)) + " / " + pct(hr2(rBearT, rBearD)) +
+             "   " + str.tostring(rBullD) + "/" + str.tostring(rBearD), COL_VAL)
+
+    addRow("Placebo (n=" + str.tostring(dP) + ")", pct(hrP), COL_VAL)
+
+    if not compact
+        addRow("  95% interval", na(plo) ? "--" : pct(plo) + " - " + pct(phi), COL_VAL)
+        addRow("  bull / bear", pct(hr2(pBullT, pBullD)) + " / " + pct(hr2(pBearT, pBearD)) +
+             "   " + str.tostring(pBullD) + "/" + str.tostring(pBearD), COL_VAL)
+        // Ambiguous bars count as losses and censoring drops slow cases. Both
+        // only cancel out of the difference if the two sides hit them at the
+        // same rate, so the rates are shown side by side.
+        addRow("  ambiguous r / p", pct(hr2(sReal.nAmbig, dR)) + " / " +
+             pct(hr2(sPlac.nAmbig, dP)), COL_WARN)
+        addRow("  unresolved r / p", pct(hr2(sReal.nCens, dR + sReal.nCens)) + " / " +
+             pct(hr2(sPlac.nCens, dP + sPlac.nCens)), COL_WARN)
+
+    addRow("real - placebo", (na(dlt) ? "--" : pct(dlt)) + "   z " + num(zd),
+         na(dlt) ? COL_VAL : dlt > 0 ? COL_UP : COL_DOWN)
+    addRow("Entry / barrier", (edgeMode ? "edge (biased)" : "close") + " / " +
+         str.tostring(kR, "#.#") + "R  " +
+         (na(medBars) ? "--" : str.tostring(medBars, "#.#") + "b") +
+         (degen ? "  TOO TIGHT" : ""), edgeMode or degen ? COL_WARN : COL_VAL)
+
+    // chart.bg_color follows the user's theme, so the panel stays readable on
+    // light and dark charts without the price lines showing through the text.
+    cellBg = color.new(chart.bg_color, 10)
+
+    table.clear(tb, 0, 0, 1, 21)
+    for i = 0 to array.size(tk) - 1
+        table.cell(tb, 0, i, array.get(tk, i), text_size = size.small,
+             text_color = COL_TXT, text_halign = text.align_left,
+             bgcolor = cellBg)
+        table.cell(tb, 1, i, array.get(tv, i), text_size = size.small,
+             text_color = array.get(tc, i), text_halign = text.align_right,
+             bgcolor = cellBg)

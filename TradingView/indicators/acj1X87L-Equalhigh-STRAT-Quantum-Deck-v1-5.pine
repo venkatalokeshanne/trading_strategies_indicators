@@ -1,0 +1,777 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator("Equalhigh — STRAT Quantum Deck v1.5", shorttitle="STRAT Quantum", overlay=true,
+     max_bars_back=1000, max_lines_count=100, max_labels_count=250)
+
+// The Strat methodology and terminology were created by Rob Smith.
+// This implementation, cockpit, score and execution-state engine are original.
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+groupScenario = "1. Scenario engine"
+showScenarios = input.bool(true, "Show 1 / 2U / 2D / 3", group=groupScenario)
+colorCandles  = input.bool(true, "Color candles by scenario", group=groupScenario)
+confirmOnly   = input.bool(true, "Confirm setups at bar close", group=groupScenario,
+     tooltip="Recommended. When disabled, signals can appear while the realtime bar is still forming.")
+showHistory   = input.bool(true, "Show historical setup capsules", group=groupScenario)
+
+groupTFC = "2. Timeframe Continuity"
+tf1 = input.timeframe("60", "Timeframe 1", group=groupTFC)
+tf2 = input.timeframe("240", "Timeframe 2", group=groupTFC)
+tf3 = input.timeframe("D", "Timeframe 3", group=groupTFC)
+tf4 = input.timeframe("W", "Timeframe 4", group=groupTFC)
+tf5 = input.timeframe("M", "Timeframe 5", group=groupTFC)
+tfcConfirmed = input.bool(false, "Use only closed TFC candles", group=groupTFC,
+     tooltip="Off = live TFC, which can change before higher-timeframe candles close. On = slower confirmed TFC.")
+
+groupStructure = "3. Magnitude and structure"
+pivotLeft    = input.int(3, "Pivot bars left", minval=1, maxval=10, group=groupStructure)
+pivotRight   = input.int(3, "Pivot confirmation bars", minval=1, maxval=10, group=groupStructure)
+targetMemory = input.int(30, "Stored magnitude levels", minval=10, maxval=100, group=groupStructure)
+targetModel  = input.string("Exact R ladder", "Target model",
+     options=["Exact R ladder", "Structure with R floors", "Previous range extreme"], group=groupStructure,
+     tooltip="Exact R ladder uses the requested R multiples. Structure with R floors selects confirmed market levels beyond minimum R thresholds. Previous range extreme anchors T1 to the highest/lowest completed bar in the selected lookback.")
+fixedTargetR1 = input.float(2.00, "Exact Target 1 (R)", minval=0.5, maxval=10, step=0.25, group=groupStructure)
+fixedTargetR2 = input.float(3.00, "Exact Target 2 (R)", minval=1, maxval=15, step=0.25, group=groupStructure)
+fixedTargetR3 = input.float(4.00, "Exact Target 3 (R)", minval=1.5, maxval=20, step=0.25, group=groupStructure)
+priorExtremeLookback = input.int(20, "Previous range lookback", minval=2, maxval=500, group=groupStructure,
+     tooltip="Uses only completed candles: highest high for a long setup, lowest low for a short setup. The live trigger candle is excluded.")
+minTargetR1  = input.float(1.00, "Minimum Target 1 distance (R)", minval=0.5, maxval=5, step=0.25, group=groupStructure)
+minTargetR2  = input.float(2.00, "Minimum Target 2 distance (R)", minval=1, maxval=10, step=0.25, group=groupStructure)
+minTargetR3  = input.float(3.00, "Minimum Target 3 distance (R)", minval=1.5, maxval=15, step=0.25, group=groupStructure)
+minTargetGapR= input.float(0.75, "Minimum gap between successive targets (R)", minval=0.25, maxval=5, step=0.25, group=groupStructure)
+fallbackR1   = input.float(1.5, "Fallback Target 1 (R)", minval=0.5, maxval=10, step=0.25, group=groupStructure)
+fallbackR2   = input.float(2.5, "Fallback Target 2 (R)", minval=1, maxval=15, step=0.25, group=groupStructure)
+fallbackR3   = input.float(3.0, "Fallback Target 3 (R)", minval=1.5, maxval=20, step=0.25, group=groupStructure)
+showBF       = input.bool(true, "Show confirmed broadening geometry", group=groupStructure)
+showPlan     = input.bool(true, "Show active entry / stop / targets", group=groupStructure)
+
+groupRisk = "4. Risk engine"
+riskCash = input.float(100.0, "Maximum cash risk", minval=0, step=10, group=groupRisk)
+pointValue = input.float(1.0, "Value per 1.0 price move", minval=0.000001, step=0.01, group=groupRisk,
+     tooltip="Stocks usually use 1. Futures and other contracts may require their point value.")
+
+groupVisual = "5. Neon display"
+displayMode = input.string("Execution", "Display mode", options=["Minimal", "Balanced", "Educational", "Execution"], group=groupVisual,
+     tooltip="Execution is the cleanest mode. Educational shows the complete scenario history and PMG structure.")
+scenarioBars = input.int(50, "Scenario history in Balanced mode", minval=10, maxval=250, group=groupVisual)
+showCockpit = input.bool(true, "Show Quantum cockpit", group=groupVisual)
+showGlow    = input.bool(true, "Show trigger glow", group=groupVisual)
+showPMG     = input.bool(true, "Show PMG level dots", group=groupVisual)
+showAxisDock= input.bool(true, "Show Entry / Stop / T1 / T2 / T3 on price scale", group=groupVisual)
+targetLockAtr = input.float(0.25, "Target Lock distance (ATR)", minval=0.05, maxval=1.0, step=0.05, group=groupVisual)
+dangerAtr   = input.float(0.50, "Stop danger distance (ATR)", minval=0.10, maxval=2.0, step=0.10, group=groupVisual)
+cockpitPos  = input.string("Top right", "Cockpit position",
+     options=["Top left", "Top center", "Top right", "Middle left", "Middle right", "Bottom left", "Bottom center", "Bottom right"], group=groupVisual)
+
+color NEON_CYAN    = color.rgb(0, 238, 255)
+color ELECTRIC_BLUE= color.rgb(0, 119, 255)
+color NEON_GREEN   = color.rgb(42, 255, 140)
+color TARGET_GOLD  = color.rgb(255, 205, 25)
+color RUNNER_VIOLET= color.rgb(175, 65, 255)
+color HOT_PINK     = color.rgb(255, 0, 170)
+color ULTRA_VIOLET = color.rgb(145, 55, 255)
+color LASER_ORANGE = color.rgb(255, 137, 24)
+color SIGNAL_RED   = color.rgb(255, 42, 77)
+color DEEP_PANEL   = color.rgb(8, 9, 24)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. UNIVERSAL SCENARIO ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+f_scenario(float h, float l, float prevH, float prevL) =>
+    bool up = h > prevH
+    bool dn = l < prevL
+    up and dn ? 3 : up ? 2 : dn ? -2 : 1
+
+int rawScenario = f_scenario(high, low, high[1], low[1])
+
+// Realtime memory enforces "once a 3, always a 3" during the active bar.
+varip bool outsideSeen = false
+if barstate.isnew
+    outsideSeen := false
+outsideSeen := outsideSeen or (high > high[1] and low < low[1])
+int scenario = outsideSeen ? 3 : rawScenario
+
+bool isOne = scenario == 1
+bool isTwoUp = scenario == 2
+bool isTwoDown = scenario == -2
+bool isThree = scenario == 3
+
+float layoutAtr = ta.atr(14)
+bool modeMinimal = displayMode == "Minimal"
+bool modeBalanced = displayMode == "Balanced"
+bool modeEducational = displayMode == "Educational"
+bool modeExecution = displayMode == "Execution"
+bool scenarioRecent = bar_index >= last_bar_index - scenarioBars
+bool showScenarioLabels = showScenarios and (modeEducational or (modeBalanced and scenarioRecent))
+// A probable actionable bar owns the event lanes, so its small scenario tag is suppressed.
+bool probableAction = (isTwoUp and (scenario[1] == 1 or scenario[1] == -2)) or (isTwoDown and (scenario[1] == 1 or scenario[1] == 2))
+float scenarioBelow = low - layoutAtr * 0.16
+float scenarioAbove = high + layoutAtr * 0.16
+
+plotshape(showScenarioLabels and not probableAction and isOne ? scenarioBelow : na, title="Scenario 1", style=shape.labelup, location=location.absolute,
+     color=color.new(ULTRA_VIOLET, 20), text="1", textcolor=color.white, size=size.tiny)
+plotshape(showScenarioLabels and not probableAction and isTwoUp ? scenarioBelow : na, title="Scenario 2U", style=shape.labelup, location=location.absolute,
+     color=color.new(NEON_CYAN, 10), text="2U", textcolor=color.rgb(3, 16, 25), size=size.tiny)
+plotshape(showScenarioLabels and not probableAction and isTwoDown ? scenarioAbove : na, title="Scenario 2D", style=shape.labeldown, location=location.absolute,
+     color=color.new(HOT_PINK, 8), text="2D", textcolor=color.white, size=size.tiny)
+plotshape(showScenarioLabels and not probableAction and isThree ? scenarioAbove : na, title="Scenario 3", style=shape.labeldown, location=location.absolute,
+     color=color.new(LASER_ORANGE, 5), text="3", textcolor=color.rgb(20, 8, 0), size=size.tiny)
+
+color scenarioColor = isOne ? ULTRA_VIOLET : isTwoUp ? NEON_CYAN : isTwoDown ? HOT_PINK : LASER_ORANGE
+barcolor(colorCandles ? color.new(scenarioColor, 5) : na)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. TIMEFRAME CONTINUITY REACTOR
+// ═════════════════════════════════════════════════════════════════════════════
+f_tfc(string tf, bool closedOnly) =>
+    closedOnly
+         ? request.security(syminfo.tickerid, tf, close[1] > open[1] ? 1 : close[1] < open[1] ? -1 : 0,
+              gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+         : request.security(syminfo.tickerid, tf, close > open ? 1 : close < open ? -1 : 0,
+              gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+int t1 = f_tfc(tf1, tfcConfirmed)
+int t2 = f_tfc(tf2, tfcConfirmed)
+int t3 = f_tfc(tf3, tfcConfirmed)
+int t4 = f_tfc(tf4, tfcConfirmed)
+int t5 = f_tfc(tf5, tfcConfirmed)
+int tfcNet = t1 + t2 + t3 + t4 + t5
+int tfcBull = (t1 == 1 ? 1 : 0) + (t2 == 1 ? 1 : 0) + (t3 == 1 ? 1 : 0) + (t4 == 1 ? 1 : 0) + (t5 == 1 ? 1 : 0)
+int tfcBear = (t1 == -1 ? 1 : 0) + (t2 == -1 ? 1 : 0) + (t3 == -1 ? 1 : 0) + (t4 == -1 ? 1 : 0) + (t5 == -1 ? 1 : 0)
+string tfcState = tfcBull == 5 ? "FULL BULL" : tfcBear == 5 ? "FULL BEAR" : math.abs(tfcNet) <= 1 ? "CONFLICT" : tfcNet > 0 ? "PARTIAL BULL" : "PARTIAL BEAR"
+color tfcColor = tfcBull == 5 ? NEON_GREEN : tfcBear == 5 ? SIGNAL_RED : math.abs(tfcNet) <= 1 ? LASER_ORANGE : tfcNet > 0 ? NEON_CYAN : HOT_PINK
+
+f_tfc_symbol(int value) => value == 1 ? "▲" : value == -1 ? "▼" : "◆"
+
+// Confirmed higher-timeframe extremes can become structural target candidates.
+f_previous_high(string tf) =>
+    request.security(syminfo.tickerid, tf, high[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+f_previous_low(string tf) =>
+    request.security(syminfo.tickerid, tf, low[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+float tf3High = f_previous_high(tf3)
+float tf4High = f_previous_high(tf4)
+float tf5High = f_previous_high(tf5)
+float tf3Low = f_previous_low(tf3)
+float tf4Low = f_previous_low(tf4)
+float tf5Low = f_previous_low(tf5)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. CONFIRMED PIVOTS, MAGNITUDE MEMORY AND BROADENING GEOMETRY
+// ═════════════════════════════════════════════════════════════════════════════
+float ph = ta.pivothigh(high, pivotLeft, pivotRight)
+float pl = ta.pivotlow(low, pivotLeft, pivotRight)
+// Completed-bar range used by the optional manual-style golden target.
+float priorRangeHigh = ta.highest(high[1], priorExtremeLookback)
+float priorRangeLow = ta.lowest(low[1], priorExtremeLookback)
+var array<float> pivotHighs = array.new_float()
+var array<float> pivotLows = array.new_float()
+
+if not na(ph)
+    array.unshift(pivotHighs, ph)
+    if array.size(pivotHighs) > targetMemory
+        array.pop(pivotHighs)
+if not na(pl)
+    array.unshift(pivotLows, pl)
+    if array.size(pivotLows) > targetMemory
+        array.pop(pivotLows)
+
+f_above_targets(array<float> levels, float reference) =>
+    float first = na
+    float second = na
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            float level = array.get(levels, i)
+            if level > reference
+                if na(first) or level < first
+                    second := first
+                    first := level
+                else if (na(second) or level < second) and level > first
+                    second := level
+    [first, second]
+
+f_below_targets(array<float> levels, float reference) =>
+    float first = na
+    float second = na
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            float level = array.get(levels, i)
+            if level < reference
+                if na(first) or level > first
+                    second := first
+                    first := level
+                else if (na(second) or level > second) and level < first
+                    second := level
+    [first, second]
+
+var float lastPH = na
+var float lastPL = na
+var int lastPHBar = na
+var int lastPLBar = na
+var line bfUpper = na
+var line bfLower = na
+var linefill bfCloud = na
+bool bfChanged = false
+
+if not na(ph)
+    int newPHBar = bar_index - pivotRight
+    if not na(lastPH) and ph > lastPH and showBF and not modeMinimal
+        if not na(bfUpper)
+            line.delete(bfUpper)
+        bfUpper := line.new(lastPHBar, lastPH, newPHBar, ph, xloc=xloc.bar_index, extend=extend.right,
+             color=color.new(HOT_PINK, 18), width=2, style=line.style_dashed)
+        bfChanged := true
+    lastPH := ph
+    lastPHBar := newPHBar
+
+if not na(pl)
+    int newPLBar = bar_index - pivotRight
+    if not na(lastPL) and pl < lastPL and showBF and not modeMinimal
+        if not na(bfLower)
+            line.delete(bfLower)
+        bfLower := line.new(lastPLBar, lastPL, newPLBar, pl, xloc=xloc.bar_index, extend=extend.right,
+             color=color.new(NEON_CYAN, 18), width=2, style=line.style_dashed)
+        bfChanged := true
+    lastPL := pl
+    lastPLBar := newPLBar
+
+if bfChanged and not na(bfUpper) and not na(bfLower)
+    if not na(bfCloud)
+        linefill.delete(bfCloud)
+    bfCloud := linefill.new(bfUpper, bfLower, color.new(ULTRA_VIOLET, 94))
+
+float bfUpperNow = not na(bfUpper) ? line.get_price(bfUpper, bar_index) : na
+float bfLowerNow = not na(bfLower) ? line.get_price(bfLower, bar_index) : na
+float bfPosition = not na(bfUpperNow) and not na(bfLowerNow) and bfUpperNow > bfLowerNow ? math.max(0.0, math.min(1.0, (close - bfLowerNow) / (bfUpperNow - bfLowerNow))) : 0.5
+
+// PMG proxy: nearby confirmed pivot levels that may form a cascade.
+float atr = ta.atr(14)
+f_count_above(array<float> levels, float reference, float span) =>
+    int count = 0
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            float level = array.get(levels, i)
+            count += level > reference and level <= reference + span ? 1 : 0
+    count
+
+f_count_below(array<float> levels, float reference, float span) =>
+    int count = 0
+    if array.size(levels) > 0
+        for i = 0 to array.size(levels) - 1
+            float level = array.get(levels, i)
+            count += level < reference and level >= reference - span ? 1 : 0
+    count
+
+int pmgAbove = f_count_above(pivotHighs, close, atr * 4.0)
+int pmgBelow = f_count_below(pivotLows, close, atr * 4.0)
+plot(showPMG and modeEducational and not na(ph) ? ph : na, "Confirmed high ammunition", style=plot.style_circles, linewidth=4, offset=-pivotRight, color=color.new(HOT_PINK, 12))
+plot(showPMG and modeEducational and not na(pl) ? pl : na, "Confirmed low ammunition", style=plot.style_circles, linewidth=4, offset=-pivotRight, color=color.new(NEON_CYAN, 12))
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. ACTIONABLE COMBO ENGINE
+// ═════════════════════════════════════════════════════════════════════════════
+f_long_combo(int prev2, int prev1) =>
+    string result = ""
+    if prev1 == 1 and prev2 == -2
+        result := "2D-1-2U"
+    else if prev1 == 1 and prev2 == 3
+        result := "3-1-2U"
+    else if prev1 == -2 and prev2 == 1
+        result := "1-2D-2U"
+    else if prev1 == -2 and prev2 == 3
+        result := "3-2D-2U"
+    else if prev1 == -2 and prev2 == 2
+        result := "2U-2D-2U"
+    else if prev1 == -2
+        result := "2-2 REV UP"
+    result
+
+f_short_combo(int prev2, int prev1) =>
+    string result = ""
+    if prev1 == 1 and prev2 == 2
+        result := "2U-1-2D"
+    else if prev1 == 1 and prev2 == 3
+        result := "3-1-2D"
+    else if prev1 == 2 and prev2 == 1
+        result := "1-2U-2D"
+    else if prev1 == 2 and prev2 == 3
+        result := "3-2U-2D"
+    else if prev1 == 2 and prev2 == -2
+        result := "2D-2U-2D"
+    else if prev1 == 2
+        result := "2-2 REV DOWN"
+    result
+
+string candidateLong = f_long_combo(scenario[2], scenario[1])
+string candidateShort = f_short_combo(scenario[2], scenario[1])
+bool longRaw = isTwoUp and candidateLong != ""
+bool shortRaw = isTwoDown and candidateShort != ""
+bool longSignal = longRaw and (not confirmOnly or barstate.isconfirmed)
+bool shortSignal = shortRaw and (not confirmOnly or barstate.isconfirmed)
+bool firstLong = longSignal and not longSignal[1]
+bool firstShort = shortSignal and not shortSignal[1]
+
+f_combo_points(string combo) =>
+    str.contains(combo, "3-1-2") ? 20.0 : str.contains(combo, "2D-1-2") or str.contains(combo, "2U-1-2") ? 19.0 : str.contains(combo, "1-2") ? 17.0 : str.contains(combo, "3-2") ? 16.0 : 13.0
+
+// One formatter everywhere prevents table/graph rounding disagreements.
+f_r(float value) => na(value) ? "—" : str.tostring(value, "#.2") + "R"
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. EXECUTION STATE, MAGNITUDES AND QUALITY SCORE
+// ═════════════════════════════════════════════════════════════════════════════
+var int activeDir = 0
+var int tradeState = 0                 // 0 scan, 1 in force, 2 T1, 3 T2, 4 T3, -1 failed
+var string activeCombo = "SCANNING"
+var float activeEntry = na
+var float activeStop = na
+var float activeT1 = na
+var float activeT2 = na
+var float activeT3 = na
+var float activeM0 = na
+var float activeR1 = na
+var float activeR2 = na
+var float activeR3 = na
+var bool activeT1IsPivot = false
+var bool activeT2IsPivot = false
+var bool activeT3IsPivot = false
+var string activeT1Origin = "—"
+var string activeT2Origin = "—"
+var string activeT3Origin = "—"
+var float activeScore = na
+var int setupBar = na
+var line entryLine = na
+var line stopLine = na
+var line target1Line = na
+var line target2Line = na
+var line target3Line = na
+var line liquidityLine = na
+var label triggerMarker = na
+var label setupCapsule = na
+var label stateEvent = na
+var label entryTag = na
+var label stopTag = na
+var label target1Tag = na
+var label target2Tag = na
+var label target3Tag = na
+var label liquidityTag = na
+
+if firstLong or firstShort
+    if not na(entryLine)
+        line.delete(entryLine)
+    if not na(stopLine)
+        line.delete(stopLine)
+    if not na(target1Line)
+        line.delete(target1Line)
+    if not na(target2Line)
+        line.delete(target2Line)
+    if not na(target3Line)
+        line.delete(target3Line)
+    if not na(liquidityLine)
+        line.delete(liquidityLine)
+    bool keepEducationalHistory = modeEducational and showHistory
+    if not keepEducationalHistory and not na(triggerMarker)
+        label.delete(triggerMarker)
+    if not keepEducationalHistory and not na(setupCapsule)
+        label.delete(setupCapsule)
+    if not na(stateEvent)
+        label.delete(stateEvent)
+    if not na(entryTag)
+        label.delete(entryTag)
+    if not na(stopTag)
+        label.delete(stopTag)
+    if not na(target1Tag)
+        label.delete(target1Tag)
+    if not na(target2Tag)
+        label.delete(target2Tag)
+    if not na(target3Tag)
+        label.delete(target3Tag)
+    if not na(liquidityTag)
+        label.delete(liquidityTag)
+    activeDir := firstLong ? 1 : -1
+    activeCombo := firstLong ? candidateLong : candidateShort
+    activeEntry := firstLong ? high[1] : low[1]
+    activeStop := firstLong ? low[1] : high[1]
+    float riskDistance = math.max(syminfo.mintick, math.abs(activeEntry - activeStop))
+    [nearestAbove1, nearestAbove2] = f_above_targets(pivotHighs, activeEntry)
+    [nearestBelow1, nearestBelow2] = f_below_targets(pivotLows, activeEntry)
+    float longThreshold1 = activeEntry + riskDistance * minTargetR1 - syminfo.mintick
+    float shortThreshold1 = activeEntry - riskDistance * minTargetR1 + syminfo.mintick
+    [qualifiedAbove1, unusedAbove1] = f_above_targets(pivotHighs, longThreshold1)
+    [qualifiedBelow1, unusedBelow1] = f_below_targets(pivotLows, shortThreshold1)
+    float selectedT1Long = qualifiedAbove1
+    float selectedT1Short = qualifiedBelow1
+    string selectedT1LongOrigin = na(selectedT1Long) ? "R-PROJ" : "NEXT HIGH"
+    string selectedT1ShortOrigin = na(selectedT1Short) ? "R-PROJ" : "NEXT LOW"
+    if targetModel == "Structure with R floors"
+        if tf3High > longThreshold1 and (na(selectedT1Long) or tf3High < selectedT1Long)
+            selectedT1Long := tf3High
+            selectedT1LongOrigin := tf3 + " HIGH"
+        if tf4High > longThreshold1 and (na(selectedT1Long) or tf4High < selectedT1Long)
+            selectedT1Long := tf4High
+            selectedT1LongOrigin := tf4 + " HIGH"
+        if tf5High > longThreshold1 and (na(selectedT1Long) or tf5High < selectedT1Long)
+            selectedT1Long := tf5High
+            selectedT1LongOrigin := tf5 + " HIGH"
+        if not na(bfUpperNow) and bfUpperNow > longThreshold1 and (na(selectedT1Long) or bfUpperNow < selectedT1Long)
+            selectedT1Long := bfUpperNow
+            selectedT1LongOrigin := "BF EDGE"
+        if tf3Low < shortThreshold1 and (na(selectedT1Short) or tf3Low > selectedT1Short)
+            selectedT1Short := tf3Low
+            selectedT1ShortOrigin := tf3 + " LOW"
+        if tf4Low < shortThreshold1 and (na(selectedT1Short) or tf4Low > selectedT1Short)
+            selectedT1Short := tf4Low
+            selectedT1ShortOrigin := tf4 + " LOW"
+        if tf5Low < shortThreshold1 and (na(selectedT1Short) or tf5Low > selectedT1Short)
+            selectedT1Short := tf5Low
+            selectedT1ShortOrigin := tf5 + " LOW"
+        if not na(bfLowerNow) and bfLowerNow < shortThreshold1 and (na(selectedT1Short) or bfLowerNow > selectedT1Short)
+            selectedT1Short := bfLowerNow
+            selectedT1ShortOrigin := "BF EDGE"
+    float fallbackDistance1 = riskDistance * math.max(fallbackR1, minTargetR1)
+    activeT1 := firstLong ? (na(selectedT1Long) ? activeEntry + fallbackDistance1 : selectedT1Long) : (na(selectedT1Short) ? activeEntry - fallbackDistance1 : selectedT1Short)
+    activeT1IsPivot := firstLong ? not na(selectedT1Long) : not na(selectedT1Short)
+    activeT1Origin := firstLong ? selectedT1LongOrigin : selectedT1ShortOrigin
+    float longThreshold2 = math.max(activeEntry + riskDistance * minTargetR2, activeT1 + riskDistance * minTargetGapR) - syminfo.mintick
+    float shortThreshold2 = math.min(activeEntry - riskDistance * minTargetR2, activeT1 - riskDistance * minTargetGapR) + syminfo.mintick
+    [qualifiedAbove2, unusedAbove2] = f_above_targets(pivotHighs, longThreshold2)
+    [qualifiedBelow2, unusedBelow2] = f_below_targets(pivotLows, shortThreshold2)
+    float selectedT2Long = qualifiedAbove2
+    float selectedT2Short = qualifiedBelow2
+    string selectedT2LongOrigin = na(selectedT2Long) ? "R-PROJ" : "NEXT HIGH"
+    string selectedT2ShortOrigin = na(selectedT2Short) ? "R-PROJ" : "NEXT LOW"
+    if targetModel == "Structure with R floors"
+        if tf3High > longThreshold2 and (na(selectedT2Long) or tf3High < selectedT2Long)
+            selectedT2Long := tf3High
+            selectedT2LongOrigin := tf3 + " HIGH"
+        if tf4High > longThreshold2 and (na(selectedT2Long) or tf4High < selectedT2Long)
+            selectedT2Long := tf4High
+            selectedT2LongOrigin := tf4 + " HIGH"
+        if tf5High > longThreshold2 and (na(selectedT2Long) or tf5High < selectedT2Long)
+            selectedT2Long := tf5High
+            selectedT2LongOrigin := tf5 + " HIGH"
+        if not na(bfUpperNow) and bfUpperNow > longThreshold2 and (na(selectedT2Long) or bfUpperNow < selectedT2Long)
+            selectedT2Long := bfUpperNow
+            selectedT2LongOrigin := "BF EDGE"
+        if tf3Low < shortThreshold2 and (na(selectedT2Short) or tf3Low > selectedT2Short)
+            selectedT2Short := tf3Low
+            selectedT2ShortOrigin := tf3 + " LOW"
+        if tf4Low < shortThreshold2 and (na(selectedT2Short) or tf4Low > selectedT2Short)
+            selectedT2Short := tf4Low
+            selectedT2ShortOrigin := tf4 + " LOW"
+        if tf5Low < shortThreshold2 and (na(selectedT2Short) or tf5Low > selectedT2Short)
+            selectedT2Short := tf5Low
+            selectedT2ShortOrigin := tf5 + " LOW"
+        if not na(bfLowerNow) and bfLowerNow < shortThreshold2 and (na(selectedT2Short) or bfLowerNow > selectedT2Short)
+            selectedT2Short := bfLowerNow
+            selectedT2ShortOrigin := "BF EDGE"
+    float fallbackDistance2 = riskDistance * math.max(fallbackR2, minTargetR2)
+    activeT2 := firstLong ? (na(selectedT2Long) ? math.max(activeT1 + riskDistance * minTargetGapR, activeEntry + fallbackDistance2) : selectedT2Long) : (na(selectedT2Short) ? math.min(activeT1 - riskDistance * minTargetGapR, activeEntry - fallbackDistance2) : selectedT2Short)
+    activeT2IsPivot := firstLong ? not na(selectedT2Long) : not na(selectedT2Short)
+    activeT2Origin := firstLong ? selectedT2LongOrigin : selectedT2ShortOrigin
+    float longThreshold3 = math.max(activeEntry + riskDistance * minTargetR3, activeT2 + riskDistance * minTargetGapR) - syminfo.mintick
+    float shortThreshold3 = math.min(activeEntry - riskDistance * minTargetR3, activeT2 - riskDistance * minTargetGapR) + syminfo.mintick
+    [selectedT3LongRaw, unusedAbove3] = f_above_targets(pivotHighs, longThreshold3)
+    [selectedT3ShortRaw, unusedBelow3] = f_below_targets(pivotLows, shortThreshold3)
+    float selectedT3Long = selectedT3LongRaw
+    float selectedT3Short = selectedT3ShortRaw
+    string selectedT3LongOrigin = na(selectedT3Long) ? "R-PROJ" : "NEXT HIGH"
+    string selectedT3ShortOrigin = na(selectedT3Short) ? "R-PROJ" : "NEXT LOW"
+    if tf3High > longThreshold3 and (na(selectedT3Long) or tf3High < selectedT3Long)
+        selectedT3Long := tf3High
+        selectedT3LongOrigin := tf3 + " HIGH"
+    if tf4High > longThreshold3 and (na(selectedT3Long) or tf4High < selectedT3Long)
+        selectedT3Long := tf4High
+        selectedT3LongOrigin := tf4 + " HIGH"
+    if tf5High > longThreshold3 and (na(selectedT3Long) or tf5High < selectedT3Long)
+        selectedT3Long := tf5High
+        selectedT3LongOrigin := tf5 + " HIGH"
+    if not na(bfUpperNow) and bfUpperNow > longThreshold3 and (na(selectedT3Long) or bfUpperNow < selectedT3Long)
+        selectedT3Long := bfUpperNow
+        selectedT3LongOrigin := "BF EDGE"
+    if tf3Low < shortThreshold3 and (na(selectedT3Short) or tf3Low > selectedT3Short)
+        selectedT3Short := tf3Low
+        selectedT3ShortOrigin := tf3 + " LOW"
+    if tf4Low < shortThreshold3 and (na(selectedT3Short) or tf4Low > selectedT3Short)
+        selectedT3Short := tf4Low
+        selectedT3ShortOrigin := tf4 + " LOW"
+    if tf5Low < shortThreshold3 and (na(selectedT3Short) or tf5Low > selectedT3Short)
+        selectedT3Short := tf5Low
+        selectedT3ShortOrigin := tf5 + " LOW"
+    if not na(bfLowerNow) and bfLowerNow < shortThreshold3 and (na(selectedT3Short) or bfLowerNow > selectedT3Short)
+        selectedT3Short := bfLowerNow
+        selectedT3ShortOrigin := "BF EDGE"
+    float fallbackDistance3 = riskDistance * math.max(fallbackR3, minTargetR3)
+    activeT3 := firstLong ? (na(selectedT3Long) ? math.max(activeT2 + riskDistance * minTargetGapR, activeEntry + fallbackDistance3) : selectedT3Long) : (na(selectedT3Short) ? math.min(activeT2 - riskDistance * minTargetGapR, activeEntry - fallbackDistance3) : selectedT3Short)
+    activeT3IsPivot := firstLong ? not na(selectedT3Long) : not na(selectedT3Short)
+    activeT3Origin := firstLong ? selectedT3LongOrigin : selectedT3ShortOrigin
+
+    // Three explicit target engines. Structure chooses prices; fixed R chooses exact distances;
+    // previous range reproduces a manually drawn line on the prior completed range extreme.
+    float fixedR1Effective = fixedTargetR1
+    float fixedR2Effective = math.max(fixedTargetR2, fixedR1Effective + minTargetGapR)
+    float fixedR3Effective = math.max(fixedTargetR3, fixedR2Effective + minTargetGapR)
+    if targetModel == "Exact R ladder"
+        activeT1 := activeEntry + activeDir * riskDistance * fixedR1Effective
+        activeT2 := activeEntry + activeDir * riskDistance * fixedR2Effective
+        activeT3 := activeEntry + activeDir * riskDistance * fixedR3Effective
+        activeT1IsPivot := false
+        activeT2IsPivot := false
+        activeT3IsPivot := false
+        activeT1Origin := str.tostring(fixedR1Effective, "#.##") + "R FIXED"
+        activeT2Origin := str.tostring(fixedR2Effective, "#.##") + "R FIXED"
+        activeT3Origin := str.tostring(fixedR3Effective, "#.##") + "R FIXED"
+    else if targetModel == "Previous range extreme"
+        bool validPriorExtreme = firstLong ? priorRangeHigh > activeEntry : priorRangeLow < activeEntry
+        activeT1 := validPriorExtreme ? (firstLong ? priorRangeHigh : priorRangeLow) : activeEntry + activeDir * riskDistance * fixedR1Effective
+        float fixedT2Price = activeEntry + activeDir * riskDistance * fixedR2Effective
+        float fixedT3Price = activeEntry + activeDir * riskDistance * fixedR3Effective
+        activeT2 := firstLong ? math.max(fixedT2Price, activeT1 + riskDistance * minTargetGapR) : math.min(fixedT2Price, activeT1 - riskDistance * minTargetGapR)
+        activeT3 := firstLong ? math.max(fixedT3Price, activeT2 + riskDistance * minTargetGapR) : math.min(fixedT3Price, activeT2 - riskDistance * minTargetGapR)
+        activeT1IsPivot := validPriorExtreme
+        activeT2IsPivot := false
+        activeT3IsPivot := false
+        activeT1Origin := validPriorExtreme ? "PRIOR " + str.tostring(priorExtremeLookback) + "-BAR " + (firstLong ? "HIGH" : "LOW") : str.tostring(fixedR1Effective, "#.##") + "R FALLBACK"
+        activeT2Origin := activeT2 == fixedT2Price ? str.tostring(fixedR2Effective, "#.##") + "R FIXED" : "AFTER PRIOR T1"
+        activeT3Origin := activeT3 == fixedT3Price ? str.tostring(fixedR3Effective, "#.##") + "R FIXED" : "AFTER PRIOR T2"
+
+    // Final monotonic guard: T1 < T2 < T3 for longs, and T1 > T2 > T3 for shorts.
+    activeT2 := firstLong ? math.max(activeT2, activeT1 + riskDistance * minTargetGapR) : math.min(activeT2, activeT1 - riskDistance * minTargetGapR)
+    activeT3 := firstLong ? math.max(activeT3, activeT2 + riskDistance * minTargetGapR) : math.min(activeT3, activeT2 - riskDistance * minTargetGapR)
+    activeM0 := firstLong ? nearestAbove1 : nearestBelow1
+    if not na(activeM0) and (firstLong ? activeM0 >= activeT1 : activeM0 <= activeT1)
+        activeM0 := na
+    activeR1 := math.abs(activeT1 - activeEntry) / riskDistance
+    activeR2 := math.abs(activeT2 - activeEntry) / riskDistance
+    activeR3 := math.abs(activeT3 - activeEntry) / riskDistance
+    float tfcAlignment = firstLong ? tfcBull / 5.0 : tfcBear / 5.0
+    float tfcPoints = 30.0 * tfcAlignment
+    float comboPoints = f_combo_points(activeCombo)
+    float structuralFactor = (activeT1IsPivot ? 0.25 : 0.0) + (activeT2IsPivot ? 0.35 : 0.0) + (activeT3IsPivot ? 0.40 : 0.0)
+    float magnitudePoints = math.min(20.0, activeR3 / 4.0 * 20.0) * structuralFactor
+    float bfPoints = 15.0 * (firstLong ? 1.0 - bfPosition : bfPosition)
+    float pmgPoints = 10.0 * math.min(1.0, (firstLong ? pmgAbove : pmgBelow) / 5.0)
+    float extensionPoints = 5.0 * math.max(0.0, 1.0 - math.abs(close - activeEntry) / math.max(atr * 1.5, syminfo.mintick))
+    activeScore := math.round(tfcPoints + comboPoints + magnitudePoints + bfPoints + pmgPoints + extensionPoints)
+    tradeState := 1
+    setupBar := bar_index
+    if showPlan and not modeMinimal
+        entryLine := line.new(bar_index, activeEntry, bar_index + 1, activeEntry, extend=extend.right, color=NEON_CYAN, width=2)
+        stopLine := line.new(bar_index, activeStop, bar_index + 1, activeStop, extend=extend.right, color=SIGNAL_RED, width=2, style=line.style_dotted)
+        target1Line := line.new(bar_index, activeT1, bar_index + 1, activeT1, extend=extend.right, color=TARGET_GOLD, width=2, style=line.style_dashed)
+        target2Line := line.new(bar_index, activeT2, bar_index + 1, activeT2, extend=extend.right, color=HOT_PINK, width=2, style=line.style_dashed)
+        target3Line := line.new(bar_index, activeT3, bar_index + 1, activeT3, extend=extend.right, color=RUNNER_VIOLET, width=2, style=line.style_dashed)
+        if not na(activeM0)
+            liquidityLine := line.new(bar_index, activeM0, bar_index + 1, activeM0, extend=extend.right, color=color.new(color.silver, 55), width=1, style=line.style_dotted)
+        entryTag := label.new(bar_index + 3, activeEntry, "ENTRY  " + str.tostring(activeEntry, format.mintick), xloc=xloc.bar_index,
+             style=label.style_label_left, color=NEON_CYAN, textcolor=color.rgb(3, 16, 25), size=size.tiny)
+        stopTag := label.new(bar_index + 3, activeStop, "STOP  " + str.tostring(activeStop, format.mintick), xloc=xloc.bar_index,
+             style=label.style_label_left, color=SIGNAL_RED, textcolor=color.white, size=size.tiny)
+        target1Tag := label.new(bar_index + 3, activeT1, "🎯 T1  " + activeT1Origin + "  " + str.tostring(activeT1, format.mintick) + "  •  " + f_r(activeR1), xloc=xloc.bar_index,
+             style=label.style_label_left, color=TARGET_GOLD, textcolor=color.rgb(25, 18, 0), size=size.tiny)
+        target2Tag := label.new(bar_index + 3, activeT2, "🎯 T2  " + activeT2Origin + "  " + str.tostring(activeT2, format.mintick) + "  •  " + f_r(activeR2), xloc=xloc.bar_index,
+             style=label.style_label_left, color=HOT_PINK, textcolor=color.white, size=size.tiny)
+        target3Tag := label.new(bar_index + 3, activeT3, "🚀 T3  " + activeT3Origin + "  " + str.tostring(activeT3, format.mintick) + "  •  " + f_r(activeR3), xloc=xloc.bar_index,
+             style=label.style_label_left, color=RUNNER_VIOLET, textcolor=color.white, size=size.tiny)
+        if not na(activeM0)
+            liquidityTag := label.new(bar_index + 3, activeM0, "◇ M0 LIQ  " + str.tostring(activeM0, format.mintick), xloc=xloc.bar_index,
+                 style=label.style_label_left, color=color.new(color.silver, 35), textcolor=color.rgb(25, 25, 30), size=size.tiny)
+    float eventLane = firstLong ? low - atr * 0.62 : high + atr * 0.62
+    triggerMarker := label.new(bar_index, eventLane, firstLong ? "▲" : "▼", xloc=xloc.bar_index,
+         style=label.style_circle, color=firstLong ? color.new(NEON_CYAN, 8) : color.new(HOT_PINK, 8),
+         textcolor=firstLong ? color.rgb(3, 16, 25) : color.white, size=showGlow ? size.normal : size.small)
+    if not modeMinimal
+        float capsuleLane = firstLong ? low - atr * 1.08 : high + atr * 1.08
+        setupCapsule := label.new(bar_index, capsuleLane,
+             activeCombo + "  •  Q" + str.tostring(activeScore, "#") + "\nT1 " + f_r(activeR1) + "  •  T2 " + f_r(activeR2) + "  •  T3 " + f_r(activeR3),
+             xloc=xloc.bar_index, style=firstLong ? label.style_label_up : label.style_label_down,
+             color=firstLong ? color.new(ELECTRIC_BLUE, 0) : color.new(HOT_PINK, 0), textcolor=color.white, size=size.small)
+
+if activeDir != 0 and bar_index > setupBar and tradeState > 0 and tradeState < 4
+    bool stopped = activeDir == 1 ? low <= activeStop : high >= activeStop
+    bool hitT3 = activeDir == 1 ? high >= activeT3 : low <= activeT3
+    bool hitT2 = activeDir == 1 ? high >= activeT2 : low <= activeT2
+    bool hitT1 = activeDir == 1 ? high >= activeT1 : low <= activeT1
+    if stopped
+        tradeState := -1
+        if not modeMinimal
+            if not na(stateEvent)
+                label.delete(stateEvent)
+            stateEvent := label.new(bar_index, activeStop, "FAILED", style=activeDir == 1 ? label.style_label_down : label.style_label_up,
+                 color=SIGNAL_RED, textcolor=color.white, size=size.small)
+    else if hitT3
+        tradeState := 4
+        if not modeMinimal
+            if not na(stateEvent)
+                label.delete(stateEvent)
+            stateEvent := label.new(bar_index, activeT3, (activeT3IsPivot ? "RUNNER MAGNITUDE ✓" : "R-TARGET 3 ✓"), style=activeDir == 1 ? label.style_label_down : label.style_label_up,
+                 color=RUNNER_VIOLET, textcolor=color.white, size=size.small)
+    else if hitT2 and tradeState < 3
+        tradeState := 3
+        if not modeMinimal
+            if not na(stateEvent)
+                label.delete(stateEvent)
+            stateEvent := label.new(bar_index, activeT2, (activeT2IsPivot ? "MAGNITUDE 2 ✓" : "R-TARGET 2 ✓"), style=activeDir == 1 ? label.style_label_down : label.style_label_up,
+                 color=HOT_PINK, textcolor=color.white, size=size.small)
+    else if hitT1 and tradeState == 1
+        tradeState := 2
+        if not modeMinimal
+            if not na(stateEvent)
+                label.delete(stateEvent)
+            stateEvent := label.new(bar_index, activeT1, (activeT1IsPivot ? "MAGNITUDE 1 ✓" : "R-TARGET 1 ✓"), style=activeDir == 1 ? label.style_label_down : label.style_label_up,
+                 color=TARGET_GOLD, textcolor=color.rgb(25, 18, 0), size=size.tiny)
+
+float structuralRisk = not na(activeEntry) and not na(activeStop) ? math.max(math.abs(activeEntry - activeStop), syminfo.mintick) : na
+bool t1Lock = activeDir != 0 and tradeState == 1 and math.abs(activeT1 - close) <= atr * targetLockAtr
+bool t2Lock = activeDir != 0 and tradeState == 2 and math.abs(activeT2 - close) <= atr * targetLockAtr
+bool t3Lock = activeDir != 0 and tradeState == 3 and math.abs(activeT3 - close) <= atr * targetLockAtr
+bool stopDanger = activeDir != 0 and tradeState > 0 and tradeState < 4 and math.abs(close - activeStop) <= atr * dangerAtr
+float progressT1Raw = activeDir == 1 ? (close - activeEntry) / math.max(activeT1 - activeEntry, syminfo.mintick) : (activeEntry - close) / math.max(activeEntry - activeT1, syminfo.mintick)
+float progressT2Raw = activeDir == 1 ? (close - activeT1) / math.max(activeT2 - activeT1, syminfo.mintick) : (activeT1 - close) / math.max(activeT1 - activeT2, syminfo.mintick)
+float progressT3Raw = activeDir == 1 ? (close - activeT2) / math.max(activeT3 - activeT2, syminfo.mintick) : (activeT2 - close) / math.max(activeT2 - activeT3, syminfo.mintick)
+float journeyProgress = tradeState == 4 ? 1.0 : math.max(0.0, math.min(1.0, tradeState >= 3 ? progressT3Raw : tradeState >= 2 ? progressT2Raw : progressT1Raw))
+float currentTarget = tradeState >= 3 ? activeT3 : tradeState >= 2 ? activeT2 : activeT1
+float remainingR = tradeState == 4 ? 0.0 : not na(structuralRisk) ? math.abs(currentTarget - close) / structuralRisk : na
+string journeyPhase = tradeState == 4 ? "RUNNER COMPLETE" : tradeState >= 3 ? "T2 → T3" : tradeState >= 2 ? "T1 → T2" : "ENTRY → T1"
+
+string stateName = t1Lock ? "T1 TARGET LOCK" : t2Lock ? "T2 TARGET LOCK" : t3Lock ? "T3 RUNNER LOCK" : stopDanger ? "STOP DANGER" : tradeState == 1 ? "IN FORCE" : tradeState == 2 ? "TARGET 1 HIT" : tradeState == 3 ? "TARGET 2 HIT" : tradeState == 4 ? "TARGET 3 HIT" : tradeState == -1 ? "FAILED" : isOne ? "ARMED: 1 BREAK" : "SCANNING"
+color stateColor = t1Lock ? TARGET_GOLD : t2Lock ? HOT_PINK : t3Lock ? RUNNER_VIOLET : stopDanger ? SIGNAL_RED : tradeState == 1 ? NEON_CYAN : tradeState == 2 ? TARGET_GOLD : tradeState == 3 ? HOT_PINK : tradeState == 4 ? RUNNER_VIOLET : tradeState == -1 ? SIGNAL_RED : isOne ? ULTRA_VIOLET : color.silver
+float riskPerUnit = not na(activeEntry) and not na(activeStop) ? math.abs(activeEntry - activeStop) * pointValue : na
+float positionSize = riskPerUnit > 0 ? riskCash / riskPerUnit : na
+float rrTarget2 = activeR2
+
+// Keep the five execution tags aligned at the right edge of the active chart.
+if barstate.islast and showPlan and not modeMinimal
+    float tagGap = atr * 0.30
+    float entryTagY = activeEntry
+    float stopTagY = activeDir == 1 ? math.min(activeStop, entryTagY - tagGap) : math.max(activeStop, entryTagY + tagGap)
+    float target1TagY = activeDir == 1 ? math.max(activeT1, entryTagY + tagGap) : math.min(activeT1, entryTagY - tagGap)
+    float target2TagY = activeDir == 1 ? math.max(activeT2, target1TagY + tagGap) : math.min(activeT2, target1TagY - tagGap)
+    float target3TagY = activeDir == 1 ? math.max(activeT3, target2TagY + tagGap) : math.min(activeT3, target2TagY - tagGap)
+    if not na(entryTag)
+        label.set_xy(entryTag, bar_index + 3, entryTagY)
+    if not na(stopTag)
+        label.set_xy(stopTag, bar_index + 3, stopTagY)
+    if not na(target1Tag)
+        label.set_xy(target1Tag, bar_index + 3, target1TagY)
+    if not na(target2Tag)
+        label.set_xy(target2Tag, bar_index + 3, target2TagY)
+    if not na(target3Tag)
+        label.set_xy(target3Tag, bar_index + 3, target3TagY)
+    if not na(liquidityTag) and not na(activeM0)
+        label.set_xy(liquidityTag, bar_index + 3, activeM0)
+    if not na(target1Line)
+        line.set_color(target1Line, t1Lock ? color.white : TARGET_GOLD)
+        line.set_width(target1Line, t1Lock ? 4 : 2)
+    if not na(target2Line)
+        line.set_color(target2Line, t2Lock ? color.white : HOT_PINK)
+        line.set_width(target2Line, t2Lock ? 4 : 2)
+    if not na(target3Line)
+        line.set_color(target3Line, t3Lock ? color.white : RUNNER_VIOLET)
+        line.set_width(target3Line, t3Lock ? 4 : 2)
+    if not na(stopLine)
+        line.set_color(stopLine, stopDanger ? color.white : SIGNAL_RED)
+        line.set_width(stopLine, stopDanger ? 4 : 2)
+    if not na(target1Tag)
+        label.set_color(target1Tag, t1Lock ? color.white : TARGET_GOLD)
+    if not na(target2Tag)
+        label.set_color(target2Tag, t2Lock ? color.white : HOT_PINK)
+    if not na(target3Tag)
+        label.set_color(target3Tag, t3Lock ? color.white : RUNNER_VIOLET)
+
+// Target Dock: residual track-price levels terminate directly on TradingView's price scale.
+plot(showAxisDock and activeDir != 0 ? activeEntry : na, "ENTRY DOCK", color=NEON_CYAN, linewidth=2,
+     trackprice=true, show_last=1, offset=-99999, display=display.price_scale + display.pane, format=format.price)
+plot(showAxisDock and activeDir != 0 ? activeStop : na, "STOP DOCK", color=stopDanger ? color.white : SIGNAL_RED, linewidth=2,
+     trackprice=true, show_last=1, offset=-99999, display=display.price_scale + display.pane, format=format.price)
+plot(showAxisDock and activeDir != 0 ? activeT1 : na, "🎯 T1 TARGET", color=t1Lock ? color.white : TARGET_GOLD, linewidth=2,
+     trackprice=true, show_last=1, offset=-99999, display=display.price_scale + display.pane, format=format.price)
+plot(showAxisDock and activeDir != 0 ? activeT2 : na, "🎯 T2 TARGET", color=t2Lock ? color.white : HOT_PINK, linewidth=2,
+     trackprice=true, show_last=1, offset=-99999, display=display.price_scale + display.pane, format=format.price)
+plot(showAxisDock and activeDir != 0 ? activeT3 : na, "🚀 T3 RUNNER", color=t3Lock ? color.white : RUNNER_VIOLET, linewidth=2,
+     trackprice=true, show_last=1, offset=-99999, display=display.price_scale + display.pane, format=format.price)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. QUANTUM COCKPIT
+// ═════════════════════════════════════════════════════════════════════════════
+f_position(string p) =>
+    switch p
+        "Top left"      => position.top_left
+        "Top center"    => position.top_center
+        "Middle left"   => position.middle_left
+        "Middle right"  => position.middle_right
+        "Bottom left"   => position.bottom_left
+        "Bottom center" => position.bottom_center
+        "Bottom right"  => position.bottom_right
+        => position.top_right
+
+f_price(float value) => na(value) ? "—" : str.tostring(value, format.mintick)
+f_metric_color(int value) => value == 1 ? NEON_GREEN : value == -1 ? SIGNAL_RED : LASER_ORANGE
+f_progress_bar(float value) =>
+    value >= 0.80 ? "█████" : value >= 0.60 ? "████░" : value >= 0.40 ? "███░░" : value >= 0.20 ? "██░░░" : value > 0 ? "█░░░░" : "░░░░░"
+
+var table deck = table.new(f_position(cockpitPos), 2, 14, bgcolor=color.new(DEEP_PANEL, 4),
+     frame_color=color.new(HOT_PINK, 20), frame_width=2, border_color=color.new(NEON_CYAN, 78))
+
+if barstate.islast and showCockpit
+    table.cell(deck, 0, 0, "STRAT // QUANTUM", text_color=color.white, bgcolor=color.new(HOT_PINK, 18), text_size=size.small)
+    table.cell(deck, 1, 0, stateName, text_color=color.white, bgcolor=color.new(stateColor, 18), text_size=size.small)
+    table.cell(deck, 0, 1, "LIVE SCENARIO", text_color=color.silver)
+    table.cell(deck, 1, 1, isOne ? "1" : isTwoUp ? "2U" : isTwoDown ? "2D" : "3", text_color=scenarioColor)
+    table.cell(deck, 0, 2, "SETUP", text_color=color.silver)
+    table.cell(deck, 1, 2, activeCombo + "\n" + targetModel, text_color=stateColor, text_size=size.tiny)
+    table.cell(deck, 0, 3, "TFC " + (tfcConfirmed ? "CLOSED" : "LIVE*"), text_color=color.silver)
+    table.cell(deck, 1, 3, tfcState + "  " + str.tostring(math.max(tfcBull, tfcBear)) + "/5", text_color=tfcColor)
+    table.cell(deck, 0, 4, tf1 + "  " + tf2 + "  " + tf3 + "  " + tf4 + "  " + tf5, text_color=color.silver, text_size=size.tiny)
+    table.cell(deck, 1, 4, f_tfc_symbol(t1) + "   " + f_tfc_symbol(t2) + "   " + f_tfc_symbol(t3) + "   " + f_tfc_symbol(t4) + "   " + f_tfc_symbol(t5), text_color=tfcColor)
+    table.cell(deck, 0, 5, "ENTRY", text_color=color.silver)
+    table.cell(deck, 1, 5, f_price(activeEntry), text_color=NEON_CYAN)
+    table.cell(deck, 0, 6, "STOP", text_color=color.silver)
+    table.cell(deck, 1, 6, f_price(activeStop), text_color=SIGNAL_RED)
+    table.cell(deck, 0, 7, "TARGET 1", text_color=color.silver)
+    table.cell(deck, 1, 7, "🎯 " + f_price(activeT1) + (na(activeR1) ? "" : "  •  " + f_r(activeR1) + "  " + activeT1Origin), text_color=t1Lock ? color.white : TARGET_GOLD)
+    table.cell(deck, 0, 8, "TARGET 2", text_color=color.silver)
+    table.cell(deck, 1, 8, "🎯 " + f_price(activeT2) + (na(activeR2) ? "" : "  •  " + f_r(activeR2) + "  " + activeT2Origin), text_color=t2Lock ? color.white : HOT_PINK)
+    table.cell(deck, 0, 9, "TARGET 3", text_color=color.silver)
+    table.cell(deck, 1, 9, "🚀 " + f_price(activeT3) + (na(activeR3) ? "" : "  •  " + f_r(activeR3) + "  " + activeT3Origin), text_color=t3Lock ? color.white : RUNNER_VIOLET)
+    table.cell(deck, 0, 10, "TARGET JOURNEY", text_color=color.silver)
+    table.cell(deck, 1, 10, activeDir == 0 ? "—" : journeyPhase + "  " + f_progress_bar(journeyProgress) + "  " + str.tostring(journeyProgress * 100.0, "#") + "%", text_color=tradeState >= 3 ? RUNNER_VIOLET : tradeState >= 2 ? HOT_PINK : TARGET_GOLD)
+    table.cell(deck, 0, 11, "RADAR", text_color=color.silver)
+    table.cell(deck, 1, 11, activeDir == 0 ? "—" : tradeState == 4 ? "✓ RUNNER COMPLETE" : (stopDanger ? "⚠ STOP " : t1Lock or t2Lock or t3Lock ? "◎ TARGET LOCK " : "◆ TRACKING ") + (na(remainingR) ? "" : f_r(remainingR) + " left"), text_color=tradeState == 4 ? RUNNER_VIOLET : stopDanger ? SIGNAL_RED : t1Lock ? TARGET_GOLD : t2Lock ? HOT_PINK : t3Lock ? RUNNER_VIOLET : NEON_CYAN)
+    table.cell(deck, 0, 12, "QUALITY / PMG", text_color=color.silver)
+    table.cell(deck, 1, 12, (na(activeScore) ? "—" : str.tostring(activeScore, "#") + "/100") + "  •  " + str.tostring(activeDir == -1 ? pmgBelow : pmgAbove), text_color=activeScore >= 75 ? NEON_GREEN : activeScore >= 55 ? NEON_CYAN : LASER_ORANGE)
+    table.cell(deck, 0, 13, "SIZE @ " + str.tostring(riskCash, "#") + " RISK", text_color=color.silver)
+    table.cell(deck, 1, 13, na(positionSize) ? "—" : str.tostring(positionSize, "#.##") + " units", text_color=color.white)
+
+if barstate.islast and not showCockpit
+    table.clear(deck, 0, 0, 1, 13)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. ALERTS AND DATA WINDOW
+// ═════════════════════════════════════════════════════════════════════════════
+alertcondition(firstLong, "STRAT Quantum — bullish combo triggered", "{{ticker}}: bullish Strat combo triggered. Check TFC, magnitude and structural risk.")
+alertcondition(firstShort, "STRAT Quantum — bearish combo triggered", "{{ticker}}: bearish Strat combo triggered. Check TFC, magnitude and structural risk.")
+alertcondition(barstate.isconfirmed and tfcBull == 5 and tfcBull[1] != 5, "STRAT Quantum — Full Bull TFC", "{{ticker}}: Full Bull Timeframe Continuity detected.")
+alertcondition(barstate.isconfirmed and tfcBear == 5 and tfcBear[1] != 5, "STRAT Quantum — Full Bear TFC", "{{ticker}}: Full Bear Timeframe Continuity detected.")
+alertcondition(barstate.isconfirmed and tradeState == -1 and tradeState[1] != -1, "STRAT Quantum — setup failed", "{{ticker}}: active Strat setup reached its structural invalidation.")
+alertcondition(barstate.isconfirmed and tradeState >= 2 and tradeState[1] < 2, "STRAT Quantum — Magnitude 1 reached", "{{ticker}}: active Strat setup reached Magnitude 1.")
+alertcondition(barstate.isconfirmed and tradeState >= 3 and tradeState[1] < 3, "STRAT Quantum — Magnitude 2 reached", "{{ticker}}: active Strat setup reached Magnitude 2.")
+alertcondition(barstate.isconfirmed and tradeState == 4 and tradeState[1] != 4, "STRAT Quantum — Runner T3 reached", "{{ticker}}: active Strat setup reached Runner Target 3.")
+alertcondition(barstate.isconfirmed and t1Lock and not t1Lock[1], "STRAT Quantum — T1 Target Lock", "{{ticker}}: price entered the T1 Target Lock zone.")
+alertcondition(barstate.isconfirmed and t2Lock and not t2Lock[1], "STRAT Quantum — T2 Target Lock", "{{ticker}}: price entered the T2 Target Lock zone.")
+alertcondition(barstate.isconfirmed and t3Lock and not t3Lock[1], "STRAT Quantum — T3 Runner Lock", "{{ticker}}: price entered the T3 Runner Lock zone.")
+alertcondition(barstate.isconfirmed and stopDanger and not stopDanger[1], "STRAT Quantum — Stop Danger", "{{ticker}}: price entered the structural stop danger zone.")
+
+plot(activeScore, "Setup Quality", display=display.data_window)
+plot(tfcNet, "TFC Net", display=display.data_window)
+plot(activeR1, "Target 1 R multiple", display=display.data_window)
+plot(rrTarget2, "Target 2 R multiple", display=display.data_window)
+plot(activeR3, "Target 3 R multiple", display=display.data_window)
+plot(positionSize, "Risk-based position size", display=display.data_window)
+plot(journeyProgress * 100.0, "Target Journey (%)", display=display.data_window)
+plot(remainingR, "Target distance remaining (R)", display=display.data_window)

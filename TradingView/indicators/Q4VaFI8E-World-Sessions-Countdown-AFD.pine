@@ -1,0 +1,790 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// © Auction Foundry
+
+//@version=6
+
+// Session windows are anchored to IANA timezone names, never to a fixed UTC offset, so they hold
+// across DST. "Now" is timenow, not time -- time is the bar's OPEN and would tick once per bar.
+// reference/wssn_oracle.py is the oracle for the arithmetic here; where they disagree it is right.
+// Reasoning behind every decision below lives in BUILD_PLAN.md as OD-1..OD-30.
+indicator("World Sessions & Countdown [AFD]", "WSSN [AFD]", overlay = true, max_labels_count = 500, max_boxes_count = 500)
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const string GROUP_SESSIONS = "Sessions"
+const string GROUP_US       = "New York hours"
+const string GROUP_BANDS    = "Session boxes & overlap"
+const string GROUP_LABELS   = "Session labels"
+const string GROUP_PANEL    = "Dashboard"
+const string GROUP_ALERTS   = "Alerts"
+
+const string SYDNEY_TZ = "Australia/Sydney"
+const string TOKYO_TZ  = "Asia/Tokyo"
+const string LONDON_TZ = "Europe/London"
+const string NY_TZ     = "America/New_York"
+
+const string NAME_SYDNEY = "SYDNEY"
+const string NAME_TOKYO  = "TOKYO"
+const string NAME_LONDON = "LONDON"
+const string NAME_NY     = "NEW YORK"
+
+const int IDX_CUSTOM = 0
+const int IDX_NY     = 1
+const int IDX_LONDON = 2
+const int IDX_TOKYO  = 3
+const int IDX_SYDNEY = 4
+const int BAND_COUNT = 5
+
+const string MODE_RTH = "Regular hours (RTH)"
+const string MODE_ETH = "Extended hours (ETH)"
+
+const string FAMILY_AUTO     = "Auto by symbol"
+const string FAMILY_EQUITIES = "Equities"
+const string FAMILY_FUTURES  = "Futures"
+
+const string POS_TOP_LEFT      = "Top left"
+const string POS_TOP_CENTER    = "Top center"
+const string POS_TOP_RIGHT     = "Top right"
+const string POS_MID_LEFT      = "Middle left"
+const string POS_MID_CENTER    = "Middle center"
+const string POS_MID_RIGHT     = "Middle right"
+const string POS_BOTTOM_LEFT   = "Bottom left"
+const string POS_BOTTOM_CENTER = "Bottom center"
+const string POS_BOTTOM_RIGHT  = "Bottom right"
+
+const string FRAME_OFF       = "Off"
+const string FRAME_STATIC    = "Static"
+const string FRAME_COUNTDOWN = "Countdown"
+
+const color PANEL_FRAME_NEUTRAL = #9598A1
+const color PANEL_GRID          = #9598A1
+
+const string SIZE_TINY   = "Tiny"
+const string SIZE_SMALL  = "Small"
+const string SIZE_NORMAL = "Normal"
+const string SIZE_LARGE  = "Large"
+const string SIZE_HUGE   = "Huge"
+
+const string LINE_SOLID  = "Solid"
+const string LINE_DASHED = "Dashed"
+const string LINE_DOTTED = "Dotted"
+
+const string OVERLAP_OFF       = "Off"
+const string OVERLAP_HIGHLIGHT = "Highlight overlap"
+const string OVERLAP_ONLY      = "Overlap only"
+
+const string GRAD_OFF    = "Off"
+const string GRAD_SOFT   = "Soft"
+const string GRAD_MEDIUM = "Medium"
+const string GRAD_STRONG = "Strong"
+
+const string GRAD_VERTICAL   = "Vertical"
+const string GRAD_HORIZONTAL = "Horizontal"
+
+const int MAX_GRADIENT_STEPS = 8
+
+// Held under Pine's ~500 box ceiling, which deletes silently and exposes no event.
+const float BOX_REGISTRY_BUDGET = 480.0
+
+const float URGENCY_WARNING  = 0.15
+const float URGENCY_CRITICAL = 0.05
+
+const color URGENCY_OK   = #26A69A
+const color URGENCY_WARN = #FFB300
+const color URGENCY_CRIT = #EF5350
+
+const int DAY_MS = 86400000
+
+// 1 = Sunday .. 7 = Saturday. For a session spanning midnight the digits name the day it ENDS,
+// so Globex is "1800-1700:23456" and not "12345".
+const string DAYS_WEEKDAYS = "23456"
+
+const int   ATR_LENGTH           = 14
+const float LABEL_PAD_ATR        = 0.35
+const float LABEL_STACK_STEP_ATR = 0.90
+
+const int MAX_DRAW_LOOKBACK = 5000
+
+const string BLOCK_FILLED = "█"
+const string BLOCK_EMPTY  = "░"
+
+const int PANEL_HEAD_ROWS = 2
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+
+bool   sydneyOn   = input.bool(true, "Sydney", group = GROUP_SESSIONS, inline = "b1", display = display.none)
+string sydneyHrs  = input.session("0700-1600", "", group = GROUP_SESSIONS, inline = "b1", display = display.none)
+string sydneyDays = input.string(DAYS_WEEKDAYS, "", group = GROUP_SESSIONS, inline = "b1", display = display.none)
+color  sydneyCol  = input.color(color.new(#AB47BC, 95), "", group = GROUP_SESSIONS, inline = "b1", display = display.none, tooltip = "Sydney — Australia/Sydney time.\n• The row is: on/off · hours · weekdays · colour.\n• Weekdays are digits, 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.\n• If a window runs past midnight, the digits are the day it ENDS.\n• The colour fills the box, at whatever opacity you set on it.")
+
+bool   tokyoOn   = input.bool(true, "Tokyo", group = GROUP_SESSIONS, inline = "b2", display = display.none)
+string tokyoHrs  = input.session("0900-1800", "", group = GROUP_SESSIONS, inline = "b2", display = display.none)
+string tokyoDays = input.string(DAYS_WEEKDAYS, "", group = GROUP_SESSIONS, inline = "b2", display = display.none)
+color  tokyoCol  = input.color(color.new(#FF7043, 95), "", group = GROUP_SESSIONS, inline = "b2", display = display.none, tooltip = "Tokyo — Asia/Tokyo time.\n• Weekdays: 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.\n• Japan has no daylight saving, so this window never shifts.")
+
+bool   londonOn   = input.bool(true, "London", group = GROUP_SESSIONS, inline = "b3", display = display.none)
+string londonHrs  = input.session("0800-1700", "", group = GROUP_SESSIONS, inline = "b3", display = display.none)
+string londonDays = input.string(DAYS_WEEKDAYS, "", group = GROUP_SESSIONS, inline = "b3", display = display.none)
+color  londonCol  = input.color(color.new(#D32F2F, 95), "", group = GROUP_SESSIONS, inline = "b3", display = display.none, tooltip = "London — Europe/London time.\n• Weekdays: 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.\n• Moves itself across the GMT/BST changeover.")
+
+bool  nyOn  = input.bool(true, "New York", group = GROUP_SESSIONS, inline = "b4", display = display.none)
+color nyCol = input.color(color.new(#42A5F5, 95), "", group = GROUP_SESSIONS, inline = "b4", display = display.none, tooltip = "New York — America/New_York time.\n• Its hours and weekdays are in the \"New York hours\" group below.\n• It is the only session with a regular/extended choice.")
+
+bool   customOn   = input.bool(false, "Custom", group = GROUP_SESSIONS, inline = "b5", display = display.none)
+string customHrs  = input.session("0930-1600", "", group = GROUP_SESSIONS, inline = "b5", display = display.none)
+string customDays = input.string(DAYS_WEEKDAYS, "", group = GROUP_SESSIONS, inline = "b5", display = display.none)
+color  customCol  = input.color(color.new(#90A4AE, 95), "", group = GROUP_SESSIONS, inline = "b5", display = display.none, tooltip = "A window of your own, read in the symbol's own exchange timezone — so it follows whatever you are looking at.\n• Weekdays: 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.\n• When several sessions run at once, this is the one BARS LEFT counts down.")
+string customName = input.string("CUSTOM", "Custom session name", group = GROUP_SESSIONS, display = display.none, tooltip = "Used on the chart label and in the dashboard row.")
+
+string nyMode      = input.string(MODE_RTH, "Session", options = [MODE_RTH, MODE_ETH], group = GROUP_US, display = display.none, tooltip = "• Regular — the cash session.\n• Extended — pre- and post-market for stocks, or the Globex overnight session for futures. Which one you get comes from the family below.")
+string nyFamily    = input.string(FAMILY_AUTO, "Instrument family", options = [FAMILY_AUTO, FAMILY_EQUITIES, FAMILY_FUTURES], group = GROUP_US, display = display.none, tooltip = "• Auto — reads the symbol and uses the futures window only on a futures contract.\n• Override it if you trade a futures-tracking ETF or CFD and want the underlying's hours.")
+string nyHrsRth    = input.session("0930-1600", "Regular hours", group = GROUP_US, inline = "ny1", display = display.none)
+string nyDaysRth   = input.string(DAYS_WEEKDAYS, "", group = GROUP_US, inline = "ny1", display = display.none, tooltip = "The US cash session.\n• Weekdays: 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.")
+string nyHrsEthEq  = input.session("0400-2000", "Extended — equities", group = GROUP_US, inline = "ny2", display = display.none)
+string nyDaysEthEq = input.string(DAYS_WEEKDAYS, "", group = GROUP_US, inline = "ny2", display = display.none, tooltip = "Pre-market and post-market, either side of the cash session.\n• Weekdays: 1 = Sunday to 7 = Saturday. 23456 is Mon–Fri.")
+string nyHrsEthFt  = input.session("1800-1700", "Extended — futures", group = GROUP_US, inline = "ny3", display = display.none)
+string nyDaysEthFt = input.string(DAYS_WEEKDAYS, "", group = GROUP_US, inline = "ny3", display = display.none, tooltip = "CME Globex, 18:00 to 17:00 the next day.\n• Weekdays: 1 = Sunday to 7 = Saturday.\n• This window crosses midnight, so the digits are the day it ENDS.\n• 23456 runs Sunday evening to Friday afternoon — the real Globex week.\n• 12345 looks right and is not: it invents a Saturday evening and loses Thursday.")
+
+bool   showBoxes    = input.bool(true, "Show session boxes", group = GROUP_BANDS, display = display.none)
+bool   fillBoxes    = input.bool(true, "Fill boxes", group = GROUP_BANDS, display = display.none, tooltip = "Off leaves outline-only rectangles.\n• Where two sessions overlap, their fills blend into a third colour matching neither chip. Off removes that.")
+string fillGradient = input.string(GRAD_MEDIUM, "Fill gradient", options = [GRAD_OFF, GRAD_SOFT, GRAD_MEDIUM, GRAD_STRONG], group = GROUP_BANDS, inline = "gr", display = display.none, tooltip = "How far the fill fades across the box. Off is flat.\n• Your colour picker's opacity is the FAINT end of the fade; the other end is more opaque by the chosen depth.\n• It costs boxes — one per step, plus the outline — so \"Session boxes kept\" is trimmed automatically at the stronger settings.")
+string fillGradDir  = input.string(GRAD_VERTICAL, "", options = [GRAD_VERTICAL, GRAD_HORIZONTAL], group = GROUP_BANDS, inline = "gr", display = display.none, tooltip = "• Vertical — fades down from the session's high.\n• Horizontal — fades from the opening bar toward the live edge.\nNeither costs more than the other.")
+int    borderTransp = input.int(0, "Border transparency", minval = 0, maxval = 100, group = GROUP_BANDS, display = display.none, tooltip = "0 is a solid outline, 100 is invisible. Uses the session's own colour.")
+int    borderWidth  = input.int(1, "Border width", minval = 1, maxval = 4, group = GROUP_BANDS, display = display.none)
+string borderStyle  = input.string(LINE_DASHED, "Border style", options = [LINE_SOLID, LINE_DASHED, LINE_DOTTED], group = GROUP_BANDS, display = display.none)
+string overlapMode  = input.string(OVERLAP_ONLY, "Overlap", options = [OVERLAP_OFF, OVERLAP_HIGHLIGHT, OVERLAP_ONLY], group = GROUP_BANDS, inline = "ov", display = display.none)
+color  overlapCol   = input.color(color.new(#66BB6A, 95), "", group = GROUP_BANDS, inline = "ov", display = display.none, tooltip = "A box over the bars two or more sessions share, spanning just those bars' high and low.\n• One colour at any depth — a three-way overlap looks like a two-way.\n• Overlap only draws that box and nothing else.")
+int    maxBoxes     = input.int(20, "Session boxes kept", minval = 10, maxval = 250, group = GROUP_BANDS, display = display.none, tooltip = "How many finished sessions stay on the chart. The oldest goes first.\n• The minimum is 10 because six can be running at once.\n• Pine allows 500 boxes in total and a gradient session uses one per step, so this is trimmed automatically to fit.")
+
+bool   showLabels      = input.bool(true, "Show session names above price", group = GROUP_LABELS, display = display.none, tooltip = "Each name sits on the top edge of its own box, over the bars that session held alone.\n• Where sessions overlap, the overlap box carries the joint name — \"TOKYO + LONDON\".\n• Nothing is ever named twice.")
+string labelSize       = input.string(SIZE_SMALL, "Label size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL, SIZE_LARGE, SIZE_HUGE], group = GROUP_LABELS, display = display.none)
+color  labelTextColor  = input.color(color.white, "Label text color", group = GROUP_LABELS, display = display.none, tooltip = "Applies to every session name. White by default so it reads against any session colour.")
+int    maxLabels       = input.int(40, "Session names kept", minval = 5, maxval = 250, group = GROUP_LABELS, display = display.none, tooltip = "How many past names stay on the chart. The oldest goes first. Pine allows 500 labels in total.")
+
+bool   showPanel       = input.bool(true, "Show dashboard", group = GROUP_PANEL, display = display.none, tooltip = "LOCAL, the open/closed dot, PROGRESS and NEXT read the real wall clock, not the bar you are looking at — so they stay correct on a weekend, on a scrolled-back chart and in Bar Replay.\n• They advance on every tick. Pine has no timer, so on a shut market — where no tick arrives — the clock holds at the last time the chart did anything. Scroll, zoom or change any setting and it catches up.\n• BAR CLOSE and BARS LEFT are the bar's own figures and behave differently. See their own tooltips.")
+string panelPosition   = input.string(POS_TOP_RIGHT, "Position", options = [POS_TOP_LEFT, POS_TOP_CENTER, POS_TOP_RIGHT, POS_MID_LEFT, POS_MID_CENTER, POS_MID_RIGHT, POS_BOTTOM_LEFT, POS_BOTTOM_CENTER, POS_BOTTOM_RIGHT], group = GROUP_PANEL, display = display.none)
+color  panelBg         = input.color(color.new(#16181E, 0), "Panel background", group = GROUP_PANEL, display = display.none, tooltip = "One colour for the whole panel.\n• The only tint on top of it is the open session's own row.")
+bool   panelGrid       = input.bool(true, "Grid lines", group = GROUP_PANEL, display = display.none, tooltip = "A line between every cell.\n• Pine's grid is all-or-nothing, so it also cuts the colour stripe down the left edge into separate squares. Turn it off to get the stripe back as one band.")
+string panelFrame      = input.string(FRAME_COUNTDOWN, "Panel frame", options = [FRAME_OFF, FRAME_STATIC, FRAME_COUNTDOWN], group = GROUP_PANEL, display = display.none, tooltip = "The frame around the panel.\n• Countdown — green, then amber, then red as BARS LEFT runs out. Grey when nothing is running.\n• Static — grey throughout.\n• Off — no frame.")
+int    panelFrameWidth = input.int(1, "Frame width", minval = 1, maxval = 4, group = GROUP_PANEL, display = display.none, active = panelFrame != FRAME_OFF)
+string panelSize       = input.string(SIZE_SMALL, "Text size", options = [SIZE_TINY, SIZE_SMALL, SIZE_NORMAL, SIZE_LARGE, SIZE_HUGE], group = GROUP_PANEL, display = display.none)
+int    progressWidth   = input.int(10, "Progress bar width", minval = 4, maxval = 24, group = GROUP_PANEL, display = display.none, tooltip = "How many cells the progress bar uses. It only fills completely at a true 100%.")
+bool   showBarClose    = input.bool(true, "Show time to bar close", group = GROUP_PANEL, display = display.none, tooltip = "Seconds until the current bar finishes.\n• It only counts on a live bar, and shows a dash otherwise.\n• A dash is not a fault. A historical bar, Bar Replay, a delayed feed or a shut market all produce one.\n• BARS LEFT counts bars rather than seconds, so it keeps working where this cannot.")
+bool   showBarsLeft    = input.bool(true, "Show bars left in session", group = GROUP_PANEL, display = display.none, tooltip = "Bars left in whichever session has priority on this bar — Custom, then New York, London, Tokyo, Sydney.\n• Blank when nothing is live.")
+
+int  alertSecondsLeft = input.int(30, "Alert at N seconds to bar close", minval = 0, maxval = 300, group = GROUP_ALERTS, display = display.none, tooltip = "0 turns this alert off.\n• How often it re-fires while the condition holds is set in the Create Alert dialog.")
+bool alertLastBar     = input.bool(false, "Alert on last bar of session", group = GROUP_ALERTS, display = display.none)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+textSizeOf(string name) =>
+    switch name
+        SIZE_TINY  => size.tiny
+        SIZE_SMALL => size.small
+        SIZE_LARGE => size.large
+        SIZE_HUGE  => size.huge
+        => size.normal
+
+lineStyleOf(string name) =>
+    switch name
+        LINE_DASHED => line.style_dashed
+        LINE_DOTTED => line.style_dotted
+        => line.style_solid
+
+gradientStepsOf(string name) =>
+    switch name
+        GRAD_SOFT   => 4
+        GRAD_MEDIUM => 6
+        GRAD_STRONG => 8
+        => 1
+
+gradientDepthOf(string name) =>
+    switch name
+        GRAD_SOFT   => 15
+        GRAD_MEDIUM => 28
+        GRAD_STRONG => 40
+        => 0
+
+sliceColorOf(color base, int k, int steps, int depth) =>
+    float position = steps <= 1 ? 0.0 : k / (steps - 1.0)
+    float transp = color.t(base) - depth + depth * position
+    color.new(base, math.max(0.0, math.min(100.0, transp)))
+
+sliceBars(int leftBar, int rightBar, int k, int steps) =>
+    float span = (rightBar - leftBar) / (steps * 1.0)
+    int sliceLeft  = leftBar + int(math.round(k * span))
+    int sliceRight = k == steps - 1 ? rightBar : leftBar + int(math.round((k + 1) * span)) - 1
+    [sliceLeft, sliceRight < sliceLeft ? sliceLeft : sliceRight]
+
+positionOf(string name) =>
+    switch name
+        POS_TOP_LEFT      => position.top_left
+        POS_TOP_CENTER    => position.top_center
+        POS_MID_LEFT      => position.middle_left
+        POS_MID_CENTER    => position.middle_center
+        POS_MID_RIGHT     => position.middle_right
+        POS_BOTTOM_LEFT   => position.bottom_left
+        POS_BOTTOM_CENTER => position.bottom_center
+        POS_BOTTOM_RIGHT  => position.bottom_right
+        => position.top_right
+
+labelY(float topPrice, float atr, int slot) =>
+    topPrice + nz(atr, syminfo.mintick * 10) * (LABEL_PAD_ATR + slot * LABEL_STACK_STEP_ATR)
+
+composeSession(string hours, string days) =>
+    str.length(days) == 0 ? hours : hours + ":" + days
+
+formatCountdown(float totalSeconds) =>
+    float ts = math.max(0.0, math.floor(totalSeconds))
+    string txt = na
+    if ts < 60
+        txt := str.tostring(ts, "0") + "s"
+    else
+        float days = math.floor(ts / 86400)
+        float dayRemainder = ts - days * 86400
+        float hours = math.floor(dayRemainder / 3600)
+        float remainder = dayRemainder - hours * 3600
+        float minutes = math.floor(remainder / 60)
+        float seconds = remainder - minutes * 60
+        string mm = minutes < 10 ? "0" + str.tostring(minutes, "0") : str.tostring(minutes, "0")
+        string ss = seconds < 10 ? "0" + str.tostring(seconds, "0") : str.tostring(seconds, "0")
+        if days > 0
+            txt := str.tostring(days, "0") + "d " + str.tostring(hours, "0") + ":" + mm
+        else if hours > 0
+            txt := str.tostring(hours, "0") + ":" + mm + ":" + ss
+        else
+            txt := str.tostring(minutes, "0") + ":" + ss
+    txt
+
+progressBarOf(float fraction, int width) =>
+    float clamped = math.max(0.0, math.min(1.0, fraction))
+    int filled = int(math.min(width, math.floor(clamped * width)))
+    int empty = width - filled
+    string txt = ""
+    if filled > 0
+        for i = 1 to filled
+            txt += BLOCK_FILLED
+    if empty > 0
+        for i = 1 to empty
+            txt += BLOCK_EMPTY
+    txt
+
+sessionMinutes(string sess) =>
+    int openMin = 0
+    int closeMin = 0
+    if sess != "24x7"
+        int colon = str.pos(sess, ":")
+        string core = na(colon) or colon < 0 ? sess : str.substring(sess, 0, colon)
+        int dash = str.pos(core, "-")
+        if not na(dash) and dash >= 0
+            string openS = str.substring(core, 0, dash)
+            string closeS = str.substring(core, dash + 1)
+            openMin := int(nz(str.tonumber(str.substring(openS, 0, 2)))) * 60 + int(nz(str.tonumber(str.substring(openS, 2, 4))))
+            closeMin := int(nz(str.tonumber(str.substring(closeS, 0, 2)))) * 60 + int(nz(str.tonumber(str.substring(closeS, 2, 4))))
+    [openMin, closeMin]
+
+sessionDayDigits(string sess) =>
+    string digits = "1234567"
+    if sess != "24x7"
+        int colon = str.pos(sess, ":")
+        if not na(colon) and colon >= 0
+            digits := str.substring(sess, colon + 1)
+    digits
+
+hourOf(int minutes) =>
+    int(math.floor(minutes / 60.0))
+
+minuteOf(int minutes) =>
+    minutes - hourOf(minutes) * 60
+
+pad2(int value) =>
+    value < 10 ? "0" + str.tostring(value, "0") : str.tostring(value, "0")
+
+clockOf(int ms, string tz) =>
+    pad2(hour(ms, tz)) + ":" + pad2(minute(ms, tz))
+
+hoursTextOf(int openMin, int closeMin) =>
+    openMin == closeMin ? "24h" : pad2(hourOf(openMin)) + ":" + pad2(minuteOf(openMin)) + "-" + pad2(hourOf(closeMin)) + ":" + pad2(minuteOf(closeMin))
+
+dateKeyOf(int ms, string tz) =>
+    year(ms, tz) * 10000 + month(ms, tz) * 100 + dayofmonth(ms, tz)
+
+dayShiftOf(int ms, string tz) =>
+    int here = dateKeyOf(ms, syminfo.timezone)
+    int there = dateKeyOf(ms, tz)
+    there > here ? " +1" : there < here ? " -1" : ""
+
+timeframeLabel() =>
+    int secs = timeframe.in_seconds()
+    string txt = timeframe.period
+    if secs > 0 and secs < 86400
+        if secs < 60
+            txt := str.tostring(secs, "0") + "s"
+        else if secs < 3600
+            txt := str.tostring(math.floor(secs / 60.0), "0") + "m"
+        else
+            txt := str.tostring(math.floor(secs / 3600.0), "0") + "h"
+    txt
+
+urgencyColorOf(float fraction, color neutral) =>
+    na(fraction) ? neutral : fraction > URGENCY_WARNING ? URGENCY_OK : fraction > URGENCY_CRITICAL ? URGENCY_WARN : URGENCY_CRIT
+
+dayAllowed(string digits, int weekday) =>
+    bool found = false
+    int n = str.length(digits)
+    if n > 0
+        for i = 0 to n - 1
+            if str.tonumber(str.substring(digits, i, i + 1)) == weekday
+                found := true
+    found
+
+sessionWindow(string sess, string tz, int nowMs) =>
+    [openMin, closeMin] = sessionMinutes(sess)
+    string digits = sessionDayDigits(sess)
+    bool isOpenNow = false
+    int openMs = na
+    int closeMs = na
+    for offset = -1 to 7
+        int roughMs = nowMs + offset * DAY_MS
+        int y = year(roughMs, tz)
+        int mo = month(roughMs, tz)
+        int d = dayofmonth(roughMs, tz)
+        int o = int(timestamp(tz, y, mo, d, hourOf(openMin), minuteOf(openMin), 0))
+        int c = int(timestamp(tz, y, mo, d, hourOf(closeMin), minuteOf(closeMin), 0))
+        if closeMin <= openMin
+            c += DAY_MS
+        if dayAllowed(digits, dayofweek(c - 1, tz))
+            if nowMs < c
+                openMs := o
+                closeMs := c
+                isOpenNow := nowMs >= o
+                break
+    [isOpenNow, openMs, closeMs]
+
+barSessionCloseMs(int barMs, string tz, int openMin, int closeMin) =>
+    int y = year(barMs, tz)
+    int mo = month(barMs, tz)
+    int d = dayofmonth(barMs, tz)
+    int barMin = hour(barMs, tz) * 60 + minute(barMs, tz)
+    int c = int(timestamp(tz, y, mo, d, hourOf(closeMin), minuteOf(closeMin), 0))
+    if closeMin <= openMin and barMin >= openMin
+        c += DAY_MS
+    c
+
+// ---------------------------------------------------------------------------
+// Session membership and band resolution
+// ---------------------------------------------------------------------------
+
+bool intraday = timeframe.isintraday
+
+string sydneySess = composeSession(sydneyHrs, sydneyDays)
+string tokyoSess  = composeSession(tokyoHrs, tokyoDays)
+string londonSess = composeSession(londonHrs, londonDays)
+string customSess = composeSession(customHrs, customDays)
+
+string nyFamilyResolved = nyFamily == FAMILY_AUTO ? (syminfo.type == "futures" ? FAMILY_FUTURES : FAMILY_EQUITIES) : nyFamily
+string nySess = nyMode == MODE_RTH ? composeSession(nyHrsRth, nyDaysRth) : nyFamilyResolved == FAMILY_FUTURES ? composeSession(nyHrsEthFt, nyDaysEthFt) : composeSession(nyHrsEthEq, nyDaysEthEq)
+
+bool sydneyLive = intraday and sydneyOn and not na(time(timeframe.period, sydneySess, SYDNEY_TZ))
+bool tokyoLive  = intraday and tokyoOn  and not na(time(timeframe.period, tokyoSess, TOKYO_TZ))
+bool londonLive = intraday and londonOn and not na(time(timeframe.period, londonSess, LONDON_TZ))
+bool nyLive     = intraday and nyOn     and not na(time(timeframe.period, nySess, NY_TZ))
+bool customLive = intraday and customOn and not na(time(timeframe.period, customSess, syminfo.timezone))
+
+int liveCount = (customLive ? 1 : 0) + (nyLive ? 1 : 0) + (londonLive ? 1 : 0) + (tokyoLive ? 1 : 0) + (sydneyLive ? 1 : 0)
+int topIdx = customLive ? IDX_CUSTOM : nyLive ? IDX_NY : londonLive ? IDX_LONDON : tokyoLive ? IDX_TOKYO : sydneyLive ? IDX_SYDNEY : -1
+
+var array<string> bandNames    = array.from(customName, NAME_NY, NAME_LONDON, NAME_TOKYO, NAME_SYDNEY)
+var array<color>  bandColors   = array.from(customCol, nyCol, londonCol, tokyoCol, sydneyCol)
+var array<string> bandTz       = array.from(syminfo.timezone, NY_TZ, LONDON_TZ, TOKYO_TZ, SYDNEY_TZ)
+var array<string> bandSessions = array.from(customSess, nySess, londonSess, tokyoSess, sydneySess)
+var array<bool>   bandEnabled  = array.from(customOn, nyOn, londonOn, tokyoOn, sydneyOn)
+
+[customOpenMin, customCloseMin] = sessionMinutes(customSess)
+[nyOpenMin, nyCloseMin]         = sessionMinutes(nySess)
+[londonOpenMin, londonCloseMin] = sessionMinutes(londonSess)
+[tokyoOpenMin, tokyoCloseMin]   = sessionMinutes(tokyoSess)
+[sydneyOpenMin, sydneyCloseMin] = sessionMinutes(sydneySess)
+
+var array<int> bandOpenMin  = array.from(customOpenMin, nyOpenMin, londonOpenMin, tokyoOpenMin, sydneyOpenMin)
+var array<int> bandCloseMin = array.from(customCloseMin, nyCloseMin, londonCloseMin, tokyoCloseMin, sydneyCloseMin)
+
+// ---------------------------------------------------------------------------
+// Band precedence
+// ---------------------------------------------------------------------------
+
+int safeIdx = math.max(topIdx, 0)
+
+// ---------------------------------------------------------------------------
+// Session boxes and name labels
+// ---------------------------------------------------------------------------
+
+// A ta.* call must run on every bar, so it lives on its own global line and is read from there.
+float atrNow = ta.atr(ATR_LENGTH)
+
+var array<label> liveTags   = array.new<label>(BAND_COUNT, na)
+var array<int>   tagStart   = array.new<int>(BAND_COUNT, na)
+var array<int>   tagSlot    = array.new<int>(BAND_COUNT, na)
+var array<bool>  wasLive    = array.new<bool>(BAND_COUNT, false)
+var array<bool>  liveNow    = array.new<bool>(BAND_COUNT, false)
+var array<label> tagHistory = array.new<label>()
+
+var array<int> soloFrom = array.new<int>(BAND_COUNT, na)
+var array<int> soloTo   = array.new<int>(BAND_COUNT, na)
+var array<int> soloCur  = array.new<int>(BAND_COUNT, na)
+// Longest stretch a session held alone, so its name never repeats what the overlap name says.
+// Longest rather than first-to-last: a session can be alone, share, then be alone again.
+
+var array<int> sessKey = array.new<int>(BAND_COUNT, na)
+
+var array<float> sessTop = array.new<float>(BAND_COUNT, na)
+var array<float> sessBot = array.new<float>(BAND_COUNT, na)
+
+var array<bool> everLive = array.new<bool>(BAND_COUNT, false)
+
+var array<box>   liveBoxes     = array.new<box>(BAND_COUNT, na)
+var array<box>   boxHistory    = array.new<box>()
+
+var array<box> liveSlices = array.new<box>(BAND_COUNT * MAX_GRADIENT_STEPS, na)
+
+array.set(liveNow, IDX_CUSTOM, customLive)
+array.set(liveNow, IDX_NY, nyLive)
+array.set(liveNow, IDX_LONDON, londonLive)
+array.set(liveNow, IDX_TOKYO, tokyoLive)
+array.set(liveNow, IDX_SYDNEY, sydneyLive)
+
+string tagSize = textSizeOf(labelSize)
+
+string boxLine          = lineStyleOf(borderStyle)
+bool   drawSessionBoxes = showBoxes and overlapMode != OVERLAP_ONLY
+bool   drawOverlapBox   = showBoxes and overlapMode != OVERLAP_OFF
+
+bool drawSessionLabels = showLabels and overlapMode != OVERLAP_ONLY
+bool drawOverlapLabel  = showLabels and drawOverlapBox
+
+int  gradSteps   = gradientStepsOf(fillGradient)
+int  gradDepth   = gradientDepthOf(fillGradient)
+bool gradientOn  = fillBoxes and gradSteps > 1
+bool gradVert    = fillGradDir == GRAD_VERTICAL
+int  perInstance = gradientOn ? gradSteps + 1 : 1
+
+// The input counts RUNS; the registry counts BOXES, and a gradient run costs one per step.
+int keptInstances = math.max(1, math.min(maxBoxes, int(math.floor(BOX_REGISTRY_BUDGET / perInstance)) - (BAND_COUNT + 1)))
+int keptBoxes     = keptInstances * perInstance
+
+bool anyInstanceChange = false
+
+for i = 0 to BAND_COUNT - 1
+    bool live = array.get(liveNow, i)
+    bool prev = array.get(wasLive, i)
+    // A run is identified by its own close instant, not by a stretch of live bars: a session
+    // covering every bar on the chart never produces a live-to-not-live transition.
+    int  keyNow  = barSessionCloseMs(time, array.get(bandTz, i), array.get(bandOpenMin, i), array.get(bandCloseMin, i))
+    int  keyPrev = nz(array.get(sessKey, i), -1)
+    bool sameRun = live and prev and keyNow == keyPrev
+    bool ended   = prev and not sameRun
+    bool started = live and not sameRun
+    if ended or started
+        anyInstanceChange := true
+    // Freeze FIRST and as its own `if`: on a new run's opening bar both ended and started fire.
+    if ended
+        box doneBox = array.get(liveBoxes, i)
+        if not na(doneBox)
+            if array.size(boxHistory) >= keptBoxes
+                box.delete(array.shift(boxHistory))
+            array.push(boxHistory, doneBox)
+            array.set(liveBoxes, i, na)
+        for k = 0 to MAX_GRADIENT_STEPS - 1
+            box doneSlice = array.get(liveSlices, i * MAX_GRADIENT_STEPS + k)
+            if not na(doneSlice)
+                if array.size(boxHistory) >= keptBoxes
+                    box.delete(array.shift(boxHistory))
+                array.push(boxHistory, doneSlice)
+                array.set(liveSlices, i * MAX_GRADIENT_STEPS + k, na)
+        label doneTag = array.get(liveTags, i)
+        if not na(doneTag)
+            if array.size(tagHistory) >= maxLabels
+                label.delete(array.shift(tagHistory))
+            array.push(tagHistory, doneTag)
+        array.set(liveTags, i, na)
+        array.set(tagStart, i, na)
+        array.set(tagSlot, i, na)
+        array.set(sessTop, i, na)
+        array.set(sessBot, i, na)
+        array.set(sessKey, i, na)
+        array.set(soloFrom, i, na)
+        array.set(soloTo, i, na)
+        array.set(soloCur, i, na)
+    bool inComposite = drawOverlapLabel and liveCount >= 2
+    if started
+        array.set(soloFrom, i, na)
+        array.set(soloTo, i, na)
+        array.set(soloCur, i, na)
+    if live and not inComposite
+        if na(array.get(soloCur, i))
+            array.set(soloCur, i, bar_index)
+        int curLen  = bar_index - array.get(soloCur, i)
+        int bestLen = na(array.get(soloFrom, i)) ? -1 : array.get(soloTo, i) - array.get(soloFrom, i)
+        if curLen > bestLen
+            array.set(soloFrom, i, array.get(soloCur, i))
+            array.set(soloTo, i, bar_index)
+    else if live
+        array.set(soloCur, i, na)
+    if started
+        array.set(tagStart, i, bar_index)
+        array.set(sessKey, i, keyNow)
+        array.set(sessTop, i, high)
+        array.set(sessBot, i, low)
+        array.set(everLive, i, true)
+        int slot = 0
+        // The i > 0 guard is load-bearing: `for j = 0 to -1` counts DOWN in Pine rather than
+        // not running.
+        if i > 0
+            for j = 0 to i - 1
+                if array.get(liveNow, j)
+                    slot += 1
+        array.set(tagSlot, i, slot)
+        if drawSessionBoxes
+            color fillCol = array.get(bandColors, i)
+            array.set(liveBoxes, i, box.new(bar_index, high, bar_index, low, xloc = xloc.bar_index, border_color = color.new(fillCol, borderTransp), border_width = borderWidth, border_style = boxLine, bgcolor = fillBoxes and not gradientOn ? fillCol : na))
+            if gradientOn
+                for k = 0 to gradSteps - 1
+                    array.set(liveSlices, i * MAX_GRADIENT_STEPS + k, box.new(bar_index, high, bar_index, low, xloc = xloc.bar_index, border_color = color.new(color.gray, 100), bgcolor = sliceColorOf(fillCol, k, gradSteps, gradDepth)))
+        if drawSessionLabels
+            string tagText = na(array.get(soloFrom, i)) ? "" : array.get(bandNames, i)
+            label tag = label.new(bar_index, labelY(high, atrNow, slot), tagText, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = labelTextColor, size = tagSize, textalign = text.align_center)
+            array.set(liveTags, i, tag)
+    else if live
+        float topNow = math.max(nz(array.get(sessTop, i), high), high)
+        float botNow = math.min(nz(array.get(sessBot, i), low), low)
+        array.set(sessTop, i, topNow)
+        array.set(sessBot, i, botNow)
+        box growBox = array.get(liveBoxes, i)
+        if not na(growBox)
+            box.set_right(growBox, bar_index)
+            box.set_top(growBox, topNow)
+            box.set_bottom(growBox, botNow)
+        if gradientOn
+            float sliceHeight = (topNow - botNow) / gradSteps
+            int   runStart    = nz(array.get(tagStart, i), bar_index)
+            for k = 0 to gradSteps - 1
+                box growSlice = array.get(liveSlices, i * MAX_GRADIENT_STEPS + k)
+                if not na(growSlice)
+                    if gradVert
+                        box.set_left(growSlice, runStart)
+                        box.set_right(growSlice, bar_index)
+                        box.set_top(growSlice, topNow - k * sliceHeight)
+                        box.set_bottom(growSlice, topNow - (k + 1) * sliceHeight)
+                    else
+                        [sliceLeft, sliceRight] = sliceBars(runStart, bar_index, k, gradSteps)
+                        box.set_left(growSlice, sliceLeft)
+                        box.set_right(growSlice, sliceRight)
+                        box.set_top(growSlice, topNow)
+                        box.set_bottom(growSlice, botNow)
+        label tag = array.get(liveTags, i)
+        int startBar = array.get(tagStart, i)
+        if not na(tag) and not na(startBar)
+            int leftBar  = drawOverlapLabel ? array.get(soloFrom, i) : startBar
+            int rightBar = drawOverlapLabel ? array.get(soloTo, i) : bar_index
+            if na(leftBar)
+                label.set_text(tag, "")
+            else
+                label.set_text(tag, array.get(bandNames, i))
+                int midBar = int(math.floor((leftBar + rightBar) / 2.0))
+                int minBar = bar_index - MAX_DRAW_LOOKBACK
+                label.set_x(tag, midBar < minBar ? minBar : midBar)
+            label.set_y(tag, labelY(topNow, atrNow, nz(array.get(tagSlot, i), 0)))
+    array.set(wasLive, i, live)
+
+var box   overlapBox     = na
+var bool  overlapWas     = false
+var float overlapTop     = na
+var float overlapBot     = na
+var label overlapTag     = na
+var int   overlapLeftBar = na
+var int   overlapSlot    = na
+var array<box> overlapSlices = array.new<box>(MAX_GRADIENT_STEPS, na)
+bool overlapLive  = drawOverlapBox and liveCount >= 2
+bool overlapEnd   = overlapWas and (not overlapLive or anyInstanceChange)
+bool overlapStart = overlapLive and (not overlapWas or anyInstanceChange)
+
+if overlapEnd
+    if not na(overlapBox)
+        if array.size(boxHistory) >= keptBoxes
+            box.delete(array.shift(boxHistory))
+        array.push(boxHistory, overlapBox)
+        overlapBox := na
+    for k = 0 to MAX_GRADIENT_STEPS - 1
+        box doneOverlapSlice = array.get(overlapSlices, k)
+        if not na(doneOverlapSlice)
+            if array.size(boxHistory) >= keptBoxes
+                box.delete(array.shift(boxHistory))
+            array.push(boxHistory, doneOverlapSlice)
+            array.set(overlapSlices, k, na)
+    if not na(overlapTag)
+        if array.size(tagHistory) >= maxLabels
+            label.delete(array.shift(tagHistory))
+        array.push(tagHistory, overlapTag)
+        overlapTag := na
+    overlapTop := na
+    overlapBot := na
+    overlapLeftBar := na
+    overlapSlot := na
+if overlapStart
+    overlapTop := high
+    overlapBot := low
+    overlapLeftBar := bar_index
+    overlapSlot := 0
+    overlapBox := box.new(bar_index, high, bar_index, low, xloc = xloc.bar_index, border_color = color.new(overlapCol, borderTransp), border_width = borderWidth, border_style = boxLine, bgcolor = fillBoxes and not gradientOn ? overlapCol : na)
+    if gradientOn
+        for k = 0 to gradSteps - 1
+            array.set(overlapSlices, k, box.new(bar_index, high, bar_index, low, xloc = xloc.bar_index, border_color = color.new(color.gray, 100), bgcolor = sliceColorOf(overlapCol, k, gradSteps, gradDepth)))
+    if drawOverlapLabel
+        string overlapName = ""
+        for j = 0 to BAND_COUNT - 1
+            if array.get(liveNow, j)
+                overlapName := str.length(overlapName) == 0 ? array.get(bandNames, j) : overlapName + " + " + array.get(bandNames, j)
+        overlapTag := label.new(bar_index, labelY(high, atrNow, overlapSlot), overlapName, xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = labelTextColor, size = tagSize, textalign = text.align_center)
+else if overlapLive
+    overlapTop := math.max(nz(overlapTop, high), high)
+    overlapBot := math.min(nz(overlapBot, low), low)
+    if not na(overlapBox)
+        box.set_right(overlapBox, bar_index)
+        box.set_top(overlapBox, overlapTop)
+        box.set_bottom(overlapBox, overlapBot)
+    if gradientOn
+        float overlapSliceHeight = (overlapTop - overlapBot) / gradSteps
+        int   overlapRunStart    = nz(overlapLeftBar, bar_index)
+        for k = 0 to gradSteps - 1
+            box growOverlapSlice = array.get(overlapSlices, k)
+            if not na(growOverlapSlice)
+                if gradVert
+                    box.set_left(growOverlapSlice, overlapRunStart)
+                    box.set_right(growOverlapSlice, bar_index)
+                    box.set_top(growOverlapSlice, overlapTop - k * overlapSliceHeight)
+                    box.set_bottom(growOverlapSlice, overlapTop - (k + 1) * overlapSliceHeight)
+                else
+                    [overlapSliceLeft, overlapSliceRight] = sliceBars(overlapRunStart, bar_index, k, gradSteps)
+                    box.set_left(growOverlapSlice, overlapSliceLeft)
+                    box.set_right(growOverlapSlice, overlapSliceRight)
+                    box.set_top(growOverlapSlice, overlapTop)
+                    box.set_bottom(growOverlapSlice, overlapBot)
+    if not na(overlapTag) and not na(overlapLeftBar)
+        int overlapMid = int(math.floor((overlapLeftBar + bar_index) / 2.0))
+        int overlapMin = bar_index - MAX_DRAW_LOOKBACK
+        label.set_x(overlapTag, overlapMid < overlapMin ? overlapMin : overlapMid)
+        label.set_y(overlapTag, labelY(overlapTop, atrNow, nz(overlapSlot, 0)))
+overlapWas := overlapLive
+
+// ---------------------------------------------------------------------------
+// Countdown math
+// ---------------------------------------------------------------------------
+
+int secsLeft = na(time_close) ? na : int(math.max(0.0, math.ceil((time_close - timenow) / 1000.0)))
+
+// barstate.isrealtime alone is true during Bar Replay and on a delayed feed, where timenow is
+// the real wall clock and the bar's close is already behind it.
+bool genuinelyLive = barstate.isrealtime and not na(time_close) and time_close > timenow
+
+// The dashboard only ever draws on the last bar, so its clock, dot, progress and NEXT read the
+// real wall clock -- a Saturday chart or a Bar Replay would otherwise report a frozen bar close
+// as "now". BAR CLOSE and BARS LEFT stay bar-based below; that split is deliberate.
+int effectiveNow = timenow
+
+float barDurationMs = timeframe.in_seconds() * 1000.0
+
+int topOpenMin  = array.get(bandOpenMin, safeIdx)
+int topCloseMin = array.get(bandCloseMin, safeIdx)
+float topSessionCloseMs = topIdx < 0 or not intraday ? na : barSessionCloseMs(time, array.get(bandTz, safeIdx), topOpenMin, topCloseMin)
+int barsLeft = na(topSessionCloseMs) or na(time_close) or barDurationMs <= 0 ? na : int(math.max(0.0, math.ceil((topSessionCloseMs - time_close) / barDurationMs)))
+
+int topDurationMin = topCloseMin > topOpenMin ? topCloseMin - topOpenMin : topCloseMin - topOpenMin + 1440
+float topTotalBars = topIdx < 0 or barDurationMs <= 0 ? na : topDurationMin * 60000.0 / barDurationMs
+float barsLeftFraction = na(barsLeft) or na(topTotalBars) or topTotalBars <= 0 ? na : barsLeft / topTotalBars
+
+float barCloseFraction = not genuinelyLive or na(secsLeft) or timeframe.in_seconds() <= 0 ? na : secsLeft / (timeframe.in_seconds() * 1.0)
+
+// ---------------------------------------------------------------------------
+// Dashboard
+// ---------------------------------------------------------------------------
+
+var table panel = na
+
+if barstate.islast and showPanel
+    int enabledSessionCount = (customOn ? 1 : 0) + (nyOn ? 1 : 0) + (londonOn ? 1 : 0) + (tokyoOn ? 1 : 0) + (sydneyOn ? 1 : 0)
+    if na(panel)
+        panel := table.new(positionOf(panelPosition), 7, enabledSessionCount + PANEL_HEAD_ROWS + 1, bgcolor = panelBg, frame_color = color.new(PANEL_FRAME_NEUTRAL, 55), frame_width = panelFrame == FRAME_OFF ? 0 : panelFrameWidth, border_color = color.new(PANEL_GRID, 70), border_width = panelGrid ? 1 : 0)
+        table.merge_cells(panel, 0, 0, 6, 0)
+
+    string pSize = textSizeOf(panelSize)
+    color  ink   = color.white
+
+    table.cell(panel, 0, 0, "WORLD SESSIONS", text_color = ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace, text_formatting = text.format_bold)
+
+    table.cell(panel, 0, 1, timeframeLabel(), text_color = ink, text_size = pSize, text_halign = text.align_left, text_font_family = font.family_monospace)
+    table.cell(panel, 1, 1, "SESSION", text_color = ink, text_size = pSize, text_halign = text.align_left, text_font_family = font.family_monospace)
+    table.cell(panel, 3, 1, "HOURS", text_color = ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace)
+    table.cell(panel, 4, 1, "LOCAL", text_color = ink, text_size = pSize, text_halign = text.align_right, text_font_family = font.family_monospace)
+    table.cell(panel, 5, 1, "PROGRESS", text_color = ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace)
+    table.cell(panel, 6, 1, "NEXT", text_color = ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace)
+
+    int row = PANEL_HEAD_ROWS
+    for i = 0 to BAND_COUNT - 1
+        if array.get(bandEnabled, i)
+            color  rowCol = array.get(bandColors, i)
+            string rowTz  = array.get(bandTz, i)
+            [isOpenNow, openMs, closeMs] = sessionWindow(array.get(bandSessions, i), rowTz, effectiveNow)
+            int rowOpenMin  = array.get(bandOpenMin, i)
+            int rowCloseMin = array.get(bandCloseMin, i)
+            float progress = isOpenNow and not na(openMs) and not na(closeMs) and closeMs > openMs ? math.max(0.0, math.min(1.0, (effectiveNow - openMs) / (closeMs - openMs))) : 0.0
+            int boundaryMs = isOpenNow ? closeMs : openMs
+            int secsUntil = na(boundaryMs) ? na : int(math.max(0.0, math.ceil((boundaryMs - effectiveNow) / 1000.0)))
+            string verb = isOpenNow ? "CLOSES IN " : "OPENS IN "
+            bool noBars = intraday and not array.get(everLive, i)
+            color rowBg = isOpenNow ? color.new(rowCol, 88) : na
+            // A single space, not an empty string: a column with no content has no width.
+            table.cell(panel, 0, row, " ", text_size = pSize, bgcolor = color.new(rowCol, 0), text_font_family = font.family_monospace)
+            table.cell(panel, 1, row, array.get(bandNames, i), text_color = color.new(rowCol, 0), text_size = pSize, text_halign = text.align_left, text_formatting = isOpenNow ? text.format_bold : text.format_none, bgcolor = rowBg, text_font_family = font.family_monospace)
+            table.cell(panel, 2, row, isOpenNow ? "●" : "○", text_color = isOpenNow ? color.new(rowCol, 0) : ink, text_size = pSize, bgcolor = rowBg, text_font_family = font.family_monospace)
+            table.cell(panel, 3, row, hoursTextOf(rowOpenMin, rowCloseMin), text_color = ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace, bgcolor = rowBg)
+            table.cell(panel, 4, row, clockOf(effectiveNow, rowTz) + dayShiftOf(effectiveNow, rowTz), text_color = ink, text_size = pSize, text_halign = text.align_right, text_font_family = font.family_monospace, bgcolor = rowBg)
+            string progressText = noBars ? "No bars here" : isOpenNow ? progressBarOf(progress, progressWidth) : "Not in session"
+            table.cell(panel, 5, row, progressText, text_color = isOpenNow ? color.new(rowCol, 0) : ink, text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace, bgcolor = rowBg)
+            table.cell(panel, 6, row, na(secsUntil) ? "" : verb + formatCountdown(secsUntil), text_color = ink, text_size = pSize, text_halign = text.align_right, text_font_family = font.family_monospace, bgcolor = rowBg)
+            row += 1
+
+    string barCloseText = showBarClose ? (genuinelyLive and not na(secsLeft) ? formatCountdown(secsLeft) : "—") : ""
+    string barsLeftText = showBarsLeft ? (na(barsLeft) ? "—" : str.tostring(barsLeft, "0")) : ""
+    string barsLeftLabel = not showBarsLeft ? "" : topIdx < 0 ? "BARS LEFT" : "BARS LEFT · " + array.get(bandNames, safeIdx)
+    table.cell(panel, 1, row, showBarClose ? "BAR CLOSE" : "", text_color = ink, text_size = pSize, text_halign = text.align_left, text_font_family = font.family_monospace)
+    table.cell(panel, 3, row, barCloseText, text_color = urgencyColorOf(barCloseFraction, ink), text_size = pSize, text_halign = text.align_center, text_font_family = font.family_monospace)
+    table.cell(panel, 5, row, barsLeftLabel, text_color = ink, text_size = pSize, text_halign = text.align_right, text_font_family = font.family_monospace)
+    table.cell(panel, 6, row, barsLeftText, text_color = urgencyColorOf(barsLeftFraction, ink), text_size = pSize, text_halign = text.align_right, text_font_family = font.family_monospace)
+
+    if panelFrame == FRAME_COUNTDOWN
+        table.set_frame_color(panel, urgencyColorOf(barsLeftFraction, color.new(PANEL_FRAME_NEUTRAL, 55)))
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+plot(secsLeft, "Seconds to bar close", display = display.data_window)
+plot(barsLeft, "Bars left in session", display = display.data_window)
+
+// bar_index > 0 guards every [1] read: Pine has no series-bool overload for na() or nz(), and
+// `and` short-circuits so the reference is never evaluated on bar zero.
+alertcondition(bar_index > 0 and sydneyLive and not sydneyLive[1], "Sydney session open", "World Sessions: Sydney session has opened")
+alertcondition(bar_index > 0 and tokyoLive and not tokyoLive[1], "Tokyo session open", "World Sessions: Tokyo session has opened")
+alertcondition(bar_index > 0 and londonLive and not londonLive[1], "London session open", "World Sessions: London session has opened")
+alertcondition(bar_index > 0 and nyLive and not nyLive[1], "New York session open", "World Sessions: New York session has opened")
+alertcondition(bar_index > 0 and liveCount == 0 and liveCount[1] > 0, "All sessions closed", "World Sessions: every enabled session is now closed")
+alertcondition(bar_index > 0 and liveCount >= 2 and liveCount[1] < 2, "Session overlap start", "World Sessions: two or more sessions are now live")
+
+alertcondition(genuinelyLive and alertSecondsLeft > 0 and not na(secsLeft) and secsLeft <= alertSecondsLeft, "N seconds to bar close", "World Sessions: bar close approaching")
+alertcondition(genuinelyLive and alertLastBar and topIdx >= 0 and barsLeft == 0, "Last bar of session", "World Sessions: last bar of the session")

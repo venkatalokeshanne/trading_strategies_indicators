@@ -1,0 +1,1331 @@
+ // This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © cryptosquanch
+
+
+//@version=6
+strategy(
+     title               = "EMA Stack Strategy (DCA or Single Entry, HTF Logic, Non Repainting)",
+     shorttitle          = "EMA Stack Strat",
+     overlay             = true,
+     scale               = scale.right,
+     pyramiding          = 50,
+     initial_capital     = 100000,
+     currency            = currency.USD,
+     default_qty_type    = strategy.cash,
+     default_qty_value   = 1000,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0,
+     slippage            = 0
+)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Utilities
+//──────────────────────────────────────────────────────────────────────────────
+ma(_source, _length, _type) =>
+    switch _type
+        "SMA"        => ta.sma(_source,  _length)
+        "EMA"        => ta.ema(_source,  _length)
+        "SMMA (RMA)" => ta.rma(_source,  _length)
+        "WMA"        => ta.wma(_source,  _length)
+        "VWMA"       => ta.vwma(_source, _length)
+        => na
+
+
+clamp(_x, _min, _max) =>
+    math.max(_min, math.min(_max, _x))
+
+
+timeStrToMinutes(_s) =>
+    _parts = str.split(_s, ":")
+    _h = array.size(_parts) > 0 ? int(str.tonumber(array.get(_parts, 0))) : 0
+    _m = array.size(_parts) > 1 ? int(str.tonumber(array.get(_parts, 1))) : 0
+    _h * 60 + _m
+
+
+inWindowHHMM(_enabled, _startHHMM, _endHHMM, _tz) =>
+    if not _enabled
+        false
+    else
+        _nowH = hour(time, _tz)
+        _nowM = minute(time, _tz)
+        _now  = _nowH * 60 + _nowM
+        _st   = timeStrToMinutes(_startHHMM)
+        _en   = timeStrToMinutes(_endHHMM)
+        _st <= _en ? (_now >= _st and _now <= _en) : (_now >= _st or _now <= _en)
+
+
+// Distance helper (returns absolute PRICE distance)
+distPrice(_mode, _anchorPrice, _unitSize, _units, _pct, _atr, _atrMult) =>
+    switch _mode
+        "Units"   => (_units * _unitSize)
+        "Percent" => (_anchorPrice * (_pct / 100.0))
+        "ATR"     => (_atr * _atrMult)
+        => na
+
+
+isLastBar = barstate.isrealtime or barstate.islastconfirmedhistory
+execConfirmed = barstate.isconfirmed
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// INPUTS (ORDERED TO MATCH YOUR SETTINGS PANEL)
+//──────────────────────────────────────────────────────────────────────────────
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 1) HELP / OVERVIEW + STATUS TABLE
+//──────────────────────────────────────────────────────────────────────────────
+uiGroup = "📘 HELP / STATUS"
+
+
+showHelpPanel   = input.bool(true, "Show on-chart help panel", group = uiGroup)
+helpBg          = input.color(color.new(color.black, 65), "Help panel background", group = uiGroup)
+helpTxt         = input.color(color.white, "Help panel text", group = uiGroup)
+
+
+showStatusTable = input.bool(false, "Show status table", group = uiGroup)
+tablePos = input.string("Top Right", "Table position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = uiGroup)
+tblBgCol = input.color(color.new(color.black, 65), "Table background", group = uiGroup)
+tblTxtCol= input.color(color.white, "Table text", group = uiGroup)
+
+
+showTvStyleTip  = input.bool(false, "Show TradingView style tip (hide trade markers)", group = uiGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 2) MODE
+//──────────────────────────────────────────────────────────────────────────────
+modeGroup = "🧭 MODE"
+tradeMode = input.string("DCA / Grid", "Trading mode", options = ["DCA / Grid", "Single Entry"], group = modeGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 3) UNITS
+//──────────────────────────────────────────────────────────────────────────────
+unitGroup = "📐 UNITS"
+unitMode  = input.string("Pips (FX)", "Unit mode", options = ["Ticks", "Points", "Pips (FX)"], group = unitGroup)
+pointSize = input.float(0.01, "Point size (if Points)", step = 0.0001, group = unitGroup)
+pipSizeFX = input.float(0.01, "Pip size (if Pips FX)", step = 0.0001, group = unitGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 4) MA SETTINGS (+ ATR)
+//──────────────────────────────────────────────────────────────────────────────
+maGroup = "📈 MA SETTINGS"
+
+
+maTfMode = input.string("Current Chart", "MA logic timeframe", options = ["Current Chart", "Higher TF"], group = maGroup)
+maTf     = input.timeframe("D", "Higher TF", group = maGroup)
+
+
+ma1_type   = input.string("EMA", "MA #1 Type", options = ["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = maGroup, inline = "m1")
+ma1_source = input.source(close, "", group = maGroup, inline = "m1")
+ma1_length = input.int(10, "", minval = 1, group = maGroup, inline = "m1")
+ma1_color  = input.color(color.new(#f6c309, 0), "MA #1 Color", group = maGroup)
+
+
+ma2_type   = input.string("EMA", "MA #2 Type", options = ["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = maGroup, inline = "m2")
+ma2_source = input.source(close, "", group = maGroup, inline = "m2")
+ma2_length = input.int(25, "", minval = 1, group = maGroup, inline = "m2")
+ma2_color  = input.color(color.new(#fb9800, 0), "MA #2 Color", group = maGroup)
+
+
+use_ma3    = input.bool(true, "Use MA #3 filter", group = maGroup, inline = "m3")
+ma3_type   = input.string("EMA", "", options = ["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = maGroup, inline = "m3")
+ma3_source = input.source(close, "", group = maGroup, inline = "m3")
+ma3_length = input.int(50, "", minval = 1, group = maGroup, inline = "m3")
+ma3_color  = input.color(color.new(color.blue, 0), "MA #3 Color", group = maGroup)
+
+
+use_ma4    = input.bool(true, "Use MA #4 filter", group = maGroup, inline = "m4")
+ma4_type   = input.string("EMA", "", options = ["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group = maGroup, inline = "m4")
+ma4_source = input.source(close, "", group = maGroup, inline = "m4")
+ma4_length = input.int(100, "", minval = 1, group = maGroup, inline = "m4")
+ma4_color  = input.color(color.new(color.green, 0), "MA #4 Color", group = maGroup)
+
+
+atrGroup  = "📉 ATR SETTINGS"
+atrLen    = input.int(14, "ATR length", minval = 1, group = atrGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 5) ENTRY RULES
+//──────────────────────────────────────────────────────────────────────────────
+entryGroup      = "✅ ENTRY RULES"
+stackHoldCloses = input.int(0, "Enter after stack holds X confirmed closes", minval = 0, group = entryGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 6) DCA / GRID SETTINGS (DCA mode only)
+//──────────────────────────────────────────────────────────────────────────────
+dcaGroup = "🧱 DCA / GRID SETTINGS — used only if DCA mode"
+
+
+dcaSizingMode = input.string("Auto Grid", "DCA sizing mode", options = ["Auto Grid", "Manual Ladder"], group = dcaGroup)
+maxEntries    = input.int(15, "Max total entries (1..25)", minval = 1, maxval = 25, group = dcaGroup)
+
+
+baseCash     = input.float(1000, "Base order size ($)", step = 50, minval = 0, group = dcaGroup)
+maxTotalCash = input.float(15000, "Max total position cash ($ cap)", step = 100, minval = 0, group = dcaGroup)
+
+
+dcaMode      = input.string("Units", "DCA distance mode", options = ["Units", "Percent", "ATR"], group = dcaGroup)
+baseDcaUnits = input.float(25.0, "Base interval (Units)", step = 0.1, group = dcaGroup)
+baseDcaPct   = input.float(0.25, "Base interval (%)", step = 0.01, group = dcaGroup)
+baseDcaAtrM  = input.float(1.0, "Base interval (ATR mult)", step = 0.1, group = dcaGroup)
+
+
+stepScale    = input.float(1.12, "Step scale (spacing growth)", step = 0.01, minval = 0.1, group = dcaGroup)
+volumeScale  = input.float(1.40, "Volume scale (size growth)", step = 0.01, minval = 0.1, group = dcaGroup)
+
+
+anchorMode   = input.string("First Entry", "DCA anchor mode", options = ["First Entry", "Average Entry"], group = dcaGroup)
+allowDcaAdds = input.bool(true, "Enable DCA adds", group = dcaGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 7) MANUAL LADDER SIZES ($) — used only if Manual Ladder
+//──────────────────────────────────────────────────────────────────────────────
+manualGroup = "🧰 MANUAL LADDER SIZES ($) — used only if Manual Ladder"
+
+
+e01 = input.float(1000, "Entry #1 ($)",  step=50, group=manualGroup)
+e02 = input.float(1000, "Entry #2 ($)",  step=50, group=manualGroup)
+e03 = input.float(1000, "Entry #3 ($)",  step=50, group=manualGroup)
+e04 = input.float(1000, "Entry #4 ($)",  step=50, group=manualGroup)
+e05 = input.float(1000, "Entry #5 ($)",  step=50, group=manualGroup)
+e06 = input.float(1000, "Entry #6 ($)",  step=50, group=manualGroup)
+e07 = input.float(1000, "Entry #7 ($)",  step=50, group=manualGroup)
+e08 = input.float(1000, "Entry #8 ($)",  step=50, group=manualGroup)
+e09 = input.float(1000, "Entry #9 ($)",  step=50, group=manualGroup)
+e10 = input.float(1000, "Entry #10 ($)", step=50, group=manualGroup)
+e11 = input.float(1000, "Entry #11 ($)", step=50, group=manualGroup)
+e12 = input.float(1000, "Entry #12 ($)", step=50, group=manualGroup)
+e13 = input.float(1000, "Entry #13 ($)", step=50, group=manualGroup)
+e14 = input.float(1000, "Entry #14 ($)", step=50, group=manualGroup)
+e15 = input.float(1000, "Entry #15 ($)", step=50, group=manualGroup)
+e16 = input.float(1000, "Entry #16 ($)", step=50, group=manualGroup)
+e17 = input.float(1000, "Entry #17 ($)", step=50, group=manualGroup)
+e18 = input.float(1000, "Entry #18 ($)", step=50, group=manualGroup)
+e19 = input.float(1000, "Entry #19 ($)", step=50, group=manualGroup)
+e20 = input.float(1000, "Entry #20 ($)", step=50, group=manualGroup)
+e21 = input.float(1000, "Entry #21 ($)", step=50, group=manualGroup)
+e22 = input.float(1000, "Entry #22 ($)", step=50, group=manualGroup)
+e23 = input.float(1000, "Entry #23 ($)", step=50, group=manualGroup)
+e24 = input.float(1000, "Entry #24 ($)", step=50, group=manualGroup)
+e25 = input.float(1000, "Entry #25 ($)", step=50, group=manualGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 8) EXITS (DCA TP/TRAIL + SINGLE EXIT MODES)
+//──────────────────────────────────────────────────────────────────────────────
+exitGroup = "🏁 EXITS (DCA TP/TRAIL + SINGLE EXIT MODES)"
+
+
+// DCA TP/Trail (Avg entry)
+tpMode  = input.string("Units", "DCA take profit mode (Avg BE ± offset)", options = ["Units", "Percent", "ATR"], group = exitGroup)
+tpUnits = input.float(100.0, "TP after breakeven (Units)", step = 0.1, group = exitGroup)
+tpPct   = input.float(0.10, "TP after breakeven (%)", step = 0.01, group = exitGroup)
+tpAtrM  = input.float(1.0, "TP after breakeven (ATR mult)", step = 0.1, group = exitGroup)
+
+
+trailEnable = input.bool(false, "Enable DCA trailing stop (default OFF)", group = exitGroup)
+trailActMode= input.string("Units", "DCA trail activation mode", options = ["Units", "Percent", "ATR"], group = exitGroup)
+trailActU   = input.float(100.0, "Activate after profit (Units)", step = 0.1, group = exitGroup)
+trailActPct = input.float(0.10, "Activate after profit (%)", step = 0.01, group = exitGroup)
+trailActAtrM= input.float(1.0, "Activate after profit (ATR mult)", step = 0.1, group = exitGroup)
+
+
+trailMode   = input.string("Units", "DCA trail distance mode", options = ["Units", "Percent", "ATR"], group = exitGroup)
+trailUnits  = input.float(50.0, "Trail distance (Units)", step = 0.1, group = exitGroup)
+trailPct    = input.float(0.05, "Trail distance (%)", step = 0.01, group = exitGroup)
+trailAtrM   = input.float(0.5, "Trail distance (ATR mult)", step = 0.1, group = exitGroup)
+
+
+// ✅ NEW: DCA exit selector + MA kill toggle + last-DCA offset settings
+dcaExitType = input.string(
+     "BE TP (Current)",
+     "DCA exit type",
+     options = ["BE TP (Current)", "After Last DCA (Offset)"],
+     group = exitGroup
+)
+
+
+dcaDisableMaKill = input.bool(false, "Disable MA kill switch (DCA mode)", group = exitGroup)
+
+
+dcaLastExitMode  = input.string("Units", "Last DCA exit offset mode", options = ["Units", "Percent"], group = exitGroup)
+dcaLastExitUnits = input.float(100.0, "Exit offset after last DCA (Units)", step = 0.1, group = exitGroup)
+dcaLastExitPct   = input.float(0.10,  "Exit offset after last DCA (%)",     step = 0.01, group = exitGroup)
+
+
+
+
+// Single exit system (inputs live under same Exits header for cleaner panel)
+singleExitType = input.string("ATR Bracket", "Single entry exit type (Single mode only)",
+    options = ["MA Cross", "ATR Bracket", "R:R Bracket", "Percent Bracket", "Time Stop"], group = exitGroup)
+
+
+// ATR bracket
+atrStopM = input.float(1.5, "ATR Stop Mult", step = 0.1, group = exitGroup)
+atrTpM   = input.float(3.0, "ATR TP Mult", step = 0.1, group = exitGroup)
+
+
+// R:R bracket
+rrStopMethod = input.string("ATR", "R:R Stop Method", options = ["ATR", "Swing"], group = exitGroup)
+rrAtrStopM   = input.float(1.5, "R:R ATR Stop Mult (if ATR)", step = 0.1, group = exitGroup)
+swingLb      = input.int(20, "Swing Lookback (if Swing)", minval = 1, group = exitGroup)
+swingBufU    = input.float(0.0, "Swing Buffer (Units)", step = 0.1, group = exitGroup)
+rrRatio      = input.float(2.0, "Risk:Reward (e.g., 2.0)", step = 0.1, minval = 0.1, group = exitGroup)
+
+
+// Percent bracket
+stopPctSingle = input.float(1.0, "Stop (%)", step = 0.1, minval = 0.01, group = exitGroup)
+tpPctSingle   = input.float(2.0, "Take Profit (%)", step = 0.1, minval = 0.01, group = exitGroup)
+
+
+// Time stop
+timeStopBars = input.int(50, "Time Stop (bars)", minval = 1, group = exitGroup)
+
+
+// Break-even
+beEnable   = input.bool(false, "Enable Break-even move (Single mode)", group = exitGroup)
+beTrigMode = input.string("ATR", "BE Trigger Mode", options = ["Units", "Percent", "ATR"], group = exitGroup)
+beTrigU    = input.float(50.0, "BE Trigger (Units)", step = 0.1, group = exitGroup)
+beTrigPct  = input.float(0.5, "BE Trigger (%)", step = 0.1, group = exitGroup)
+beTrigAtrM = input.float(1.0, "BE Trigger (ATR mult)", step = 0.1, group = exitGroup)
+beOffsetU  = input.float(0.0, "BE Stop Offset (Units)", step = 0.1, group = exitGroup)
+
+
+// Single trailing (independent overlay)
+seTrailEnable   = input.bool(false, "Enable Single Entry Trailing Stop", group = exitGroup)
+seTrailActMode  = input.string("ATR", "SE trail activation mode", options = ["Units", "Percent", "ATR"], group = exitGroup)
+seTrailActU     = input.float(50.0, "SE trail activate after profit (Units)", step = 0.1, group = exitGroup)
+seTrailActPct   = input.float(0.5, "SE trail activate after profit (%)", step = 0.1, group = exitGroup)
+seTrailActAtrM  = input.float(1.0, "SE trail activate after profit (ATR mult)", step = 0.1, group = exitGroup)
+
+
+seTrailDistMode = input.string("ATR", "SE trail distance mode", options = ["Units", "Percent", "ATR"], group = exitGroup)
+seTrailDistU    = input.float(25.0, "SE trail distance (Units)", step = 0.1, group = exitGroup)
+seTrailDistPct  = input.float(0.25, "SE trail distance (%)", step = 0.01, group = exitGroup)
+seTrailDistAtrM = input.float(0.5, "SE trail distance (ATR mult)", step = 0.1, group = exitGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 9) VISUALS (LINES / PLOTS ONLY)
+//──────────────────────────────────────────────────────────────────────────────
+visGroup = "🎨 VISUALS"
+
+
+colNextLevel       = input.color(color.new(color.purple, 0), "Next DCA level line", group = visGroup)
+showNextLevelLine  = input.bool(true, "Show next DCA level line (DCA mode)", group = visGroup)
+
+
+showAvgEntryLine   = input.bool(true, "Show Avg Break Even line", group = visGroup)
+colAvgEntry        = input.color(color.new(color.white, 0), "Avg BE line color", group = visGroup)
+
+
+showTPLine         = input.bool(true, "Show Take Profit line (DCA mode)", group = visGroup)
+colTPLine          = input.color(color.new(color.lime, 0), "TP line color", group = visGroup)
+
+
+showLineLabels     = input.bool(true, "Show right-edge line labels (Avg/TP/Next DCA)", group = visGroup)
+lineLblBg          = input.color(color.new(color.black, 55), "Line label background", group = visGroup)
+lineLblTxt         = input.color(color.white, "Line label text", group = visGroup)
+
+
+// ✅ NEW (as requested): Two separate debug toggles
+showMaCrossTriangles = input.bool(false, "Show MA1/MA2 cross triangles", group = visGroup)
+showStackDiamonds    = input.bool(false, "Show stack confirmation diamonds", group = visGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 10) LABEL CALLOUTS (TRADE SUMMARIES)
+//──────────────────────────────────────────────────────────────────────────────
+calloutGroup = "🧷 LABEL CALLOUTS (TRADE SUMMARIES)"
+
+
+// What to show
+showTradeLabels     = input.bool(true, "Show trade summary labels", group = calloutGroup)
+showEntryInfoLabels = input.bool(true, "Show entry markers (Base + optional DCA)", group = calloutGroup)
+
+
+entryLabelMode = input.string(
+     "All DCA Entries",
+     "Entry/DCA markers mode",
+     options = ["Off", "Base Entries Only", "All DCA Entries"],
+     group = calloutGroup
+)
+
+
+// Callout placement / stacking (from your screenshot)
+useCallouts        = input.bool(true,  "Offset callouts from candles", group = calloutGroup)
+drawCalloutLines   = input.bool(true,  "Draw dotted connector lines to callouts", group = calloutGroup)
+
+
+calloutXBars       = input.int(1,      "Callout X offset (bars to the right)", minval = 0, maxval = 50, group = calloutGroup)
+calloutBaseAtr     = input.float(3,    "Base separation from price (ATR)", step = 0.1, group = calloutGroup)
+calloutStepAtr     = input.float(1.2,  "Vertical stack step (ATR)", step = 0.1, group = calloutGroup)
+calloutDetectAtr   = input.float(0.35, "Detect overlap distance (ATR)", step = 0.05, group = calloutGroup)
+calloutDetectBars  = input.int(8,      "Detect overlap within X bars", minval = 0, maxval = 100, group = calloutGroup)
+calloutMaxStack    = input.int(12,     "Max stacked callouts per cluster", minval = 1, maxval = 50, group = calloutGroup)
+calloutMemory      = input.int(250, "Callout memory (recycles old callouts)", minval = 50, maxval = 2000, group = calloutGroup)
+
+
+// Label colors (kept with callouts)
+entryInfoBg = input.color(color.new(color.black, 30), "Entry label bg", group = calloutGroup)
+entryInfoTxt= input.color(color.new(color.white, 0), "Entry label text", group = calloutGroup)
+
+
+colExitWin   = input.color(color.new(color.lime, 0), "Exit label (win base)", group = calloutGroup)
+colExitLoss  = input.color(color.new(color.red, 0), "Exit label (loss base)", group = calloutGroup)
+exitBoxTransparency = input.int(60, "Trade summary box transparency (0..100)", minval = 0, maxval = 100, group = calloutGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// 11) NO-NEW-TRADE WINDOWS
+//──────────────────────────────────────────────────────────────────────────────
+blockGroup = "⏰ NO-NEW-TRADE WINDOWS"
+
+
+tzOpt = input.string(
+     "America/New_York",
+     "Time zone",
+     options = [
+         "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+         "UTC", "Etc/UTC",
+         "Europe/London", "Europe/Paris",
+         "Asia/Tokyo", "Asia/Hong_Kong", "Asia/Singapore",
+         "Australia/Sydney"
+     ],
+     group = blockGroup
+)
+
+
+w1_en = input.bool(false, "Block window #1", group = blockGroup, inline = "w1")
+w1_st = input.string("16:45", "Start", group = blockGroup, inline = "w1", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+w1_enT= input.string("18:15", "End", group = blockGroup, inline = "w1", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+
+
+w2_en = input.bool(false, "Block window #2", group = blockGroup, inline = "w2")
+w2_st = input.string("00:00", "Start", group = blockGroup, inline = "w2", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+w2_enT= input.string("00:00", "End", group = blockGroup, inline = "w2", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+
+
+w3_en = input.bool(false, "Block window #3", group = blockGroup, inline = "w3")
+w3_st = input.string("00:00", "Start", group = blockGroup, inline = "w3", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+w3_enT= input.string("00:00", "End", group = blockGroup, inline = "w3", options =
+    ["00:00","00:15","00:30","00:45","01:00","01:15","01:30","01:45","02:00","02:15","02:30","02:45",
+     "03:00","03:15","03:30","03:45","04:00","04:15","04:30","04:45","05:00","05:15","05:30","05:45",
+     "06:00","06:15","06:30","06:45","07:00","07:15","07:30","07:45","08:00","08:15","08:30","08:45",
+     "09:00","09:15","09:30","09:45","10:00","10:15","10:30","10:45","11:00","11:15","11:30","11:45",
+     "12:00","12:15","12:30","12:45","13:00","13:15","13:30","13:45","14:00","14:15","14:30","14:45",
+     "15:00","15:15","15:30","15:45","16:00","16:15","16:30","16:45","17:00","17:15","17:30","17:45",
+     "18:00","18:15","18:30","18:45","19:00","19:15","19:30","19:45","20:00","20:15","20:30","20:45",
+     "21:00","21:15","21:30","21:45","22:00","22:15","22:30","22:45","23:00","23:15","23:30","23:45"]
+)
+
+
+blockDcaDuringWindows = input.bool(false, "Also block DCA adds during windows", group = blockGroup)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Derived config + series
+//──────────────────────────────────────────────────────────────────────────────
+unitSize =
+     unitMode == "Ticks"     ? syminfo.mintick :
+     unitMode == "Points"    ? pointSize :
+     unitMode == "Pips (FX)" ? pipSizeFX :
+     syminfo.mintick
+
+
+logicTf       = maTfMode == "Current Chart" ? timeframe.period : maTf
+logicUpdate   = maTfMode == "Current Chart" ? true : (ta.change(time(logicTf)) != 0)
+
+
+use_ma4_effective = use_ma4 and use_ma3
+
+
+ma1_series = request.security(syminfo.tickerid, logicTf, ma(ma1_source, ma1_length, ma1_type), barmerge.gaps_off, barmerge.lookahead_off)
+ma2_series = request.security(syminfo.tickerid, logicTf, ma(ma2_source, ma2_length, ma2_type), barmerge.gaps_off, barmerge.lookahead_off)
+ma3_series = request.security(syminfo.tickerid, logicTf, ma(ma3_source, ma3_length, ma3_type), barmerge.gaps_off, barmerge.lookahead_off)
+ma4_series = request.security(syminfo.tickerid, logicTf, ma(ma4_source, ma4_length, ma4_type), barmerge.gaps_off, barmerge.lookahead_off)
+
+
+atrSeries = request.security(syminfo.tickerid, logicTf, ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+
+// Plots (MAs)
+plot(ma1_series, "MA #1", ma1_color, linewidth = 2, trackprice = false)
+plot(ma2_series, "MA #2", ma2_color, linewidth = 2, trackprice = false)
+plot(use_ma3 ? ma3_series : na, "MA #3", ma3_color, linewidth = 2, trackprice = false)
+plot(use_ma4_effective ? ma4_series : na, "MA #4", ma4_color, linewidth = 2, trackprice = false)
+
+
+// No-new-trade windows computed
+blockNewBaseEntry =
+     inWindowHHMM(w1_en, w1_st, w1_enT, tzOpt) or
+     inWindowHHMM(w2_en, w2_st, w2_enT, tzOpt) or
+     inWindowHHMM(w3_en, w3_st, w3_enT, tzOpt)
+
+
+// Mode helpers for entry markers
+modeLabelsOff      = entryLabelMode == "Off"
+modeBaseEntries    = entryLabelMode == "Base Entries Only"
+modeAllDcaEntries  = entryLabelMode == "All DCA Entries"
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// HELP PANEL (on-chart)
+//──────────────────────────────────────────────────────────────────────────────
+var table helpTbl = na
+if showHelpPanel and na(helpTbl)
+    helpTbl := table.new(position.middle_center, 1, 1, border_width = 1)
+
+
+if showHelpPanel and isLastBar and not na(helpTbl)
+    table.clear(helpTbl, 0, 0)
+
+
+    string overview =
+         "EMA STACK STRATEGY\n" +
+         "MODE:\n" +
+         "• DCA / Grid: Adds at spaced levels (Auto Grid or Manual Ladder). TP is based on Avg Entry (BE) + offset.\n" +
+         "• Single Entry: Only 1 entry per trade. Exits selectable (MA Cross / ATR Bracket / R:R / Percent / Time Stop).\n\n" +
+         "TREND GATE:\n" +
+         "• Trades only when MAs are properly stacked.\n" +
+         "• Optional Higher TF Logic: signals update only on Higher-TF candle close (non-repainting).\n\n" +
+         "UNITS:\n" +
+         "• Unit Mode makes this portable (FX/stocks/crypto).\n" +
+         "  - Ticks uses syminfo.mintick\n" +
+         "  - Points uses your chosen point size\n" +
+         "  - Pips (FX) uses pip size\n" +
+         (showTvStyleTip ? "\nTIP (TradingView UI): Hide the vertical exit markers:\nStrategy Settings → Style → OFF 'Trades on chart' / 'Executions'.\n" : "")
+
+
+    table.cell(helpTbl, 0, 0, overview, text_color = helpTxt, bgcolor = helpBg)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Status Table
+//──────────────────────────────────────────────────────────────────────────────
+posFromOpt(_opt) =>
+    switch _opt
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+
+var table statusTbl = na
+if showStatusTable and na(statusTbl)
+    statusTbl := table.new(posFromOpt(tablePos), 2, 13, border_width = 1)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// LABEL CALLOUT ENGINE (RECYCLE + OPTIONAL LINES)
+//──────────────────────────────────────────────────────────────────────────────
+
+
+// Separate channels so closes (UP) don't affect entries (DN)
+var int[]    _co_up_x  = array.new<int>()
+var float[]  _co_up_y  = array.new<float>()
+var label[]  _co_up_lb = array.new<label>()
+var line[]   _co_up_ln = array.new<line>()
+
+
+var int[]    _co_dn_x  = array.new<int>()
+var float[]  _co_dn_y  = array.new<float>()
+var label[]  _co_dn_lb = array.new<label>()
+var line[]   _co_dn_ln = array.new<line>()
+
+
+_coEnsureSpace(_xs, _ys, _lbs, _lns) =>
+    while array.size(_xs) >= calloutMemory
+        array.shift(_xs)
+        array.shift(_ys)
+
+
+        label oldLb = array.shift(_lbs)
+        if not na(oldLb)
+            label.delete(oldLb)
+
+
+        line oldLn = array.shift(_lns)
+        if not na(oldLn)
+            line.delete(oldLn)
+
+
+_coCount(_xs, _ys, _x0, _y0, _barsWin, _yThresh) =>
+    int n = math.min(array.size(_xs), array.size(_ys))
+    if n <= 0
+        0
+    else
+        int cnt = 0
+        for i = 0 to n - 1
+            int   xi = array.get(_xs, i)
+            float yi = array.get(_ys, i)
+            bool nearX = math.abs(xi - _x0) <= _barsWin
+            bool nearY = math.abs(yi - _y0) <= _yThresh
+            if nearX and nearY
+                cnt += 1
+        cnt
+
+
+_coMark(_xs, _ys, _lbs, _lns, _xPlaced, _yPlaced, _lb, _ln) =>
+    array.push(_xs, _xPlaced)
+    array.push(_ys, _yPlaced)
+    array.push(_lbs, _lb)
+    array.push(_lns, _ln)
+
+
+makeCallout(_dir, _xAnchor, _yAnchor, _text, _bg, _style, _txtCol) =>
+    float yThresh = atrSeries * calloutDetectAtr
+    float step    = atrSeries * calloutStepAtr
+    float baseSep = atrSeries * calloutBaseAtr
+    int   barsWin = calloutDetectBars
+
+
+    bool doOffset = useCallouts
+
+
+    int cnt = 0
+    if doOffset
+        if _dir == "UP"
+            cnt := _coCount(_co_up_x, _co_up_y, _xAnchor, _yAnchor, barsWin, yThresh)
+        else
+            cnt := _coCount(_co_dn_x, _co_dn_y, _xAnchor, _yAnchor, barsWin, yThresh)
+        cnt := math.min(cnt, calloutMaxStack)
+
+
+    int   xPlaced = doOffset ? (_xAnchor + calloutXBars) : _xAnchor
+    float yPlaced = na
+
+
+    if doOffset
+        if _dir == "UP"
+            yPlaced := _yAnchor + baseSep + (cnt * step)
+        else
+            yPlaced := _yAnchor - baseSep - (cnt * step)
+    else
+        yPlaced := _yAnchor
+
+
+    if _dir == "UP"
+        _coEnsureSpace(_co_up_x, _co_up_y, _co_up_lb, _co_up_ln)
+    else
+        _coEnsureSpace(_co_dn_x, _co_dn_y, _co_dn_lb, _co_dn_ln)
+
+
+    line ln = na
+    if doOffset and drawCalloutLines
+        ln := line.new(
+            _xAnchor, _yAnchor,
+            xPlaced,  yPlaced,
+            xloc = xloc.bar_index,
+            extend = extend.none,
+            style = line.style_dotted,
+            width = 2,
+            color = color.new(color.white, 0)
+        )
+
+
+    label lb = label.new(
+        xPlaced, yPlaced, _text,
+        xloc = xloc.bar_index, yloc = yloc.price,
+        style = _style, textcolor = _txtCol, color = _bg, size = size.small
+    )
+
+
+    if _dir == "UP"
+        _coMark(_co_up_x, _co_up_y, _co_up_lb, _co_up_ln, xPlaced, yPlaced, lb, ln)
+    else
+        _coMark(_co_dn_x, _co_dn_y, _co_dn_lb, _co_dn_ln, xPlaced, yPlaced, lb, ln)
+
+
+    lb
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Entry Rules
+//──────────────────────────────────────────────────────────────────────────────
+stackLong =
+     (ma1_series > ma2_series) and
+     (not use_ma3 or (ma2_series > ma3_series)) and
+     (not use_ma4_effective or (ma3_series > ma4_series))
+
+
+stackShort =
+     (ma1_series < ma2_series) and
+     (not use_ma3 or (ma2_series < ma3_series)) and
+     (not use_ma4_effective or (ma3_series < ma4_series))
+
+
+var int stackCountLong  = 0
+var int stackCountShort = 0
+if logicUpdate
+    stackCountLong  := stackLong  ? (stackCountLong + 1)  : 0
+    stackCountShort := stackShort ? (stackCountShort + 1) : 0
+
+
+stackReadyLong  = stackCountLong  >= (stackHoldCloses + 1)
+stackReadyShort = stackCountShort >= (stackHoldCloses + 1)
+
+
+// ✅ NEW: stack "confirmation" events (first bar it becomes ready), HTF-safe
+stackLongConfirmed  = logicUpdate and stackReadyLong  and not stackReadyLong[1]
+stackShortConfirmed = logicUpdate and stackReadyShort and not stackReadyShort[1]
+
+
+// Plot stack diamonds (separate toggle)
+plotshape(showStackDiamonds and stackLongConfirmed,  title="Stack Confirmed Long",  style=shape.diamond, location=location.belowbar, color=color.green, size=size.small)
+plotshape(showStackDiamonds and stackShortConfirmed, title="Stack Confirmed Short", style=shape.diamond, location=location.abovebar, color=color.red,   size=size.small)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Manual ladder helper
+//──────────────────────────────────────────────────────────────────────────────
+manualEntryCash(_n) =>
+    switch _n
+        1  => e01
+        2  => e02
+        3  => e03
+        4  => e04
+        5  => e05
+        6  => e06
+        7  => e07
+        8  => e08
+        9  => e09
+        10 => e10
+        11 => e11
+        12 => e12
+        13 => e13
+        14 => e14
+        15 => e15
+        16 => e16
+        17 => e17
+        18 => e18
+        19 => e19
+        20 => e20
+        21 => e21
+        22 => e22
+        23 => e23
+        24 => e24
+        25 => e25
+        => 0.0
+
+
+cumDistPrice(_anchor, _entriesSoFar) =>
+    _k = _entriesSoFar
+    _base = distPrice(dcaMode, _anchor, unitSize, baseDcaUnits, baseDcaPct, atrSeries, baseDcaAtrM)
+    if _k <= 0
+        0.0
+    else
+        stepScale == 1.0 ? (_base * _k) : (_base * (math.pow(stepScale, _k) - 1.0) / (stepScale - 1.0))
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// State
+//──────────────────────────────────────────────────────────────────────────────
+var float firstEntryPrice = na
+var float lastDcaPrice    = na   // ✅ NEW: last entry price (base + any DCA fill)
+var int   entriesSoFar    = 0
+var float maxAdverseUnits = 0.0
+var int   lastTradeDir    = 0
+
+
+// Snapshots for trade summary box
+var int   snapEntries     = 0
+var float snapMaxAdverseU = 0.0
+var float snapCashUsed    = 0.0
+var int   snapDir         = 0
+var float snapFirstEntry  = na
+
+
+pos      = strategy.position_size
+posPrev  = strategy.position_size[1]
+inLong   = pos > 0
+inShort  = pos < 0
+flat     = pos == 0
+
+
+newPositionOpened = (pos != 0 and posPrev == 0)
+positionClosed    = (pos == 0 and posPrev != 0)
+
+
+var float plannedCashUsed = 0.0
+baseCashEffective = dcaSizingMode == "Manual Ladder" ? manualEntryCash(1) : baseCash
+
+
+if newPositionOpened
+    firstEntryPrice := strategy.position_avg_price
+    lastDcaPrice    := strategy.position_avg_price  // ✅ NEW
+    entriesSoFar    := 1
+    maxAdverseUnits := 0.0
+    lastTradeDir    := inLong ? 1 : inShort ? -1 : lastTradeDir
+    plannedCashUsed := baseCashEffective
+
+
+if pos != 0
+    avg = strategy.position_avg_price
+    adverseU =
+         inLong  ? (avg - low)  / unitSize :
+         inShort ? (high - avg) / unitSize :
+         0.0
+    maxAdverseUnits := math.max(maxAdverseUnits, adverseU)
+
+
+if positionClosed
+    snapEntries     := entriesSoFar
+    snapMaxAdverseU := maxAdverseUnits
+    snapCashUsed    := plannedCashUsed
+    snapDir         := lastTradeDir
+    snapFirstEntry  := firstEntryPrice
+
+
+if flat
+    firstEntryPrice := na
+    lastDcaPrice    := na       // ✅ NEW
+    entriesSoFar    := 0
+    maxAdverseUnits := 0.0
+    plannedCashUsed := 0.0
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Kill Switch / MA Cross (HTF-safe)
+//──────────────────────────────────────────────────────────────────────────────
+crossDn = ta.crossunder(ma1_series, ma2_series)
+crossUp = ta.crossover(ma1_series, ma2_series)
+
+
+killLong  = execConfirmed and inLong  and (ma1_series < ma2_series)
+killShort = execConfirmed and inShort and (ma1_series > ma2_series)
+
+
+// ✅ NEW: MA cross debug triangles (separate toggle, matches your example)
+plotshape(showMaCrossTriangles and crossDn, style=shape.triangleup,   location=location.abovebar, color=color.red,   size=size.small, title="MA Cross Down")
+plotshape(showMaCrossTriangles and crossUp, style=shape.triangledown, location=location.belowbar, color=color.green, size=size.small, title="MA Cross Up")
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Base Entries
+//──────────────────────────────────────────────────────────────────────────────
+canEnterNow = not blockNewBaseEntry
+
+
+baseLongSignal  = logicUpdate and flat and stackReadyLong  and canEnterNow
+baseShortSignal = logicUpdate and flat and stackReadyShort and canEnterNow
+
+
+bool baseLongEvent  = baseLongSignal  and (baseCashEffective > 0)
+bool baseShortEvent = baseShortSignal and (baseCashEffective > 0)
+
+
+if baseLongEvent
+    strategy.entry("Long", strategy.long, qty = baseCashEffective, comment = "")
+    if showEntryInfoLabels and not modeLabelsOff
+        string t = ""
+        if modeAllDcaEntries
+            t := "Base Long (#1)\n+ ($) " + str.tostring(baseCashEffective, "#.##") + "\nPrice: " + str.tostring(close, "#.000")
+        else
+            t := "Base Long (#1)\n$" + str.tostring(baseCashEffective, "#.##") + "\n" + str.tostring(close, "#.000")
+        makeCallout("DN", bar_index, close, t, entryInfoBg, label.style_label_up, entryInfoTxt)
+
+
+if baseShortEvent
+    strategy.entry("Short", strategy.short, qty = baseCashEffective, comment = "")
+    if showEntryInfoLabels and not modeLabelsOff
+        string t = ""
+        if modeAllDcaEntries
+            t := "Base Short (#1)\n+ ($) " + str.tostring(baseCashEffective, "#.##") + "\nPrice: " + str.tostring(close, "#.000")
+        else
+            t := "Base Short (#1)\n$" + str.tostring(baseCashEffective, "#.##") + "\n" + str.tostring(close, "#.000")
+        makeCallout("DN", bar_index, close, t, entryInfoBg, label.style_label_down, entryInfoTxt)
+
+
+// Base markers (kept for Base Entries Only)
+plotshape(showEntryInfoLabels and modeBaseEntries and baseLongEvent,  title="Base Long Marker",  style=shape.circle, location=location.belowbar, size=size.tiny, text="B")
+plotshape(showEntryInfoLabels and modeBaseEntries and baseShortEvent, title="Base Short Marker", style=shape.circle, location=location.abovebar, size=size.tiny, text="B")
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// DCA Adds (disabled in Single Entry mode)
+//──────────────────────────────────────────────────────────────────────────────
+canUseDca = (tradeMode == "DCA / Grid")
+
+
+anchor =
+     anchorMode == "First Entry"   ? firstEntryPrice :
+     anchorMode == "Average Entry" ? strategy.position_avg_price :
+     na
+
+
+canDcaNow = blockDcaDuringWindows ? (not blockNewBaseEntry) : true
+
+
+canAdd =
+     canUseDca and
+     allowDcaAdds and
+     canDcaNow and
+     (pos != 0) and
+     (entriesSoFar >= 1) and
+     (entriesSoFar < maxEntries) and
+     (not na(anchor))
+
+
+float nextDist  = na
+float nextLevel = na
+if canAdd
+    nextDist  := cumDistPrice(anchor, entriesSoFar)
+    nextLevel := inLong ? (anchor - nextDist) : (anchor + nextDist)
+
+
+touchNext =
+     canAdd and not na(nextLevel) and (
+         (inLong  and low  <= nextLevel) or
+         (inShort and high >= nextLevel)
+     )
+
+
+nextEntryIndex = entriesSoFar + 1
+autoNextCash   = baseCash * math.pow(volumeScale, entriesSoFar)
+manualNextCash = manualEntryCash(nextEntryIndex)
+nextCashRaw    = dcaSizingMode == "Manual Ladder" ? manualNextCash : autoNextCash
+
+
+roomCash = maxTotalCash - plannedCashUsed
+nextCash = clamp(nextCashRaw, 0.0, roomCash)
+
+
+bool dcaLongEvent  = false
+bool dcaShortEvent = false
+int  dcaThisIndex  = na
+float dcaLabelPrice = na
+
+
+if touchNext and (nextCash > 0)
+    dcaThisIndex  := entriesSoFar + 1
+    dcaLabelPrice := nextLevel
+    lastDcaPrice  := dcaLabelPrice  // ✅ NEW: record last DCA fill level
+
+
+    if inLong
+        dcaLongEvent := true
+        strategy.entry("Long", strategy.long, qty = nextCash, comment = "")
+        if showEntryInfoLabels and modeAllDcaEntries
+            string t = "DCA Long (#" + str.tostring(dcaThisIndex) + ")\n+ ($) " + str.tostring(nextCash, "#.##") + "\nPrice: " + str.tostring(dcaLabelPrice, "#.000")
+            makeCallout("DN", bar_index, dcaLabelPrice, t, entryInfoBg, label.style_label_up, entryInfoTxt)
+
+
+    if inShort
+        dcaShortEvent := true
+        strategy.entry("Short", strategy.short, qty = nextCash, comment = "")
+        if showEntryInfoLabels and modeAllDcaEntries
+            string t = "DCA Short (#" + str.tostring(dcaThisIndex) + ")\n+ ($) " + str.tostring(nextCash, "#.##") + "\nPrice: " + str.tostring(dcaLabelPrice, "#.000")
+            makeCallout("DN", bar_index, dcaLabelPrice, t, entryInfoBg, label.style_label_down, entryInfoTxt)
+
+
+    entriesSoFar += 1
+    plannedCashUsed += nextCash
+
+
+// In Base Entries Only mode: suppress DCA plotshape markers as requested
+plotshape(false, title="DCA Long Marker",  style=shape.circle, location=location.belowbar, size=size.tiny, text="D")
+plotshape(false, title="DCA Short Marker", style=shape.circle, location=location.abovebar, size=size.tiny, text="D")
+
+
+plot((canUseDca and showNextLevelLine) ? nextLevel : na, "Next DCA Level", colNextLevel, style=plot.style_linebr, linewidth=2, trackprice=false)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// DCA TP lines
+//──────────────────────────────────────────────────────────────────────────────
+avgPrice   = strategy.position_avg_price
+tpOffset   = distPrice(tpMode, avgPrice, unitSize, tpUnits, tpPct, atrSeries, tpAtrM)
+tpPriceDca = inLong ? (avgPrice + tpOffset) : inShort ? (avgPrice - tpOffset) : na
+
+
+// ✅ NEW: After-last-DCA exit target (arms only once entriesSoFar >= maxEntries)
+reachedLastDca =
+     (tradeMode == "DCA / Grid") and (pos != 0) and (entriesSoFar >= maxEntries) and not na(lastDcaPrice)
+
+
+lastExitOffset =
+     dcaLastExitMode == "Units"   ? (dcaLastExitUnits * unitSize) :
+     dcaLastExitMode == "Percent" ? (lastDcaPrice * (dcaLastExitPct / 100.0)) :
+     na
+
+
+tpPriceAfterLast =
+     reachedLastDca ?
+         (inLong ? (lastDcaPrice + lastExitOffset) : (lastDcaPrice - lastExitOffset))
+         : na
+
+
+avgEntryPlot = (pos != 0) ? avgPrice : na
+plot(showAvgEntryLine ? avgEntryPlot : na, "Avg Break Even", colAvgEntry, style=plot.style_linebr, linewidth=2, trackprice=false)
+plot(showTPLine ? (tradeMode == "DCA / Grid" ? tpPriceDca : na) : na, "Take Profit (DCA)", colTPLine, style=plot.style_linebr, linewidth=2, trackprice=false)
+
+
+// Right-edge line labels
+var label lblAvg  = na
+var label lblTP   = na
+var label lblNext = na
+
+
+if isLastBar and showLineLabels
+    label.delete(lblAvg)
+    label.delete(lblTP)
+    label.delete(lblNext)
+
+
+    if pos != 0 and showAvgEntryLine
+        lblAvg := label.new(bar_index, avgPrice, "Avg Break Even: " + str.tostring(avgPrice, "#.000"),
+            yloc = yloc.price, style = label.style_label_left, textcolor = lineLblTxt, color = lineLblBg)
+
+
+    if pos != 0 and showTPLine and tradeMode == "DCA / Grid" and not na(tpPriceDca)
+        lblTP := label.new(bar_index, tpPriceDca, "Take Profit: " + str.tostring(tpPriceDca, "#.000"),
+            yloc = yloc.price, style = label.style_label_left, textcolor = lineLblTxt, color = lineLblBg)
+
+
+    if pos != 0 and showNextLevelLine and tradeMode == "DCA / Grid" and not na(nextLevel)
+        lblNext := label.new(bar_index, nextLevel, "Next DCA: " + str.tostring(nextLevel, "#.000"),
+            yloc = yloc.price, style = label.style_label_left, textcolor = lineLblTxt, color = lineLblBg)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// DCA trailing
+//──────────────────────────────────────────────────────────────────────────────
+var float trailExtreme = na
+var bool  trailActive  = false
+
+
+if newPositionOpened
+    trailExtreme := na
+    trailActive  := false
+if pos == 0
+    trailExtreme := na
+    trailActive  := false
+
+
+actOffset = distPrice(trailActMode, avgPrice, unitSize, trailActU, trailActPct, atrSeries, trailActAtrM)
+trailDist = distPrice(trailMode, avgPrice, unitSize, trailUnits, trailPct, atrSeries, trailAtrM)
+
+
+if trailEnable and pos != 0 and tradeMode == "DCA / Grid"
+    if inLong
+        trailExtreme := na(trailExtreme) ? high : math.max(trailExtreme, high)
+        if not trailActive and (trailExtreme - avgPrice) >= actOffset
+            trailActive := true
+    if inShort
+        trailExtreme := na(trailExtreme) ? low : math.min(trailExtreme, low)
+        if not trailActive and (avgPrice - trailExtreme) >= actOffset
+            trailActive := true
+
+
+trailStop = (trailEnable and trailActive and pos != 0 and tradeMode == "DCA / Grid") ? (inLong ? (trailExtreme - trailDist) : (trailExtreme + trailDist)) : na
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// SINGLE ENTRY: exits + independent trailing stop
+//──────────────────────────────────────────────────────────────────────────────
+var int barsInTrade = 0
+if newPositionOpened
+    barsInTrade := 0
+if pos != 0 and barstate.isconfirmed
+    barsInTrade += 1
+if pos == 0
+    barsInTrade := 0
+
+
+swingLow  = ta.lowest(low, swingLb)
+swingHigh = ta.highest(high, swingLb)
+
+
+rrStopPrice =
+     rrStopMethod == "ATR" ?
+         (inLong ? (avgPrice - atrSeries * rrAtrStopM) : (avgPrice + atrSeries * rrAtrStopM)) :
+         (inLong ? (swingLow - swingBufU * unitSize)   : (swingHigh + swingBufU * unitSize))
+
+
+rrRiskDist = inLong ? (avgPrice - rrStopPrice) : inShort ? (rrStopPrice - avgPrice) : na
+rrTpPrice  = inLong ? (avgPrice + rrRiskDist * rrRatio) : inShort ? (avgPrice - rrRiskDist * rrRatio) : na
+
+
+atrStopPrice = inLong ? (avgPrice - atrSeries * atrStopM) : inShort ? (avgPrice + atrSeries * atrStopM) : na
+atrTpPrice   = inLong ? (avgPrice + atrSeries * atrTpM)   : inShort ? (avgPrice - atrSeries * atrTpM)   : na
+
+
+pctStopPrice = inLong ? (avgPrice * (1.0 - stopPctSingle / 100.0)) : inShort ? (avgPrice * (1.0 + stopPctSingle / 100.0)) : na
+pctTpPrice   = inLong ? (avgPrice * (1.0 + tpPctSingle / 100.0))   : inShort ? (avgPrice * (1.0 - tpPctSingle / 100.0))   : na
+
+
+beTrigDist = distPrice(beTrigMode, avgPrice, unitSize, beTrigU, beTrigPct, atrSeries, beTrigAtrM)
+var bool beArmed = false
+if newPositionOpened
+    beArmed := false
+if pos == 0
+    beArmed := false
+
+
+if tradeMode == "Single Entry" and beEnable and pos != 0
+    if inLong and not beArmed and (high - avgPrice) >= beTrigDist
+        beArmed := true
+    if inShort and not beArmed and (avgPrice - low) >= beTrigDist
+        beArmed := true
+
+
+beStop = beArmed and pos != 0 ? (inLong ? (avgPrice + beOffsetU * unitSize) : (avgPrice - beOffsetU * unitSize)) : na
+
+
+// Single trailing (independent)
+var float seTrailExtreme = na
+var bool  seTrailActive  = false
+
+
+if newPositionOpened
+    seTrailExtreme := na
+    seTrailActive  := false
+if pos == 0
+    seTrailExtreme := na
+    seTrailActive  := false
+
+
+seActDist   = distPrice(seTrailActMode, avgPrice, unitSize, seTrailActU, seTrailActPct, atrSeries, seTrailActAtrM)
+seTrailDist = distPrice(seTrailDistMode, avgPrice, unitSize, seTrailDistU, seTrailDistPct, atrSeries, seTrailDistAtrM)
+
+
+if tradeMode == "Single Entry" and seTrailEnable and pos != 0
+    if inLong
+        seTrailExtreme := na(seTrailExtreme) ? high : math.max(seTrailExtreme, high)
+        if not seTrailActive and (seTrailExtreme - avgPrice) >= seActDist
+            seTrailActive := true
+    if inShort
+        seTrailExtreme := na(seTrailExtreme) ? low : math.min(seTrailExtreme, low)
+        if not seTrailActive and (avgPrice - seTrailExtreme) >= seActDist
+            seTrailActive := true
+
+
+seTrailStop = (tradeMode == "Single Entry" and seTrailEnable and seTrailActive and pos != 0) ?
+     (inLong ? (seTrailExtreme - seTrailDist) : (seTrailExtreme + seTrailDist)) : na
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Apply exits
+//──────────────────────────────────────────────────────────────────────────────
+if tradeMode == "DCA / Grid"
+    // ✅ NEW: choose which limit to use for DCA mode
+    dcaLimit =
+         dcaExitType == "After Last DCA (Offset)" ? tpPriceAfterLast : tpPriceDca
+
+
+    if inLong
+        strategy.exit("X", from_entry="Long", limit=dcaLimit, stop=(trailEnable and trailActive ? trailStop : na), comment="")
+    if inShort
+        strategy.exit("X", from_entry="Short", limit=dcaLimit, stop=(trailEnable and trailActive ? trailStop : na), comment="")
+
+
+    // ✅ NEW: MA kill switch control
+    // - If using "After Last DCA (Offset)", suppress MA kill so it doesn't interfere
+    // - Or user can manually disable MA kill for DCA mode
+    useMaKill = (not dcaDisableMaKill) and (dcaExitType != "After Last DCA (Offset)")
+
+
+    if useMaKill
+        if killLong
+            strategy.close("Long", comment="")
+        if killShort
+            strategy.close("Short", comment="")
+
+
+if tradeMode == "Single Entry" and pos != 0
+    if seTrailEnable and seTrailActive and not na(seTrailStop)
+        strategy.exit("SE-T", from_entry=(inLong ? "Long" : "Short"), stop=seTrailStop, comment="")
+
+
+    if singleExitType == "MA Cross"
+        if execConfirmed and inLong and crossDn
+            strategy.close("Long", comment="")
+        if execConfirmed and inShort and crossUp
+            strategy.close("Short", comment="")
+
+
+    if singleExitType == "Time Stop"
+        if execConfirmed and barsInTrade >= timeStopBars
+            strategy.close(inLong ? "Long" : "Short", comment="")
+
+
+    if singleExitType == "ATR Bracket"
+        stopP = atrStopPrice
+        limP  = atrTpPrice
+        if beEnable and beArmed and not na(beStop)
+            stopP := inLong ? math.max(stopP, beStop) : math.min(stopP, beStop)
+        strategy.exit("SE-B", from_entry=(inLong ? "Long" : "Short"), stop=stopP, limit=limP, comment="")
+
+
+    if singleExitType == "R:R Bracket"
+        stopP = rrStopPrice
+        limP  = rrTpPrice
+        if beEnable and beArmed and not na(beStop)
+            stopP := inLong ? math.max(stopP, beStop) : math.min(stopP, beStop)
+        strategy.exit("SE-B", from_entry=(inLong ? "Long" : "Short"), stop=stopP, limit=limP, comment="")
+
+
+    if singleExitType == "Percent Bracket"
+        stopP = pctStopPrice
+        limP  = pctTpPrice
+        if beEnable and beArmed and not na(beStop)
+            stopP := inLong ? math.max(stopP, beStop) : math.min(stopP, beStop)
+        strategy.exit("SE-B", from_entry=(inLong ? "Long" : "Short"), stop=stopP, limit=limP, comment="")
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Trade summary box (stack UP via callouts)
+//──────────────────────────────────────────────────────────────────────────────
+if positionClosed and showTradeLabels
+    idx = strategy.closedtrades - 1
+    if idx >= 0
+        pl     = strategy.closedtrades.profit(idx)
+        plPct  = strategy.closedtrades.profit_percent(idx)
+        xPrice = strategy.closedtrades.exit_price(idx)
+
+
+        dirStr = snapDir == 1 ? "LONG" : "SHORT"
+
+
+        txt =
+             dirStr + " CLOSED\n" +
+             "P/L: " + str.tostring(pl, "#.###") + " (" + str.tostring(plPct, "#.##") + "%)\n" +
+             "1st Entry Price: " + str.tostring(snapFirstEntry, "#.000") + "\n" +
+             "Exit Price: " + str.tostring(xPrice, "#.000") + "\n" +
+             "Total Entries: " + str.tostring(snapEntries) + "\n" +
+             "Max Adverse: " + str.tostring(snapMaxAdverseU, "#.0") + " u\n" +
+             "Cash Used for Trade: $" + str.tostring(snapCashUsed, "#.##")
+
+
+        baseCol = pl >= 0 ? colExitWin : colExitLoss
+        boxCol  = color.new(baseCol, exitBoxTransparency)
+
+
+        makeCallout("UP", bar_index, xPrice, txt, boxCol, label.style_label_down, color.white)
+
+
+//──────────────────────────────────────────────────────────────────────────────
+// Status Table render
+//──────────────────────────────────────────────────────────────────────────────
+if showStatusTable and isLastBar and not na(statusTbl)
+    table.clear(statusTbl, 0, 0)
+
+
+    dirTxt   = inLong ? "LONG" : inShort ? "SHORT" : "FLAT"
+    stackTxt = stackLong ? "BULL STACK" : stackShort ? "BEAR STACK" : "NO STACK"
+    holdTxt  = stackLong ? str.tostring(stackCountLong) : stackShort ? str.tostring(stackCountShort) : "0"
+    blockTxt = blockNewBaseEntry ? "YES" : "NO"
+    dcaBlk   = (blockDcaDuringWindows and blockNewBaseEntry) ? "YES" : "NO"
+
+
+    table.cell(statusTbl, 0, 0, "Mode", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 0, tradeMode, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 1, "Logic TF", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 1, logicTf, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 2, "Direction", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 2, dirTxt, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 3, "Stack", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 3, stackTxt, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 4, "Stack Holds", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 4, holdTxt + " / need " + str.tostring(stackHoldCloses + 1), text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 5, "Blocked (Base)", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 5, blockTxt, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 6, "Blocked (DCA)", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 6, tradeMode == "DCA / Grid" ? dcaBlk : "n/a", text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 7, "Entries", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 7, tradeMode == "DCA / Grid" ? (str.tostring(entriesSoFar) + " / " + str.tostring(maxEntries)) : (pos != 0 ? "1 / 1" : "0 / 1"), text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 8, "Cash Used", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 8, "$" + str.tostring(plannedCashUsed, "#.##") + " / $" + str.tostring(maxTotalCash, "#.##"), text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 9, "Unit Mode", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 9, unitMode + " (size=" + str.tostring(unitSize, "#.######") + ")", text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    warn = (use_ma4 and not use_ma3) ? "⚠ MA4 disabled because MA3 is off" : "OK"
+    table.cell(statusTbl, 0, 10, "MA4 Status", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 10, warn, text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    tipTxt = "Strategy Settings → Style → OFF 'Trades on chart' / 'Executions'"
+    table.cell(statusTbl, 0, 11, "TV Tip", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 11, showTvStyleTip ? tipTxt : "OFF", text_color=tblTxtCol, bgcolor=tblBgCol)
+
+
+    table.cell(statusTbl, 0, 12, "Markers", text_color=tblTxtCol, bgcolor=tblBgCol)
+    table.cell(statusTbl, 1, 12,
+        modeLabelsOff ? "OFF" :
+        modeBaseEntries ? "Base Entries Only + summary" :
+        "All DCA Entries + summary",
+        text_color=tblTxtCol, bgcolor=tblBgCol)
+

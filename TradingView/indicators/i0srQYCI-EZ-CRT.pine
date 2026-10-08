@@ -1,0 +1,902 @@
+//@version=6
+indicator("EZ$ CRT Three-Candle Entry v1.3 • Sweep Shift FVG", shorttitle="EZ$ CRT", overlay=true,
+     max_boxes_count=80, max_lines_count=120, max_labels_count=250)
+
+//──────────────────────────────────────────────────────────────────────────────
+// EZ$ CRT THREE-CANDLE ENTRY v1.3 • SWEEP / SHIFT / FVG
+//
+// Core CRT is unchanged:
+//   C1 = anchor/range candle.
+//   C2 = manipulation candle: sweeps one side of C1 and CLOSES back inside C1.
+//   C3 = distribution/delivery candle.
+//   Bull CRT: C2 sweeps C1 low -> C1 high target -> entry through C2 high.
+//   Bear CRT: C2 sweeps C1 high -> C1 low target -> entry through C2 low.
+//
+// v1.3 keeps the Perfect CRT selection/bias/price-action framework and adds the supplied
+// "mark range -> sweep -> shift lower TF -> enter on FVG" signal logic:
+//   • 15M / 30M / 1H remain the CRT source timeframes.
+//   • The first valid NY CRT is selected. If several appear together, the tightest C1 range wins;
+//     a lower timeframe wins an effective tie.
+//   • 1H structure remains baseline bias, but a confirmed HTF swing-liquidity sweep + rejection may flip bias.
+//   • C2 must sweep a C1 extreme and CLOSE back inside the C1 range.
+//   • On the execution chart, price must then break the opposite C2 extreme (the lower-TF shift).
+//   • CRT Shift + FVG (default): after the C2 shift, capture the first directional 3-candle FVG
+//     and print the signal on its first qualified retest.
+//   • 1M price action is still classified CLEAN / CHOP / SEVERE CHOP; severe chop can block entries.
+//   • VIDEO ADAPTIVE and the prior manual entry models remain available for study/replay.
+//   • New York entries only by default, 09:30–13:00 ET, with one entry per NY session.
+//   • Monday/news awareness is a dashboard reminder only; Pine does not supply economic-calendar data here.
+//──────────────────────────────────────────────────────────────────────────────
+
+// ───── 1. CRT Sources
+groupCRT = "1. CRT Sources"
+tf1 = input.timeframe("15", "CRT Source 1", group=groupCRT)
+tf2 = input.timeframe("30", "CRT Source 2", group=groupCRT)
+tf3 = input.timeframe("60", "CRT Source 3", group=groupCRT)
+allowDualSweep = input.bool(false, "Allow C2 to Sweep Both C1 Extremes", group=groupCRT,
+     tooltip="OFF recommended. A C2 candle that purges both C1 extremes is treated as ambiguous.")
+
+// ───── 2. Trend Permission
+groupTrend = "2. Trend Permission"
+biasMode = input.string("Auto Structure", "Bias Mode",
+     options=["Auto Structure", "Manual Bullish", "Manual Bearish", "Both Directions"], group=groupTrend)
+trendTimeframe = input.timeframe("60", "Auto Trend Timeframe", group=groupTrend)
+trendPivotStrength = input.int(2, "Trend Pivot Strength", minval=1, maxval=8, group=groupTrend)
+useLiquidityBiasOverride = input.bool(true, "Allow HTF Liquidity Sweep to Flip Bias", group=groupTrend,
+     tooltip="Recommended for the supplied Perfect CRT lesson. A confirmed swing high sweep + bearish rejection may permit bearish CRTs against a bullish structural trend; a confirmed swing low sweep + bullish rejection may permit bullish CRTs against a bearish trend.")
+liquidityOverrideBars = input.int(2, "Liquidity Flip Valid For HTF Bars", minval=1, maxval=6, group=groupTrend)
+liquidityRejectWickBody = input.float(0.75, "Liquidity Rejection Wick ÷ Body", minval=0.10, maxval=5.0, step=0.05, group=groupTrend)
+liquidityStrongClose = input.float(0.60, "Liquidity Rejection Strong Close", minval=0.50, maxval=0.90, step=0.01, group=groupTrend)
+showTrendEMA = input.bool(false, "Show Optional Trend EMA", group=groupTrend)
+trendEMALength = input.int(50, "Trend EMA Length", minval=2, group=groupTrend)
+
+// ───── 3. Session + Entry
+groupExec = "3. Session + Entry"
+useNYSession = input.bool(true, "Only Allow Entries in New York Window", group=groupExec)
+nySession = input.session("0930-1300", "New York Entry Window", group=groupExec)
+nyTimeZone = input.string("America/New_York", "Session Time Zone", group=groupExec)
+executionCharts = input.string("1M Only", "Execution Chart",
+     options=["1M Only", "1M / 2M", "Any Intraday"], group=groupExec)
+confirmEntryOnClose = input.bool(true, "Confirm Entry on Execution Candle Close", group=groupExec,
+     tooltip="Recommended. Prevents temporary intrabar entry markers from disappearing before the 1M candle closes.")
+entryModel = input.string("CRT Shift + FVG", "CRT Entry Model",
+     options=["CRT Shift + FVG", "Video Adaptive", "Exact C2 Break", "Break + Retest", "TBS + Structure Shift", "Aggressive Structure Break"], group=groupExec,
+     tooltip="CRT Shift + FVG follows the supplied sequence: C1 range -> C2 sweep/reclaim -> lower-TF break of the opposite C2 extreme -> first directional FVG -> first qualified FVG retest. Video Adaptive and the prior manual models remain available for comparison.")
+triggerMode = input.string("Wick Break", "Exact C2 Trigger",
+     options=["Wick Break", "Close Break"], group=groupExec,
+     tooltip="Defines the lower-TF break of the opposite C2 extreme. Wick Break is earlier; Close Break is more conservative.")
+executionStructureLookback = input.int(3, "1M Structure Lookback", minval=1, maxval=10, group=groupExec)
+executionATRLength = input.int(14, "1M ATR Length", minval=2, group=groupExec)
+executionDisplacementATR = input.float(0.60, "1M Displacement Range × ATR", minval=0.20, maxval=3.0, step=0.05, group=groupExec)
+executionDisplacementBody = input.float(0.55, "1M Displacement Body ÷ Range", minval=0.25, maxval=0.95, step=0.05, group=groupExec)
+requireExecutionDisplacement = input.bool(true, "Require Displacement With Structure Break", group=groupExec)
+retestWindowBars = input.int(8, "Break + Retest: Maximum Bars to Retest", minval=1, maxval=50, group=groupExec)
+retestToleranceATR = input.float(0.12, "Break + Retest: Retest Tolerance × ATR", minval=0.00, maxval=1.0, step=0.01, group=groupExec)
+tbsLiquidityLookback = input.int(3, "TBS: Local Liquidity Lookback", minval=1, maxval=10, group=groupExec)
+tbsMaxBarsBeforeShift = input.int(5, "TBS: Maximum Bars Before Structure Shift", minval=1, maxval=20, group=groupExec)
+oneEntryPerNYSession = input.bool(true, "One CRT Entry per NY Session", group=groupExec)
+useMidpointEntryFilter = input.bool(false, "Require Entry in Preferred Half of C1", group=groupExec,
+     tooltip="Optional lesson filter. Long entry must occur at/below C1 50%; short entry at/above C1 50%.")
+
+// ───── 4. CRT Shift + FVG Signal
+groupFVG = "4. CRT Shift + FVG Signal"
+fvgSearchBars = input.int(8, "Bars After C2 Shift to Find FVG", minval=1, maxval=30, group=groupFVG,
+     tooltip="After the lower-timeframe break of the opposite C2 extreme, the first same-direction 3-candle FVG must form within this many execution bars.")
+fvgRetestBars = input.int(12, "Bars to Retest FVG", minval=1, maxval=50, group=groupFVG,
+     tooltip="Maximum execution bars allowed for the first qualified return into the selected FVG.")
+fvgMinATR = input.float(0.05, "Minimum FVG Size × ATR", minval=0.00, maxval=1.00, step=0.01, group=groupFVG,
+     tooltip="Filters microscopic gaps. 0.05 means the FVG must be at least 5% of execution-chart ATR.")
+requireFVGDirectionalClose = input.bool(true, "Require Directional Close From FVG", group=groupFVG,
+     tooltip="Recommended. Bullish FVG retest must close bullish; bearish FVG retest must close bearish.")
+showFVGZone = input.bool(true, "Show Active CRT FVG Zone", group=groupFVG)
+
+// ───── 5. 1M Price Action Quality
+groupPA = "4. 1M Price Action Quality"
+paLookback = input.int(6, "Price-Action Lookback Bars", minval=3, maxval=20, group=groupPA)
+paCleanEfficiency = input.float(0.38, "Clean/Chop Efficiency Threshold", minval=0.05, maxval=0.90, step=0.01, group=groupPA,
+     tooltip="Efficiency compares net progress with total bar-to-bar movement. Lower values mean more back-and-forth movement.")
+paChopAlternation = input.float(0.55, "Chop Candle-Alternation Ratio", minval=0.20, maxval=1.00, step=0.05, group=groupPA)
+paChopWickRatio = input.float(0.34, "Chop Two-Sided-Wick Ratio", minval=0.10, maxval=1.00, step=0.05, group=groupPA)
+paTwoSidedWickPct = input.float(0.22, "Two-Sided Wick Minimum % of Candle", minval=0.05, maxval=0.45, step=0.01, group=groupPA)
+paSevereEfficiency = input.float(0.20, "Severe-Chop Efficiency", minval=0.02, maxval=0.60, step=0.01, group=groupPA)
+paSevereAlternation = input.float(0.70, "Severe-Chop Alternation Ratio", minval=0.30, maxval=1.00, step=0.05, group=groupPA)
+paSevereWickRatio = input.float(0.50, "Severe-Chop Two-Sided-Wick Ratio", minval=0.20, maxval=1.00, step=0.05, group=groupPA)
+blockSevereChop = input.bool(true, "Block Entries During Severe Chop", group=groupPA,
+     tooltip="Recommended. Matches the lesson's instruction to skip CRTs when 1M price action is violently alternating and wicking both sides.")
+
+// ───── 6. Visuals
+groupVis = "6. Visuals"
+showSyntheticCRT = input.bool(true, "Show C1 / C2 / C3 Candles on Right", group=groupVis)
+visualOffset = input.int(10, "Synthetic Candle Offset", minval=4, maxval=100, group=groupVis)
+visualGroupSpacing = input.int(12, "CRT Group Spacing", minval=9, maxval=40, group=groupVis)
+showActiveLevels = input.bool(true, "Show Active CRT Levels", group=groupVis)
+showSetupLabels = input.bool(true, "Show CRT Setup Labels", group=groupVis)
+showExecutionStateLabel = input.bool(true, "Show Active Execution State", group=groupVis)
+showEntryLabels = input.bool(true, "Show CRT Entry Labels", group=groupVis)
+showDashboard = input.bool(true, "Show CRT Dashboard", group=groupVis)
+
+bullColor = input.color(color.rgb(45, 164, 78), "Bull Color", group=groupVis)
+bearColor = input.color(color.rgb(210, 70, 70), "Bear Color", group=groupVis)
+anchorColor = input.color(color.rgb(125, 125, 125), "C1 Anchor Color", group=groupVis)
+bullCRTColor = input.color(color.rgb(37, 150, 190), "Bull CRT Highlight", group=groupVis)
+bearCRTColor = input.color(color.rgb(225, 145, 45), "Bear CRT Highlight", group=groupVis)
+
+// ───── Helpers
+f_tf_label(string tf) =>
+    switch tf
+        "1" => "1M"
+        "2" => "2M"
+        "3" => "3M"
+        "5" => "5M"
+        "10" => "10M"
+        "15" => "15M"
+        "30" => "30M"
+        "45" => "45M"
+        "60" => "1H"
+        "120" => "2H"
+        "180" => "3H"
+        "240" => "4H"
+        "480" => "8H"
+        "1D" => "D"
+        "1W" => "W"
+        => tf
+
+f_structure_bias(int strength) =>
+    float ph = ta.pivothigh(high, strength, strength)
+    float pl = ta.pivotlow(low, strength, strength)
+    var float lastHigh = na
+    var float priorHigh = na
+    var float lastLow = na
+    var float priorLow = na
+
+    if not na(ph)
+        priorHigh := lastHigh
+        lastHigh := ph
+    if not na(pl)
+        priorLow := lastLow
+        lastLow := pl
+
+    int result = 0
+    bool enough = not na(lastHigh) and not na(priorHigh) and not na(lastLow) and not na(priorLow)
+    if enough
+        bool bull = lastHigh > priorHigh and lastLow > priorLow
+        bool bear = lastHigh < priorHigh and lastLow < priorLow
+        result := bull ? 1 : bear ? -1 : 0
+    result
+
+// Confirmed HTF liquidity sweep/rejection override.
+// +1 = latest qualified sweep was below a confirmed swing low and reclaimed.
+// -1 = latest qualified sweep was above a confirmed swing high and rejected.
+f_liquidity_override(int strength, float wickBodyMin, float strongClose, int holdBars) =>
+    float ph = ta.pivothigh(high, strength, strength)
+    float pl = ta.pivotlow(low, strength, strength)
+    var float lastHigh = na
+    var float lastLow = na
+
+    if not na(ph)
+        lastHigh := ph
+    if not na(pl)
+        lastLow := pl
+
+    float r = math.max(high - low, syminfo.mintick)
+    float b = math.max(math.abs(close - open), syminfo.mintick)
+    float upperW = high - math.max(open, close)
+    float lowerW = math.min(open, close) - low
+    float closeLoc = (close - low) / r
+
+    bool bullSweepReject = not na(lastLow) and low < lastLow and close > lastLow and close > open and
+         lowerW >= b * wickBodyMin and closeLoc >= strongClose
+    bool bearSweepReject = not na(lastHigh) and high > lastHigh and close < lastHigh and close < open and
+         upperW >= b * wickBodyMin and closeLoc <= 1.0 - strongClose
+
+    int bullAgo = ta.barssince(bullSweepReject)
+    int bearAgo = ta.barssince(bearSweepReject)
+    bool bullRecent = not na(bullAgo) and bullAgo <= holdBars
+    bool bearRecent = not na(bearAgo) and bearAgo <= holdBars
+
+    bullRecent and (not bearRecent or bullAgo < bearAgo) ? 1 :
+         bearRecent and (not bullRecent or bearAgo < bullAgo) ? -1 : 0
+
+int autoBias = request.security(syminfo.tickerid, trendTimeframe,
+     f_structure_bias(trendPivotStrength), lookahead=barmerge.lookahead_off)
+// [1] + lookahead_on intentionally exposes only the last COMPLETED trend-timeframe bar's override state.
+int liquidityBiasOverride = request.security(syminfo.tickerid, trendTimeframe,
+     f_liquidity_override(trendPivotStrength, liquidityRejectWickBody, liquidityStrongClose, liquidityOverrideBars)[1],
+     lookahead=barmerge.lookahead_on)
+int effectiveAutoBias = useLiquidityBiasOverride and liquidityBiasOverride != 0 ? liquidityBiasOverride : autoBias
+
+bool allowBull = biasMode == "Manual Bullish" or biasMode == "Both Directions" or
+     (biasMode == "Auto Structure" and effectiveAutoBias == 1)
+bool allowBear = biasMode == "Manual Bearish" or biasMode == "Both Directions" or
+     (biasMode == "Auto Structure" and effectiveAutoBias == -1)
+
+string biasText = biasMode == "Manual Bullish" ? "BULLISH • MANUAL" :
+     biasMode == "Manual Bearish" ? "BEARISH • MANUAL" :
+     biasMode == "Both Directions" ? "BOTH" :
+     useLiquidityBiasOverride and liquidityBiasOverride == 1 ? "BULLISH • LIQ FLIP" :
+     useLiquidityBiasOverride and liquidityBiasOverride == -1 ? "BEARISH • LIQ FLIP" :
+     effectiveAutoBias == 1 ? "BULLISH" : effectiveAutoBias == -1 ? "BEARISH" : "WAIT"
+
+color biasColor = allowBull and not allowBear ? color.new(bullColor, 10) :
+     allowBear and not allowBull ? color.new(bearColor, 10) : color.new(color.gray, 45)
+
+float trendEMA = request.security(syminfo.tickerid, trendTimeframe,
+     ta.ema(close, trendEMALength), lookahead=barmerge.lookahead_off)
+plot(showTrendEMA ? trendEMA : na, "Trend EMA", color=color.new(color.gray, 30), linewidth=2)
+
+// Confirmed C1/C2 values. Every expression is offset, so lookahead_on does not leak future HTF values.
+[aO1, aH1, aL1, aC1, mO1, mH1, mL1, mC1] = request.security(syminfo.tickerid, tf1,
+     [open[2], high[2], low[2], close[2], open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[aO2, aH2, aL2, aC2, mO2, mH2, mL2, mC2] = request.security(syminfo.tickerid, tf2,
+     [open[2], high[2], low[2], close[2], open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[aO3, aH3, aL3, aC3, mO3, mH3, mL3, mC3] = request.security(syminfo.tickerid, tf3,
+     [open[2], high[2], low[2], close[2], open[1], high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// Current C3 opening times.
+int crtTime1 = time(tf1)
+int crtTime2 = time(tf2)
+int crtTime3 = time(tf3)
+bool newCRT1 = ta.change(crtTime1) != 0
+bool newCRT2 = ta.change(crtTime2) != 0
+bool newCRT3 = ta.change(crtTime3) != 0
+
+// Build the developing C3 candle from the execution chart itself.
+var float dO1 = na
+var float dH1 = na
+var float dL1 = na
+var float dC1 = na
+var float dO2 = na
+var float dH2 = na
+var float dL2 = na
+var float dC2 = na
+var float dO3 = na
+var float dH3 = na
+var float dL3 = na
+var float dC3 = na
+
+if newCRT1 or na(dO1)
+    dO1 := open
+    dH1 := high
+    dL1 := low
+    dC1 := close
+else
+    dH1 := math.max(dH1, high)
+    dL1 := math.min(dL1, low)
+    dC1 := close
+
+if newCRT2 or na(dO2)
+    dO2 := open
+    dH2 := high
+    dL2 := low
+    dC2 := close
+else
+    dH2 := math.max(dH2, high)
+    dL2 := math.min(dL2, low)
+    dC2 := close
+
+if newCRT3 or na(dO3)
+    dO3 := open
+    dH3 := high
+    dL3 := low
+    dC3 := close
+else
+    dH3 := math.max(dH3, high)
+    dL3 := math.min(dL3, low)
+    dC3 := close
+
+f_bull_crt(float aH, float aL, float mH, float mL, float mC) =>
+    bool sweptLow = mL < aL
+    bool sweptHigh = mH > aH
+    bool closeInside = mC >= aL and mC <= aH
+    sweptLow and closeInside and (allowDualSweep or not sweptHigh)
+
+f_bear_crt(float aH, float aL, float mH, float mL, float mC) =>
+    bool sweptHigh = mH > aH
+    bool sweptLow = mL < aL
+    bool closeInside = mC >= aL and mC <= aH
+    sweptHigh and closeInside and (allowDualSweep or not sweptLow)
+
+bool bullCRT1 = f_bull_crt(aH1, aL1, mH1, mL1, mC1)
+bool bearCRT1 = f_bear_crt(aH1, aL1, mH1, mL1, mC1)
+bool bullCRT2 = f_bull_crt(aH2, aL2, mH2, mL2, mC2)
+bool bearCRT2 = f_bear_crt(aH2, aL2, mH2, mL2, mC2)
+bool bullCRT3 = f_bull_crt(aH3, aL3, mH3, mL3, mC3)
+bool bearCRT3 = f_bear_crt(aH3, aL3, mH3, mL3, mC3)
+
+bool bullAligned1 = bullCRT1 and allowBull
+bool bearAligned1 = bearCRT1 and allowBear
+bool bullAligned2 = bullCRT2 and allowBull
+bool bearAligned2 = bearCRT2 and allowBear
+bool bullAligned3 = bullCRT3 and allowBull
+bool bearAligned3 = bearCRT3 and allowBear
+
+// ───── Session / execution permissions.
+bool nyRaw = not na(time(timeframe.period, nySession, nyTimeZone))
+bool inEntryWindow = not useNYSession or nyRaw
+bool nySessionStart = useNYSession and nyRaw and not nyRaw[1]
+bool newChartDay = ta.change(time("D")) != 0
+
+bool execTFAllowed = executionCharts == "Any Intraday" ? timeframe.isintraday :
+     executionCharts == "1M / 2M" ? (timeframe.isminutes and (timeframe.multiplier == 1 or timeframe.multiplier == 2)) :
+     (timeframe.isminutes and timeframe.multiplier == 1)
+
+var bool entryDone = false
+if nySessionStart or (not useNYSession and newChartDay)
+    entryDone := false
+
+// ───── Active CRT selection — FIRST valid setup, TIGHTEST range on simultaneous setups.
+// This is intentionally different from v1.1, which always promoted the highest active timeframe.
+float sec1 = timeframe.in_seconds(tf1)
+float sec2 = timeframe.in_seconds(tf2)
+float sec3 = timeframe.in_seconds(tf3)
+float c1Range1 = math.max(aH1 - aL1, syminfo.mintick)
+float c1Range2 = math.max(aH2 - aL2, syminfo.mintick)
+float c1Range3 = math.max(aH3 - aL3, syminfo.mintick)
+
+var int selectedIdx = 0
+var bool selectedBull = false
+var int selectedC3Time = na
+var float selectedC1Range = na
+bool selectionMadeThisBar = false
+string selectionReason = ""
+
+if nySessionStart or (not useNYSession and newChartDay)
+    selectedIdx := 0
+    selectedBull := false
+    selectedC3Time := na
+    selectedC1Range := na
+
+int selectedCurrentC3 = selectedIdx == 1 ? crtTime1 : selectedIdx == 2 ? crtTime2 : selectedIdx == 3 ? crtTime3 : na
+bool selectedAlignedNow = selectedIdx == 1 ? (selectedBull ? bullAligned1 : bearAligned1) :
+     selectedIdx == 2 ? (selectedBull ? bullAligned2 : bearAligned2) :
+     selectedIdx == 3 ? (selectedBull ? bullAligned3 : bearAligned3) : false
+float selectedInvalidationNow = selectedIdx == 1 ? (selectedBull ? mL1 : mH1) :
+     selectedIdx == 2 ? (selectedBull ? mL2 : mH2) :
+     selectedIdx == 3 ? (selectedBull ? mL3 : mH3) : na
+float selectedTargetNow = selectedIdx == 1 ? (selectedBull ? aH1 : aL1) :
+     selectedIdx == 2 ? (selectedBull ? aH2 : aL2) :
+     selectedIdx == 3 ? (selectedBull ? aH3 : aL3) : na
+bool selectedExpired = selectedIdx != 0 and (selectedCurrentC3 != selectedC3Time or not selectedAlignedNow)
+bool selectedInvalidNow = selectedIdx != 0 and barstate.isconfirmed and not na(selectedInvalidationNow) and
+     (selectedBull ? close < selectedInvalidationNow : close > selectedInvalidationNow)
+bool selectedTargetHitNow = selectedIdx != 0 and not na(selectedTargetNow) and
+     (selectedBull ? high >= selectedTargetNow : low <= selectedTargetNow)
+
+if selectedExpired or selectedInvalidNow or selectedTargetHitNow
+    selectedIdx := 0
+    selectedBull := false
+    selectedC3Time := na
+    selectedC1Range := na
+
+bool crt1TargetAlready = bullAligned1 ? dH1 >= aH1 : bearAligned1 ? dL1 <= aL1 : false
+bool crt2TargetAlready = bullAligned2 ? dH2 >= aH2 : bearAligned2 ? dL2 <= aL2 : false
+bool crt3TargetAlready = bullAligned3 ? dH3 >= aH3 : bearAligned3 ? dL3 <= aL3 : false
+bool crt1InvalidAlready = bullAligned1 ? close < mL1 : bearAligned1 ? close > mH1 : false
+bool crt2InvalidAlready = bullAligned2 ? close < mL2 : bearAligned2 ? close > mH2 : false
+bool crt3InvalidAlready = bullAligned3 ? close < mL3 : bearAligned3 ? close > mH3 : false
+bool candidate1 = (bullAligned1 or bearAligned1) and (newCRT1 or nySessionStart) and not crt1TargetAlready and not crt1InvalidAlready
+bool candidate2 = (bullAligned2 or bearAligned2) and (newCRT2 or nySessionStart) and not crt2TargetAlready and not crt2InvalidAlready
+bool candidate3 = (bullAligned3 or bearAligned3) and (newCRT3 or nySessionStart) and not crt3TargetAlready and not crt3InvalidAlready
+int candidateCount = (candidate1 ? 1 : 0) + (candidate2 ? 1 : 0) + (candidate3 ? 1 : 0)
+
+if selectedIdx == 0 and inEntryWindow and (not oneEntryPerNYSession or not entryDone) and candidateCount > 0
+    float bestRange = 1e20
+    float bestSec = 1e20
+
+    if candidate1
+        bestRange := c1Range1
+        bestSec := sec1
+        selectedIdx := 1
+        selectedBull := bullAligned1
+        selectedC3Time := crtTime1
+        selectedC1Range := c1Range1
+
+    if candidate2 and (c1Range2 < bestRange - syminfo.mintick or (math.abs(c1Range2 - bestRange) <= syminfo.mintick and sec2 < bestSec))
+        bestRange := c1Range2
+        bestSec := sec2
+        selectedIdx := 2
+        selectedBull := bullAligned2
+        selectedC3Time := crtTime2
+        selectedC1Range := c1Range2
+
+    if candidate3 and (c1Range3 < bestRange - syminfo.mintick or (math.abs(c1Range3 - bestRange) <= syminfo.mintick and sec3 < bestSec))
+        bestRange := c1Range3
+        bestSec := sec3
+        selectedIdx := 3
+        selectedBull := bullAligned3
+        selectedC3Time := crtTime3
+        selectedC1Range := c1Range3
+
+    selectionMadeThisBar := selectedIdx != 0
+    selectionReason := candidateCount > 1 ? "TIGHTEST RANGE" : "FIRST VALID"
+
+int activeIdx = selectedIdx
+bool activeBull = selectedBull
+float activeAH = activeIdx == 1 ? aH1 : activeIdx == 2 ? aH2 : activeIdx == 3 ? aH3 : na
+float activeAL = activeIdx == 1 ? aL1 : activeIdx == 2 ? aL2 : activeIdx == 3 ? aL3 : na
+float activeMid = activeIdx != 0 ? (activeAH + activeAL) * 0.5 : na
+float activeTrigger = activeIdx == 1 ? (activeBull ? mH1 : mL1) :
+     activeIdx == 2 ? (activeBull ? mH2 : mL2) :
+     activeIdx == 3 ? (activeBull ? mH3 : mL3) : na
+float activeInvalidation = activeIdx == 1 ? (activeBull ? mL1 : mH1) :
+     activeIdx == 2 ? (activeBull ? mL2 : mH2) :
+     activeIdx == 3 ? (activeBull ? mL3 : mH3) : na
+float activeTarget = activeIdx != 0 ? (activeBull ? activeAH : activeAL) : na
+string activeTF = activeIdx == 1 ? f_tf_label(tf1) : activeIdx == 2 ? f_tf_label(tf2) : activeIdx == 3 ? f_tf_label(tf3) : "WAIT"
+int activeC3Time = activeIdx == 1 ? crtTime1 : activeIdx == 2 ? crtTime2 : activeIdx == 3 ? crtTime3 : na
+
+// 1M execution measurements.
+float executionATR = ta.atr(executionATRLength)
+float executionRange = math.max(high - low, syminfo.mintick)
+float executionBodyPct = math.abs(close - open) / executionRange
+float priorExecHigh = ta.highest(high[1], executionStructureLookback)
+float priorExecLow = ta.lowest(low[1], executionStructureLookback)
+
+bool bullStructureBreak = not na(priorExecHigh) and close > priorExecHigh
+bool bearStructureBreak = not na(priorExecLow) and close < priorExecLow
+bool bullDisplacement = close > open and executionRange >= executionATR * executionDisplacementATR and executionBodyPct >= executionDisplacementBody
+bool bearDisplacement = close < open and executionRange >= executionATR * executionDisplacementATR and executionBodyPct >= executionDisplacementBody
+bool bullShiftQualified = bullStructureBreak and (not requireExecutionDisplacement or bullDisplacement)
+bool bearShiftQualified = bearStructureBreak and (not requireExecutionDisplacement or bearDisplacement)
+
+// 1M price-action quality. The lesson's "clean vs chop" decision is approximated with three simple facts:
+// net efficiency, candle-direction alternation, and repeated two-sided wick behavior.
+float paPath = 0.0
+int paAlternations = 0
+int paTwoSidedWicks = 0
+int paSamples = 0
+for i = 0 to paLookback - 1
+    if not na(close[i + 1])
+        float r = math.max(high[i] - low[i], syminfo.mintick)
+        float upW = high[i] - math.max(open[i], close[i])
+        float dnW = math.min(open[i], close[i]) - low[i]
+        int d0 = close[i] > open[i] ? 1 : close[i] < open[i] ? -1 : 0
+        int d1 = close[i + 1] > open[i + 1] ? 1 : close[i + 1] < open[i + 1] ? -1 : 0
+        paPath += math.abs(close[i] - close[i + 1])
+        paSamples += 1
+        if d0 != 0 and d1 != 0 and d0 != d1
+            paAlternations += 1
+        if upW >= r * paTwoSidedWickPct and dnW >= r * paTwoSidedWickPct
+            paTwoSidedWicks += 1
+
+float paEfficiency = paPath > syminfo.mintick and not na(close[paLookback]) ? math.abs(close - close[paLookback]) / paPath : 1.0
+float paAlternationRatio = paSamples > 1 ? float(paAlternations) / float(paSamples) : 0.0
+float paWickRatio = paSamples > 0 ? float(paTwoSidedWicks) / float(paSamples) : 0.0
+bool severeChop = paEfficiency <= paSevereEfficiency and paAlternationRatio >= paSevereAlternation and paWickRatio >= paSevereWickRatio
+bool choppyPA = severeChop or (paEfficiency < paCleanEfficiency and
+     (paAlternationRatio >= paChopAlternation or paWickRatio >= paChopWickRatio))
+bool cleanPA = not choppyPA
+bool priceActionEntryOK = not blockSevereChop or not severeChop
+string paState = severeChop ? "SEVERE CHOP • SKIP" : choppyPA ? "CHOP • RETEST" : "CLEAN • BREAK"
+color paColor = severeChop ? color.new(bearColor, 20) : choppyPA ? color.new(color.orange, 20) : color.new(bullColor, 20)
+
+f_exact_break_up(float level) =>
+    not na(level) and (triggerMode == "Wick Break" ?
+         (high > level and high[1] <= level) :
+         (close > level and close[1] <= level))
+
+f_exact_break_down(float level) =>
+    not na(level) and (triggerMode == "Wick Break" ?
+         (low < level and low[1] >= level) :
+         (close < level and close[1] >= level))
+
+f_mid_ok_bull(float aH, float aL) =>
+    not useMidpointEntryFilter or close <= (aH + aL) * 0.5
+
+f_mid_ok_bear(float aH, float aL) =>
+    not useMidpointEntryFilter or close >= (aH + aL) * 0.5
+
+// Entry state resets whenever the selected C3 changes, direction changes, or no aligned CRT is active.
+var int stateIdx = 0
+var int stateC3Time = na
+var bool stateBull = false
+var bool setupInvalid = false
+var bool targetAlreadyReached = false
+var bool structureBroken = false
+var float retestLevel = na
+var int structureBreakBar = na
+var bool tbsSeen = false
+var int tbsBar = na
+var bool videoBreakSeen = false
+var int videoBreakBar = na
+var float videoRetestLevel = na
+var bool crtShiftSeen = false
+var int crtShiftBar = na
+var bool fvgArmed = false
+var float crtFVGTop = na
+var float crtFVGBottom = na
+var int crtFVGBar = na
+var label executionStateLabel = na
+
+bool setupChanged = activeIdx != stateIdx or activeC3Time != stateC3Time or (activeIdx != 0 and activeBull != stateBull)
+if setupChanged
+    stateIdx := activeIdx
+    stateC3Time := activeC3Time
+    stateBull := activeBull
+    setupInvalid := false
+    targetAlreadyReached := false
+    structureBroken := false
+    retestLevel := na
+    structureBreakBar := na
+    tbsSeen := false
+    tbsBar := na
+    videoBreakSeen := false
+    videoBreakBar := na
+    videoRetestLevel := na
+    crtShiftSeen := false
+    crtShiftBar := na
+    fvgArmed := false
+    crtFVGTop := na
+    crtFVGBottom := na
+    crtFVGBar := na
+    if not na(executionStateLabel)
+        label.delete(executionStateLabel)
+        executionStateLabel := na
+
+bool activeSetup = activeIdx != 0
+bool exactBullBreakNow = activeSetup and activeBull and f_exact_break_up(activeTrigger)
+bool exactBearBreakNow = activeSetup and not activeBull and f_exact_break_down(activeTrigger)
+if activeSetup
+    if not setupInvalid
+        setupInvalid := barstate.isconfirmed and (activeBull ? close < activeInvalidation : close > activeInvalidation)
+    if not targetAlreadyReached
+        targetAlreadyReached := activeBull ? high >= activeTarget : low <= activeTarget
+
+// Lower-timeframe Turtle Body Soup proxy used only by the optional TBS entry model.
+// Bullish CRT wants a downside body purge first; bearish CRT wants an upside body purge.
+float tbsPriorHigh = ta.highest(high[1], tbsLiquidityLookback)
+float tbsPriorLow = ta.lowest(low[1], tbsLiquidityLookback)
+bool bullTBSRaw = activeSetup and activeBull and not na(tbsPriorLow) and close < tbsPriorLow
+bool bearTBSRaw = activeSetup and not activeBull and not na(tbsPriorHigh) and close > tbsPriorHigh
+
+if activeSetup and inEntryWindow and execTFAllowed and not setupInvalid and not targetAlreadyReached
+    if bullTBSRaw or bearTBSRaw
+        tbsSeen := true
+        tbsBar := bar_index
+
+    if entryModel == "Break + Retest" and not structureBroken
+        if activeBull and bullShiftQualified
+            structureBroken := true
+            retestLevel := priorExecHigh
+            structureBreakBar := bar_index
+        if not activeBull and bearShiftQualified
+            structureBroken := true
+            retestLevel := priorExecLow
+            structureBreakBar := bar_index
+
+    if entryModel == "Break + Retest" and structureBroken and not na(structureBreakBar) and bar_index - structureBreakBar > retestWindowBars
+        structureBroken := false
+        retestLevel := na
+        structureBreakBar := na
+
+    // VIDEO ADAPTIVE: choppy-but-not-severe price action must prove the C2 break first,
+    // then reject the same C2 trigger on the first qualified retest.
+    if entryModel == "Video Adaptive" and not videoBreakSeen and choppyPA and not severeChop
+        if exactBullBreakNow or exactBearBreakNow
+            videoBreakSeen := true
+            videoBreakBar := bar_index
+            videoRetestLevel := activeTrigger
+
+    if entryModel == "Video Adaptive" and videoBreakSeen and not na(videoBreakBar) and bar_index - videoBreakBar > retestWindowBars
+        videoBreakSeen := false
+        videoBreakBar := na
+        videoRetestLevel := na
+
+    // CRT SHIFT + FVG: the C2 sweep is already confirmed by the HTF CRT.
+    // Now require the execution chart to break the opposite C2 extreme before an FVG can arm.
+    if entryModel == "CRT Shift + FVG" and not crtShiftSeen and (exactBullBreakNow or exactBearBreakNow)
+        crtShiftSeen := true
+        crtShiftBar := bar_index
+        fvgArmed := false
+        crtFVGTop := na
+        crtFVGBottom := na
+        crtFVGBar := na
+
+    // If no FVG forms soon after the shift, the precision-entry opportunity expires.
+    if entryModel == "CRT Shift + FVG" and crtShiftSeen and not fvgArmed and not na(crtShiftBar) and bar_index - crtShiftBar > fvgSearchBars
+        crtShiftSeen := false
+        crtShiftBar := na
+
+float retestTolerance = executionATR * retestToleranceATR
+
+// Classic directional 3-candle FVG on the execution chart.
+float bullFVGSize = not na(high[2]) ? low - high[2] : na
+float bearFVGSize = not na(low[2]) ? low[2] - high : na
+bool bullFVGNow = activeSetup and activeBull and not na(bullFVGSize) and bullFVGSize > 0 and bullFVGSize >= executionATR * fvgMinATR
+bool bearFVGNow = activeSetup and not activeBull and not na(bearFVGSize) and bearFVGSize > 0 and bearFVGSize >= executionATR * fvgMinATR
+
+if entryModel == "CRT Shift + FVG" and activeSetup and crtShiftSeen and not fvgArmed and not na(crtShiftBar) and bar_index - crtShiftBar <= fvgSearchBars
+    if activeBull and bullFVGNow
+        fvgArmed := true
+        crtFVGBottom := high[2]
+        crtFVGTop := low
+        crtFVGBar := bar_index
+    else if not activeBull and bearFVGNow
+        fvgArmed := true
+        crtFVGBottom := high
+        crtFVGTop := low[2]
+        crtFVGBar := bar_index
+
+// The selected FVG can fail or expire before a signal. If it does, keep the parent CRT intact
+// but do not print an FVG entry from a broken precision zone.
+if entryModel == "CRT Shift + FVG" and fvgArmed
+    bool fvgInvalidNow = barstate.isconfirmed and (activeBull ? close < crtFVGBottom : close > crtFVGTop)
+    bool fvgExpiredNow = not na(crtFVGBar) and bar_index - crtFVGBar > fvgRetestBars
+    if fvgInvalidNow or fvgExpiredNow
+        fvgArmed := false
+        crtFVGTop := na
+        crtFVGBottom := na
+        crtFVGBar := na
+bool bullRetest = activeSetup and activeBull and structureBroken and not na(retestLevel) and not na(structureBreakBar) and
+     bar_index > structureBreakBar and bar_index - structureBreakBar <= retestWindowBars and
+     low <= retestLevel + retestTolerance and close >= retestLevel and close > open
+bool bearRetest = activeSetup and not activeBull and structureBroken and not na(retestLevel) and not na(structureBreakBar) and
+     bar_index > structureBreakBar and bar_index - structureBreakBar <= retestWindowBars and
+     high >= retestLevel - retestTolerance and close <= retestLevel and close < open
+
+bool videoBullRetest = activeSetup and activeBull and videoBreakSeen and not na(videoRetestLevel) and not na(videoBreakBar) and
+     bar_index > videoBreakBar and bar_index - videoBreakBar <= retestWindowBars and
+     low <= videoRetestLevel + retestTolerance and close >= videoRetestLevel and close > open
+bool videoBearRetest = activeSetup and not activeBull and videoBreakSeen and not na(videoRetestLevel) and not na(videoBreakBar) and
+     bar_index > videoBreakBar and bar_index - videoBreakBar <= retestWindowBars and
+     high >= videoRetestLevel - retestTolerance and close <= videoRetestLevel and close < open
+
+bool bullFVGRetest = activeSetup and activeBull and fvgArmed and not na(crtFVGTop) and not na(crtFVGBottom) and not na(crtFVGBar) and
+     bar_index > crtFVGBar and bar_index - crtFVGBar <= fvgRetestBars and
+     low <= crtFVGTop and high >= crtFVGBottom and close >= crtFVGBottom and
+     (not requireFVGDirectionalClose or close > open)
+bool bearFVGRetest = activeSetup and not activeBull and fvgArmed and not na(crtFVGTop) and not na(crtFVGBottom) and not na(crtFVGBar) and
+     bar_index > crtFVGBar and bar_index - crtFVGBar <= fvgRetestBars and
+     high >= crtFVGBottom and low <= crtFVGTop and close <= crtFVGTop and
+     (not requireFVGDirectionalClose or close < open)
+
+bool recentBullTBS = tbsSeen and not na(tbsBar) and bar_index > tbsBar and bar_index - tbsBar <= tbsMaxBarsBeforeShift
+bool recentBearTBS = recentBullTBS  // same stored state; direction is fixed by active CRT
+bool entryBarReady = not confirmEntryOnClose or barstate.isconfirmed
+
+bool modelBullSignal = false
+bool modelBearSignal = false
+string entryReason = ""
+
+if activeSetup and inEntryWindow and execTFAllowed and not setupInvalid and not targetAlreadyReached and priceActionEntryOK
+    if entryModel == "CRT Shift + FVG"
+        modelBullSignal := activeBull and bullFVGRetest and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and bearFVGRetest and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := modelBullSignal or modelBearSignal ? "C2 SHIFT • FVG RETEST" : "CRT SHIFT + FVG"
+    else if entryModel == "Video Adaptive"
+        // Clean delivery gets the video's direct C2 break. Choppy-but-tradable delivery waits for the C2 retest.
+        modelBullSignal := activeBull and ((cleanPA and exactBullBreakNow) or videoBullRetest) and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and ((cleanPA and exactBearBreakNow) or videoBearRetest) and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := modelBullSignal or modelBearSignal ? (videoBreakSeen ? "C2 RETEST • PA" : "C2 BREAK • CLEAN PA") : "VIDEO ADAPTIVE"
+    else if entryModel == "Exact C2 Break"
+        modelBullSignal := activeBull and exactBullBreakNow and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and exactBearBreakNow and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := "C2 BREAK"
+    else if entryModel == "Aggressive Structure Break"
+        modelBullSignal := activeBull and bullShiftQualified and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and bearShiftQualified and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := "STRUCTURE BREAK"
+    else if entryModel == "TBS + Structure Shift"
+        modelBullSignal := activeBull and recentBullTBS and bullShiftQualified and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and recentBearTBS and bearShiftQualified and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := "TBS + SHIFT"
+    else
+        modelBullSignal := activeBull and bullRetest and f_mid_ok_bull(activeAH, activeAL)
+        modelBearSignal := not activeBull and bearRetest and f_mid_ok_bear(activeAH, activeAL)
+        entryReason := "BREAK + RETEST"
+
+bool mayFire = entryBarReady and (modelBullSignal or modelBearSignal) and (not oneEntryPerNYSession or not entryDone)
+bool crtLongEntry = mayFire and modelBullSignal
+bool crtShortEntry = mayFire and modelBearSignal
+
+if crtLongEntry or crtShortEntry
+    entryDone := true
+    if entryModel == "CRT Shift + FVG"
+        fvgArmed := false
+
+// Setup label appears only for the CRT actually selected for execution.
+if showSetupLabels and selectionMadeThisBar and activeIdx != 0
+    string selectDirection = activeBull ? "LONG" : "SHORT"
+    string sweepText = activeBull ? "C2 LOW SWEPT • RECLAIMED" : "C2 HIGH SWEPT • RECLAIMED"
+    string flipText = biasMode == "Auto Structure" and useLiquidityBiasOverride and liquidityBiasOverride != 0 ? " • LIQ FLIP" : ""
+    label.new(bar_index, activeBull ? low : high,
+         activeTF + " CRT " + selectDirection + " SETUP\n" + selectionReason + flipText + " • " + sweepText,
+         style=activeBull ? label.style_label_up : label.style_label_down,
+         color=color.new(activeBull ? bullCRTColor : bearCRTColor, 15), textcolor=color.white, size=size.tiny)
+
+if showEntryLabels and crtLongEntry
+    string longPrefix = entryModel == "CRT Shift + FVG" ? "CRT FVG LONG" : entryModel == "Video Adaptive" ? "PERFECT CRT LONG" : entryModel == "TBS + Structure Shift" ? "A+ CRT LONG" : "CRT LONG"
+    label.new(bar_index, low, longPrefix + "\n" + activeTF + " • " + entryReason,
+         style=label.style_label_up, color=color.new(bullColor, 0), textcolor=color.white, size=size.small)
+if showEntryLabels and crtShortEntry
+    string shortPrefix = entryModel == "CRT Shift + FVG" ? "CRT FVG SHORT" : entryModel == "Video Adaptive" ? "PERFECT CRT SHORT" : entryModel == "TBS + Structure Shift" ? "A+ CRT SHORT" : "CRT SHORT"
+    label.new(bar_index, high, shortPrefix + "\n" + activeTF + " • " + entryReason,
+         style=label.style_label_down, color=color.new(bearColor, 0), textcolor=color.white, size=size.small)
+
+// Optional live state label so replay makes it obvious why a signal has or has not fired.
+string executionState = not execTFAllowed ? "USE 1M" :
+     useNYSession and not nyRaw ? "OUTSIDE NY" :
+     oneEntryPerNYSession and entryDone ? "ENTRY COMPLETE" :
+     severeChop and blockSevereChop ? "PA SEVERE CHOP • SKIP" :
+     not activeSetup ? "WAIT CRT" :
+     setupInvalid ? "CRT INVALID" :
+     targetAlreadyReached ? "TARGET HIT" :
+     entryModel == "CRT Shift + FVG" and fvgArmed ? "FVG READY • WAIT RETEST" :
+     entryModel == "CRT Shift + FVG" and crtShiftSeen ? "C2 SHIFT • WAIT FVG" :
+     entryModel == "CRT Shift + FVG" ? "CRT ARMED • WAIT C2 SHIFT" :
+     entryModel == "Video Adaptive" and videoBreakSeen ? "C2 BROKE • WAIT RETEST" :
+     entryModel == "Video Adaptive" and cleanPA ? "CRT ARMED • CLEAN BREAK" :
+     entryModel == "Video Adaptive" and choppyPA ? "CRT ARMED • WAIT C2+RETEST" :
+     entryModel == "Break + Retest" and structureBroken ? "WAIT RETEST" :
+     entryModel == "TBS + Structure Shift" and tbsSeen ? "TBS SEEN • WAIT SHIFT" :
+     "CRT ARMED • " + entryModel
+
+if barstate.islast
+    if showExecutionStateLabel and activeSetup and not na(activeTrigger)
+        float stateY = activeBull ? activeTrigger : activeTrigger
+        color stateColor = activeBull ? color.new(bullCRTColor, 20) : color.new(bearCRTColor, 20)
+        if na(executionStateLabel)
+            executionStateLabel := label.new(bar_index + 2, stateY, activeTF + " • " + executionState,
+                 xloc=xloc.bar_index, style=label.style_label_left, color=stateColor, textcolor=color.white, size=size.tiny)
+        else
+            label.set_xy(executionStateLabel, bar_index + 2, stateY)
+            label.set_text(executionStateLabel, activeTF + " • " + executionState)
+            label.set_color(executionStateLabel, stateColor)
+    else if not na(executionStateLabel)
+        label.delete(executionStateLabel)
+        executionStateLabel := na
+
+// Active CRT levels and current execution retest level.
+plot(showActiveLevels ? activeAH : na, "CRT C1 High", color=color.new(color.gray, 25), linewidth=1, style=plot.style_linebr)
+plot(showActiveLevels ? activeAL : na, "CRT C1 Low", color=color.new(color.gray, 25), linewidth=1, style=plot.style_linebr)
+plot(showActiveLevels ? activeMid : na, "CRT C1 50%", color=color.new(color.gray, 65), linewidth=1, style=plot.style_linebr)
+plot(showActiveLevels ? activeTrigger : na, "CRT C2 Exact Trigger", color=activeBull ? bullCRTColor : bearCRTColor, linewidth=2, style=plot.style_linebr)
+plot(showActiveLevels ? activeTarget : na, "CRT Target", color=activeBull ? color.new(bullColor, 5) : color.new(bearColor, 5), linewidth=2, style=plot.style_linebr)
+plot(showActiveLevels ? activeInvalidation : na, "CRT C2 Sweep Extreme", color=color.new(color.gray, 55), linewidth=1, style=plot.style_linebr)
+float displayedRetestLevel = entryModel == "Video Adaptive" and videoBreakSeen ? videoRetestLevel :
+     entryModel == "Break + Retest" and structureBroken ? retestLevel : na
+plot(showActiveLevels ? displayedRetestLevel : na,
+     "CRT 1M Retest Level", color=color.new(color.yellow, 10), linewidth=2, style=plot.style_linebr)
+
+float activeFVGTopPlot = showFVGZone and entryModel == "CRT Shift + FVG" and fvgArmed ? crtFVGTop : na
+float activeFVGBottomPlot = showFVGZone and entryModel == "CRT Shift + FVG" and fvgArmed ? crtFVGBottom : na
+color activeFVGColor = activeBull ? color.new(bullCRTColor, 82) : color.new(bearCRTColor, 82)
+pFVGTop = plot(activeFVGTopPlot, "CRT FVG Upper", color=color.new(activeBull ? bullCRTColor : bearCRTColor, 25), linewidth=1, style=plot.style_linebr)
+pFVGBottom = plot(activeFVGBottomPlot, "CRT FVG Lower", color=color.new(activeBull ? bullCRTColor : bearCRTColor, 25), linewidth=1, style=plot.style_linebr)
+fill(pFVGTop, pFVGBottom, color=activeFVGColor, title="CRT FVG Zone")
+
+// ───── Synthetic C1/C2/C3 candles on the right
+var box[] visBoxes = array.new_box()
+var line[] visLines = array.new_line()
+var label[] visLabels = array.new_label()
+
+f_clear_visuals() =>
+    if array.size(visBoxes) > 0
+        for i = 0 to array.size(visBoxes) - 1
+            box.delete(array.get(visBoxes, i))
+    if array.size(visLines) > 0
+        for i = 0 to array.size(visLines) - 1
+            line.delete(array.get(visLines, i))
+    if array.size(visLabels) > 0
+        for i = 0 to array.size(visLabels) - 1
+            label.delete(array.get(visLabels, i))
+    array.clear(visBoxes)
+    array.clear(visLines)
+    array.clear(visLabels)
+
+f_actual_color(float o, float c) =>
+    c >= o ? bullColor : bearColor
+
+f_draw_candle(int x, float o, float h, float l, float c, color bodyColor) =>
+    if not na(o) and not na(h) and not na(l) and not na(c)
+        float top = math.max(o, c)
+        float bottom = math.min(o, c)
+        if top - bottom < syminfo.mintick
+            top += syminfo.mintick
+            bottom -= syminfo.mintick
+        line wick = line.new(x, h, x, l, xloc=xloc.bar_index, color=bodyColor, width=1)
+        box body = box.new(x - 1, top, x + 1, bottom, xloc=xloc.bar_index,
+             bgcolor=color.new(bodyColor, 15), border_color=bodyColor, border_width=1)
+        array.push(visLines, wick)
+        array.push(visBoxes, body)
+
+f_draw_group(int baseX, string tfText,
+     float ao, float ah, float al, float ac,
+     float mo, float mh, float ml, float mc,
+     float do_, float dh, float dl, float dc,
+     bool bullSetup, bool bearSetup, bool bullAligned, bool bearAligned, float yPad) =>
+
+    color c1Color = anchorColor
+    color c2Color = bullSetup ? bullCRTColor : bearSetup ? bearCRTColor : f_actual_color(mo, mc)
+    color c3Color = bullAligned ? bullCRTColor : bearAligned ? bearCRTColor : f_actual_color(do_, dc)
+
+    f_draw_candle(baseX, ao, ah, al, ac, c1Color)
+    f_draw_candle(baseX + 3, mo, mh, ml, mc, c2Color)
+    f_draw_candle(baseX + 6, do_, dh, dl, dc, c3Color)
+
+    float groupHigh = math.max(ah, math.max(mh, dh))
+    float groupLow = math.min(al, math.min(ml, dl))
+    string state = bullAligned ? "BULL CRT" : bearAligned ? "BEAR CRT" :
+         bullSetup ? "BULL • COUNTER" : bearSetup ? "BEAR • COUNTER" : "WAIT"
+    color stateColor = bullAligned ? bullCRTColor : bearAligned ? bearCRTColor : color.new(color.gray, 10)
+
+    label title = label.new(baseX + 3, groupHigh + yPad, tfText + "\n" + state,
+         xloc=xloc.bar_index, style=label.style_none, textcolor=stateColor, size=size.small)
+    label n1 = label.new(baseX, groupLow - yPad * 0.35, "1", xloc=xloc.bar_index,
+         style=label.style_none, textcolor=color.white, size=size.tiny)
+    label n2 = label.new(baseX + 3, groupLow - yPad * 0.35, "2", xloc=xloc.bar_index,
+         style=label.style_none, textcolor=color.white, size=size.tiny)
+    label n3 = label.new(baseX + 6, groupLow - yPad * 0.35, "3", xloc=xloc.bar_index,
+         style=label.style_none, textcolor=color.white, size=size.tiny)
+
+    array.push(visLabels, title)
+    array.push(visLabels, n1)
+    array.push(visLabels, n2)
+    array.push(visLabels, n3)
+
+float visualATR = ta.atr(14)
+float visualPad = math.max(visualATR * 0.20, syminfo.mintick * 20.0)
+
+if barstate.islast
+    f_clear_visuals()
+    if showSyntheticCRT
+        int base1 = bar_index + visualOffset
+        int base2 = base1 + visualGroupSpacing
+        int base3 = base2 + visualGroupSpacing
+
+        f_draw_group(base1, f_tf_label(tf1),
+             aO1, aH1, aL1, aC1, mO1, mH1, mL1, mC1, dO1, dH1, dL1, dC1,
+             bullCRT1, bearCRT1, bullAligned1, bearAligned1, visualPad)
+        f_draw_group(base2, f_tf_label(tf2),
+             aO2, aH2, aL2, aC2, mO2, mH2, mL2, mC2, dO2, dH2, dL2, dC2,
+             bullCRT2, bearCRT2, bullAligned2, bearAligned2, visualPad)
+        f_draw_group(base3, f_tf_label(tf3),
+             aO3, aH3, aL3, aC3, mO3, mH3, mL3, mC3, dO3, dH3, dL3, dC3,
+             bullCRT3, bearCRT3, bullAligned3, bearAligned3, visualPad)
+
+// ───── Dashboard
+var table crtTable = table.new(position.bottom_right, 2, 8,
+     bgcolor=color.new(color.black, 72), border_width=1, border_color=color.new(color.gray, 65))
+
+if barstate.islast
+    table.clear(crtTable, 0, 0, 1, 7)
+    if showDashboard
+        table.cell(crtTable, 0, 0, "CRT BIAS", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 0, biasText, text_color=color.white, bgcolor=biasColor, text_size=size.tiny)
+
+        string s1 = bullAligned1 ? "BULL C3" : bearAligned1 ? "BEAR C3" : bullCRT1 or bearCRT1 ? "COUNTER" : "WAIT"
+        string s2 = bullAligned2 ? "BULL C3" : bearAligned2 ? "BEAR C3" : bullCRT2 or bearCRT2 ? "COUNTER" : "WAIT"
+        string s3 = bullAligned3 ? "BULL C3" : bearAligned3 ? "BEAR C3" : bullCRT3 or bearCRT3 ? "COUNTER" : "WAIT"
+
+        table.cell(crtTable, 0, 1, f_tf_label(tf1), text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 1, s1, text_color=color.white,
+             bgcolor=bullAligned1 ? color.new(bullCRTColor, 30) : bearAligned1 ? color.new(bearCRTColor, 30) : color.new(color.gray, 55), text_size=size.tiny)
+        table.cell(crtTable, 0, 2, f_tf_label(tf2), text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 2, s2, text_color=color.white,
+             bgcolor=bullAligned2 ? color.new(bullCRTColor, 30) : bearAligned2 ? color.new(bearCRTColor, 30) : color.new(color.gray, 55), text_size=size.tiny)
+        table.cell(crtTable, 0, 3, f_tf_label(tf3), text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 3, s3, text_color=color.white,
+             bgcolor=bullAligned3 ? color.new(bullCRTColor, 30) : bearAligned3 ? color.new(bearCRTColor, 30) : color.new(color.gray, 55), text_size=size.tiny)
+
+        string selectedText = activeIdx == 0 ? "WAIT" : activeTF + (activeBull ? " • LONG" : " • SHORT")
+        color selectedColor = activeIdx == 0 ? color.new(color.gray, 55) : activeBull ? color.new(bullCRTColor, 30) : color.new(bearCRTColor, 30)
+        table.cell(crtTable, 0, 4, "SELECT", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 4, selectedText, text_color=color.white, bgcolor=selectedColor, text_size=size.tiny)
+
+        table.cell(crtTable, 0, 5, "1M PA", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 5, paState, text_color=color.white, bgcolor=paColor, text_size=size.tiny)
+
+        string dayState = dayofweek == dayofweek.monday ? "MON • CHECK NEWS" : "CHECK CALENDAR"
+        color dayColor = dayofweek == dayofweek.monday ? color.new(color.orange, 25) : color.new(color.gray, 55)
+        table.cell(crtTable, 0, 6, "NEWS", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 6, dayState, text_color=color.white, bgcolor=dayColor, text_size=size.tiny)
+
+        color execColor = activeIdx == 0 ? color.new(color.gray, 55) :
+             activeBull ? color.new(bullCRTColor, 30) : color.new(bearCRTColor, 30)
+        table.cell(crtTable, 0, 7, "EXEC", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(crtTable, 1, 7, executionState, text_color=color.white, bgcolor=execColor, text_size=size.tiny)
+
+alertcondition(crtLongEntry, "EZ$ CRT Long Entry",
+     "EZ$ CRT: selected bullish CRT entry confirmed on the execution chart. CRT Shift + FVG mode signals after C2 shift and FVG retest.")
+alertcondition(crtShortEntry, "EZ$ CRT Short Entry",
+     "EZ$ CRT: selected bearish CRT entry confirmed on the execution chart. CRT Shift + FVG mode signals after C2 shift and FVG retest.")

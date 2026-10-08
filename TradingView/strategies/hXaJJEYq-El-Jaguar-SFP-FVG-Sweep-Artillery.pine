@@ -1,0 +1,248 @@
+//@version=6
+// El Jaguar - liquidity-sweep reversal strategy: hourly swing-failure pattern (SFP),
+// then a 5-minute fair value gap (FVG) retrace entry, targeting the prior day's range.
+// Concept credit: the daily sweep model popularised by the trader JadeCap. All code original.
+// Canonical republication (version suffix dropped, neutral defaults). Educational tool. Not financial advice.
+
+strategy("El Jaguar SFP FVG Sweep [Artillery]", shorttitle="El Jaguar", overlay=true, margin_long=5, margin_short=5,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.62,
+     slippage=1, process_orders_on_close=false, calc_on_every_tick=false,
+     max_bars_back=500, currency=currency.USD)
+
+// ─── INPUTS ─────────────────────────────────────────────────────────
+// Direction filter
+dirInput       = input.string("Both", "Trade Direction", options=["Both", "Long Only", "Short Only"], group="Direction")
+allowLongs     = dirInput == "Both" or dirInput == "Long Only"
+allowShorts    = dirInput == "Both" or dirInput == "Short Only"
+
+swingLookback  = input.int(3, "Swing Lookback Bars (1H)", minval=2, maxval=10, group="Swing Points")
+sfpWickMin     = input.float(1.0, "Min SFP Wick Points", step=0.5, group="SFP Filter",
+                 tooltip="Minimum points the sweep must extend beyond the swing level")
+sfpMaxAge      = input.int(30, "SFP Valid Window (bars)", minval=3, maxval=60, group="SFP Filter",
+                 tooltip="Bars after SFP detection that entry is still valid")
+
+fvgMinSize     = input.float(1.5, "Min FVG Size (pts)", step=0.5, group="FVG Entry")
+fvgMaxAge      = input.int(20, "Max FVG Age (bars)", minval=3, maxval=30, group="FVG Entry")
+
+slBuffer       = input.float(2.0, "SL Buffer Beyond Sweep (pts)", step=0.5, group="Risk Mgmt")
+rrRatio        = input.float(2.0, "Risk:Reward Ratio", step=0.25, minval=1.0, maxval=4.0, group="Risk Mgmt")
+maxTrades      = input.int(2, "Max Trades/Day", minval=1, maxval=5, group="Risk Mgmt")
+timeStopHour   = input.int(12, "Time Stop Hour ET", minval=11, maxval=15, group="Risk Mgmt")
+
+sessStartH     = input.int(9, "Session Start Hour ET", minval=0, maxval=23, group="Session")
+sessStartM     = input.int(30, "Session Start Minute ET", minval=0, maxval=59, group="Session")
+sessEndH       = input.int(11, "Session End Hour ET", minval=0, maxval=23, group="Session")
+sessEndM       = input.int(30, "Session End Minute ET", minval=0, maxval=59, group="Session")
+
+// ─── SESSION CALCULATIONS ───────────────────────────────────────────
+etHour   = hour(time, "America/New_York")
+etMinute = minute(time, "America/New_York")
+etTime   = etHour * 100 + etMinute
+inSession = etTime >= sessStartH * 100 + sessStartM and etTime < sessEndH * 100 + sessEndM
+
+// ─── PREVIOUS DAY HIGH / LOW ────────────────────────────────────────
+var float pdh = na
+var float pdl = na
+var float todayHigh = na
+var float todayLow  = na
+
+newDay = ta.change(time("D")) != 0
+if newDay
+    pdh := todayHigh
+    pdl := todayLow
+    todayHigh := high
+    todayLow  := low
+else
+    todayHigh := math.max(nz(todayHigh, high), high)
+    todayLow  := math.min(nz(todayLow, low), low)
+
+// ─── HOURLY SWING POINTS VIA REQUEST.SECURITY ──────────────────────
+h1SwingHigh = request.security(syminfo.tickerid, "60",
+     ta.pivothigh(high, swingLookback, swingLookback), lookahead=barmerge.lookahead_off)
+h1SwingLow  = request.security(syminfo.tickerid, "60",
+     ta.pivotlow(low, swingLookback, swingLookback), lookahead=barmerge.lookahead_off)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(h1SwingHigh)
+    lastSwingHigh := h1SwingHigh
+if not na(h1SwingLow)
+    lastSwingLow  := h1SwingLow
+
+// ─── SFP DETECTION — ONE-SHOT + TIME-LIMITED ────────────────────────
+var bool  bullSFP       = false
+var bool  bearSFP       = false
+var float sfpSweepLow   = na
+var float sfpSweepHigh  = na
+var int   bullSFP_bar   = na
+var int   bearSFP_bar   = na
+
+if newDay
+    bullSFP      := false
+    bearSFP      := false
+    sfpSweepLow  := na
+    sfpSweepHigh := na
+    bullSFP_bar  := na
+    bearSFP_bar  := na
+
+// Bullish SFP: low sweeps below lastSwingLow, close back above
+if not na(lastSwingLow) and not bullSFP
+    swept = low < lastSwingLow - syminfo.mintick
+    wickSize = lastSwingLow - low
+    closedAbove = close > lastSwingLow
+    if swept and closedAbove and wickSize >= sfpWickMin
+        bullSFP     := true
+        sfpSweepLow := low
+        bullSFP_bar := bar_index
+
+// Bearish SFP: high sweeps above lastSwingHigh, close back below
+if not na(lastSwingHigh) and not bearSFP
+    swept = high > lastSwingHigh + syminfo.mintick
+    wickSize = high - lastSwingHigh
+    closedBelow = close < lastSwingHigh
+    if swept and closedBelow and wickSize >= sfpWickMin
+        bearSFP      := true
+        sfpSweepHigh := high
+        bearSFP_bar  := bar_index
+
+// Expire SFP after validity window
+bullSFP_valid = bullSFP and not na(bullSFP_bar) and (bar_index - bullSFP_bar) <= sfpMaxAge
+bearSFP_valid = bearSFP and not na(bearSFP_bar) and (bar_index - bearSFP_bar) <= sfpMaxAge
+
+// ─── FVG DETECTION — MUST FORM AFTER SFP ───────────────────────────
+bullFVG_top    = low
+bullFVG_bottom = high[2]
+bullFVG_size   = bullFVG_top - bullFVG_bottom
+bullFVG_valid  = bullFVG_size >= fvgMinSize and close[1] > open[1]
+
+bearFVG_top    = low[2]
+bearFVG_bottom = high
+bearFVG_size   = bearFVG_top - bearFVG_bottom
+bearFVG_valid  = bearFVG_size >= fvgMinSize and close[1] < open[1]
+
+var float activeBullFVG_top    = na
+var float activeBullFVG_bottom = na
+var int   activeBullFVG_bar    = na
+
+var float activeBearFVG_top    = na
+var float activeBearFVG_bottom = na
+var int   activeBearFVG_bar    = na
+
+if bullFVG_valid and bullFVG_size > 0 and bullSFP_valid
+    activeBullFVG_top    := bullFVG_top
+    activeBullFVG_bottom := bullFVG_bottom
+    activeBullFVG_bar    := bar_index
+
+if bearFVG_valid and bearFVG_size > 0 and bearSFP_valid
+    activeBearFVG_top    := bearFVG_top
+    activeBearFVG_bottom := bearFVG_bottom
+    activeBearFVG_bar    := bar_index
+
+// FVG freshness
+bullFVG_fresh = not na(activeBullFVG_bar) and (bar_index - activeBullFVG_bar) <= fvgMaxAge
+bearFVG_fresh = not na(activeBearFVG_bar) and (bar_index - activeBearFVG_bar) <= fvgMaxAge
+
+// FVG retrace
+bullFVG_retrace = bullFVG_fresh and low <= activeBullFVG_top and close > activeBullFVG_bottom
+bearFVG_retrace = bearFVG_fresh and high >= activeBearFVG_bottom and close < activeBearFVG_top
+
+// ─── TARGET NOT ALREADY HIT ─────────────────────────────────────────
+notAlreadyHitPDH = not na(pdh) and todayHigh < pdh
+notAlreadyHitPDL = not na(pdl) and todayLow > pdl
+
+// ─── TRADE MANAGEMENT ───────────────────────────────────────────────
+var int tradesToday = 0
+if newDay
+    tradesToday := 0
+
+noPos    = strategy.position_size == 0
+canTrade = tradesToday < maxTrades and inSession and noPos
+
+// ─── ENTRY SIGNALS — GATED BY DIRECTION FILTER ─────────────────────
+longSig  = canTrade and allowLongs and bullSFP_valid and bullFVG_retrace and notAlreadyHitPDH
+shortSig = canTrade and allowShorts and bearSFP_valid and bearFVG_retrace and notAlreadyHitPDL
+
+// ─── SL / TP ────────────────────────────────────────────────────────
+var float entryPrice = na
+var float stopLoss   = na
+var float takeProfit  = na
+
+if longSig
+    entryPrice := close
+    stopLoss   := sfpSweepLow - slBuffer
+    riskPts    = entryPrice - stopLoss
+    takeProfit := entryPrice + (riskPts * rrRatio)
+    if not na(pdh) and pdh < takeProfit
+        takeProfit := pdh
+    tradesToday += 1
+    strategy.entry("Long", strategy.long)
+    strategy.exit("LX", "Long", stop=stopLoss, limit=takeProfit)
+    bullSFP     := false
+    bullSFP_bar := na
+    activeBullFVG_bar := na
+
+if shortSig
+    entryPrice := close
+    stopLoss   := sfpSweepHigh + slBuffer
+    riskPts    = stopLoss - entryPrice
+    takeProfit := entryPrice - (riskPts * rrRatio)
+    if not na(pdl) and pdl > takeProfit
+        takeProfit := pdl
+    tradesToday += 1
+    strategy.entry("Short", strategy.short)
+    strategy.exit("SX", "Short", stop=stopLoss, limit=takeProfit)
+    bearSFP     := false
+    bearSFP_bar := na
+    activeBearFVG_bar := na
+
+// ─── TIME STOP ──────────────────────────────────────────────────────
+if strategy.position_size != 0 and etHour >= timeStopHour
+    strategy.close_all("TimeStop")
+
+// ─── VISUALS ────────────────────────────────────────────────────────
+bullCol = color.new(#00E676, 0)
+bearCol = color.new(#FF1744, 0)
+neutCol = color.new(#78909C, 0)
+goldCol = color.new(#FFD700, 0)
+
+plot(pdh, "PDH", color=color.new(bearCol, 40), style=plot.style_stepline_diamond, linewidth=1)
+plot(pdl, "PDL", color=color.new(bullCol, 40), style=plot.style_stepline_diamond, linewidth=1)
+plot(lastSwingHigh, "Swing High", color=color.new(#FF6D00, 50), style=plot.style_circles, linewidth=2)
+plot(lastSwingLow,  "Swing Low",  color=color.new(#2979FF, 50), style=plot.style_circles, linewidth=2)
+
+plotshape(bullSFP and bullSFP != bullSFP[1], "Bull SFP", shape.diamond, location.belowbar,
+     goldCol, size=size.small, text="SFP")
+plotshape(bearSFP and bearSFP != bearSFP[1], "Bear SFP", shape.diamond, location.abovebar,
+     goldCol, size=size.small, text="SFP")
+
+plotshape(longSig,  "LONG",  shape.triangleup,   location.belowbar, bullCol, size=size.normal)
+plotshape(shortSig, "SHORT", shape.triangledown,  location.abovebar, bearCol, size=size.normal)
+
+bgcolor(bullFVG_fresh and bullFVG_retrace ? color.new(bullCol, 92) : na, title="Bull FVG Zone")
+bgcolor(bearFVG_fresh and bearFVG_retrace ? color.new(bearCol, 92) : na, title="Bear FVG Zone")
+bgcolor(inSession ? color.new(goldCol, 95) : na, title="NY Kill Zone")
+
+// ─── INFO TABLE ─────────────────────────────────────────────────────
+var table infoTbl = table.new(position.top_right, 2, 7, bgcolor=color.new(#1a1a2e, 10),
+     border_color=color.new(neutCol, 70), border_width=1)
+if barstate.islast
+    table.cell(infoTbl, 0, 0, "EL JAGUAR", text_color=goldCol, text_size=size.small)
+    table.cell(infoTbl, 1, 0, dirInput, text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 0, 1, "Bias", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 1, bullSFP_valid ? "BULL SFP" : bearSFP_valid ? "BEAR SFP" : "Waiting...",
+         text_color=bullSFP_valid ? bullCol : bearSFP_valid ? bearCol : neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 0, 2, "PDH", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 2, str.tostring(pdh, "#.##"), text_color=bearCol, text_size=size.tiny)
+    table.cell(infoTbl, 0, 3, "PDL", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 3, str.tostring(pdl, "#.##"), text_color=bullCol, text_size=size.tiny)
+    table.cell(infoTbl, 0, 4, "Trades", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 4, str.tostring(tradesToday) + "/" + str.tostring(maxTrades),
+         text_color=color.white, text_size=size.tiny)
+    table.cell(infoTbl, 0, 5, "Session", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 5, inSession ? "ACTIVE" : "CLOSED",
+         text_color=inSession ? bullCol : neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 0, 6, "Direction", text_color=neutCol, text_size=size.tiny)
+    table.cell(infoTbl, 1, 6, allowLongs and allowShorts ? "BOTH" : allowShorts ? "SHORT" : "LONG",
+         text_color=allowShorts and not allowLongs ? bearCol : allowLongs and not allowShorts ? bullCol : neutCol, text_size=size.tiny)

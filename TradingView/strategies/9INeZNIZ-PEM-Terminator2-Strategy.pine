@@ -1,0 +1,140 @@
+//@version=5
+strategy("PEM Terminator2 Strategy", overlay=true, 
+     initial_capital=50000, 
+     default_qty_type=strategy.fixed, 
+     default_qty_value=6,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.50,
+     calc_on_every_tick=false)
+
+// ==================== INPUTS ====================
+atrLen      = input.int(14,    "ATR Length")
+impulseMult = input.float(1.1, "Impulse Strength (ATR)")
+compressPct = input.float(0.7, "Compression Tightness %")
+stallBars   = input.int(2,     "Min Stall Bars")
+minBodyFrac = input.float(0.20,"Min Body % (Break)")
+
+// ---- Risk Parameters (all in NQ points) ----
+// Set useSL=false to run with NO stop loss (raw signal quality test)
+useSL       = input.bool(false,  "Use Stop Loss?")
+slPoints    = input.float(60.0,  "Stop Loss (NQ points) - ignored if above is false")
+tp1Points   = input.float(10.0,  "TP1 (NQ points) - 2 contracts")
+tp2Points   = input.float(25.0,  "TP2 (NQ points) - 2 contracts")
+trailPoints = input.float(20.0,  "Runner Trailing Stop (NQ points)")
+
+emaFastLen = input.int(8,  "EMA Fast Length")
+emaSlowLen = input.int(55, "EMA Slow Length")
+
+// ==================== INDICATORS ====================
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+vwapVal = ta.vwap(hlc3)
+
+// ==================== TERMINATOR 2 CORE ====================
+atr      = ta.atr(atrLen)
+barRange = high - low
+body     = math.abs(close - open)
+bodyFrac = barRange > 0 ? body / barRange : 0.0
+
+var int   state      = 0
+var float compHigh   = na
+var float compLow    = na
+var int   stallCount = 0
+var int   fireBar    = na
+var bool  fireLong   = false
+var bool  fireShort  = false
+
+strongUp   = close > open and barRange > atr * impulseMult
+strongDown = close < open and barRange > atr * impulseMult
+
+if state == 0 and (strongUp or strongDown)
+    state      := 1
+    stallCount := 0
+    compHigh   := na
+    compLow    := na
+
+smallCandle = barRange < atr * compressPct
+
+if state == 1 and smallCandle
+    state      := 2
+    stallCount := 1
+    compHigh   := high
+    compLow    := low
+
+if state == 2 and smallCandle
+    stallCount := stallCount + 1
+    compHigh   := math.max(compHigh, high)
+    compLow    := math.min(compLow, low)
+
+validComp  = state == 2 and stallCount >= stallBars
+bullBreak  = validComp and close > compHigh
+bearBreak  = validComp and close < compLow
+breakClean = bodyFrac >= minBodyFrac
+fire       = (bullBreak or bearBreak) and breakClean
+
+if fire
+    fireLong   := bullBreak
+    fireShort  := bearBreak
+    fireBar    := bar_index
+    state      := 0
+    stallCount := 0
+    compHigh   := na
+    compLow    := na
+
+if state != 0 and stallCount > 15
+    state      := 0
+    stallCount := 0
+    compHigh   := na
+    compLow    := na
+
+// ==================== CONFIRMATION CANDLE ====================
+isConfirmBar = not na(fireBar) and bar_index == fireBar + 1
+confirmLong  = isConfirmBar and fireLong  and close > open
+confirmShort = isConfirmBar and fireShort and close < open
+
+// ==================== PEM FILTERS ====================
+filterLong  = close > emaSlow and close > vwapVal
+filterShort = close < emaSlow and close < vwapVal
+
+// ==================== ENTRIES ====================
+goLong  = confirmLong  and filterLong  and strategy.position_size == 0
+goShort = confirmShort and filterShort and strategy.position_size == 0
+
+if goLong
+    strategy.entry("Long", strategy.long, qty=6)
+
+if goShort
+    strategy.entry("Short", strategy.short, qty=6)
+
+// ==================== EXITS - 3 TIER HARVEST ====================
+if strategy.position_size > 0
+    ep     = strategy.position_avg_price
+    longSL = useSL ? ep - slPoints : na
+    strategy.exit("TP1-L", from_entry="Long",  qty=2, limit=ep + tp1Points, stop=longSL)
+    strategy.exit("TP2-L", from_entry="Long",  qty=2, limit=ep + tp2Points, stop=longSL)
+    strategy.exit("Run-L", from_entry="Long",  qty=2, trail_points=trailPoints * 4, trail_offset=trailPoints * 4, stop=longSL)
+
+if strategy.position_size < 0
+    ep      = strategy.position_avg_price
+    shortSL = useSL ? ep + slPoints : na
+    strategy.exit("TP1-S", from_entry="Short", qty=2, limit=ep - tp1Points, stop=shortSL)
+    strategy.exit("TP2-S", from_entry="Short", qty=2, limit=ep - tp2Points, stop=shortSL)
+    strategy.exit("Run-S", from_entry="Short", qty=2, trail_points=trailPoints * 4, trail_offset=trailPoints * 4, stop=shortSL)
+
+// ==================== VISUALS ====================
+if fire
+    line.new(bar_index, low, bar_index, high, extend=extend.both, color=color.rgb(0, 150, 255), width=2)
+
+if isConfirmBar
+    line.new(bar_index, low, bar_index, high, extend=extend.both, color=close > open ? color.green : color.red, width=2)
+
+plot(emaFast, "EMA 8",  color=color.blue,   linewidth=1)
+plot(emaSlow, "EMA 55", color=color.green,  linewidth=2)
+plot(vwapVal, "VWAP",   color=color.orange, linewidth=1)
+
+plotshape(goLong,  title="Long Entry",  style=shape.triangleup,   location=location.belowbar, color=color.lime, size=size.small)
+plotshape(goShort, title="Short Entry", style=shape.triangledown, location=location.abovebar, color=color.red,  size=size.small)
+
+// ==================== ALERTS ====================
+alertcondition(goLong,  title="PEM Long Signal",  message="PEM Long Entry - Terminator2 + EMA55 + VWAP confirmed")
+alertcondition(goShort, title="PEM Short Signal", message="PEM Short Entry - Terminator2 + EMA55 + VWAP confirmed")

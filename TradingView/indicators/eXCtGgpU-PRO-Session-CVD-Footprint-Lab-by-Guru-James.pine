@@ -1,0 +1,940 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  Session CVD Footprint Lab
+//  Native request.footprint() order-flow companion for TradingView.
+//
+//  Requires TradingView Premium or Ultimate (request.footprint).
+//  Pair with the Volume Footprint chart: set Ticks per row to the SAME
+//  value as Chart settings → Volume footprint → Ticks per row so Session
+//  CVD matches the chart's own Session CVD readout.
+//
+//  Pane  : session CVD + bar delta (effort).
+//  Chart : professional signal labels, stacked-imbalance zones,
+//          unfinished-business lines, optional compact footprint cells.
+//
+//  Signals follow the research model:
+//    CONFIRM   — price and session CVD print the same structure
+//    REG DIV   — regular divergence (reversal location)
+//    HID DIV   — hidden divergence (continuation)
+//    ABSORB    — high |delta|, little price travel (effort ≠ result)
+//    EXHAUST   — climactic delta, weak close
+//    STACK     — 3+ consecutive diagonal imbalances
+//    UB/EXCESS — unfinished vs finished auction at the extreme
+//    FAIL BRK  — new price extreme without CVD / without stacks
+//    Δ FLIP    — delta sign change after a same-side run
+//
+//  Labels mark locations. Price still has to confirm. Not a signal service.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator(
+     title               = "Session CVD Footprint Lab",
+     shorttitle          = "CVD Lab",
+     overlay             = false,
+     format              = format.volume,
+     max_labels_count    = 500,
+     max_lines_count     = 500,
+     max_boxes_count     = 500,
+     max_bars_back       = 500,
+     explicit_plot_zorder = true)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Inputs
+//══════════════════════════════════════════════════════════════════════════════
+string G1 = "01  Footprint engine"
+string G2 = "02  Session CVD"
+string G3 = "03  Detection"
+string G4 = "04  Chart drawings"
+string G5 = "05  Labels"
+string G6 = "06  HUD"
+string G7 = "07  Colors"
+string G8 = "08  Alerts"
+
+int    i_ticks = input.int(1, "Ticks per row", minval = 1, maxval = 100000, group = G1,
+     tooltip = "MUST match the Volume Footprint chart (Chart settings → Volume footprint → Ticks per row). ES/NQ/CL: 1–4. Equities: 5–20. BTC: 50–500. Smaller = more rows, heavier drawing.")
+int    i_vaPct = input.int(70, "Value area %", minval = 50, maxval = 95, group = G1,
+     tooltip = "Share of bar volume that defines VAH / VAL. 70 is the auction-market standard.")
+int    i_imbPct = input.int(300, "Imbalance %", minval = 150, maxval = 900, step = 50, group = G1,
+     tooltip = "Diagonal imbalance threshold. 300 = 3:1 (TradingView default). Buy imb: ask at P vs bid at P−1 row.")
+float  i_minImbVol = input.float(0.0, "Min volume to count an imbalance", minval = 0.0, group = G1,
+     tooltip = "Ignore thin 3:1 prints. Use contracts / shares. 0 = native imbalance only.")
+
+string i_reset = input.string("Daily (TV Session CVD)", "CVD reset",
+     options = ["Daily (TV Session CVD)", "Chart session", "Regular hours", "Custom session", "Never"],
+     group = G2,
+     tooltip = "Daily matches TradingView's native Session CVD on footprint charts (fixed 1D reset). Regular hours = RTH. Custom = the session string below.")
+string i_sess  = input.session("0930-1600", "Custom session", group = G2)
+string i_tz    = input.string("America/New_York", "Custom timezone", group = G2,
+     options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Singapore", "UTC"])
+int    i_emaFast = input.int(8,  "CVD fast EMA", minval = 1, group = G2)
+int    i_emaSlow = input.int(21, "CVD slow EMA", minval = 2, group = G2)
+
+string i_density = input.string("Balanced", "Signal density",
+     options = ["Conservative", "Balanced", "All"], group = G3,
+     tooltip = "Conservative: regular divergence, absorption, failed break — only near session extremes. Balanced: adds hidden div, stacks, exhaust, confirm. All: adds UB, excess, delta-flip.")
+int    i_pivot   = input.int(5, "Pivot length", minval = 2, maxval = 15, group = G3,
+     tooltip = "Bars left/right to confirm a swing for regular / hidden CVD divergence. Larger = fewer, later, cleaner.")
+float  i_minAtr  = input.float(0.35, "Min pivot swing (× ATR)", minval = 0.0, step = 0.05, group = G3)
+int    i_minStack = input.int(3, "Stacked imbalance rows", minval = 2, maxval = 12, group = G3)
+float  i_absDelta = input.float(1.6, "Absorption |Δ| vs average", minval = 1.0, step = 0.1, group = G3)
+float  i_absRange = input.float(0.65, "Absorption max range (× ATR)", minval = 0.15, step = 0.05, group = G3)
+float  i_exhMult  = input.float(2.2, "Exhaustion |Δ| vs average", minval = 1.2, step = 0.1, group = G3)
+int    i_runBars  = input.int(4, "Δ-flip run length", minval = 2, maxval = 20, group = G3)
+int    i_cool     = input.int(4, "Label cooldown (bars)", minval = 1, maxval = 50, group = G3)
+bool   i_needExt  = input.bool(true, "Reversal signals only at session extremes", group = G3,
+     tooltip = "Regular divergence, absorption and failed breaks must print at/through the session high or low.")
+
+bool   i_showPoc   = input.bool(true,  "Bar POC trail", group = G4)
+bool   i_showVa    = input.bool(false, "Bar VAH / VAL trail", group = G4)
+bool   i_showCells = input.bool(false, "Compact footprint cells (last N bars)", group = G4,
+     tooltip = "Leave OFF when the chart type is already Volume Footprint. Turn ON on a regular candle chart.")
+string i_cellMode  = input.string("Bid × Ask", "Cell text", options = ["Bid × Ask", "Delta", "Total"], group = G4)
+int    i_cellBars  = input.int(12, "Cell / imbalance lookback (bars)", minval = 2, maxval = 40, group = G4)
+int    i_maxRows   = input.int(16, "Max cell rows per bar", minval = 4, maxval = 40, group = G4)
+bool   i_showImb   = input.bool(true,  "Imbalance ticks (when cells off)", group = G4)
+bool   i_showStack = input.bool(true,  "Project stacked-imbalance zones", group = G4)
+int    i_stackExt  = input.int(18, "Stack zone length (bars)", minval = 4, maxval = 80, group = G4)
+int    i_maxZones  = input.int(6, "Max live stack zones", minval = 1, maxval = 12, group = G4)
+bool   i_showUb    = input.bool(true,  "Unfinished-business lines", group = G4)
+int    i_ubExt     = input.int(30, "UB line length (bars)", minval = 4, maxval = 120, group = G4)
+bool   i_showDivLn = input.bool(true,  "Divergence connector lines", group = G4)
+bool   i_barcol    = input.bool(false, "Color candles by bar delta", group = G4)
+
+bool   i_labReg   = input.bool(true,  "Regular divergence", group = G5)
+bool   i_labHid   = input.bool(true,  "Hidden divergence", group = G5)
+bool   i_labAbs   = input.bool(true,  "Absorption", group = G5)
+bool   i_labExh   = input.bool(true,  "Exhaustion", group = G5)
+bool   i_labStk   = input.bool(true,  "Stack spawn", group = G5)
+bool   i_labUb    = input.bool(false, "Unfinished / excess", group = G5)
+bool   i_labBrk   = input.bool(true,  "Confirm / fail break", group = G5)
+bool   i_labFlip  = input.bool(false, "Delta flip", group = G5)
+bool   i_labSess  = input.bool(true,  "Session extreme divergence", group = G5)
+string i_labSize  = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = G5)
+
+bool   i_hud      = input.bool(true, "Show HUD", group = G6)
+string i_hudPos   = input.string("Top right", "HUD position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = G6)
+bool   i_hudCompact = input.bool(false, "Compact HUD", group = G6)
+
+color cBuy    = input.color(#2A9D8F, "Buy / bull",      group = G7)
+color cSell   = input.color(#C44536, "Sell / bear",     group = G7)
+color cWarn   = input.color(#D4A017, "Absorption / warn", group = G7)
+color cPoc    = input.color(#E08A3D, "POC",             group = G7)
+color cVa     = input.color(#6C7A89, "Value area",      group = G7)
+color cUb     = input.color(#7B6CB0, "Unfinished",      group = G7)
+color cHudBg  = input.color(#0E1116, "HUD background",  group = G7)
+color cHudFg  = input.color(#E8EAED, "HUD text",        group = G7)
+color cHudDim = input.color(#8B919A, "HUD muted",       group = G7)
+
+bool i_alReg   = input.bool(true, "Alert · regular divergence", group = G8)
+bool i_alHid   = input.bool(true, "Alert · hidden divergence",  group = G8)
+bool i_alAbs   = input.bool(true, "Alert · absorption",         group = G8)
+bool i_alStk   = input.bool(true, "Alert · stacked imbalance",  group = G8)
+bool i_alBrk   = input.bool(true, "Alert · confirm / fail break", group = G8)
+bool i_alSess  = input.bool(true, "Alert · session CVD divergence", group = G8)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Types / helpers
+//══════════════════════════════════════════════════════════════════════════════
+type StackZone
+    box  bx
+    int  dir
+    float hi
+    float lo
+    int  born
+    bool live
+
+type UbMark
+    line ln
+    float px
+    bool isHigh
+    int  born
+    bool live
+
+type QLab
+    int    x
+    float  y
+    string txt
+    color  bg
+    string tip
+    string sty
+    bool   bold
+
+f_fmtVol(float v) =>
+    na(v) ? "—" : str.tostring(v, format.volume)
+
+f_fmtSigned(float v) =>
+    na(v) ? "—" : (v > 0 ? "+" : "") + str.tostring(v, format.volume)
+
+f_fmtPx(float p) =>
+    na(p) ? "—" : str.tostring(p, format.mintick)
+
+f_fmtPct(float v) =>
+    na(v) ? "—" : str.tostring(v, "#.0") + "%"
+
+f_labSize() =>
+    switch i_labSize
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+f_rowMid(volume_row r) =>
+    na(r) ? float(na) : (r.up_price() + r.down_price()) * 0.5
+
+string hudPos = switch i_hudPos
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    => position.top_right
+
+//══════════════════════════════════════════════════════════════════════════════
+// Native footprint request — ONE call (Premium / Ultimate)
+//══════════════════════════════════════════════════════════════════════════════
+footprint fp = request.footprint(i_ticks, i_vaPct, i_imbPct)
+bool hasFp = not na(fp)
+
+float barBuy  = hasFp ? fp.buy_volume()   : float(na)
+float barSell = hasFp ? fp.sell_volume()  : float(na)
+float barDel  = hasFp ? fp.delta()        : float(na)
+float barVol  = hasFp ? fp.total_volume() : float(na)
+float delPct  = not na(barVol) and barVol != 0.0 ? 100.0 * barDel / barVol : float(na)
+
+volume_row pocRow = hasFp ? fp.poc() : na
+volume_row vahRow = hasFp ? fp.vah() : na
+volume_row valRow = hasFp ? fp.val() : na
+
+float pocMid = f_rowMid(pocRow)
+float pocHi  = na(pocRow) ? float(na) : pocRow.up_price()
+float pocLo  = na(pocRow) ? float(na) : pocRow.down_price()
+float vahPx  = na(vahRow) ? float(na) : vahRow.up_price()
+float valPx  = na(valRow) ? float(na) : valRow.down_price()
+
+//══════════════════════════════════════════════════════════════════════════════
+// Session reset + Session CVD
+//══════════════════════════════════════════════════════════════════════════════
+bool inCustom    = not na(time(timeframe.period, i_sess, i_tz))
+bool customStart = inCustom and not inCustom[1]
+
+bool reset = switch i_reset
+    "Daily (TV Session CVD)" => timeframe.change("D")
+    "Chart session"          => session.isfirstbar
+    "Regular hours"          => session.isfirstbar_regular
+    "Custom session"         => customStart
+    => false
+
+var float sessionCvd = 0.0
+var float sessPxHigh = float(na)
+var float sessPxLow  = float(na)
+var float sessCvdHi  = float(na)
+var float sessCvdLo  = float(na)
+var int   sessStartBar = 0
+
+if reset
+    sessionCvd := 0.0
+    sessStartBar := bar_index
+
+if not na(barDel)
+    sessionCvd += barDel
+
+bool madePxHigh  = not reset and not na(sessPxHigh) and high > sessPxHigh
+bool madePxLow   = not reset and not na(sessPxLow)  and low  < sessPxLow
+bool madeCvdHigh = not reset and not na(sessCvdHi)  and sessionCvd > sessCvdHi
+bool madeCvdLow  = not reset and not na(sessCvdLo)  and sessionCvd < sessCvdLo
+
+if reset or na(sessPxHigh)
+    sessPxHigh := high
+    sessPxLow  := low
+    sessCvdHi  := sessionCvd
+    sessCvdLo  := sessionCvd
+else
+    sessPxHigh := math.max(sessPxHigh, high)
+    sessPxLow  := math.min(sessPxLow, low)
+    sessCvdHi  := math.max(sessCvdHi, sessionCvd)
+    sessCvdLo  := math.min(sessCvdLo, sessionCvd)
+
+float cvdEmaF = ta.ema(sessionCvd, i_emaFast)
+float cvdEmaS = ta.ema(sessionCvd, i_emaSlow)
+float atr     = ta.atr(14)
+float avgAbsD = ta.sma(math.abs(barDel), 20)
+float rng     = high - low
+
+bool cvdRising  = sessionCvd > sessionCvd[1]
+bool cvdFalling = sessionCvd < sessionCvd[1]
+bool pxUpBar    = close > open
+bool pxDnBar    = close < open
+bool confirmBar = (pxUpBar and not na(barDel) and barDel > 0) or (pxDnBar and not na(barDel) and barDel < 0)
+bool divergeBar = (pxUpBar and not na(barDel) and barDel < 0) or (pxDnBar and not na(barDel) and barDel > 0)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Row scan — stacks, unfinished / excess, extreme volume
+//══════════════════════════════════════════════════════════════════════════════
+int   nRows      = 0
+int   buyImbN    = 0
+int   sellImbN   = 0
+int   buyStack   = 0
+int   sellStack  = 0
+int   curBuyRun  = 0
+int   curSellRun = 0
+float buyStLo    = float(na)
+float buyStHi    = float(na)
+float sellStLo   = float(na)
+float sellStHi   = float(na)
+float runBuyLo   = float(na)
+float runBuyHi   = float(na)
+float runSellLo  = float(na)
+float runSellHi  = float(na)
+float topBuy     = 0.0
+float topSell    = 0.0
+float botBuy     = 0.0
+float botSell    = 0.0
+float topHi      = float(na)
+float topLo      = float(na)
+float botHi      = float(na)
+float botLo      = float(na)
+bool  ubHigh     = false
+bool  ubLow      = false
+bool  xsHigh     = false
+bool  xsLow      = false
+
+if hasFp
+    array<volume_row> rows = fp.rows()
+    if not na(rows)
+        nRows := array.size(rows)
+        if nRows > 0
+            volume_row botR = array.get(rows, 0)
+            volume_row topR = array.get(rows, nRows - 1)
+            botBuy  := nz(botR.buy_volume())
+            botSell := nz(botR.sell_volume())
+            topBuy  := nz(topR.buy_volume())
+            topSell := nz(topR.sell_volume())
+            topHi   := topR.up_price()
+            topLo   := topR.down_price()
+            botHi   := botR.up_price()
+            botLo   := botR.down_price()
+            float minPrint = i_minImbVol > 0 ? i_minImbVol : math.max(nz(barVol, 0.0) * 0.008, 0.0)
+            bool topLive = topBuy > minPrint and topSell > minPrint
+            bool botLive = botBuy > minPrint and botSell > minPrint
+            ubHigh := topLive
+            ubLow  := botLive
+            xsHigh := not topLive and topSell <= minPrint
+            xsLow  := not botLive and botBuy  <= minPrint
+
+            for int i = 0 to nRows - 1
+                volume_row rw = array.get(rows, i)
+                float tv = nz(rw.total_volume())
+                bool volOk = i_minImbVol <= 0 or tv >= i_minImbVol
+                bool bImb = volOk and rw.has_buy_imbalance()
+                bool sImb = volOk and rw.has_sell_imbalance()
+                if bImb
+                    buyImbN += 1
+                    curBuyRun += 1
+                    runBuyLo := na(runBuyLo) ? rw.down_price() : runBuyLo
+                    runBuyHi := rw.up_price()
+                    if curBuyRun > buyStack
+                        buyStack := curBuyRun
+                        buyStLo  := runBuyLo
+                        buyStHi  := runBuyHi
+                else
+                    curBuyRun := 0
+                    runBuyLo  := float(na)
+                    runBuyHi  := float(na)
+                if sImb
+                    sellImbN += 1
+                    curSellRun += 1
+                    runSellLo := na(runSellLo) ? rw.down_price() : math.min(runSellLo, rw.down_price())
+                    runSellHi := na(runSellHi) ? rw.up_price()   : math.max(runSellHi, rw.up_price())
+                    if curSellRun > sellStack
+                        sellStack := curSellRun
+                        sellStLo  := runSellLo
+                        sellStHi  := runSellHi
+                else
+                    curSellRun := 0
+                    runSellLo  := float(na)
+                    runSellHi  := float(na)
+
+bool stackedBuy  = buyStack  >= i_minStack
+bool stackedSell = sellStack >= i_minStack
+
+//══════════════════════════════════════════════════════════════════════════════
+// Absorption / exhaustion / delta-flip
+//══════════════════════════════════════════════════════════════════════════════
+bool effortHi = not na(barDel) and not na(avgAbsD) and math.abs(barDel) >= avgAbsD * i_absDelta
+bool tightRng = not na(atr) and atr > 0 and rng <= atr * i_absRange
+bool absorb   = hasFp and effortHi and tightRng and nz(barVol) > 0
+
+bool absorbBid = absorb and barDel < 0 and (close - low) <= rng * 0.45
+bool absorbAsk = absorb and barDel > 0 and (high - close) <= rng * 0.45
+
+bool climax    = hasFp and not na(barDel) and not na(avgAbsD) and math.abs(barDel) >= avgAbsD * i_exhMult
+bool exhBuy    = climax and barDel > 0 and close < hl2
+bool exhSell   = climax and barDel < 0 and close > hl2
+
+var int runDir = 0
+var int runLen = 0
+int newDir = na(barDel) or barDel == 0 ? 0 : barDel > 0 ? 1 : -1
+if newDir == 0
+    runDir := runDir
+    runLen := runLen
+else if newDir == runDir
+    runLen += 1
+else
+    runDir := newDir
+    runLen := 1
+
+bool flipSell = barstate.isconfirmed and runDir == -1 and runLen == 1 and runDir[1] == 1 and runLen[1] >= i_runBars
+bool flipBuy  = barstate.isconfirmed and runDir ==  1 and runLen == 1 and runDir[1] == -1 and runLen[1] >= i_runBars
+
+bool atSessHi = not na(sessPxHigh) and high >= sessPxHigh - nz(atr, 0) * 0.15
+bool atSessLo = not na(sessPxLow)  and low  <= sessPxLow  + nz(atr, 0) * 0.15
+bool atExt    = atSessHi or atSessLo
+
+//══════════════════════════════════════════════════════════════════════════════
+// Pivot divergence (regular = reversal, hidden = continuation)
+//══════════════════════════════════════════════════════════════════════════════
+float pHigh = ta.pivothigh(high, i_pivot, i_pivot)
+float pLow  = ta.pivotlow(low,  i_pivot, i_pivot)
+
+var float prevPhPx  = float(na)
+var float prevPhCvd = float(na)
+var int   prevPhBar = int(na)
+var float prevPlPx  = float(na)
+var float prevPlCvd = float(na)
+var int   prevPlBar = int(na)
+
+int   pvBar = bar_index - i_pivot
+float pvCvd = sessionCvd[i_pivot]
+float pvAtr = atr[i_pivot]
+bool  swingOkH = na(prevPhPx) or na(pvAtr) or math.abs(pHigh - prevPhPx) >= pvAtr * i_minAtr
+bool  swingOkL = na(prevPlPx) or na(pvAtr) or math.abs(pLow  - prevPlPx) >= pvAtr * i_minAtr
+
+bool regBear = false
+bool regBull = false
+bool hidBear = false
+bool hidBull = false
+int  divX1   = int(na)
+int  divX2   = int(na)
+float divY1  = float(na)
+float divY2  = float(na)
+float divC1  = float(na)
+float divC2  = float(na)
+
+if not na(pHigh) and swingOkH
+    if not na(prevPhPx) and not na(prevPhCvd) and not na(pvCvd)
+        bool pxHH = pHigh > prevPhPx
+        bool pxLH = pHigh < prevPhPx
+        bool cdHH = pvCvd > prevPhCvd
+        bool cdLH = pvCvd < prevPhCvd
+        regBear := pxHH and cdLH
+        hidBear := pxLH and cdHH
+        if regBear or hidBear
+            divX1 := prevPhBar
+            divX2 := pvBar
+            divY1 := prevPhPx
+            divY2 := pHigh
+            divC1 := prevPhCvd
+            divC2 := pvCvd
+    prevPhPx  := pHigh
+    prevPhCvd := pvCvd
+    prevPhBar := pvBar
+
+if not na(pLow) and swingOkL
+    if not na(prevPlPx) and not na(prevPlCvd) and not na(pvCvd)
+        bool pxLL = pLow < prevPlPx
+        bool pxHL = pLow > prevPlPx
+        bool cdLL = pvCvd < prevPlCvd
+        bool cdHL = pvCvd > prevPlCvd
+        regBull := pxLL and cdHL
+        hidBull := pxHL and cdLL
+        if regBull or hidBull
+            divX1 := prevPlBar
+            divX2 := pvBar
+            divY1 := prevPlPx
+            divY2 := pLow
+            divC1 := prevPlCvd
+            divC2 := pvCvd
+    prevPlPx  := pLow
+    prevPlCvd := pvCvd
+    prevPlBar := pvBar
+
+// Session-extreme divergence / confirmation (same-bar, day-trade timing)
+bool sessDivBear = madePxHigh and not madeCvdHigh
+bool sessDivBull = madePxLow  and not madeCvdLow
+bool sessConfUp  = madePxHigh and madeCvdHigh
+bool sessConfDn  = madePxLow  and madeCvdLow
+
+// Initiative vs failed break using stacks + CVD
+bool failUp   = barstate.isconfirmed and madePxHigh and not madeCvdHigh and not stackedBuy
+bool failDn   = barstate.isconfirmed and madePxLow  and not madeCvdLow  and not stackedSell
+bool confUp   = barstate.isconfirmed and madePxHigh and madeCvdHigh and stackedBuy
+bool confDn   = barstate.isconfirmed and madePxLow  and madeCvdLow  and stackedSell
+
+//══════════════════════════════════════════════════════════════════════════════
+// Density gates
+//══════════════════════════════════════════════════════════════════════════════
+bool densAll  = i_density == "All"
+bool densBal  = i_density == "Balanced" or densAll
+bool densCon  = true
+
+bool gateRev = not i_needExt or atExt
+
+bool fireRegBear = i_labReg and densCon and regBear and gateRev
+bool fireRegBull = i_labReg and densCon and regBull and gateRev
+bool fireHidBear = i_labHid and densBal and hidBear
+bool fireHidBull = i_labHid and densBal and hidBull
+bool fireAbsAsk  = i_labAbs and densCon and barstate.isconfirmed and absorbAsk and gateRev
+bool fireAbsBid  = i_labAbs and densCon and barstate.isconfirmed and absorbBid and gateRev
+bool fireExhBuy  = i_labExh and densBal and barstate.isconfirmed and exhBuy and gateRev
+bool fireExhSell = i_labExh and densBal and barstate.isconfirmed and exhSell and gateRev
+bool fireFailUp  = i_labBrk and densCon and failUp
+bool fireFailDn  = i_labBrk and densCon and failDn
+bool fireConfUp  = i_labBrk and densBal and confUp
+bool fireConfDn  = i_labBrk and densBal and confDn
+bool fireSessDb  = i_labSess and densCon and barstate.isconfirmed and sessDivBear
+bool fireSessDu  = i_labSess and densCon and barstate.isconfirmed and sessDivBull
+bool fireStkBuy  = i_labStk and densBal and barstate.isconfirmed and stackedBuy  and not stackedBuy[1]
+bool fireStkSell = i_labStk and densBal and barstate.isconfirmed and stackedSell and not stackedSell[1]
+bool fireUbH     = i_labUb and densAll and barstate.isconfirmed and ubHigh
+bool fireUbL     = i_labUb and densAll and barstate.isconfirmed and ubLow
+bool fireXsH     = i_labUb and densAll and barstate.isconfirmed and xsHigh
+bool fireXsL     = i_labUb and densAll and barstate.isconfirmed and xsLow
+bool fireFlipS   = i_labFlip and densAll and flipSell
+bool fireFlipB   = i_labFlip and densAll and flipBuy
+
+//══════════════════════════════════════════════════════════════════════════════
+// Drawing managers
+//══════════════════════════════════════════════════════════════════════════════
+var array<label>     labBag   = array.new<label>()
+var array<line>      lnBag    = array.new<line>()
+var array<box>       cellBag  = array.new<box>()
+var array<int>       cellBars = array.new<int>()
+var array<StackZone> zones    = array.new<StackZone>()
+var array<UbMark>    ubs      = array.new<UbMark>()
+var int lastLabBar            = int(na)
+var int labsOnBar             = 0
+array<QLab> qLabs             = array.new<QLab>()
+
+f_pushLab(label lb) =>
+    array.push(labBag, lb)
+    if array.size(labBag) > 80
+        label.delete(array.shift(labBag))
+
+f_pushLn(line ln) =>
+    array.push(lnBag, ln)
+    if array.size(lnBag) > 80
+        line.delete(array.shift(lnBag))
+
+// Queue only. Pine forbids assigning globals (labsOnBar / lastLabBar) inside a function.
+f_lab(int x, float y, string txt, color bg, string tip, string sty, bool bold) =>
+    array.push(qLabs, QLab.new(x, y, txt, bg, tip, sty, bold))
+
+f_divLines(int x1, float y1, float c1, int x2, float y2, float c2, color col) =>
+    if i_showDivLn and not na(x1) and not na(x2)
+        line a = line.new(x1, y1, x2, y2, xloc.bar_index, extend.none, color.new(col, 15), line.style_dotted, 2, force_overlay = true)
+        line b = line.new(x1, c1, x2, c2, xloc.bar_index, extend.none, color.new(col, 25), line.style_dotted, 2)
+        f_pushLn(a)
+        f_pushLn(b)
+
+// Prune compact cells that scrolled out of the lookback window
+if array.size(cellBars) > 0
+    int cutoff = last_bar_index - i_cellBars
+    while array.size(cellBars) > 0 and array.get(cellBars, 0) < cutoff
+        box.delete(array.shift(cellBag))
+        array.shift(cellBars)
+
+// Compact cells / imbalance ticks on recent bars only
+bool recent = last_bar_index - bar_index <= i_cellBars
+if hasFp and recent and (i_showCells or i_showImb)
+    array<volume_row> dRows = fp.rows()
+    if not na(dRows) and array.size(dRows) > 0
+        int lim = array.size(dRows)
+        bool tooMany = lim > i_maxRows
+        for int j = 0 to lim - 1
+            volume_row rw = array.get(dRows, j)
+            float up = rw.up_price()
+            float dn = rw.down_price()
+            float bv = nz(rw.buy_volume())
+            float sv = nz(rw.sell_volume())
+            float dv = nz(rw.delta())
+            float tv = nz(rw.total_volume())
+            bool bIm = rw.has_buy_imbalance() and (i_minImbVol <= 0 or tv >= i_minImbVol)
+            bool sIm = rw.has_sell_imbalance() and (i_minImbVol <= 0 or tv >= i_minImbVol)
+            bool isPoc = not na(pocRow) and math.abs(up - pocRow.up_price()) <= syminfo.mintick
+            bool drawCell = i_showCells and (not tooMany or isPoc or bIm or sIm or j == 0 or j == lim - 1)
+            if drawCell
+                string tx = switch i_cellMode
+                    "Delta" => f_fmtSigned(dv)
+                    "Total" => f_fmtVol(tv)
+                    => f_fmtVol(sv) + " × " + f_fmtVol(bv)
+                color base = dv >= 0 ? cBuy : cSell
+                float trn  = isPoc ? 55.0 : tv > 0 and not na(pocRow) and pocRow.total_volume() > 0 ? 88.0 - 28.0 * math.min(tv / pocRow.total_volume(), 1.0) : 82.0
+                color bdr  = isPoc ? cPoc : bIm ? cBuy : sIm ? cSell : color.new(base, 70)
+                box bx = box.new(
+                     bar_index, up, bar_index + 1, dn,
+                     border_color    = color.new(bdr, 20),
+                     border_width    = isPoc or bIm or sIm ? 2 : 1,
+                     bgcolor         = color.new(base, trn),
+                     text            = tx,
+                     text_color      = color.new(cHudFg, 15),
+                     text_size       = size.tiny,
+                     text_halign     = text.align_center,
+                     text_valign     = text.align_center,
+                     force_overlay   = true)
+                array.push(cellBag, bx)
+                array.push(cellBars, bar_index)
+            else if i_showImb and not i_showCells and (bIm or sIm)
+                color ic = bIm ? cBuy : cSell
+                int   x0 = bIm ? bar_index : bar_index
+                int   x1 = bar_index + 1
+                box tk = box.new(
+                     x0, up, x1, dn,
+                     border_color  = color.new(ic, 0),
+                     border_width  = 1,
+                     bgcolor       = color.new(ic, 62),
+                     force_overlay = true)
+                array.push(cellBag, tk)
+                array.push(cellBars, bar_index)
+
+// Stacked-imbalance zones — spawn, extend, invalidate
+if i_showStack
+    if array.size(zones) > 0
+        for int z = array.size(zones) - 1 to 0
+            StackZone zn = array.get(zones, z)
+            if zn.live
+                bool killed = zn.dir == 1 ? close < zn.lo : close > zn.hi
+                if killed
+                    zn.live := false
+                    box.set_bgcolor(zn.bx, color.new(zn.dir == 1 ? cBuy : cSell, 92))
+                    box.set_border_style(zn.bx, line.style_dashed)
+                    box.set_right(zn.bx, bar_index)
+                else if bar_index - zn.born >= i_stackExt
+                    zn.live := false
+                    box.set_right(zn.bx, bar_index)
+                else
+                    box.set_right(zn.bx, bar_index + 1)
+
+    bool spawnBuy  = barstate.isconfirmed and stackedBuy  and buyStack[1] < i_minStack and not na(buyStLo)
+    bool spawnSell = barstate.isconfirmed and stackedSell and sellStack[1] < i_minStack and not na(sellStLo)
+    if spawnBuy or spawnSell
+        int   dir = spawnBuy ? 1 : -1
+        float zh  = spawnBuy ? buyStHi : sellStHi
+        float zl  = spawnBuy ? buyStLo : sellStLo
+        color zc  = spawnBuy ? cBuy : cSell
+        box zb = box.new(
+             bar_index, zh, bar_index + i_stackExt, zl,
+             border_color  = color.new(zc, 10),
+             border_width  = 1,
+             border_style  = line.style_solid,
+             bgcolor       = color.new(zc, 84),
+             text          = (spawnBuy ? "STACK " : "STACK ") + str.tostring(spawnBuy ? buyStack : sellStack) + (spawnBuy ? " ▲" : " ▼"),
+             text_color    = color.new(zc, 0),
+             text_size     = size.tiny,
+             text_halign   = text.align_left,
+             text_valign   = text.align_top,
+             force_overlay = true)
+        StackZone nz = StackZone.new(zb, dir, zh, zl, bar_index, true)
+        array.push(zones, nz)
+        if array.size(zones) > i_maxZones
+            StackZone old = array.shift(zones)
+            box.delete(old.bx)
+
+// Unfinished business — project until traded through and finished
+if i_showUb and barstate.isconfirmed
+    if array.size(ubs) > 0
+        for int u = array.size(ubs) - 1 to 0
+            UbMark mk = array.get(ubs, u)
+            if mk.live
+                bool done = mk.isHigh ? high > mk.px and xsHigh : low < mk.px and xsLow
+                bool aged = bar_index - mk.born >= i_ubExt
+                if done or aged
+                    mk.live := false
+                    line.set_extend(mk.ln, extend.none)
+                    line.set_x2(mk.ln, bar_index)
+                    if done
+                        line.set_style(mk.ln, line.style_solid)
+                        line.set_color(mk.ln, color.new(cVa, 20))
+                else
+                    line.set_x2(mk.ln, bar_index + 1)
+
+    if ubHigh and not na(topHi)
+        bool dupH = false
+        if array.size(ubs) > 0
+            for int u2 = 0 to array.size(ubs) - 1
+                UbMark e = array.get(ubs, u2)
+                if e.live and e.isHigh and math.abs(e.px - topHi) <= syminfo.mintick
+                    dupH := true
+        if not dupH
+            line lnH = line.new(bar_index, topHi, bar_index + i_ubExt, topHi, xloc.bar_index, extend.none, color.new(cUb, 10), line.style_dashed, 1, force_overlay = true)
+            array.push(ubs, UbMark.new(lnH, topHi, true, bar_index, true))
+            if array.size(ubs) > 16
+                UbMark drop = array.shift(ubs)
+                line.delete(drop.ln)
+    if ubLow and not na(botLo)
+        bool dupL = false
+        if array.size(ubs) > 0
+            for int u3 = 0 to array.size(ubs) - 1
+                UbMark e2 = array.get(ubs, u3)
+                if e2.live and not e2.isHigh and math.abs(e2.px - botLo) <= syminfo.mintick
+                    dupL := true
+        if not dupL
+            line lnL = line.new(bar_index, botLo, bar_index + i_ubExt, botLo, xloc.bar_index, extend.none, color.new(cUb, 10), line.style_dashed, 1, force_overlay = true)
+            array.push(ubs, UbMark.new(lnL, botLo, false, bar_index, true))
+            if array.size(ubs) > 16
+                UbMark drop2 = array.shift(ubs)
+                line.delete(drop2.ln)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Professional labels
+//══════════════════════════════════════════════════════════════════════════════
+if fireRegBear
+    f_lab(divX2, divY2, "REG  ·  BEAR", cSell,
+         "Regular bearish divergence. Price printed a higher high while session CVD printed a lower high — buying effort is fading. Location of interest only. Wait for a reclaim back below the high (failed auction) before fading.",
+         label.style_label_down, true)
+    f_divLines(divX1, divY1, divC1, divX2, divY2, divC2, cSell)
+
+if fireRegBull
+    f_lab(divX2, divY2, "REG  ·  BULL", cBuy,
+         "Regular bullish divergence. Price printed a lower low while session CVD printed a higher low — selling effort is fading. Location of interest only. Wait for a reclaim back above the low before buying.",
+         label.style_label_up, true)
+    f_divLines(divX1, divY1, divC1, divX2, divY2, divC2, cBuy)
+
+if fireHidBear
+    f_lab(divX2, divY2, "HID  ·  BEAR", color.new(cSell, 15),
+         "Hidden bearish divergence — continuation. Price made a lower high, session CVD made a higher high. Buyers tried harder and failed. Sell the rally once the footprint shows ask-side absorption and delta flipping down.",
+         label.style_label_down, false)
+    f_divLines(divX1, divY1, divC1, divX2, divY2, divC2, cSell)
+
+if fireHidBull
+    f_lab(divX2, divY2, "HID  ·  BULL", color.new(cBuy, 15),
+         "Hidden bullish divergence — continuation. Price made a higher low, session CVD made a lower low. Sellers dumped into the dip and still could not take the prior low. Buy the dip once pullback selling is absorbed.",
+         label.style_label_up, false)
+    f_divLines(divX1, divY1, divC1, divX2, divY2, divC2, cBuy)
+
+if fireSessDb
+    f_lab(bar_index, high, "SESS  ·  DIV ↓", cSell,
+         "Session extreme divergence. Price made a new session high. Session CVD did not. Effort is not confirming the break. Fade only after a reclaim below the high; stand aside if CVD repairs and stacked buy imbalances appear.",
+         label.style_label_down, true)
+
+if fireSessDu
+    f_lab(bar_index, low, "SESS  ·  DIV ↑", cBuy,
+         "Session extreme divergence. Price made a new session low. Session CVD did not. Selling effort is fading at the low. Long only after a reclaim above the low.",
+         label.style_label_up, true)
+
+if fireFailUp
+    f_lab(bar_index, high, "FAIL  ·  BREAK", cSell,
+         "Failed breakout. New session high without a new session-CVD high and without stacked buy imbalances. Empty break. Short the reclaim back inside, stop beyond the absorption cluster.",
+         label.style_label_down, true)
+
+if fireFailDn
+    f_lab(bar_index, low, "FAIL  ·  BREAK", cBuy,
+         "Failed breakdown. New session low without a new session-CVD low and without stacked sell imbalances. Empty break. Long the reclaim back inside.",
+         label.style_label_up, true)
+
+if fireConfUp
+    f_lab(bar_index, high, "CONF  ·  BREAK", cBuy,
+         "Confirmed breakout. New session high + new session-CVD high + stacked buy imbalances. Initiative buying. Buy the first defended pullback into the stack / broken level. Do not fade.",
+         label.style_label_down, false)
+
+if fireConfDn
+    f_lab(bar_index, low, "CONF  ·  BREAK", cSell,
+         "Confirmed breakdown. New session low + new session-CVD low + stacked sell imbalances. Initiative selling. Sell the first defended pullback into the stack.",
+         label.style_label_up, false)
+
+if fireAbsAsk
+    f_lab(bar_index, high, "ABSORB  ·  ASK", cWarn,
+         "Buy-side absorption. Aggressive buyers lifted the offer (large +delta) and price barely travelled. A passive seller is defending. Fade after flow stops and price reclaims below the cluster — not while the iceberg is still filling.",
+         label.style_label_down, true)
+
+if fireAbsBid
+    f_lab(bar_index, low, "ABSORB  ·  BID", cWarn,
+         "Sell-side absorption. Aggressive sellers hit the bid (large −delta) and price held. A passive buyer is defending. Long after selling dries up and delta flips positive.",
+         label.style_label_up, true)
+
+if fireExhBuy
+    f_lab(bar_index, high, "EXHAUST  ·  BUY", cWarn,
+         "Buyer exhaustion. Climactic positive delta, close back in the lower half of the bar. Aggression is spent. Do not fade a climax alone — wait for absorption or a failed follow-through bar.",
+         label.style_label_down, false)
+
+if fireExhSell
+    f_lab(bar_index, low, "EXHAUST  ·  SELL", cWarn,
+         "Seller exhaustion. Climactic negative delta, close back in the upper half of the bar. Wait for absorption or a failed follow-through before fading.",
+         label.style_label_up, false)
+
+if fireStkBuy
+    f_lab(bar_index, nz(buyStLo, low), "STACK  ·  " + str.tostring(buyStack) + " ▲", cBuy,
+         "Stacked buy imbalances (" + str.tostring(buyStack) + " consecutive  rows at " + str.tostring(i_imbPct) + "%). Institutional fuel. Mark the zone and buy a later defence / retest. Filter lunch prints and mid-air stacks.",
+         label.style_label_up, false)
+
+if fireStkSell
+    f_lab(bar_index, nz(sellStHi, high), "STACK  ·  " + str.tostring(sellStack) + " ▼", cSell,
+         "Stacked sell imbalances (" + str.tostring(sellStack) + " consecutive rows). Mark as supply. Sell a later defence of the zone.",
+         label.style_label_down, false)
+
+if fireUbH
+    f_lab(bar_index, high, "UB  ·  HIGH", cUb,
+         "Unfinished auction at the high — both sides still traded at the extreme. Magnet: price often returns to finish. Not a short by itself. Fade only after the auction finishes and absorption appears.",
+         label.style_label_down, false)
+
+if fireUbL
+    f_lab(bar_index, low, "UB  ·  LOW", cUb,
+         "Unfinished auction at the low. Magnet for a revisit. Not a long by itself.",
+         label.style_label_up, false)
+
+if fireXsH
+    f_lab(bar_index, high, "EXCESS  ·  HIGH", cVa,
+         "Finished auction / excess at the high (near-zero sell volume at the extreme). The upside auction completed. This high can hold until later initiative takes it.",
+         label.style_label_down, false)
+
+if fireXsL
+    f_lab(bar_index, low, "EXCESS  ·  LOW", cVa,
+         "Finished auction / excess at the low (near-zero buy volume at the extreme). The downside auction completed.",
+         label.style_label_up, false)
+
+if fireFlipS
+    f_lab(bar_index, high, "Δ FLIP  ·  SELL", cSell,
+         "Delta flip after a buy run. Aggressive control rotated from buyers to sellers. Useful as a regime-change notice, not a standalone entry.",
+         label.style_label_down, false)
+
+if fireFlipB
+    f_lab(bar_index, low, "Δ FLIP  ·  BUY", cBuy,
+         "Delta flip after a sell run. Aggressive control rotated from sellers to buyers.",
+         label.style_label_up, false)
+
+// Flush queued labels here (global scope) so cooldown counters can be updated.
+int nq = array.size(qLabs)
+if nq > 0
+    for int qi = 0 to nq - 1
+        QLab q = array.get(qLabs, qi)
+        bool isCurr = q.x == bar_index
+        bool sameBar = isCurr and lastLabBar == bar_index
+        bool coolOk = not isCurr or (sameBar ? labsOnBar < 2 : na(lastLabBar) or bar_index - lastLabBar >= i_cool)
+        if coolOk
+            label lb = label.new(
+                 q.x, q.y, q.txt,
+                 xloc            = xloc.bar_index,
+                 yloc            = yloc.price,
+                 color           = color.new(q.bg, 8),
+                 style           = q.sty,
+                 textcolor       = color.white,
+                 size            = f_labSize(),
+                 tooltip         = q.tip,
+                 force_overlay   = true,
+                 text_formatting = q.bold ? text.format_bold : text.format_none)
+            f_pushLab(lb)
+            if isCurr
+                labsOnBar := sameBar ? labsOnBar + 1 : 1
+                lastLabBar := bar_index
+
+//══════════════════════════════════════════════════════════════════════════════
+// Pane — Session CVD + bar delta
+//══════════════════════════════════════════════════════════════════════════════
+color delCol = na(barDel) ? color.new(cHudDim, 40) : divergeBar ? color.new(cWarn, 10) : barDel >= 0 ? color.new(cBuy, 15) : color.new(cSell, 15)
+color cvdCol = sessionCvd >= cvdEmaF ? cBuy : cSell
+
+plot(barDel,     "Bar Δ",            delCol, 3, plot.style_columns)
+plot(sessionCvd, "Session CVD",      cvdCol, 2, plot.style_line)
+plot(cvdEmaF,    "CVD EMA fast",     color.new(cHudDim, 20), 1)
+plot(cvdEmaS,    "CVD EMA slow",     color.new(cHudDim, 50), 1)
+hline(0, "Zero", color.new(cHudDim, 40), hline.style_dotted)
+
+plot(i_showPoc ? pocMid : na, "Bar POC",  cPoc, 2, plot.style_stepline, force_overlay = true)
+plot(i_showVa  ? vahPx  : na, "Bar VAH",  color.new(cVa, 20), 1, plot.style_stepline, force_overlay = true)
+plot(i_showVa  ? valPx  : na, "Bar VAL",  color.new(cVa, 20), 1, plot.style_stepline, force_overlay = true)
+
+barcolor(i_barcol and not na(barDel) ? (barDel >= 0 ? color.new(cBuy, 55) : color.new(cSell, 55)) : na)
+
+// Last-bar CVD tag in the pane
+var label cvdTag = na
+if barstate.islast
+    if not na(cvdTag)
+        label.delete(cvdTag)
+    cvdTag := label.new(
+         bar_index, sessionCvd,
+         "S-CVD  " + f_fmtSigned(sessionCvd),
+         style     = label.style_label_left,
+         color     = color.new(cvdCol, 15),
+         textcolor = color.white,
+         size      = size.small)
+
+// Data window
+plot(sessionCvd, "DW Session CVD",     display = display.data_window)
+plot(barDel,     "DW Bar Δ",           display = display.data_window)
+plot(barBuy,     "DW Buy volume",      display = display.data_window)
+plot(barSell,    "DW Sell volume",     display = display.data_window)
+plot(delPct,     "DW Δ %",             display = display.data_window)
+plot(pocMid,     "DW POC",             display = display.data_window)
+plot(buyStack,   "DW Buy stack",       display = display.data_window)
+plot(sellStack,  "DW Sell stack",      display = display.data_window)
+
+//══════════════════════════════════════════════════════════════════════════════
+// HUD
+//══════════════════════════════════════════════════════════════════════════════
+var table hud = table.new(hudPos, 2, 16, color.new(cHudBg, 8), color.new(cHudDim, 55), 1, color.new(cHudBg, 8), 0)
+var int fpOk = 0
+var int fpMiss = 0
+if hasFp
+    fpOk += 1
+else
+    fpMiss += 1
+
+f_cell(int r, string k, string v, color vk, bool head) =>
+    table.cell(hud, 0, r, k, text_color = head ? cHudFg : cHudDim, text_halign = text.align_left,  text_size = size.small, bgcolor = cHudBg)
+    table.cell(hud, 1, r, v, text_color = vk,                      text_halign = text.align_right, text_size = size.small, bgcolor = cHudBg, text_font_family = font.family_monospace)
+
+if i_hud and barstate.islast
+    string stateTxt = not hasFp and fpOk == 0 ? "NO FOOTPRINT" : sessDivBear or sessDivBull ? "DIVERGE" : absorb ? "ABSORB" : stackedBuy and cvdRising ? "INITIATIVE ▲" : stackedSell and cvdFalling ? "INITIATIVE ▼" : confirmBar and cvdRising ? "CONFIRM ▲" : confirmBar and cvdFalling ? "CONFIRM ▼" : "BALANCE"
+    color  stateCol = stateTxt == "NO FOOTPRINT" ? cHudDim : str.contains(stateTxt, "DIVERGE") or str.contains(stateTxt, "ABSORB") ? cWarn : str.contains(stateTxt, "▼") and not str.contains(stateTxt, "CONFIRM ▲") ? cSell : str.contains(stateTxt, "▲") ? cBuy : cHudFg
+    string slp = cvdRising ? "▲" : cvdFalling ? "▼" : "–"
+    string auc = ubHigh ? "UB HIGH" : ubLow ? "UB LOW" : xsHigh ? "EXCESS HIGH" : xsLow ? "EXCESS LOW" : "TWO-SIDED"
+    string stk = stackedBuy ? str.tostring(buyStack) + " BUY" : stackedSell ? str.tostring(sellStack) + " SELL" : "—"
+    string eng = fpOk == 0 ? "UNAVAILABLE" : "NATIVE  ·  " + str.tostring(nRows) + " rows"
+
+    table.clear(hud, 0, 0, 1, 15)
+    f_cell(0, "SESSION CVD LAB", "", cHudFg, true)
+    f_cell(1, "STATE",   stateTxt, stateCol, false)
+    f_cell(2, "S-CVD",   f_fmtSigned(sessionCvd) + "  " + slp, cvdCol, false)
+    if not i_hudCompact
+        f_cell(3, "BAR Δ",   f_fmtSigned(barDel) + "   " + f_fmtPct(delPct), na(barDel) ? cHudDim : barDel >= 0 ? cBuy : cSell, false)
+        f_cell(4, "BUY",     f_fmtVol(barBuy),  cBuy, false)
+        f_cell(5, "SELL",    f_fmtVol(barSell), cSell, false)
+        f_cell(6, "POC",     f_fmtPx(pocMid),   cPoc, false)
+        f_cell(7, "VA",      f_fmtPx(valPx) + " – " + f_fmtPx(vahPx), cVa, false)
+        f_cell(8, "STACK",   stk, stackedBuy ? cBuy : stackedSell ? cSell : cHudDim, false)
+        f_cell(9, "AUCTION", auc, ubHigh or ubLow ? cUb : cHudDim, false)
+        f_cell(10, "RESET",  i_reset, cHudDim, false)
+        f_cell(11, "ROW",    str.tostring(i_ticks) + " tk  ·  " + f_fmtPx(i_ticks * syminfo.mintick), cHudDim, false)
+        f_cell(12, "ENGINE", eng, fpOk == 0 ? cSell : cHudDim, false)
+        if fpOk == 0
+            f_cell(13, "NOTE", "Premium + volume required", cWarn, false)
+    else
+        f_cell(3, "BAR Δ", f_fmtSigned(barDel), na(barDel) ? cHudDim : barDel >= 0 ? cBuy : cSell, false)
+        f_cell(4, "STACK", stk, stackedBuy ? cBuy : stackedSell ? cSell : cHudDim, false)
+        f_cell(5, "ENGINE", eng, fpOk == 0 ? cSell : cHudDim, false)
+
+//══════════════════════════════════════════════════════════════════════════════
+// Alerts
+//══════════════════════════════════════════════════════════════════════════════
+bool alReg  = fireRegBear or fireRegBull
+bool alHid  = fireHidBear or fireHidBull
+bool alAbs  = fireAbsAsk or fireAbsBid
+bool alStk  = fireStkBuy or fireStkSell
+bool alBrk  = fireFailUp or fireFailDn or fireConfUp or fireConfDn
+bool alSess = fireSessDb or fireSessDu
+
+alertcondition(alReg,  "CVD Lab · Regular divergence", "Regular CVD divergence (reversal location). Wait for a reclaim.")
+alertcondition(alHid,  "CVD Lab · Hidden divergence",  "Hidden CVD divergence (continuation).")
+alertcondition(alAbs,  "CVD Lab · Absorption",         "Absorption — effort without result at the extreme.")
+alertcondition(alStk,  "CVD Lab · Stacked imbalance",  "New stacked imbalance zone.")
+alertcondition(alBrk,  "CVD Lab · Confirm / fail break","Confirmed or failed session break.")
+alertcondition(alSess, "CVD Lab · Session CVD divergence", "Price session extreme not confirmed by session CVD.")
+
+if barstate.isconfirmed
+    if i_alReg and alReg
+        alert("CVD Lab · REG DIV · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)
+    if i_alHid and alHid
+        alert("CVD Lab · HID DIV · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)
+    if i_alAbs and alAbs
+        alert("CVD Lab · ABSORB · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)
+    if i_alStk and alStk
+        alert("CVD Lab · STACK · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)
+    if i_alBrk and alBrk
+        alert("CVD Lab · BREAK · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)
+    if i_alSess and alSess
+        alert("CVD Lab · SESS DIV · " + syminfo.ticker + " · " + f_fmtPx(close), alert.freq_once_per_bar_close)

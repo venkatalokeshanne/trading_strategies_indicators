@@ -1,0 +1,694 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator(title = 'CAN SLIM Checker v2', shorttitle = 'CAN SLIM', overlay = true, max_bars_back = 500)
+
+// Scores the chart's symbol against William O'Neil's CAN SLIM criteria and renders
+// one diagnostic table: a row per check, green (pass) / red (fail) / gray (no data),
+// with the rule quoted in each row's tooltip.
+//
+// CHANGES vs v1 -------------------------------------------------------------
+//  1. TIMEFRAME INDEPENDENCE. Every price/volume series is now pulled from a
+//     DAILY request.security() on the chart's own symbol, so the 50/200-day MAs,
+//     the 52-week high, the 3/6/9/12-month returns, the U/D volume ratio and the
+//     dollar-volume proxy are correct on an intraday, weekly or monthly chart.
+//     v1 counted these in CHART bars, which silently produced nonsense intraday.
+//     (One exception remains -- the RS-line 52-week high, see #6.)
+//  2. REPORT CLOCK BUG. v1 read "n reports ago" with
+//     ta.valuewhen(ta.change(series) != 0, series, n) PER SERIES. When two
+//     consecutive reports carry the identical value the change never fires and the
+//     lookup silently reaches 5 or 6 reports back instead of 4. This is not
+//     hypothetical: TOTAL_SHARES_OUTSTANDING repeats constantly, so v1's dilution
+//     check was frequently comparing against the wrong quarter. v2 derives ONE
+//     report clock from TOTAL_REVENUE (which effectively never repeats exactly)
+//     and samples every other series against it.
+//  3. DILUTED EPS by default. Basic EPS flatters companies that issue options;
+//     O'Neil / IBD work from the diluted (and in IBD's case, adjusted) figure.
+//     Falls back to basic when diluted is unavailable.
+//  4. C now checks TWO quarters. O'Neil wanted a run of strong quarters, not one.
+//  5. NEW CHECKS: debt/equity with its year-ago value, stock above its own 50- and
+//     200-day MA, index 50-day above 200-day, breakout-volume surge (info),
+//     "extended above the 50-day" climax warning (info), minimum share price.
+//  6. DISTRIBUTION DAYS now implement the 5%-rally expiry that v1's tooltip
+//     claimed but never coded, and the market legs act as a GATE: O'Neil's rule is
+//     that you do not buy in a correction no matter how good the other 15 rows look.
+//  7. A "Needs" column prints the threshold each row must clear beside its actual
+//     value. Every string is generated from the SAME input the pass/fail test
+//     reads, so retuning a threshold cannot leave the column lying. Rows with no
+//     numeric threshold state the condition ("above both", "> index"); the two
+//     rows that are pure context show a dash.
+//  8. M IS NOW THREE ROWS AND THREE STATES. A single "index above its 50 and 200"
+//     bool is too slow to be useful and too crude to act on. In its place:
+//     a slow structure row (21-EMA / 50-SMA / 50>200), IBD's POWER TREND, and the
+//     distribution count -- feeding a CONFIRMED UPTREND / UNDER PRESSURE /
+//     CORRECTION state rather than a bool. The Power Trend is the right answer to
+//     "can I use something faster, like ema10 > ema20": it uses 21-EMA vs 50-SMA,
+//     but gates every transition behind persistence counters (the index LOW above
+//     the 21-EMA for 10 straight sessions, the 21/50 cross holding for 5), which
+//     is what keeps a fast pair of averages from whipsawing a market gate.
+//  9. BACKGROUND SHADING marks every bar on which the symbol met a configurable
+//     CAN SLIM bar, so the qualifying WINDOWS are visible across history rather
+//     than only the latest bar. Gated on three conditions, not one: an absolute
+//     passed-count floor, a percentage floor, and -- the one that matters -- a
+//     data-COVERAGE floor. Unresolved rows leave the denominator, so without that
+//     third floor a symbol with almost no reported financials shades its whole
+//     chart green on a 3/3. It is honest about time (request.financial delivers
+//     each figure on its publication date, so no bar sees a number that was not
+//     yet public) but it is NOT a backtest: it says "this met your bar here",
+//     never "buying here worked".
+//
+// STILL NOT COMPUTABLE IN PINE, and handled honestly rather than faked:
+//   - I (institutional sponsorship): request.financial() exposes no ownership,
+//     fund-count or 13F data. Permanently gray, with average dollar volume shown
+//     as a weak proxy -- "funds COULD build a position", not "funds ARE buying".
+//   - L (RS Rating 80+): IBD's rating is a percentile across the whole market; a
+//     Pine script sees one symbol. Two single-symbol stand-ins are used: the RS
+//     line (close/index) at/near its own 52-week high, and an IBD-weighted
+//     12-month momentum score (40/20/20/20) required to beat the index's score.
+//   - N's qualitative half (new product, new management) -- read the news.
+//   - A proper base / cup-with-handle / pivot point. The "extended" row uses
+//     distance above the 50-day MA as a stand-in for "chasing".
+//
+// STRINGS: tooltips containing apostrophes use double-quoted strings -- the Pine
+// linter rejects backslash-escaped quotes inside single-quoted strings.
+// LINE CONTINUATION: wrapped lines are indented by 5/9/10 spaces on purpose --
+// Pine treats an indent that is a multiple of 4 as a new block.
+
+// ---------------------------------------------------------------- Inputs ----
+
+grpC = 'C -- Current Quarterly Earnings'
+useDiluted   = input.bool(true, 'Use diluted EPS (recommended)', group = grpC, tooltip = 'Diluted EPS accounts for options and convertibles. Basic EPS overstates growth at companies that issue a lot of stock. Falls back to basic when the symbol has no diluted figure.')
+epsQThresh   = input.float(25.0, 'Min EPS YoY growth (FQ) %', minval = 0, group = grpC, tooltip = "O'Neil: current quarterly EPS up at least 25% vs the same quarter a year earlier. He preferred 40%+; 25% is his stated floor.")
+requireTwoQ  = input.bool(true, 'Require the prior quarter to clear it too', group = grpC, tooltip = "O'Neil looked for a RUN of accelerating quarters, not one lucky print. Checks the previous quarter's own YoY growth against the same threshold.")
+salesQThresh = input.float(20.0, 'Min Sales YoY growth (FQ) %', minval = 0, group = grpC, tooltip = 'Sales growth backing the EPS: 25%+ ideal, 20% floor -- EPS growth without revenue growth is cost-cutting, which runs out.')
+
+grpA = 'A -- Annual Earnings Growth'
+epsYThresh = input.float(25.0, 'Min annual EPS growth, each of last 3 years %', minval = 0, group = grpA, tooltip = 'Annual EPS up 25%+ in EACH of the last three fiscal years. Needs 4 annual reports inside the chart history -- roughly 5 years of bars. Gray until then.')
+roeThresh  = input.float(17.0, 'Min Return on Equity %', minval = 0, group = grpA, tooltip = "O'Neil: ROE of 17% or better, marking efficient use of capital. Latest annual (FY) figure. TradingView returns this already expressed as a percent.")
+maxDE      = input.float(1.0, 'Max Debt / Equity', minval = 0, step = 0.1, group = grpA, tooltip = "O'Neil disliked leveraged balance sheets and especially RISING leverage. Computed from TOTAL_DEBT / TOTAL_EQUITY (FQ) rather than the DEBT_TO_EQUITY field so the units are unambiguous. The year-ago value is shown alongside -- falling is what you want. The right cutoff is industry-dependent; utilities and REITs will fail this on principle.")
+
+grpN = 'N -- New High'
+nearHighPct  = input.float(15.0, 'Max distance below 52-week high %', minval = 0, group = grpN, tooltip = "The buyable zone: within ~15% of the 52-week high means the stock is basing near highs rather than repairing damage. Upgrades to NEW HIGH when today sets one -- O'Neil bought new highs, not bargains.")
+minPrice     = input.float(10.0, 'Min share price', minval = 0, group = grpN, tooltip = "O'Neil avoided low-priced stocks; institutions largely cannot buy them. Folded into the liquidity row, not scored separately.")
+breakoutVolX = input.float(1.4, 'Breakout volume vs 50-day avg (x)', minval = 1, step = 0.1, group = grpN, tooltip = "O'Neil's breakout wants volume at least 40-50% above average. INFORMATIONAL only -- a stock is not breaking out most days, so scoring this would drag every healthy base down.")
+extendedPct  = input.float(12.0, 'Climax warning: % above 50-day MA', minval = 0, group = grpN, tooltip = "O'Neil: never chase more than ~5% past the pivot. Pine cannot find the pivot without base detection, so distance above the 50-day MA is the stand-in. INFORMATIONAL -- a red here means 'too late to start', not 'bad stock'.")
+
+grpS = 'S -- Supply & Demand'
+maxFloatM    = input.float(100, 'Max float (millions of shares)', minval = 0, group = grpS, tooltip = "Smaller supply moves further on the same demand. O'Neil's 1988 examples used <25M shares; floats have inflated since -- 100M is a reasonable modern cutoff, tighten to taste. NOTE: TradingView only publishes float as an ANNUAL (FY) figure, so it can be up to a year stale, and it is missing entirely for many symbols.")
+maxDilutePct = input.float(2.0, 'Max shares-outstanding growth YoY %', minval = 0, group = grpS, tooltip = 'Passes when the share count is flat or shrinking (buybacks). Fails on dilution beyond this -- new supply works against the holder.')
+udVolLen     = input.int(50, 'Up/Down volume lookback (daily bars)', minval = 10, group = grpS, tooltip = 'Sum of volume on up-closes divided by volume on down-closes, over DAILY bars regardless of chart timeframe. Above 1.0 means more volume has flowed in on rallies than on declines -- the demand half of S.')
+udVolMin     = input.float(1.0, 'Min U/D volume ratio', minval = 0, step = 0.05, group = grpS, tooltip = 'IBD treats 1.0 as neutral; true accumulation in a leader usually reads 1.25 or better. Raise this if you want a stricter demand filter.')
+
+grpL = 'L -- Leader'
+rsNearPct = input.float(5.0, 'Max RS-line distance below its 52-week high %', minval = 0, group = grpL, tooltip = "The RS line is close/index. At or near its own 52-week high means the stock is outperforming NOW -- O'Neil's ideal breakout has the RS line at a new high with or before price. Single-symbol stand-in for IBD's cross-sectional RS Rating, which Pine cannot compute.")
+momMargin = input.float(0.0, 'Required momentum margin over index', step = 5, group = grpL, tooltip = "How far the stock's weighted 12-month momentum score must exceed the index's. Zero means 'merely beating the market', which in a bear market is a low bar -- raise it to demand real leadership.")
+
+grpI = 'I -- Institutional (proxy only)'
+minDollarVolM = input.float(20, 'Min avg daily dollar volume ($ millions)', minval = 0, group = grpI, tooltip = 'Pine has no institutional-ownership data, so this row can never be more than a proxy: enough dollar volume that funds CAN build positions, and a share price they are allowed to buy. 50-day average of close x volume.')
+
+grpM = 'M -- Market Direction'
+marketSymbol = input.symbol('AMEX:SPY', 'Market index (needs volume)', group = grpM, tooltip = 'Used for trend, distribution days, and as the RS-line/momentum reference. SPY rather than SPX because distribution days need a volume series and SPX has none. Use QQQ for growth/tech-heavy portfolios.')
+distLookback = input.int(25, 'Distribution-day window (days)', minval = 5, maxval = 100, group = grpM, tooltip = 'IBD counts distribution days over the trailing 25 sessions.')
+distMax      = input.int(4, 'Max distribution days', minval = 1, group = grpM, tooltip = 'IBD treats 5-6 distribution days in the window as a correction signal. Pass while at or under this count.')
+distDownPct  = input.float(0.2, 'Distribution-day decline threshold %', minval = 0.05, step = 0.05, group = grpM, tooltip = 'Index close down at least this much on volume higher than the prior session.')
+distRallyPct = input.float(5.0, 'Expire a distribution day after a rally of %', minval = 0, step = 0.5, group = grpM, tooltip = 'IBD retires a distribution day once the index closes this far above the close of that day. v1 promised this in a tooltip but never implemented it; set to 0 to disable and count purely by age.')
+ptLowDays   = input.int(10, 'Power Trend: days the low must hold above the 21-EMA', minval = 1, maxval = 60, group = grpM, tooltip = "IBD's Power Trend, condition 1. Not 'the index is above the 21-EMA' but 'the index has not even DIPPED to it', for ten straight sessions. The persistence is the whole point -- it is what stops a moving-average rule from whipsawing you in and out of the market every fortnight.")
+ptEmaDays   = input.int(5, 'Power Trend: days the 21-EMA must hold above the 50-SMA', minval = 1, maxval = 60, group = grpM, tooltip = "IBD's Power Trend, condition 2. A 21/50 cross has to STICK for five sessions before it counts.")
+ptBreakPct  = input.float(10.0, 'Power Trend circuit breaker: % below 3-month high', minval = 0, step = 1, group = grpM, tooltip = 'The rare early exit: the index closes below its 50-day SMA while already this far off its three-month high. Without it the Power Trend can only end on a 21/50 cross, which is slow in a crash.')
+distMaxPress = input.int(6, 'Distribution days that force a correction call', minval = 2, group = grpM, tooltip = 'Above the pass threshold but at or below this, the market reads UNDER PRESSURE. Beyond it, CORRECTION. IBD puts the danger zone at 5-6.')
+marketGates  = input.bool(true, 'Treat M as a gate, not just points in the score', group = grpM, tooltip = "O'Neil called M the most important letter and meant it literally: in a market correction you do not buy, however good the stock. When on, a failing market stamps the score row regardless of the other rows.")
+gateBlocksOn = input.string('Correction only', 'Gate blocks when the market is', options = ['Correction only', 'Correction or Under Pressure'], group = grpM, tooltip = "IBD's own guidance is to stop buying outright in a correction and to be selective -- smaller positions, only the best setups -- when an uptrend is under pressure. Pick which of those two you want the score row to veto.")
+
+// The table only ever draws on the last bar, but every check above is evaluated
+// on EVERY bar, so the qualifying state has a full history. Shading it makes that
+// history visible: the green stretches are the windows in which this symbol
+// actually met your CAN SLIM bar. Read the caveats in the tooltips before
+// treating a long green run as evidence of anything -- see also the note above
+// the calculation itself, further down.
+grpBG = 'Background shading'
+bgEnable   = input.bool(true, 'Shade the chart while the score qualifies', group = grpBG, tooltip = 'Paints the chart background on every bar where the criteria below are met, so you can see at a glance which stretches of history this symbol passed CAN SLIM and which it did not.')
+bgMinPass  = input.int(12, 'Min checks passed', minval = 1, maxval = 17, group = grpBG, tooltip = 'Absolute floor on the number of scored checks that must pass. There are 17 in total. This is the main dial.')
+bgMinPct   = input.float(70.0, 'Min % of evaluable checks passed', minval = 0, maxval = 100, step = 5, group = grpBG, tooltip = 'A ratio floor on top of the absolute one. Both must be satisfied. The ratio alone would be gameable -- see the data-coverage floor below.')
+bgMinEval  = input.int(12, 'Min evaluable checks (data coverage floor)', minval = 1, maxval = 17, group = grpBG, tooltip = "The guard that makes this honest. Unresolved rows leave the denominator rather than counting as failures, so a symbol with almost no reported financials can post a perfect 3/3 and shade the whole chart green on nothing. This floor refuses to shade until enough checks actually resolved. Keep it high; lowering it is how you fool yourself.")
+bgUseGate  = input.bool(true, 'Also require the market gate to allow buying', group = grpBG, tooltip = "Applies the same CONFIRMED UPTREND / UNDER PRESSURE / CORRECTION gate the score row uses, with the same 'Gate blocks when the market is' setting. Off means the shading judges the stock alone and ignores the market -- useful for seeing whether a name was strong THROUGH a correction, which is exactly what O'Neil looked for in the next cycle's leaders.")
+bgShowNear = input.bool(true, 'Shade differently when only the market blocks it', group = grpBG, tooltip = 'A second shade for bars where the stock cleared your bar but the market gate vetoed it. Those are the setups worth remembering -- the stock was ready and the tape was not.')
+bgColorOk  = input.color(color.new(color.green, 88), 'Qualifying shade', group = grpBG)
+bgColorNear = input.color(color.new(color.orange, 91), 'Stock-only shade', group = grpBG)
+
+grpD = 'Display'
+tablePos  = input.string('Top right', 'Table position', options = ['Top right', 'Top left', 'Bottom right', 'Bottom left', 'Middle right'], group = grpD)
+tableLayout = input.string('Full', 'Layout', options = ['Full', 'Compact', 'Minimal (phone)'], group = grpD, tooltip = "FULL: all 21 checks, five columns -- a desk monitor. COMPACT: drops the four informational rows (they are context, not criteria) and shortens the labels, leaving the 17 scored checks. MINIMAL: one row per CAN SLIM letter showing how many of that letter's checks passed, plus the market state and the score -- nine rows, readable on a phone without pinching. Every layout runs the identical arithmetic; only what is DRAWN changes, so the score never differs between them.")
+tableSize = input.string('Small', 'Table text size', options = ['Auto', 'Tiny', 'Small', 'Normal', 'Large', 'Huge'], group = grpD, tooltip = 'AUTO scales the text to the size of the chart pane, which is usually what you want on a phone -- the same table then reads on a 6-inch screen and a 27-inch monitor without touching this setting. The fixed sizes are there for when you want the table to stay put as you resize the pane.')
+showTarget = input.bool(true, 'Show the "Needs" column', group = grpD, tooltip = 'Prints the threshold each row has to clear next to its actual value, built from the same input the pass/fail test reads. Turning it off does not blank the column -- it leaves those cells unset entirely, so the column collapses to zero width instead of leaving an empty striped gap. Forced off in the Minimal layout, where per-row thresholds have nothing to attach to.')
+
+// ------------------------------------------------------------- Functions ----
+
+// Rolling distribution-day count with IBD's rally expiry. Runs inside the index's
+// daily context, so the loop offsets are daily sessions.
+f_distDays(len, thrFrac, rallyFrac) =>
+    isDist = close / close[1] - 1 <= -thrFrac and volume > volume[1]
+    float cnt = 0.0
+    for i = 0 to len - 1
+        expired = rallyFrac > 0 and close >= close[i] * (1 + rallyFrac)
+        if isDist[i] and not expired
+            cnt := cnt + 1
+    cnt
+
+// IBD's Power Trend, the answer to "something faster than 50/200 that does not
+// whipsaw". Runs inside the index's daily context. Turns ON only when all four
+// hold at once -- the index low has stayed above the 21-EMA for `lowLen` straight
+// sessions, the 21-EMA has stayed above the 50-SMA for `emaLen`, the 50-SMA is
+// rising, and today closed up. Turns OFF on a 21/50 cross back down, or on the
+// circuit breaker: a close under the 50-SMA while already `breakFrac` off the
+// three-month high.
+//
+// The persistence counters are what make this usable as a gate. A bare
+// ema10 > ema20 cross fires several times a year on SPY, and every flip would
+// veto or un-veto every stock in the table.
+f_powerTrend(lowLen, emaLen, breakFrac) =>
+    ema21 = ta.ema(close, 21)
+    sma50 = ta.sma(close, 50)
+    lowHolds = not na(ema21) and low > ema21
+    emaHolds = not na(ema21) and not na(sma50) and ema21 > sma50
+    // barssince() is na until the condition has failed at least once, which on a
+    // clean uptrending history is exactly when the streak is longest -- fall back
+    // to the full bar count rather than reading na as "no streak".
+    lowRaw = ta.barssince(not lowHolds)
+    emaRaw = ta.barssince(not emaHolds)
+    lowStreak = na(lowRaw) ? bar_index : lowRaw
+    emaStreak = na(emaRaw) ? bar_index : emaRaw
+    smaRising = not na(sma50) and not na(sma50[1]) and sma50 > sma50[1]
+    hi3m    = ta.highest(high, 63)
+    breaker = not na(sma50) and not na(hi3m) and close < sma50 and close < hi3m * (1 - breakFrac)
+    turnOn  = lowStreak >= lowLen and emaStreak >= emaLen and smaRising and close > close[1]
+    turnOff = (not na(ema21) and not na(sma50) and ema21 < sma50) or breaker
+    var bool pt = false
+    if turnOff
+        pt := false
+    else if turnOn
+        pt := true
+    pt ? 1.0 : 0.0
+
+// Percent growth, na when the base is zero or negative (a growth RATE off a
+// negative base is meaningless; the turnaround case is handled separately).
+f_growthPct(cur, prior) =>
+    na(cur) or na(prior) or prior <= 0 ? na : (cur - prior) / prior * 100
+
+// True on the bar a value genuinely moves (na-safe, unlike ta.change(x) != 0
+// which is na on the first print and 0 on a repeated value).
+f_moved(x) =>
+    not na(x) and not na(x[1]) and x != x[1]
+
+// IBD-style weighted 12-month momentum: 40% on the 3-month leg, 20% each on 6/9/12.
+f_momScore(r3, r6, r9, r12) =>
+    na(r3) or na(r6) or na(r9) or na(r12) ? na : 2 * r3 + r6 + r9 + r12
+
+f_eval(unres) =>
+    unres ? 0 : 1
+
+f_score(unres, pass) =>
+    not unres and pass ? 1 : 0
+
+// ------------------------------------------------- Daily price/volume data ----
+
+// The chart's own symbol, pulled at DAILY resolution. Everything downstream uses
+// these instead of the chart's close/volume, which is what makes the indicator
+// give the same answer on a 5-minute chart as on a daily one.
+[dClose, dSma50, dSma200, dHi52, dVol, dVolAvg50, dUpVol, dDnVol, dDolVol50, dR3, dR6, dR9, dR12, dNewHigh] =
+     request.security(syminfo.tickerid, 'D',
+         [close,
+          ta.sma(close, 50),
+          ta.sma(close, 200),
+          ta.highest(high, 252),
+          volume,
+          ta.sma(volume, 50),
+          math.sum(close > close[1] ? volume : 0.0, udVolLen),
+          math.sum(close < close[1] ? volume : 0.0, udVolLen),
+          ta.sma(close * volume, 50),
+          (close / close[63] - 1) * 100,
+          (close / close[126] - 1) * 100,
+          (close / close[189] - 1) * 100,
+          (close / close[252] - 1) * 100,
+          high >= ta.highest(high, 252) ? 1.0 : 0.0])
+
+// The market index, same daily context.
+[iClose, iEma21, iSma50, iSma200, iPT, iDist, iR3, iR6, iR9, iR12] =
+     request.security(marketSymbol, 'D',
+         [close,
+          ta.ema(close, 21),
+          ta.sma(close, 50),
+          ta.sma(close, 200),
+          f_powerTrend(ptLowDays, ptEmaDays, ptBreakPct / 100),
+          f_distDays(distLookback, distDownPct / 100, distRallyPct / 100),
+          (close / close[63] - 1) * 100,
+          (close / close[126] - 1) * 100,
+          (close / close[189] - 1) * 100,
+          (close / close[252] - 1) * 100],
+         ignore_invalid_symbol = true)
+
+// ------------------------------------------------------------ Financials ----
+
+epsFqD = request.financial(syminfo.tickerid, 'EARNINGS_PER_SHARE_DILUTED', 'FQ', ignore_invalid_symbol = true)
+epsFqB = request.financial(syminfo.tickerid, 'EARNINGS_PER_SHARE_BASIC', 'FQ', ignore_invalid_symbol = true)
+epsFyD = request.financial(syminfo.tickerid, 'EARNINGS_PER_SHARE_DILUTED', 'FY', ignore_invalid_symbol = true)
+epsFyB = request.financial(syminfo.tickerid, 'EARNINGS_PER_SHARE_BASIC', 'FY', ignore_invalid_symbol = true)
+revFq  = request.financial(syminfo.tickerid, 'TOTAL_REVENUE', 'FQ', ignore_invalid_symbol = true)
+revFy  = request.financial(syminfo.tickerid, 'TOTAL_REVENUE', 'FY', ignore_invalid_symbol = true)
+roeFy  = request.financial(syminfo.tickerid, 'RETURN_ON_EQUITY', 'FY', ignore_invalid_symbol = true)
+debtFq = request.financial(syminfo.tickerid, 'TOTAL_DEBT', 'FQ', ignore_invalid_symbol = true)
+eqFq   = request.financial(syminfo.tickerid, 'TOTAL_EQUITY', 'FQ', ignore_invalid_symbol = true)
+totShares   = request.financial(syminfo.tickerid, 'TOTAL_SHARES_OUTSTANDING', 'FQ', ignore_invalid_symbol = true)
+floatShares = request.financial(syminfo.tickerid, 'FLOAT_SHARES_OUTSTANDING', 'FY', ignore_invalid_symbol = true)
+
+epsFq = useDiluted and not na(epsFqD) ? epsFqD : epsFqB
+epsFy = useDiluted and not na(epsFyD) ? epsFyD : epsFyB
+
+// ONE report clock per period type, driven by revenue. All FQ figures from the
+// same filing land on the same bar, so sampling them all against this clock keeps
+// "4 reports ago" honest even when a value repeats verbatim.
+// Both branches are evaluated unconditionally and then selected: a function that
+// references history must run on every bar or its internal series desynchronises.
+movedRevQ = f_moved(revFq)
+movedEpsQ = f_moved(epsFq)
+movedRevY = f_moved(revFy)
+movedEpsY = f_moved(epsFy)
+newFQ = na(revFq) ? movedEpsQ : movedRevQ
+newFY = na(revFy) ? movedEpsY : movedRevY
+
+f_fqBack(src, n) =>
+    ta.valuewhen(newFQ, src, n)
+
+f_fyBack(src, n) =>
+    ta.valuewhen(newFY, src, n)
+
+// --- C: quarterly EPS + sales, YoY, two quarters deep ---
+epsQ1 = f_fqBack(epsFq, 1)
+epsQ4 = f_fqBack(epsFq, 4)
+epsQ5 = f_fqBack(epsFq, 5)
+revQ4 = f_fqBack(revFq, 4)
+
+epsG0 = f_growthPct(epsFq, epsQ4)
+epsG1 = f_growthPct(epsQ1, epsQ5)
+revG0 = f_growthPct(revFq, revQ4)
+
+// A loss turning into a profit is the strongest possible "growth" and has no
+// percentage; O'Neil counted it, so it passes explicitly.
+turn0 = not na(epsFq) and not na(epsQ4) and epsQ4 <= 0 and epsFq > 0
+turn1 = not na(epsQ1) and not na(epsQ5) and epsQ5 <= 0 and epsQ1 > 0
+
+cEpsUnres = na(epsG0) and not turn0
+cEpsPass  = turn0 or (not na(epsG0) and epsG0 >= epsQThresh)
+
+cEps2Unres = not requireTwoQ ? false : na(epsG1) and not turn1
+cEps2Pass  = not requireTwoQ ? true : turn1 or (not na(epsG1) and epsG1 >= epsQThresh)
+
+cSalesUnres = na(revG0)
+cSalesPass  = not cSalesUnres and revG0 >= salesQThresh
+
+cAccelUnres = na(epsG0) or na(epsG1)
+cAccelPass  = not cAccelUnres and epsG0 > epsG1
+
+// --- A: annual EPS three years running, ROE, leverage ---
+epsY1 = f_fyBack(epsFy, 1)
+epsY2 = f_fyBack(epsFy, 2)
+epsY3 = f_fyBack(epsFy, 3)
+epsGA0 = f_growthPct(epsFy, epsY1)
+epsGA1 = f_growthPct(epsY1, epsY2)
+epsGA2 = f_growthPct(epsY2, epsY3)
+
+aEpsUnres = na(epsGA0) or na(epsGA1) or na(epsGA2)
+aEpsPass  = not aEpsUnres and epsGA0 >= epsYThresh and epsGA1 >= epsYThresh and epsGA2 >= epsYThresh
+aRoeUnres = na(roeFy)
+aRoePass  = not aRoeUnres and roeFy >= roeThresh
+
+debt4 = f_fqBack(debtFq, 4)
+eq4   = f_fqBack(eqFq, 4)
+deNow = not na(debtFq) and not na(eqFq) and eqFq > 0 ? debtFq / eqFq : na
+deOld = not na(debt4) and not na(eq4) and eq4 > 0 ? debt4 / eq4 : na
+aDeUnres = na(deNow)
+aDePass  = not aDeUnres and deNow <= maxDE
+
+// ------------------------------------------------------- N: the new high ----
+
+pctFromHigh = na(dHi52) or dHi52 <= 0 ? na : (dClose / dHi52 - 1) * 100
+isNewHigh   = not na(dNewHigh) and dNewHigh > 0.5
+nHighUnres  = na(pctFromHigh)
+nHighPass   = not nHighUnres and pctFromHigh >= -nearHighPct
+
+volRatio  = na(dVolAvg50) or dVolAvg50 <= 0 ? na : dVol / dVolAvg50
+nVolUnres = na(volRatio) or na(pctFromHigh)
+nVolPass  = not nVolUnres and volRatio >= breakoutVolX and pctFromHigh >= -2.0
+
+extPct    = na(dSma50) or dSma50 <= 0 ? na : (dClose / dSma50 - 1) * 100
+nExtUnres = na(extPct)
+nExtPass  = not nExtUnres and extPct <= extendedPct
+
+// -------------------------------------------------- S: supply and demand ----
+
+floatM = floatShares / 1e6
+sFloatUnres = na(floatShares)
+sFloatPass  = not sFloatUnres and floatM <= maxFloatM
+
+shares4 = f_fqBack(totShares, 4)
+sharesChgPct = f_growthPct(totShares, shares4)
+sSharesUnres = na(sharesChgPct)
+sSharesPass  = not sSharesUnres and sharesChgPct <= maxDilutePct
+
+// A stock with literally no down days over the window is maximally accumulated,
+// not "no data" -- v1 returned na here and grayed the row out.
+udRatio = na(dUpVol) or na(dDnVol) ? float(na) : dDnVol > 0 ? dUpVol / dDnVol : dUpVol > 0 ? 99.0 : float(na)
+sUdUnres = na(udRatio)
+sUdPass  = not sUdUnres and udRatio >= udVolMin
+
+// ------------------------------------------------------------- L: leader ----
+
+// Stock holding above its own 50- and 200-day: the simplest thing every O'Neil
+// leader has in common and the one v1 never checked.
+lMaUnres = na(dSma50) or na(dSma200) or na(dClose)
+lMaPass  = not lMaUnres and dClose > dSma50 and dClose > dSma200
+
+// RS line vs the market symbol, at/near its own 52-week high.
+// CAVEAT: unlike everything else here, the RS line's own 52-week high is measured
+// in CHART bars, because Pine cannot nest one request.security inside another to
+// build the ratio in a daily context. The row therefore grays out on intraday
+// charts rather than reporting a 252-five-minute-bar "52-week" high.
+rsBars  = timeframe.isweekly ? 52 : timeframe.ismonthly ? 12 : 252
+rsTfOk  = timeframe.isdaily or timeframe.isweekly or timeframe.ismonthly
+rsLine  = not na(iClose) and iClose > 0 and not na(dClose) ? dClose / iClose : na
+rsHi52  = ta.highest(rsLine, rsBars)
+rsFromHigh = na(rsLine) or na(rsHi52) or rsHi52 <= 0 ? na : (rsLine / rsHi52 - 1) * 100
+rsNewHigh  = not na(rsLine) and not na(rsHi52) and rsLine >= rsHi52
+lRsUnres = not rsTfOk or na(rsFromHigh) or bar_index < rsBars
+lRsPass  = not lRsUnres and rsFromHigh >= -rsNearPct
+
+stkScore = f_momScore(dR3, dR6, dR9, dR12)
+idxScore = f_momScore(iR3, iR6, iR9, iR12)
+lMomUnres = na(stkScore) or na(idxScore)
+lMomPass  = not lMomUnres and stkScore > idxScore + momMargin
+
+// ---------------------------------------- I: proxy, never the real thing ----
+
+avgDollarVolM = dDolVol50 / 1e6
+iProxyUnres = na(avgDollarVolM) or na(dClose)
+iProxyPass  = not iProxyUnres and avgDollarVolM >= minDollarVolM and dClose >= minPrice
+
+// ------------------------------------------------------------ Market leg ----
+
+// Structural backdrop -- slow, and deliberately so. This is the "is the tide in"
+// question; the Power Trend below is the "is it safe to swim today" question.
+mTrendUnres = na(iClose) or na(iEma21) or na(iSma50) or na(iSma200)
+mTrendPass  = not mTrendUnres and iClose > iEma21 and iClose > iSma50 and iSma50 > iSma200
+
+mPtUnres = na(iPT)
+mPtPass  = not mPtUnres and iPT > 0.5
+
+mDistUnres = na(iDist)
+mDistPass  = not mDistUnres and iDist <= distMax
+
+// Three states rather than a bool, because "not a confirmed uptrend" and "get
+// out" are different instructions and O'Neil traded them differently.
+//   3 = Confirmed Uptrend   Power Trend on and distribution contained.
+//   2 = Under Pressure      One of the two is failing but the index still holds
+//                           its 50-day. Smaller size, only the best setups.
+//   1 = Correction          Power Trend off and the index has lost the 50-day,
+//                           or distribution has run past the danger threshold.
+//   0 = Unknown             Index data unavailable.
+mDataUnres = mTrendUnres or mPtUnres or mDistUnres
+mState = mDataUnres ? 0 : mPtPass and mDistPass ? 3 : (not mPtPass and iClose < iSma50) or iDist > distMaxPress ? 1 : 2
+marketOk   = mState == 3
+marketStop = gateBlocksOn == 'Correction only' ? mState == 1 : mState == 1 or mState == 2
+
+// ----------------------------------------------------------------- Score ----
+
+// Scored rows only. EPS acceleration, breakout volume, the extension warning and
+// the institutional placeholder display but never count -- they are context, not
+// pass/fail criteria. Unresolved rows leave the denominator, they are not waved
+// through.
+cntEval = f_eval(cEpsUnres) + f_eval(cEps2Unres) + f_eval(cSalesUnres) + f_eval(aEpsUnres) + f_eval(aRoeUnres) + f_eval(aDeUnres) + f_eval(nHighUnres) + f_eval(sFloatUnres) + f_eval(sSharesUnres) + f_eval(sUdUnres) + f_eval(lMaUnres) + f_eval(lRsUnres) + f_eval(lMomUnres) + f_eval(iProxyUnres) + f_eval(mTrendUnres) + f_eval(mPtUnres) + f_eval(mDistUnres)
+cntPass = f_score(cEpsUnres, cEpsPass) + f_score(cEps2Unres, cEps2Pass) + f_score(cSalesUnres, cSalesPass) + f_score(aEpsUnres, aEpsPass) + f_score(aRoeUnres, aRoePass) + f_score(aDeUnres, aDePass) + f_score(nHighUnres, nHighPass) + f_score(sFloatUnres, sFloatPass) + f_score(sSharesUnres, sSharesPass) + f_score(sUdUnres, sUdPass) + f_score(lMaUnres, lMaPass) + f_score(lRsUnres, lRsPass) + f_score(lMomUnres, lMomPass) + f_score(iProxyUnres, iProxyPass) + f_score(mTrendUnres, mTrendPass) + f_score(mPtUnres, mPtPass) + f_score(mDistUnres, mDistPass)
+
+// Per-letter tallies, used by the Minimal layout and nowhere else. Same f_eval /
+// f_score helpers as the total, so a letter can never disagree with the score.
+evC = f_eval(cEpsUnres) + f_eval(cEps2Unres) + f_eval(cSalesUnres)
+psC = f_score(cEpsUnres, cEpsPass) + f_score(cEps2Unres, cEps2Pass) + f_score(cSalesUnres, cSalesPass)
+evA = f_eval(aEpsUnres) + f_eval(aRoeUnres) + f_eval(aDeUnres)
+psA = f_score(aEpsUnres, aEpsPass) + f_score(aRoeUnres, aRoePass) + f_score(aDeUnres, aDePass)
+evN = f_eval(nHighUnres)
+psN = f_score(nHighUnres, nHighPass)
+evS = f_eval(sFloatUnres) + f_eval(sSharesUnres) + f_eval(sUdUnres)
+psS = f_score(sFloatUnres, sFloatPass) + f_score(sSharesUnres, sSharesPass) + f_score(sUdUnres, sUdPass)
+evL = f_eval(lMaUnres) + f_eval(lRsUnres) + f_eval(lMomUnres)
+psL = f_score(lMaUnres, lMaPass) + f_score(lRsUnres, lRsPass) + f_score(lMomUnres, lMomPass)
+evI = f_eval(iProxyUnres)
+psI = f_score(iProxyUnres, iProxyPass)
+evM = f_eval(mTrendUnres) + f_eval(mPtUnres) + f_eval(mDistUnres)
+psM = f_score(mTrendUnres, mTrendPass) + f_score(mPtUnres, mPtPass) + f_score(mDistUnres, mDistPass)
+
+// ------------------------------------------------ Qualifying state + shade ----
+
+// THREE conditions, not one, and the third is the one that matters.
+//
+// An unresolved row leaves the denominator rather than counting as a failure --
+// correct for a checker, but it means a symbol with almost no reported financials
+// can post 3 / 3 and shade its entire chart green on nothing at all. The coverage
+// floor (bgMinEval) refuses to shade until enough checks actually resolved, which
+// is what stops the shading from being brightest exactly where the data is
+// thinnest. The absolute floor and the ratio floor then both have to clear.
+//
+// WHAT THE SHADING IS AND IS NOT. It is honest about time: request.financial()
+// delivers each figure on its publication date, so a historical bar only ever
+// sees numbers that were public on that bar -- there is no lookahead. It is NOT a
+// backtest. It says "this symbol met your bar here", never "buying here worked".
+// Restatements are not modelled, TradingView's fundamental history is finite (the
+// early years of any chart will be gray and unshaded for want of data, not for
+// want of quality), and the daily series behind every price check is complete on
+// historical bars but still forming on today's.
+covOk     = cntEval >= bgMinEval
+absOk     = cntPass >= bgMinPass
+ratioOk   = cntEval > 0 and cntPass * 100.0 / cntEval >= bgMinPct
+stockOk   = covOk and absOk and ratioOk
+canSlimOk = stockOk and (not bgUseGate or not marketStop)
+canSlimNear = stockOk and not canSlimOk
+
+qualRaw  = ta.barssince(not canSlimOk)
+qualBars = canSlimOk ? (na(qualRaw) ? bar_index + 1 : qualRaw) : 0
+
+bgcolor(not bgEnable ? na : canSlimOk ? bgColorOk : bgShowNear and canSlimNear ? bgColorNear : na, title = 'CAN SLIM qualifying')
+
+// ----------------------------------------------------------- Data Window ----
+
+plot(canSlimOk ? 1 : 0, 'BG: qualifying (1/0)', display = display.data_window)
+plot(qualBars, 'BG: bars in current run', display = display.data_window)
+
+plot(epsG0, 'C: EPS YoY %', display = display.data_window)
+plot(epsG1, 'C: EPS YoY prior Q %', display = display.data_window)
+plot(revG0, 'C: Sales YoY %', display = display.data_window)
+plot(epsGA0, 'A: EPS annual Y0 %', display = display.data_window)
+plot(roeFy, 'A: ROE %', display = display.data_window)
+plot(deNow, 'A: Debt/Equity', display = display.data_window)
+plot(pctFromHigh, 'N: % from 52w high', display = display.data_window)
+plot(volRatio, 'N: Volume vs 50d avg (x)', display = display.data_window)
+plot(extPct, 'N: % above 50d MA', display = display.data_window)
+plot(floatM, 'S: Float (M shares)', display = display.data_window)
+plot(sharesChgPct, 'S: Shares YoY %', display = display.data_window)
+plot(udRatio, 'S: U/D volume ratio', display = display.data_window)
+plot(rsFromHigh, 'L: RS line % from high', display = display.data_window)
+plot(stkScore, 'L: Momentum score (stock)', display = display.data_window)
+plot(idxScore, 'L: Momentum score (index)', display = display.data_window)
+plot(avgDollarVolM, 'I: Avg $ vol ($M)', display = display.data_window)
+plot(iPT, 'M: Power Trend on (1/0)', display = display.data_window)
+plot(iDist, 'M: Distribution days', display = display.data_window)
+plot(mState, 'M: State (3=uptrend 2=pressure 1=correction)', display = display.data_window)
+plot(cntPass, 'Score: passed', display = display.data_window)
+plot(cntEval, 'Score: evaluable', display = display.data_window)
+
+// ----------------------------------------------------------------- Table ----
+
+f_fmtPct(x) =>
+    na(x) ? 'n/a' : (x >= 0 ? '+' : '') + str.tostring(x, '#.#') + '%'
+
+f_fmtM(x) =>
+    na(x) ? 'n/a' : x >= 1000 ? str.tostring(x / 1000, '#.##') + 'B' : str.tostring(x, '#.#') + 'M'
+
+f_fmtNum(x, fmt) =>
+    na(x) ? 'n/a' : str.tostring(x, fmt)
+
+// Threshold formatters for the "Needs" column. Every string below is built from
+// the SAME input the pass/fail test uses, so the column can never drift out of
+// sync with the logic when you retune a threshold.
+f_geP(x) =>
+    '>= ' + str.tostring(x, '#.#') + '%'
+
+f_leP(x) =>
+    '<= ' + str.tostring(x, '#.#') + '%'
+
+f_geN(x, fmt) =>
+    '>= ' + str.tostring(x, fmt)
+
+f_leN(x, fmt) =>
+    '<= ' + str.tostring(x, fmt)
+
+colPass   = color.new(color.green, 0)
+colFail   = color.new(color.red, 0)
+colUnres  = color.new(color.gray, 0)
+colInfo   = color.new(color.aqua, 0)
+colWarn   = color.new(color.orange, 0)
+colNeed   = color.new(color.white, 55)
+colHeadBg = color.new(color.gray, 40)
+colBg     = color.new(color.black, 70)
+
+pos = tablePos == 'Top left' ? position.top_left : tablePos == 'Bottom right' ? position.bottom_right : tablePos == 'Bottom left' ? position.bottom_left : tablePos == 'Middle right' ? position.middle_right : position.top_right
+txtSize = tableSize == 'Auto' ? size.auto : tableSize == 'Tiny' ? size.tiny : tableSize == 'Normal' ? size.normal : tableSize == 'Large' ? size.large : tableSize == 'Huge' ? size.huge : size.small
+
+// Layout switches. Only what is DRAWN changes -- every check above has already
+// been computed and tallied by this point, so the score is identical in all three.
+isMinimal = tableLayout == 'Minimal (phone)'
+isFull    = tableLayout == 'Full'
+showInfoRows = isFull
+useTarget    = showTarget and not isMinimal
+// Short labels for the narrow layouts. Same rows, fewer pixels.
+f_lbl(long, short) =>
+    isFull ? long : short
+
+// One row: letter | check | value | needs | verdict.
+//
+// `show` decides whether the row is drawn, and the function RETURNS THE NEXT ROW
+// INDEX -- so hidden rows do not leave holes and the call sites never hard-code a
+// number. A table cell that is never set is not drawn at all, which is why the
+// "needs" column collapses to nothing rather than leaving an empty striped gap
+// when it is switched off; blanking it with '' would still paint a background.
+f_row(tbl, row, show, ltr, name, val, need, pass, unres, info, tip) =>
+    if show
+        verdict = unres ? 'n/a' : info ? (pass ? 'ok' : 'watch') : pass ? 'PASS' : 'FAIL'
+        vCol    = unres ? colUnres : info ? (pass ? colInfo : colWarn) : pass ? colPass : colFail
+        table.cell(tbl, 0, row, ltr, text_color = color.white, bgcolor = colHeadBg, text_size = txtSize)
+        table.cell(tbl, 1, row, name, text_color = info ? color.silver : color.white, bgcolor = colBg, tooltip = tip, text_halign = text.align_left, text_size = txtSize)
+        table.cell(tbl, 2, row, val, text_color = color.silver, bgcolor = colBg, text_halign = text.align_right, text_size = txtSize)
+        if useTarget
+            table.cell(tbl, 3, row, need, text_color = colNeed, bgcolor = colBg, text_halign = text.align_left, text_size = txtSize)
+        table.cell(tbl, 4, row, verdict, text_color = vCol, bgcolor = colBg, text_size = txtSize)
+    row + (show ? 1 : 0)
+
+// Minimal layout: one row per CAN SLIM letter, "passed / evaluable" for that
+// letter. Partial credit is orange rather than red -- a letter is a group of
+// checks, not a single test, so all-or-nothing colouring would read as worse
+// news than it is.
+f_letterRow(tbl, row, ltr, name, ps, ev, tip) =>
+    vCol = ev == 0 ? colUnres : ps == ev ? colPass : ps * 2 >= ev ? colWarn : colFail
+    txt  = ev == 0 ? 'n/a' : str.tostring(ps) + ' / ' + str.tostring(ev)
+    table.cell(tbl, 0, row, ltr, text_color = color.white, bgcolor = colHeadBg, text_size = txtSize)
+    table.cell(tbl, 1, row, name, text_color = color.white, bgcolor = colBg, tooltip = tip, text_halign = text.align_left, text_size = txtSize)
+    table.cell(tbl, 2, row, txt, text_color = vCol, bgcolor = colBg, text_halign = text.align_right, text_size = txtSize)
+    table.cell(tbl, 4, row, ev == 0 ? 'n/a' : ps == ev ? 'PASS' : 'FAIL', text_color = vCol, bgcolor = colBg, text_size = txtSize)
+    row + 1
+
+if barstate.islast
+    var table t = table.new(pos, 5, 26, border_width = 1, border_color = color.gray, bgcolor = colBg)
+
+    table.cell(t, 0, 0, '', bgcolor = colHeadBg, text_size = txtSize)
+    table.cell(t, 1, 0, (isFull ? 'CAN SLIM -- ' : '') + syminfo.ticker, text_color = color.white, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize,
+         tooltip = 'All price and volume checks are computed on DAILY data regardless of the chart timeframe. The table always reflects the most recent bar; scrub the Data Window to see raw values on a historical bar.')
+    table.cell(t, 2, 0, 'Value', text_color = color.white, bgcolor = colHeadBg, text_halign = text.align_right, text_size = txtSize)
+    if useTarget
+        table.cell(t, 3, 0, 'Needs', text_color = color.white, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize,
+             tooltip = 'The threshold this row must clear, read straight from the inputs. Rows with no numeric threshold show the condition instead; the two rows that are pure context show a dash.')
+    table.cell(t, 4, 0, '', bgcolor = colHeadBg, text_size = txtSize)
+
+    int rw = 1
+
+    if isMinimal
+        rw := f_letterRow(t, rw, 'C', 'Current earnings', psC, evC,
+             "Quarterly EPS growth, the prior quarter's growth, and quarterly sales growth. Switch to the Full layout to see which of the three is failing.")
+        rw := f_letterRow(t, rw, 'A', 'Annual earnings', psA, evA,
+             'Three straight years of annual EPS growth, return on equity, and debt/equity. Gray when the symbol has too little reported history.')
+        rw := f_letterRow(t, rw, 'N', 'New high', psN, evN,
+             'Distance below the 52-week high. The qualitative half of N -- new product, new management -- is not computable; read the news.')
+        rw := f_letterRow(t, rw, 'S', 'Supply & demand', psS, evS,
+             'Float size, share-count change year over year, and the up/down volume ratio.')
+        rw := f_letterRow(t, rw, 'L', 'Leader', psL, evL,
+             'Holding above the 50- and 200-day, RS line near its own 52-week high, and weighted 12-month momentum beating the index.')
+        rw := f_letterRow(t, rw, 'I', 'Institutional', psI, evI,
+             'Liquidity proxy only. Real sponsorship data does not exist in Pine, so the placeholder row is hidden in this layout rather than padding the count with a permanent gray.')
+        rw := f_letterRow(t, rw, 'M', 'Market', psM, evM,
+             'Index structure, Power Trend, and the distribution-day count. See the market state row below for what to actually do about it.')
+    else
+        rw := f_row(t, rw, true, 'C', f_lbl('EPS YoY (Q)', 'EPS YoY Q'), turn0 ? 'loss -> profit' : f_fmtPct(epsG0), f_geP(epsQThresh), cEpsPass, cEpsUnres, false,
+             "Current quarterly EPS vs the same quarter a year ago, reached through the revenue-driven report clock. O'Neil floor: +25%, ideal +40%. 'loss -> profit' is a turnaround quarter and counts as a pass whatever the threshold says.")
+        rw := f_row(t, rw, true, 'C', f_lbl('EPS YoY (prior Q)', 'EPS YoY Q-1'), not requireTwoQ ? 'off' : turn1 ? 'loss -> profit' : f_fmtPct(epsG1), not requireTwoQ ? '--' : f_geP(epsQThresh), cEps2Pass, cEps2Unres, false,
+             "The quarter before last, against the same threshold. O'Neil wanted a RUN of strong quarters -- one good print is noise. Turn this off in the inputs if you only care about the latest quarter.")
+        rw := f_row(t, rw, true, 'C', f_lbl('Sales YoY (Q)', 'Sales YoY'), f_fmtPct(revG0), f_geP(salesQThresh), cSalesPass, cSalesUnres, false,
+             'Quarterly revenue vs a year ago. EPS growth without sales behind it is cost-cutting, and cost-cutting runs out.')
+        rw := f_row(t, rw, showInfoRows, 'C', 'EPS accelerating', cAccelUnres ? 'n/a' : f_fmtPct(epsG1) + ' -> ' + f_fmtPct(epsG0), '> prior Q', cAccelPass, cAccelUnres, true,
+             "This quarter's YoY growth vs last quarter's YoY growth. Acceleration is O'Neil's ideal, not his floor -- informational, never scored, so there is no input behind it.")
+        rw := f_row(t, rw, true, 'A', f_lbl('EPS 3yr annual', 'EPS 3yr'), aEpsUnres ? 'n/a' : f_fmtPct(epsGA2) + ' / ' + f_fmtPct(epsGA1) + ' / ' + f_fmtPct(epsGA0), f_geP(epsYThresh) + ' x3', aEpsPass, aEpsUnres, false,
+             'Annual EPS growth in each of the last three fiscal years (oldest first). ALL THREE must clear the threshold -- that is what the x3 means. Needs 4 annual reports inside the chart history, so it is gray on recent listings and on short charts.')
+        rw := f_row(t, rw, true, 'A', f_lbl('ROE (FY)', 'ROE'), f_fmtPct(roeFy), f_geP(roeThresh), aRoePass, aRoeUnres, false,
+             "Return on equity, latest annual report. O'Neil: 17%+.")
+        rw := f_row(t, rw, true, 'A', f_lbl('Debt / Equity', 'D/E'), aDeUnres ? 'n/a' : f_fmtNum(deNow, '#.##') + (na(deOld) or not isFull ? '' : ' (was ' + f_fmtNum(deOld, '#.##') + ')'), f_leN(maxDE, '#.##'), aDePass, aDeUnres, false,
+             "TOTAL_DEBT / TOTAL_EQUITY, latest quarter. In the Full layout the same quarter a year ago is shown in brackets -- only the current figure is tested, but O'Neil cared about the DIRECTION. Gray when equity is zero or negative. Capital-intensive sectors fail this by construction.")
+        rw := f_row(t, rw, true, 'N', f_lbl('vs 52-week high', 'vs 52w hi'), isNewHigh ? 'NEW HIGH' : f_fmtPct(pctFromHigh), '>= -' + str.tostring(nearHighPct, '#.#') + '%', nHighPass, nHighUnres, false,
+             "Distance below the 52-week high, on daily bars. Near highs = basing, not repairing. The qualitative half of N (new product, new management, new industry conditions) is not computable -- read the news.")
+        rw := f_row(t, rw, showInfoRows, 'N', 'Breakout volume', na(volRatio) ? 'n/a' : f_fmtNum(volRatio, '#.##') + 'x avg', f_geN(breakoutVolX, '#.#') + 'x', nVolPass, nVolUnres, true,
+             "Today's daily volume against the 50-day average, and only counted within 2% of the high. O'Neil's breakout wants 40-50%+ above average. INFORMATIONAL -- a stock is not breaking out most days, so this never enters the score. The current day's volume is still forming until the close.")
+        rw := f_row(t, rw, showInfoRows, 'N', 'Extended vs 50d', f_fmtPct(extPct), f_leP(extendedPct), nExtPass, nExtUnres, true,
+             "Distance above the 50-day MA, as a stand-in for O'Neil's 'never chase more than 5% past the pivot' (Pine cannot find the pivot without base detection). WATCH means late entry, not a bad stock -- informational only.")
+        rw := f_row(t, rw, true, 'S', 'Float', f_fmtM(floatM), f_leN(maxFloatM, '#') + 'M', sFloatPass, sFloatUnres, false,
+             'Free-float shares. Smaller supply moves further on the same demand. TradingView only publishes float annually (FY), so this figure can be up to a year stale and is missing outright for many symbols.')
+        rw := f_row(t, rw, true, 'S', f_lbl('Share count YoY', 'Shares YoY'), f_fmtPct(sharesChgPct), f_leP(maxDilutePct), sSharesPass, sSharesUnres, false,
+             'Shares outstanding vs 4 reports ago. Shrinking (buybacks) is a plus; dilution past the threshold fails. This is the check v1 got wrong -- share counts repeat verbatim between quarters, which defeated its per-series change detection.')
+        rw := f_row(t, rw, true, 'S', f_lbl('U/D volume (' + str.tostring(udVolLen) + 'd)', 'U/D vol'), na(udRatio) ? 'n/a' : udRatio >= 99 ? '>99' : f_fmtNum(udRatio, '#.##'), f_geN(udVolMin, '#.##'), sUdPass, sUdUnres, false,
+             'Daily volume on up-closes / volume on down-closes over the lookback. Above 1.0 = net accumulation; leaders usually read 1.25+, so consider raising the input.')
+        rw := f_row(t, rw, true, 'L', f_lbl('Above 50d & 200d', '>50d >200d'), lMaUnres ? 'n/a' : (dClose > dSma50 ? '>50d' : '<50d') + ' ' + (dClose > dSma200 ? '>200d' : '<200d'), 'above both', lMaPass, lMaUnres, false,
+             'The stock holding above its own 50-day and 200-day moving averages. No input behind this one -- the MAs are the threshold. Institutional buyers defend the 50-day in a real leader; losing it is the first crack.')
+        rw := f_row(t, rw, true, 'L', f_lbl('RS line vs high', 'RS line'), not rsTfOk ? 'daily+ only' : rsNewHigh ? 'NEW HIGH' : f_fmtPct(rsFromHigh), '>= -' + str.tostring(rsNearPct, '#.#') + '%', lRsPass, lRsUnres, false,
+             "close/index ratio vs its own 52-week high. At a new high with (or before) price is O'Neil's ideal breakout. Single-symbol stand-in for IBD's RS Rating, which ranks against every other stock and cannot be computed in Pine. This is the one row still measured in CHART bars, so it grays out on intraday charts.")
+        rw := f_row(t, rw, true, 'L', f_lbl('Momentum vs index', 'Momentum'), lMomUnres ? 'n/a' : f_fmtNum(stkScore, '#') + ' vs ' + f_fmtNum(idxScore, '#'), momMargin == 0 ? '> index' : '> index + ' + str.tostring(momMargin, '#'), lMomPass, lMomUnres, false,
+             'IBD-weighted 12-month return (40/20/20/20 on the 3/6/9/12-month legs), stock vs the market symbol. The target is the index score itself, which is why it moves. Beating the index is a floor, not the top-20%-of-market percentile Pine cannot compute -- in a bear market almost anything green clears it, so consider raising the required margin.')
+        rw := f_row(t, rw, showInfoRows, 'I', 'Institutional', 'no data in Pine', '--', false, true, false,
+             "request.financial() exposes no ownership, fund-count or 13F data -- this criterion genuinely cannot be evaluated on TradingView, so there is no threshold to show. Check IBD's Accumulation/Distribution rating or 13F sources directly. Always gray, never scored. Hidden outside the Full layout, since a permanently gray row is the first thing worth dropping when space is tight.")
+        rw := f_row(t, rw, true, 'I', f_lbl('Liquidity (proxy)', 'Liquidity'), na(avgDollarVolM) ? 'n/a' : '$' + f_fmtM(avgDollarVolM) + (isFull ? ' / $' + f_fmtNum(dClose, '#.##') : ''), '>= $' + str.tostring(minDollarVolM, '#') + 'M / $' + str.tostring(minPrice, '#.#'), iProxyPass, iProxyUnres, false,
+             'Two conditions in one row: 50-day average dollar volume deep enough that institutions CAN hold it, and a share price above the minimum they are allowed to buy. Both must clear. A liquidity floor, not evidence of sponsorship.')
+        rw := f_row(t, rw, true, 'M', f_lbl('Index structure', 'Index'), mTrendUnres ? 'n/a' : (iClose > iEma21 ? '>21e' : '<21e') + ' ' + (iClose > iSma50 ? '>50d' : '<50d') + ' ' + (iSma50 > iSma200 ? '50>200' : '50<200'), 'all three', mTrendPass, mTrendUnres, false,
+             'The slow backdrop: index above its 21-day EMA and 50-day SMA, with the 50 above the 200. This answers "is the tide in". It is deliberately sluggish -- the Power Trend row below is the one that moves.')
+        rw := f_row(t, rw, true, 'M', f_lbl('Power Trend', 'PowerTrend'), mPtUnres ? 'n/a' : (iPT > 0.5 ? 'ON' : 'OFF') + (isFull ? ' (' + (iEma21 > iSma50 ? '21e>50d' : '21e<50d') + ')' : ''), 'ON', mPtPass, mPtUnres, false,
+             "IBD's Power Trend, and the reason a plain ema10>ema20 cross is the wrong tool here. It turns ON only when FOUR things hold at once: the index LOW has stayed above the 21-day EMA for " + str.tostring(ptLowDays) + " straight sessions (not merely the close -- the index has not even dipped to it), the 21-EMA has held above the 50-SMA for " + str.tostring(ptEmaDays) + ", the 50-SMA is rising, and today closed up. It ends on a 21/50 cross back down, or on the circuit breaker: a close under the 50-SMA while already " + str.tostring(ptBreakPct, '#') + "% off the three-month high. The persistence counters are what stop it whipsawing.")
+        rw := f_row(t, rw, true, 'M', f_lbl('Distribution days', 'Dist days'), mDistUnres ? 'n/a' : f_fmtNum(iDist, '#') + (isFull ? ' in ' + str.tostring(distLookback) + 'd' : ''), f_leN(distMax, '#'), mDistPass, mDistUnres, false,
+             'Index down >= ' + str.tostring(distDownPct, '#.##') + "% on volume higher than the prior session, counted over the window, with days retired once the index rallies " + str.tostring(distRallyPct, '#.#') + "% above the close of that day. IBD treats 5-6 as a correction signal; past " + str.tostring(distMaxPress) + " the gate below calls a correction outright.")
+
+    gateTxt = mState == 0 ? 'no data' : mState == 3 ? (isFull ? 'CONFIRMED UPTREND' : 'UPTREND') : mState == 2 ? 'PRESSURE' : 'CORRECTION'
+    gateCol = mState == 0 ? colUnres : mState == 3 ? colPass : mState == 2 ? colWarn : colFail
+    gateNeed = mState == 0 ? '--' : marketStop ? 'blocks buys' : mState == 3 ? 'buy normally' : 'reduce size'
+    table.cell(t, 0, rw, 'M', text_color = color.white, bgcolor = colHeadBg, text_size = txtSize)
+    table.cell(t, 1, rw, f_lbl('Market state', 'Market'), text_color = color.white, bgcolor = colBg, text_halign = text.align_left, text_size = txtSize,
+         tooltip = "Three states, not a bool, because 'not a confirmed uptrend' and 'get out' are different instructions and O'Neil traded them differently. CONFIRMED UPTREND = Power Trend on and distribution contained. UNDER PRESSURE = one of those is failing but the index still holds its 50-day; IBD's guidance there is smaller size and only the best setups, not cash. CORRECTION = Power Trend off with the 50-day lost, or distribution past the danger threshold; that is the one O'Neil said to sit out. Three of four stocks follow the market, so this row outranks everything above it.")
+    table.cell(t, 2, rw, marketGates ? gateTxt : 'gate off', text_color = marketGates ? gateCol : colUnres, bgcolor = colBg, text_halign = text.align_right, text_size = txtSize)
+    if useTarget
+        table.cell(t, 3, rw, marketGates ? gateNeed : '--', text_color = colNeed, bgcolor = colBg, text_halign = text.align_left, text_size = txtSize)
+    table.cell(t, 4, rw, '', bgcolor = colBg, text_size = txtSize)
+
+    rwScore  = rw + 1
+    gated    = marketGates and marketStop
+    scoreCol = gated ? colFail : cntEval == 0 ? colUnres : cntPass == cntEval ? colPass : cntPass * 2 >= cntEval ? colWarn : colFail
+    scoreTxt = str.tostring(cntPass) + ' / ' + str.tostring(cntEval) + (gated and isFull ? '  (no new buys)' : '')
+    table.cell(t, 0, rwScore, '', bgcolor = colHeadBg, text_size = txtSize)
+    table.cell(t, 1, rwScore, 'Score', text_color = color.white, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize)
+    table.cell(t, 2, rwScore, scoreTxt, text_color = scoreCol, bgcolor = colHeadBg, text_halign = text.align_right, text_size = txtSize)
+    if useTarget
+        table.cell(t, 3, rwScore, str.tostring(cntEval) + ' / ' + str.tostring(cntEval), text_color = colNeed, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize)
+    table.cell(t, 4, rwScore, '', bgcolor = colHeadBg, text_size = txtSize,
+         tooltip = 'Passed checks / checks with resolvable data. Gray rows are excluded, not waved through. The four informational rows (EPS acceleration, breakout volume, extension, institutional) never count. The score is computed from all 17 checks in every layout -- Compact and Minimal hide rows, they do not skip arithmetic. The denominator is not fixed: a 13/13 on a symbol with no financials means far less than 13/17.')
+
+    // Why the shading is or is not on right now, and how long the current run has
+    // lasted. Full layout only -- in the narrow layouts the background speaks for
+    // itself and this row is the first thing worth dropping.
+    if isFull
+        rwHl   = rwScore + 1
+        hlTxt  = not bgEnable ? 'disabled' : canSlimOk ? 'ON (' + str.tostring(qualBars) + ' bars)' : canSlimNear ? 'stock ok, market blocks' : not covOk ? 'too little data (' + str.tostring(cntEval) + ' resolved)' : 'below threshold'
+        hlCol  = not bgEnable ? colUnres : canSlimOk ? colPass : canSlimNear ? colWarn : not covOk ? colUnres : colFail
+        table.cell(t, 0, rwHl, '', bgcolor = colHeadBg, text_size = txtSize)
+        table.cell(t, 1, rwHl, 'Shading', text_color = color.white, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize,
+             tooltip = 'Why the chart is or is not shaded on this bar, and how many consecutive bars the current qualifying run has lasted. Three conditions must all hold: enough checks resolved (the data-coverage floor), enough of them passed in absolute terms, and enough of them passed as a percentage. The coverage floor is the important one -- without it a symbol with no reported financials shades green on a 3/3, which is the shading being brightest exactly where the data is thinnest.')
+        table.cell(t, 2, rwHl, hlTxt, text_color = hlCol, bgcolor = colHeadBg, text_halign = text.align_right, text_size = txtSize)
+        if useTarget
+            table.cell(t, 3, rwHl, str.tostring(bgMinPass) + '+, ' + str.tostring(bgMinPct, '#') + '%, ' + str.tostring(bgMinEval) + ' resolved', text_color = colNeed, bgcolor = colHeadBg, text_halign = text.align_left, text_size = txtSize)
+        table.cell(t, 4, rwHl, '', bgcolor = colHeadBg, text_size = txtSize)

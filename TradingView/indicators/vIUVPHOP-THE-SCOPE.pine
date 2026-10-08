@@ -1,0 +1,338 @@
+//@version=6
+indicator("SCOPE", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500, max_bars_back=500)
+
+// ══════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════
+swingLength     = input.int(10, "Swing Length", minval=3, group="Core")
+fibLookback     = input.int(50, "Fibonacci Lookback", minval=20, group="Core")
+vpLookback      = input.int(100, "Volume Profile Lookback", minval=50, group="Core")
+confluenceTol   = input.float(0.35, "Confluence Tolerance %", step=0.05, group="Core")
+futureExtend    = input.int(12, "Future Extension (bars)", minval=5, maxval=20, group="Core")
+
+mc_sims         = input.int(800, "Monte Carlo Simulations", minval=200, maxval=2000, group="Monte Carlo")
+mc_days         = input.int(30, "Forecast Horizon (bars)", group="Monte Carlo")
+
+showPivots      = input.bool(true, "Classic Pivots", group="Display")
+showFib         = input.bool(true, "Fibonacci", group="Display")
+showMA          = input.bool(true, "Moving Averages", group="Display")
+showVP          = input.bool(true, "Volume Profile", group="Display")
+showPSAR        = input.bool(true, "Parabolic SAR", group="Display")
+showConfluence  = input.bool(true, "Confluence Zones", group="Display")
+showAuditWidget = input.bool(true, "Audit Widget", group="Display")
+showScopeWidget = input.bool(true, "The Scope Widget", group="Display")
+
+proximityPct    = input.float(0.45, "Scope Proximity %", step=0.05, group="The Scope")
+
+// ══════════════════════════════════════════════════════════════
+// COLORS
+// ══════════════════════════════════════════════════════════════
+colPivot    = color.new(#00BFFF, 0)
+colR1       = color.new(#00FF9C, 0)
+colS1       = color.new(#FF4D4D, 0)
+colFib      = color.new(#FFD700, 0)
+colEMA200   = color.new(#00E5FF, 0)
+colEMA50    = color.new(#FF00FF, 40)
+colMA       = color.new(#00FF9C, 40)          // ← Fixed: was missing
+colPOC      = color.new(#FFD700, 0)
+colVAH      = color.new(#FF8C00, 0)
+colVAL      = color.new(#00FF00, 0)
+colInZone   = color.new(#00E676, 0)
+colOutZone  = color.new(#78909C, 0)
+colConfluence = color.new(#1E90FF, 78)
+
+// ══════════════════════════════════════════════════════════════
+// 1. CLASSIC PIVOTS
+// ══════════════════════════════════════════════════════════════
+prevHigh  = request.security(syminfo.tickerid, "D", high[1])
+prevLow   = request.security(syminfo.tickerid, "D", low[1])
+prevClose = request.security(syminfo.tickerid, "D", close[1])
+
+pp = (prevHigh + prevLow + prevClose) / 3
+r1 = pp * 2 - prevLow
+s1 = pp * 2 - prevHigh
+r2 = pp + (prevHigh - prevLow)
+s2 = pp - (prevHigh - prevLow)
+
+// ══════════════════════════════════════════════════════════════
+// 2. FIBONACCI
+// ══════════════════════════════════════════════════════════════
+highestHigh = ta.highest(high, fibLookback)
+lowestLow   = ta.lowest(low, fibLookback)
+fibRange    = highestHigh - lowestLow
+
+fib382 = highestHigh - fibRange * 0.382
+fib50  = highestHigh - fibRange * 0.50
+fib618 = highestHigh - fibRange * 0.618
+
+// ══════════════════════════════════════════════════════════════
+// 3. MOVING AVERAGES
+// ══════════════════════════════════════════════════════════════
+ema20  = ta.ema(close, 20)
+ema50  = ta.ema(close, 50)
+ema200 = ta.ema(close, 200)
+
+// ══════════════════════════════════════════════════════════════
+// 4. VOLUME PROFILE
+// ══════════════════════════════════════════════════════════════
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+
+highest = ta.highest(high, vpLookback)
+lowest  = ta.lowest(low, vpLookback)
+step    = (highest - lowest) / 40
+
+var float[] volBins = array.new_float(41, 0.0)
+
+if barstate.islast and showVP
+    array.fill(volBins, 0.0)
+    for i = 0 to vpLookback - 1
+        price = (high[i] + low[i]) / 2
+        bin = int(math.max(0, math.min(40, (price - lowest) / step)))
+        array.set(volBins, bin, array.get(volBins, bin) + volume[i])
+
+    maxVol = 0.0
+    pocBin = 0
+    for i = 0 to 40
+        if array.get(volBins, i) > maxVol
+            maxVol := array.get(volBins, i)
+            pocBin := i
+
+    pocPrice := lowest + pocBin * step + step / 2
+
+    totalVol   = array.sum(volBins)
+    targetVol  = totalVol * 0.70
+    currentVol = array.get(volBins, pocBin)
+    up = pocBin
+    down = pocBin
+
+    while currentVol < targetVol and (up < 40 or down > 0)
+        volUp   = up < 40 ? array.get(volBins, up + 1) : 0.0
+        volDown = down > 0 ? array.get(volBins, down - 1) : 0.0
+        if volUp >= volDown and up < 40
+            up += 1
+            currentVol += volUp
+        else if down > 0
+            down -= 1
+            currentVol += volDown
+        else
+            break
+
+    vahPrice := lowest + up * step + step
+    valPrice := lowest + down * step
+
+// ══════════════════════════════════════════════════════════════
+// 5. MONTE CARLO + SMART MONEY (Fixed consistency warning)
+// ══════════════════════════════════════════════════════════════
+log_ret  = math.log(close / nz(close[1], close))
+mu_mc    = ta.sma(log_ret, 252)
+sigma_mc = ta.stdev(log_ret, 252)
+
+up_target  = close * math.exp((mu_mc - 0.5 * math.pow(sigma_mc, 2)) * mc_days + sigma_mc * math.sqrt(mc_days) * 1.28)
+exp_target = close * math.exp(mu_mc * mc_days)
+lo_target  = close * math.exp((mu_mc - 0.5 * math.pow(sigma_mc, 2)) * mc_days - sigma_mc * math.sqrt(mc_days) * 1.28)
+
+var int count_upper = 0
+var int count_exp   = 0
+var int count_lower = 0
+
+if barstate.islast
+    count_upper := 0
+    count_exp   := 0
+    count_lower := 0
+    for i = 1 to mc_sims
+        sim_price = close
+        for j = 1 to mc_days
+            rand = math.sqrt(-2.0 * math.log(math.random())) * math.cos(2.0 * math.pi * math.random())
+            sim_price *= math.exp((mu_mc - 0.5 * math.pow(sigma_mc, 2)) + sigma_mc * rand)
+        if sim_price >= up_target
+            count_upper += 1
+        if sim_price >= exp_target
+            count_exp += 1
+        if sim_price <= lo_target
+            count_lower += 1
+
+prob_upper = (count_upper / mc_sims) * 100
+prob_exp   = (count_exp   / mc_sims) * 100
+prob_lower = (count_lower / mc_sims) * 100
+
+// Fixed: Call ta.sma on every bar for consistency
+sma_vol_20 = ta.sma(volume, 20)
+inst_pressure = sma_vol_20 != 0 ? ta.sma(volume * (close - low) / math.max(high - low, 0.0001), 20) / sma_vol_20 : 0.0
+
+trValue = ta.tr(true)
+viPlus  = math.sum(math.abs(high - nz(low[1])), 14) / math.sum(trValue, 14)
+viMinus = math.sum(math.abs(low - nz(high[1])), 14) / math.sum(trValue, 14)
+vortexRatio = viMinus != 0 ? viPlus / viMinus : 1.0
+
+lowest_52w   = request.security(syminfo.tickerid, "D", ta.lowest(low, 252))
+price_vs_52w = lowest_52w != 0 ? (close - lowest_52w) / lowest_52w : 0.0
+adv          = request.security(syminfo.tickerid, "D", ta.sma(volume, 30))
+vol_vs_adv   = adv != 0 ? volume / adv : 0.0
+confidence_eq = math.max(0, math.min(100, 50 + (ema20 > ema50 ? 15 : -15) + (close > ema200 ? 20 : -20)))
+
+// ══════════════════════════════════════════════════════════════
+// 6. THE SCOPE + PSAR + AUDIT SCORE
+// ══════════════════════════════════════════════════════════════
+distancePct = not na(pocPrice) ? math.abs(close - pocPrice) / pocPrice * 100 : 999.0
+inZone      = distancePct <= proximityPct
+
+var int scopeBars = 0
+if inZone
+    scopeBars += 1
+else
+    scopeBars := 0
+
+secondsPerBar = timeframe.in_seconds()
+totalSeconds  = scopeBars * secondsPerBar
+hours         = math.floor(totalSeconds / 3600)
+minutes       = math.floor((totalSeconds % 3600) / 60)
+
+psar      = ta.sar(0.02, 0.02, 0.2)
+atr14     = ta.atr(14)
+distToSar = math.abs(close - psar)
+psarColor = distToSar < (atr14 * 0.3) ? color.white : (close > psar ? color.lime : color.red)
+
+auditScore = 0.0
+if not na(pocPrice) and close > pocPrice
+    auditScore += 3.0
+if not na(pocPrice) and not na(vahPrice) and pocPrice <= close and close <= vahPrice
+    auditScore += 2.0
+if prob_exp >= 40
+    auditScore += 2.0
+if close > ema200
+    auditScore += 1.5
+if inZone
+    auditScore += 1.5
+auditScore := math.min(10.0, auditScore)
+
+// ══════════════════════════════════════════════════════════════
+// 7. PLOTS - MATCHED TO YOUR CHART STYLE
+// ══════════════════════════════════════════════════════════════
+plot(showPivots ? pp : na, "F#C:Pivot", color=colPivot, linewidth=1, style=plot.style_stepline)
+plot(showPivots ? r1 : na, "F#C:R1", color=colR1, linewidth=1, style=plot.style_stepline)
+plot(showPivots ? s1 : na, "F#C:S1", color=colS1, linewidth=1, style=plot.style_stepline)
+plot(showPivots ? r2 : na, "F#C:R2", color=color.new(colPivot, 40), linewidth=1, style=plot.style_stepline)
+plot(showPivots ? s2 : na, "F#C:S2", color=color.new(colS1, 30), linewidth=1, style=plot.style_stepline)
+
+plot(showFib ? fib618 : na, "F#C:Fib 61.8%", color=colFib, linewidth=1)
+plot(showFib ? fib50  : na, "F#C:Fib 50%", color=color.new(colFib, 20), linewidth=1)
+plot(showFib ? fib382 : na, "F#C:Fib 38.2%", color=color.new(colFib, 40), linewidth=1)
+
+plot(showMA ? ema200 : na, "F#C:EMA 200", color=colEMA200, linewidth=2)
+plot(showMA ? ema50  : na, "F#C:EMA 50", color=colEMA50, linewidth=1)
+plot(showMA ? ema20  : na, "F#C:EMA 20", color=colMA, linewidth=1)
+
+plot(showVP ? pocPrice : na, "S$C:POC", color=colPOC, linewidth=2)
+plot(showVP ? vahPrice : na, "S$C:VAH", color=colVAH, linewidth=1, style=plot.style_stepline)
+plot(showVP ? valPrice : na, "S$C:VAL", color=colVAL, linewidth=1, style=plot.style_stepline)
+
+plot(showPSAR ? psar : na, "S$C:Parabolic SAR", color=psarColor, style=plot.style_circles, linewidth=2)
+
+bgcolor(inZone ? color.new(colInZone, 92) : na)
+
+// ══════════════════════════════════════════════════════════════
+// 8. CONFLUENCE ZONES
+// ══════════════════════════════════════════════════════════════
+if barstate.islast and showConfluence
+    levels = array.new_float()
+    if showPivots
+        array.push(levels, pp)
+        array.push(levels, r1)
+        array.push(levels, s1)
+        array.push(levels, r2)
+        array.push(levels, s2)
+    if showFib
+        array.push(levels, fib382)
+        array.push(levels, fib50)
+        array.push(levels, fib618)
+    if showMA
+        array.push(levels, ema20)
+        array.push(levels, ema50)
+        array.push(levels, ema200)
+    if showVP and not na(pocPrice)
+        array.push(levels, pocPrice)
+        array.push(levels, vahPrice)
+        array.push(levels, valPrice)
+
+    for i = 0 to array.size(levels) - 1
+        base = array.get(levels, i)
+        count = 0
+        for j = 0 to array.size(levels) - 1
+            if math.abs(base - array.get(levels, j)) / base * 100 <= confluenceTol
+                count += 1
+        if count >= 3
+            box.new(bar_index - 8, base * (1 + confluenceTol / 200), bar_index + futureExtend, base * (1 - confluenceTol / 200),
+                 bgcolor=colConfluence, border_color=color.new(#1E90FF, 40), border_width=1)
+
+// ══════════════════════════════════════════════════════════════
+// 9. THE SCOPE WIDGET
+// ══════════════════════════════════════════════════════════════
+var table scopeWidget = table.new(position.top_right, 1, 7, bgcolor=color.new(#0D0D0D, 10), border_width=1)
+
+if showScopeWidget and barstate.islast
+    table.cell(scopeWidget, 0, 0, "THE SCOPE", text_color=color.white, text_size=size.normal, text_halign=text.align_center)
+    table.cell(scopeWidget, 0, 1, "STATUS", text_color=color.gray, text_size=size.tiny)
+    table.cell(scopeWidget, 0, 2, inZone ? "IN ZONE" : "OUT OF ZONE", text_color=inZone ? colInZone : colOutZone, text_size=size.small, text_halign=text.align_center)
+    table.cell(scopeWidget, 0, 3, "DURATION", text_color=color.gray, text_size=size.tiny)
+    table.cell(scopeWidget, 0, 4, str.tostring(scopeBars) + " bars | " + str.tostring(hours) + "h " + str.tostring(minutes) + "m", text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    table.cell(scopeWidget, 0, 5, "PROXIMITY", text_color=color.gray, text_size=size.tiny)
+    table.cell(scopeWidget, 0, 6, str.tostring(distancePct, "#.##") + "%", text_color=inZone ? colInZone : colOutZone, text_size=size.small, text_halign=text.align_center)
+
+// ══════════════════════════════════════════════════════════════
+// 10. AUDIT WIDGET
+// ══════════════════════════════════════════════════════════════
+var table auditWidget = table.new(position.bottom_right, 2, 17, bgcolor=color.new(#000000, 90), border_width=1)
+
+if showAuditWidget and barstate.islast
+    table.cell(auditWidget, 0, 0, "SMC+MC AUDIT", text_color=color.yellow, text_size=size.tiny)
+    table.cell(auditWidget, 1, 0, str.tostring(auditScore, "#") + "/10", text_color=auditScore >= 8 ? color.green : auditScore >= 5 ? color.yellow : color.red, text_size=size.tiny)
+
+    table.cell(auditWidget, 0, 1, "VAH", text_color=color.red, text_size=size.tiny)
+    table.cell(auditWidget, 1, 1, str.tostring(vahPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 2, "POC", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 2, str.tostring(pocPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 3, "VAL", text_color=color.green, text_size=size.tiny)
+    table.cell(auditWidget, 1, 3, str.tostring(valPrice, "#.##"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(auditWidget, 0, 4, "U/%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 4, str.tostring(up_target, "#.##") + "/" + str.tostring(prob_upper, "#.#") + "%", text_color=color.green, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 5, "E/%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 5, str.tostring(exp_target, "#.##") + "/" + str.tostring(prob_exp, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 6, "L/%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 6, str.tostring(lo_target, "#.##") + "/" + str.tostring(prob_lower, "#.#") + "%", text_color=color.red, text_size=size.tiny)
+
+    table.cell(auditWidget, 0, 7, "VRTX", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 7, str.tostring(vortexRatio, "#.##") + "x", text_color=vortexRatio > 1.1 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 8, "INST%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 8, str.tostring(inst_pressure * 100, "#.##") + "%", text_color=inst_pressure > 0.55 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 9, "52W%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 9, str.tostring(price_vs_52w * 100, "#.##") + "%", text_color=color.green, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 10, "V/A", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 10, str.tostring(vol_vs_adv, "#.##") + "x", text_color=vol_vs_adv > 1.5 ? color.green : color.red, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 11, "EQ%", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 11, str.tostring(confidence_eq, "#.##") + "%", text_color=confidence_eq >= 60 ? color.green : color.red, text_size=size.tiny)
+
+    table.cell(auditWidget, 0, 12, "AUD", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 12, str.tostring(auditScore, "#") + "/10", text_color=auditScore >= 8 ? color.green : auditScore >= 5 ? color.yellow : color.red, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 13, "RR", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 13, "1:4+", text_color=color.lime, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 14, "INV", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 14, "VAL", text_color=color.red, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 15, "CAT", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 15, "Exceed", text_color=color.green, text_size=size.tiny)
+    
+    table.cell(auditWidget, 0, 16, "PT", text_color=color.white, text_size=size.tiny)
+    table.cell(auditWidget, 1, 16, "Low", text_color=color.green, text_size=size.tiny)

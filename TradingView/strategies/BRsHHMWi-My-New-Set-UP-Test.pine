@@ -1,0 +1,195 @@
+//@version=5
+strategy("Fund-Grade Daytrade System (FIXED + Stable Build)",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01)
+
+// =====================================================
+// INPUTS
+// =====================================================
+rr = input.float(2.0, "Risk/Reward Ratio")
+
+useATR = input.bool(true, "Use ATR Stops")
+atrLen = input.int(14)
+atrMult = input.float(1.5)
+slPerc = input.float(0.5, "Stop Loss % (if ATR off)")
+
+// =======================
+// ANTI-CHOP FILTER
+// =======================
+useAntiChop = input.bool(true, "Enable Anti-Chop Filter")
+adxLen = input.int(14, "ADX Length")
+adxMin = input.float(18, "Min ADX")
+
+bbLen = input.int(20, "BB Length")
+bbWidthMin = input.float(0.5, "Min BB Width %")
+
+// =======================
+// FAKEOUT KILLER
+// =======================
+useFakeoutKiller = input.bool(true, "Enable Fakeout Killer")
+cooldownMin = input.int(5, "No-trade window (min)")
+
+// =====================================================
+// SESSION LOGIC
+// =====================================================
+inPremarket = not na(time(timeframe.period, "0400-0930"))
+inRegular = not na(time(timeframe.period, "0930-1600"))
+tradeWindow = inRegular
+
+sessionOpen = timestamp(year, month, dayofmonth, 9, 30)
+minutesFromOpen = (time - sessionOpen) / 60000
+isFirstWindow = minutesFromOpen <= cooldownMin
+inCooldown = useFakeoutKiller and isFirstWindow
+
+// =====================================================
+// PREMARKET HIGH / LOW
+// =====================================================
+var float pmHigh = na
+var float pmLow = na
+
+if ta.change(time("D")) != 0
+    pmHigh := na
+    pmLow := na
+
+if inPremarket
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow := na(pmLow) ? low : math.min(pmLow, low)
+
+// =====================================================
+// BREAKOUT LOGIC
+// =====================================================
+longBreak = tradeWindow and not na(pmHigh) and close > pmHigh
+shortBreak = tradeWindow and not na(pmLow) and close < pmLow
+
+// =====================================================
+// ADX (FIXED)
+// =====================================================
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+trendStrong = adx >= adxMin
+
+// =====================================================
+// BOLLINGER CHOP FILTER
+// =====================================================
+bbBasis = ta.sma(close, bbLen)
+bbDev = ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+bbWidth = 100 * (bbUpper - bbLower) / bbBasis
+volOK = bbWidth > bbWidthMin
+
+antiChopOK = not useAntiChop or (trendStrong and volOK)
+
+// =====================================================
+// ATR STOP ENGINE
+// =====================================================
+atr = ta.atr(atrLen)
+
+longSL = useATR ? close - atr * atrMult : close * (1 - slPerc / 100)
+shortSL = useATR ? close + atr * atrMult : close * (1 + slPerc / 100)
+
+longTP = close + (close - longSL) * rr
+shortTP = close - (shortSL - close) * rr
+
+// =====================================================
+// FIRST 5-MIN FAKEOUT KILLER
+// =====================================================
+var float openHigh = na
+var float openLow = na
+
+if ta.change(time("D")) != 0
+    openHigh := na
+    openLow := na
+
+if isFirstWindow
+    openHigh := na(openHigh) ? high : math.max(openHigh, high)
+    openLow := na(openLow) ? low : math.min(openLow, low)
+
+// early traps
+earlyBreakUp = isFirstWindow and not na(pmHigh) and high > pmHigh
+earlyBreakDown = isFirstWindow and not na(pmLow) and low < pmLow
+
+fakeoutUp = earlyBreakUp and close < pmHigh
+fakeoutDown = earlyBreakDown and close > pmLow
+
+var bool blockLong = false
+var bool blockShort = false
+
+if ta.change(time("D")) != 0
+    blockLong := false
+    blockShort := false
+
+if fakeoutUp
+    blockLong := true
+
+if fakeoutDown
+    blockShort := true
+
+if not isFirstWindow
+    blockLong := false
+    blockShort := false
+
+allowLong = not blockLong and not inCooldown
+allowShort = not blockShort and not inCooldown
+
+// =====================================================
+// FINAL CONDITIONS
+// =====================================================
+longCondition = longBreak and antiChopOK and allowLong
+shortCondition = shortBreak and antiChopOK and allowShort
+
+// =====================================================
+// EXECUTION
+// =====================================================
+if longCondition
+    strategy.entry("LONG", strategy.long)
+    strategy.exit("LONG EXIT", "LONG", stop=longSL, limit=longTP)
+
+if shortCondition
+    strategy.entry("SHORT", strategy.short)
+    strategy.exit("SHORT EXIT", "SHORT", stop=shortSL, limit=shortTP)
+
+// =====================================================
+// VISUALS
+// =====================================================
+plot(pmHigh, "PM High", color=color.green, linewidth=2)
+plot(pmLow, "PM Low", color=color.red, linewidth=2)
+
+plot(bbUpper, color=color.gray)
+plot(bbLower, color=color.gray)
+
+// ENTRY MARKERS
+plotshape(longCondition, title="LONG", style=shape.labelup,
+     text="LONG", color=color.lime, location=location.belowbar)
+
+plotshape(shortCondition, title="SHORT", style=shape.labeldown,
+     text="SHORT", color=color.red, location=location.abovebar)
+
+// FAKEOUT MARKERS
+plotshape(fakeoutUp, title="Fakeout High", style=shape.xcross,
+     color=color.orange, location=location.abovebar, text="TRAP↑")
+
+plotshape(fakeoutDown, title="Fakeout Low", style=shape.xcross,
+     color=color.orange, location=location.belowbar, text="TRAP↓")
+
+// =====================================================
+// RR LINES
+// =====================================================
+var line slLine = na
+var line tpLine = na
+
+if longCondition
+    line.delete(slLine)
+    line.delete(tpLine)
+    slLine := line.new(bar_index, longSL, bar_index + 10, longSL, color=color.red)
+    tpLine := line.new(bar_index, longTP, bar_index + 10, longTP, color=color.green)
+
+if shortCondition
+    line.delete(slLine)
+    line.delete(tpLine)
+    slLine := line.new(bar_index, shortSL, bar_index + 10, shortSL, color=color.red)
+    tpLine := line.new(bar_index, shortTP, bar_index + 10, shortTP, color=color.green)

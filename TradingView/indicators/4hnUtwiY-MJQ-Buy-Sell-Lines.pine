@@ -1,0 +1,255 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © MJQ_AI
+
+//@version=6
+indicator("MJQ.Buy Sell Lines", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-timeframe engulf levels — Monthly / Weekly / Daily / 4H.
+//   • Engulf : an HTF candle CLOSES beyond the previous HTF candle's extreme.
+//                close BELOW previous low   →  BUY  line at the engulfed candle's LOW
+//                close ABOVE previous high  →  SELL line at the engulfed candle's HIGH
+//              The level is always the ENGULFED (previous) candle's extreme.
+//   • Sides  : BUY reads bearish, SELL reads bullish — hence BUY (BEAR) / SELL(BULL).
+//              BUY is purple, SELL is green.
+//   • Weight : line thickness encodes timeframe (Monthly thickest → 4H thinnest).
+//              Newest BUY / newest SELL per timeframe are SOLID; older ones DOTTED.
+//   • Live   : the in-progress candle is also tested. If price is CURRENTLY beyond the
+//              previous candle's extreme, a dashed "potential" level is drawn, tagged "?".
+//   • Labels : each timeframe gets its own column at the right edge, so levels that
+//              share a price on different timeframes never stack on top of each other.
+//              Previous-line labels drop their bubble and read as secondary.
+//   • Conflu.: levels from any timeframe/side falling within a tolerance band are boxed
+//              and counted (×2, ×3 …) — these are the prices that matter most.
+//   • Repaint: confirmed levels never repaint (lookahead_on + [1]/[2] = last CLOSED HTF
+//              bar). The dashed potential is live by design — see f_pot() for why it
+//              needs lookahead_on rather than the seemingly-safer lookahead_off.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─── Inputs ───  (display.none = kept out of the status line, still editable in Settings)
+grpTF = "Timeframes"
+useM  = input.bool(true,       "Monthly", group = grpTF, inline = "m", display = display.none)
+tfM   = input.timeframe("M",   "",        group = grpTF, inline = "m", display = display.none)
+useW  = input.bool(true,       "Weekly",  group = grpTF, inline = "w", display = display.none)
+tfW   = input.timeframe("W",   "",        group = grpTF, inline = "w", display = display.none)
+useD  = input.bool(true,       "Daily",   group = grpTF, inline = "d", display = display.none)
+tfD   = input.timeframe("D",   "",        group = grpTF, inline = "d", display = display.none)
+useH  = input.bool(true,       "4 hour",  group = grpTF, inline = "h", display = display.none)
+tfH   = input.timeframe("240", "",        group = grpTF, inline = "h", display = display.none)
+
+grpLines = "Lines shown"
+maxBuy   = input.int(5, "BUY lines per timeframe",  minval = 1, maxval = 50, group = grpLines, display = display.none, tooltip = "Total BUY levels kept on each timeframe. The newest is solid, the rest dotted.")
+maxSell  = input.int(5, "SELL lines per timeframe", minval = 1, maxval = 50, group = grpLines, display = display.none, tooltip = "Total SELL levels kept on each timeframe. The newest is solid, the rest dotted.")
+showPot  = input.bool(true, "Potential level (unclosed candle)", group = grpLines, display = display.none, tooltip = "Test the still-forming candle too. If price is already beyond the previous candle's extreme, draw a dashed provisional level tagged '?'. It can disappear before the candle closes.")
+
+grpW = "Line width by timeframe"
+wM   = input.int(5, "Monthly", minval = 1, maxval = 8, group = grpW, inline = "ww", display = display.none)
+wW   = input.int(3, "Weekly",  minval = 1, maxval = 8, group = grpW, inline = "ww", display = display.none)
+wD   = input.int(2, "Daily",   minval = 1, maxval = 8, group = grpW, inline = "ww", display = display.none)
+wH   = input.int(1, "4H",      minval = 1, maxval = 8, group = grpW, inline = "ww", display = display.none)
+
+grpStyle = "Style"
+colBuy   = input.color(#9c27b0, "BUY (BEAR)", group = grpStyle, inline = "c", display = display.none)
+colSell  = input.color(#089981, "SELL(BULL)", group = grpStyle, inline = "c", display = display.none)
+extBars  = input.int(10, "Extend right (bars)", minval = 0, group = grpStyle, display = display.none, tooltip = "How far past the last bar the nearest (4H) column projects.")
+
+grpLbl      = "Labels"
+showLbl     = input.bool(true, "Show labels", group = grpLbl, display = display.none)
+lblDetail   = input.string("Full", "Detail", options = ["Full", "Compact", "Price only"], group = grpLbl, display = display.none, tooltip = "Full = 'W SELL(BULL) 66743.5'. Compact = 'W SELL 66743.5'. Price only = '66743.5'.")
+showPrevLbl = input.bool(true, "Label previous lines", group = grpLbl, display = display.none, tooltip = "Off = only the newest BUY and SELL on each timeframe get a label.")
+lblSizeI    = input.string("small", "Size", options = ["tiny", "small", "normal", "large"], group = grpLbl, display = display.none)
+colBars     = input.int(12, "Timeframe column spacing (bars)", minval = 0, maxval = 100, group = grpLbl, display = display.none, tooltip = "Each timeframe's labels get their own column at the right edge, spaced this many bars apart (4H nearest, Monthly furthest). Set 0 to stack every timeframe in one column.")
+
+grpConf = "Confluence"
+showConf = input.bool(true, "Highlight clustered levels", group = grpConf, display = display.none, tooltip = "Box any group of levels — any timeframe, either side — that fall within the tolerance band of each other.")
+confTol  = input.float(0.15, "Cluster tolerance (% of price)", minval = 0.01, maxval = 5.0, step = 0.01, group = grpConf, display = display.none, tooltip = "Levels within this percentage of each other count as one cluster. 0.15% of 67000 ≈ 100 points.")
+confMin  = input.int(2, "Minimum levels in a cluster", minval = 2, maxval = 8, group = grpConf, display = display.none)
+confCol  = input.color(#ffb300, "Cluster", group = grpConf, display = display.none)
+
+lblSize = lblSizeI == "tiny" ? size.tiny : lblSizeI == "normal" ? size.normal : lblSizeI == "large" ? size.large : size.small
+
+BUYTXT  = "BUY (BEAR)"
+SELLTXT = "SELL(BULL)"
+
+// ─── Records ───
+type Lvl
+    float price = na
+    int   t     = na      // open time of the ENGULFED candle (line anchor)
+    line  ln    = na
+    label lb    = na
+
+type TfState
+    array<Lvl> buys
+    array<Lvl> sells
+    line  potLn = na
+    label potLb = na
+
+// ─── HTF probes ───
+// Confirmed: did the last CLOSED candle close beyond its predecessor's extreme?
+// [1] = last closed bar, [2] = the bar it engulfed. lookahead_on + those offsets means
+// the chart only ever sees fully closed HTF bars — no repaint.
+f_sig() =>
+    [close[1] > high[2], close[1] < low[2], high[2], low[2], time[2]]
+
+// Potential: the still-forming candle's running close vs the last closed candle.
+// lookahead_ON with NO offset on close is the only way to see the developing HTF bar.
+// lookahead_off would return the last CLOSED bar instead, which just re-derives the
+// confirmed signal one bar late (and hides the bug whenever tf == the chart's own tf).
+// Safe despite the name: read only at barstate.islast, where no future exists yet.
+f_pot() =>
+    [close, high[1], low[1], time[1]]
+
+// A requested timeframe is only meaningful if it is >= the chart timeframe.
+f_valid(string tf) =>
+    timeframe.in_seconds(tf) >= timeframe.in_seconds(timeframe.period)
+
+f_tfName(string tf) =>
+    s = timeframe.in_seconds(tf)
+    s >= 2592000 ? "M" : s >= 604800 ? "W" : s >= 86400 ? "D" : s >= 3600 ? str.tostring(s / 3600) + "H" : str.tostring(s / 60) + "m"
+
+f_lblText(string nm, bool isSell, float px, bool pot) =>
+    p = str.tostring(px, format.mintick)
+    q = pot ? " ?" : ""
+    lblDetail == "Price only" ? p + q : lblDetail == "Compact" ? nm + " " + (isSell ? "SELL" : "BUY") + q + "  " + p : nm + " " + (isSell ? SELLTXT : BUYTXT) + q + "  " + p
+
+// ─── Confluence collection (rebuilt every render pass) ───
+var confPx     = array.new<float>()
+var confBoxes  = array.new<box>()
+var confLabels = array.new<label>()
+
+// ─── Record a level on one side (deduplicated by the engulfed candle's timestamp) ───
+f_pushSide(array<Lvl> arr, float px, int t, int maxN) =>
+    dup = false
+    if array.size(arr) > 0
+        dup := array.get(arr, array.size(arr) - 1).t == t
+    if not dup
+        array.push(arr, Lvl.new(px, t))
+        if array.size(arr) > maxN
+            old = array.shift(arr)
+            line.delete(old.ln)
+            label.delete(old.lb)
+
+f_update(TfState st, bool sell, bool buy, float hi, float lo, int t, bool en) =>
+    if en and not na(t)
+        if sell
+            f_pushSide(st.sells, hi, t, maxSell)
+        if buy
+            f_pushSide(st.buys, lo, t, maxBuy)
+
+// ─── Render one side: newest solid + full label, older dotted + bubble-less label ───
+f_drawSide(array<Lvl> arr, string nm, bool isSell, color col, int w, int x2, bool en) =>
+    if array.size(arr) > 0
+        last = array.size(arr) - 1
+        for i = 0 to last
+            L = array.get(arr, i)
+            line.delete(L.ln)
+            label.delete(L.lb)
+            L.ln := na
+            L.lb := na
+            if en
+                isLatest = i == last
+                L.ln := line.new(L.t, L.price, x2, L.price, xloc = xloc.bar_time, color = col, width = isLatest ? w : math.max(1, w - 1), style = isLatest ? line.style_solid : line.style_dotted)
+                array.push(confPx, L.price)
+                if showLbl and (isLatest or showPrevLbl)
+                    L.lb := label.new(x2, L.price, f_lblText(nm, isSell, L.price, false), xloc = xloc.bar_time, style = label.style_label_left, color = isLatest ? color.new(col, 85) : color.new(col, 100), textcolor = isLatest ? col : color.new(col, 30), size = isLatest ? lblSize : size.tiny)
+
+// ─── Render the provisional level from the unclosed candle (dashed, tagged "?") ───
+f_drawPot(TfState st, string nm, float c, float ph, float pl, int t, int w, int x2, bool en) =>
+    line.delete(st.potLn)
+    label.delete(st.potLb)
+    st.potLn := na
+    st.potLb := na
+    if en and showPot and not na(t) and not na(c)
+        isSell = c > ph
+        isBuy  = c < pl
+        if isSell or isBuy
+            px  = isSell ? ph : pl
+            col = isSell ? colSell : colBuy
+            st.potLn := line.new(t, px, x2, px, xloc = xloc.bar_time, color = col, width = w, style = line.style_dashed)
+            array.push(confPx, px)
+            if showLbl
+                st.potLb := label.new(x2, px, f_lblText(nm, isSell, px, true), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(col, 92), textcolor = col, size = lblSize)
+
+f_render(TfState st, string tf, bool en, float c, float ph, float pl, int t, int w, int col_i) =>
+    if barstate.islast
+        nm    = f_tfName(tf)
+        barMs = timeframe.in_seconds(timeframe.period) * 1000
+        x2    = time + (extBars + col_i * colBars) * barMs
+        f_drawSide(st.buys,  nm, false, colBuy,  w, x2, en)
+        f_drawSide(st.sells, nm, true,  colSell, w, x2, en)
+        f_drawPot(st, nm, c, ph, pl, t, w, x2, en)
+
+// ─── Box every cluster of levels sitting within the tolerance band ───
+f_confluence(int x2) =>
+    if array.size(confBoxes) > 0
+        for i = 0 to array.size(confBoxes) - 1
+            box.delete(array.get(confBoxes, i))
+    array.clear(confBoxes)
+    if array.size(confLabels) > 0
+        for i = 0 to array.size(confLabels) - 1
+            label.delete(array.get(confLabels, i))
+    array.clear(confLabels)
+    if showConf and array.size(confPx) >= confMin
+        arr = array.copy(confPx)
+        array.sort(arr, order.ascending)
+        tol = close * confTol / 100.0
+        n   = array.size(arr)
+        pad = math.max(tol * 0.25, syminfo.mintick * 2)
+        x1  = na(chart.left_visible_bar_time) ? time - 100 * timeframe.in_seconds(timeframe.period) * 1000 : math.min(chart.left_visible_bar_time, x2)
+        cs  = 0                                     // index where the open cluster starts
+        // Walk the sorted levels and close a cluster whenever the next level is out of band.
+        // Bounds are checked with a nested `if` rather than `and` — Pine does not reliably
+        // short-circuit, so `array.get(arr, i)` at i == n would read out of bounds.
+        for i = 1 to n
+            atEnd = i == n
+            cut   = atEnd
+            if not atEnd
+                cut := array.get(arr, i) - array.get(arr, cs) > tol
+            if cut
+                cnt = i - cs
+                if cnt >= confMin
+                    lo = array.get(arr, cs)
+                    hi = array.get(arr, i - 1)
+                    array.push(confBoxes, box.new(x1, hi + pad, x2, lo - pad, xloc = xloc.bar_time, bgcolor = color.new(confCol, 88), border_color = color.new(confCol, 45), border_width = 1))
+                    // style_label_LEFT so the body extends right, INTO the chart. With
+                    // style_label_right it would hang off the left screen edge, invisible.
+                    array.push(confLabels, label.new(x1, hi + pad, "×" + str.tostring(cnt), xloc = xloc.bar_time, style = label.style_label_left, color = color.new(confCol, 82), textcolor = confCol, size = size.small))
+                cs := i
+
+// ─── Wire up the four timeframes ───
+[sM, bM, hiM, loM, tvM] = request.security(syminfo.tickerid, tfM, f_sig(), lookahead = barmerge.lookahead_on)
+[sW, bW, hiW, loW, tvW] = request.security(syminfo.tickerid, tfW, f_sig(), lookahead = barmerge.lookahead_on)
+[sD, bD, hiD, loD, tvD] = request.security(syminfo.tickerid, tfD, f_sig(), lookahead = barmerge.lookahead_on)
+[sH, bH, hiH, loH, tvH] = request.security(syminfo.tickerid, tfH, f_sig(), lookahead = barmerge.lookahead_on)
+
+[pcM, phM, plM, ptM] = request.security(syminfo.tickerid, tfM, f_pot(), lookahead = barmerge.lookahead_on)
+[pcW, phW, plW, ptW] = request.security(syminfo.tickerid, tfW, f_pot(), lookahead = barmerge.lookahead_on)
+[pcD, phD, plD, ptD] = request.security(syminfo.tickerid, tfD, f_pot(), lookahead = barmerge.lookahead_on)
+[pcH, phH, plH, ptH] = request.security(syminfo.tickerid, tfH, f_pot(), lookahead = barmerge.lookahead_on)
+
+okM = useM and f_valid(tfM)
+okW = useW and f_valid(tfW)
+okD = useD and f_valid(tfD)
+okH = useH and f_valid(tfH)
+
+var stM = TfState.new(array.new<Lvl>(), array.new<Lvl>())
+var stW = TfState.new(array.new<Lvl>(), array.new<Lvl>())
+var stD = TfState.new(array.new<Lvl>(), array.new<Lvl>())
+var stH = TfState.new(array.new<Lvl>(), array.new<Lvl>())
+
+f_update(stM, sM, bM, hiM, loM, tvM, okM)
+f_update(stW, sW, bW, hiW, loW, tvW, okW)
+f_update(stD, sD, bD, hiD, loD, tvD, okD)
+f_update(stH, sH, bH, hiH, loH, tvH, okH)
+
+// Column index orders the right-edge label columns: 4H nearest → Monthly furthest.
+if barstate.islast
+    array.clear(confPx)
+
+f_render(stH, tfH, okH, pcH, phH, plH, ptH, wH, 0)
+f_render(stD, tfD, okD, pcD, phD, plD, ptD, wD, 1)
+f_render(stW, tfW, okW, pcW, phW, plW, ptW, wW, 2)
+f_render(stM, tfM, okM, pcM, phM, plM, ptM, wM, 3)
+
+if barstate.islast
+    f_confluence(time + (extBars + 3 * colBars) * timeframe.in_seconds(timeframe.period) * 1000)

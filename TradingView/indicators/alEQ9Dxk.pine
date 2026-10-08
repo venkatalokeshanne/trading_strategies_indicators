@@ -1,0 +1,169 @@
+//@version=6
+// ============================================================
+//  Multi-Oscillator Divergence Confluence
+//  Detects divergence between price and THREE oscillators
+//  (RSI, MACD histogram, MFI) at the same price pivot, and
+//  only reports a setup when a chosen number of them agree.
+//
+//  Architecture note: confirmed price pivots are stored in
+//  arrays together with a snapshot of every oscillator at that
+//  pivot. Each new pivot is then compared against stored pivots
+//  inside the allowed distance — the oscillators are evaluated
+//  in one pass at that moment, which is what makes the
+//  agreement count possible.
+// ============================================================
+indicator("Multi-Oscillator Divergence Confluence", overlay = true, max_labels_count = 300, max_lines_count = 300)
+
+// ---------- Inputs ----------
+grpD = "Detection"
+pivL    = input.int(5,  "Pivot lookback left",  minval = 1, group = grpD)
+pivR    = input.int(5,  "Pivot lookback right", minval = 1, group = grpD)
+minBars = input.int(5,  "Min bars between pivots", minval = 1, group = grpD)
+maxBars = input.int(60, "Max bars between pivots", minval = 2, group = grpD)
+minAgree = input.int(3, "Oscillators required to agree", minval = 1, maxval = 3, group = grpD,
+     tooltip = "A setup is reported only when at least this many of the three oscillators show divergence at the same price pivot. Lower values produce many more signals.")
+cmpMode = input.string("Previous pivot only", "Compare against",
+     options = ["Previous pivot only", "Any pivot in range"], group = grpD,
+     tooltip = "Standard divergence compares a new pivot with the one immediately before it. 'Any pivot in range' scans every stored pivot inside the distance range and reports the first match — this finds more setups but produces far more signals.")
+
+grpO = "Oscillators"
+useRsi  = input.bool(true, "RSI",            group = grpO, inline = "r")
+rsiLen  = input.int(14, "len", minval = 2,   group = grpO, inline = "r")
+useMacd = input.bool(true, "MACD histogram", group = grpO, inline = "m")
+macdF   = input.int(12, "fast", minval = 1,  group = grpO, inline = "m")
+macdS   = input.int(26, "slow", minval = 1,  group = grpO, inline = "m")
+macdSig = input.int(9,  "signal", minval = 1,group = grpO, inline = "m")
+useMfi  = input.bool(true, "MFI (money flow)", group = grpO, inline = "f")
+mfiLen  = input.int(14, "len", minval = 2,     group = grpO, inline = "f")
+
+grpU = "Display"
+showLines  = input.bool(true, "Draw divergence lines on price", group = grpU)
+showLabels = input.bool(true, "Show labels with agreement count", group = grpU)
+colBull = input.color(color.new(#26a69a, 0), "Bullish", group = grpU)
+colBear = input.color(color.new(#ef5350, 0), "Bearish", group = grpU)
+
+// ---------- Oscillators (global scope, evaluated every bar) ----------
+oRsi  = ta.rsi(close, rsiLen)
+[_ml, _sl, oMacd] = ta.macd(close, macdF, macdS, macdSig)
+// MFI is used instead of a cumulative volume line: it carries the volume
+// dimension while staying bounded and mean-reverting, so it disagrees with
+// RSI/MACD often enough for the agreement count to carry real information.
+oMfi  = ta.mfi(hlc3, mfiLen)
+
+// Number of oscillators actually enabled. The label denominator and the
+// effective threshold both follow this, so disabling one does not make
+// the requirement unreachable or the label misleading.
+enabledN = (useRsi ? 1 : 0) + (useMacd ? 1 : 0) + (useMfi ? 1 : 0)
+reqN     = math.min(minAgree, math.max(enabledN, 1))
+
+// ---------- Pivot storage ----------
+// Parallel arrays: bar index, price level, and one snapshot per oscillator.
+var array<int>   loBar = array.new<int>()
+var array<float> loPrc = array.new<float>()
+var array<float> loRsi = array.new<float>()
+var array<float> loMac = array.new<float>()
+var array<float> loMfi = array.new<float>()
+
+var array<int>   hiBar = array.new<int>()
+var array<float> hiPrc = array.new<float>()
+var array<float> hiRsi = array.new<float>()
+var array<float> hiMac = array.new<float>()
+var array<float> hiMfi = array.new<float>()
+
+pivLo = ta.pivotlow(low,   pivL, pivR)
+pivHi = ta.pivothigh(high, pivL, pivR)
+
+// Keep storage bounded
+f_trim(array<int> a, array<float> b, array<float> c, array<float> d, array<float> e) =>
+    if array.size(a) > 40
+        array.shift(a), array.shift(b), array.shift(c), array.shift(d), array.shift(e)
+
+// ---------- Comparison helpers ----------
+// Count how many enabled oscillators diverge from price between two pivots.
+f_countBull(float prevR, float prevM, float prevF) =>
+    int n = 0
+    if useRsi  and oRsi[pivR]  > prevR
+        n += 1
+    if useMacd and oMacd[pivR] > prevM
+        n += 1
+    if useMfi  and oMfi[pivR]  > prevF
+        n += 1
+    n
+
+f_countBear(float prevR, float prevM, float prevF) =>
+    int n = 0
+    if useRsi  and oRsi[pivR]  < prevR
+        n += 1
+    if useMacd and oMacd[pivR] < prevM
+        n += 1
+    if useMfi  and oMfi[pivR]  < prevF
+        n += 1
+    n
+
+// ---------- Bullish: price lower low, oscillators higher low ----------
+bullFired = false
+int bullCount = 0
+if not na(pivLo)
+    curBar = bar_index - pivR
+    curPrc = low[pivR]
+    // scan stored pivots from newest to oldest, take the first valid match
+    scanAll = cmpMode == "Any pivot in range"
+    lastIdx = array.size(loBar) - 1
+    if array.size(loBar) > 0
+        for i = lastIdx to 0
+            pBar = array.get(loBar, i)
+            dist = curBar - pBar
+            // default: only the immediately preceding pivot is eligible
+            eligible = scanAll or i == lastIdx
+            if eligible and dist >= minBars and dist <= maxBars and not bullFired
+                if curPrc < array.get(loPrc, i)
+                    c = f_countBull(array.get(loRsi, i), array.get(loMac, i), array.get(loMfi, i))
+                    if c >= reqN and enabledN > 0
+                        bullFired := true
+                        bullCount := c
+                        if showLines
+                            line.new(pBar, array.get(loPrc, i), curBar, curPrc, color = colBull, width = 2)
+                        if showLabels
+                            label.new(curBar, curPrc, str.tostring(c) + "/" + str.tostring(enabledN), style = label.style_label_up,
+                                 color = colBull, textcolor = color.white, size = size.small,
+                                 tooltip = "Bullish divergence agreed by " + str.tostring(c) + " oscillator(s)")
+    array.push(loBar, curBar), array.push(loPrc, curPrc)
+    array.push(loRsi, oRsi[pivR]), array.push(loMac, oMacd[pivR]), array.push(loMfi, oMfi[pivR])
+    f_trim(loBar, loPrc, loRsi, loMac, loMfi)
+
+// ---------- Bearish: price higher high, oscillators lower high ----------
+bearFired = false
+int bearCount = 0
+if not na(pivHi)
+    curBar = bar_index - pivR
+    curPrc = high[pivR]
+    scanAllH = cmpMode == "Any pivot in range"
+    lastIdxH = array.size(hiBar) - 1
+    if array.size(hiBar) > 0
+        for i = lastIdxH to 0
+            pBar = array.get(hiBar, i)
+            dist = curBar - pBar
+            eligibleH = scanAllH or i == lastIdxH
+            if eligibleH and dist >= minBars and dist <= maxBars and not bearFired
+                if curPrc > array.get(hiPrc, i)
+                    c = f_countBear(array.get(hiRsi, i), array.get(hiMac, i), array.get(hiMfi, i))
+                    if c >= reqN and enabledN > 0
+                        bearFired := true
+                        bearCount := c
+                        if showLines
+                            line.new(pBar, array.get(hiPrc, i), curBar, curPrc, color = colBear, width = 2)
+                        if showLabels
+                            label.new(curBar, curPrc, str.tostring(c) + "/" + str.tostring(enabledN), style = label.style_label_down,
+                                 color = colBear, textcolor = color.white, size = size.small,
+                                 tooltip = "Bearish divergence agreed by " + str.tostring(c) + " oscillator(s)")
+    array.push(hiBar, curBar), array.push(hiPrc, curPrc)
+    array.push(hiRsi, oRsi[pivR]), array.push(hiMac, oMacd[pivR]), array.push(hiMfi, oMfi[pivR])
+    f_trim(hiBar, hiPrc, hiRsi, hiMac, hiMfi)
+
+// ---------- Alerts ----------
+alertcondition(bullFired, "Bullish divergence confluence", "Divergence Confluence: bullish divergence confirmed by multiple oscillators")
+alertcondition(bearFired, "Bearish divergence confluence", "Divergence Confluence: bearish divergence confirmed by multiple oscillators")
+allBull = bullFired and bullCount == enabledN
+allBear = bearFired and bearCount == enabledN
+alertcondition(allBull, "Bullish divergence (all oscillators)", "Divergence Confluence: bullish divergence on all enabled oscillators")
+alertcondition(allBear, "Bearish divergence (all oscillators)", "Divergence Confluence: bearish divergence on all enabled oscillators")

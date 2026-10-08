@@ -1,0 +1,340 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © VolumeVigilante (Fixed Cooldown Logic for Pine Script v6)
+
+//@version=6
+strategy(
+    title = "Volume Vigilante | Long-Only ORB with Pivots + Cooldown After 2 Consecutive Losses",
+    shorttitle = "",
+    overlay = true,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 100,
+    initial_capital = 10000,
+    pyramiding = 0,
+    process_orders_on_close = true,
+    max_lines_count = 500
+)
+
+// ─────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────
+const string SL_TYPE_PCT  = "Percentage"
+const string SL_TYPE_PREV = "Previous Low"
+
+const color  BULL_COLOR    = #26A69A
+const color  NEUTRAL_COLOR = #787B86
+const color  STOP_COLOR    = #FF0000
+const color  COOLDOWN_COLOR = #FF9800
+
+// ─────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────
+string sessionGroupInput   = "Session Settings"
+string riskGroupInput      = "Risk Settings"
+string tradeGroupInput     = "Trade Limits"
+string backtestGroupInput  = "Backtest Window"
+string displayGroupInput   = "Display"
+string cooldownGroupInput  = "Cooldown Settings"
+
+string openingSessionInput = input.session(
+    defval = "0930-0945",
+    title = "Opening Session",
+    group = sessionGroupInput,
+    tooltip = "Opening range window used to calculate the ORB high. Default: 09:30–09:45 (exchange time)."
+)
+
+int maxTradesPerDayInput = input.int(
+    defval = 1,
+    title = "Max Trades per Day",
+    minval = 0,
+    group = tradeGroupInput,
+    tooltip = "Maximum number of entries allowed per day."
+)
+
+// 冷却期设置（修复后）
+int cooldownBarsInput = input.int(
+    defval = 20,
+    title = "Cooldown Period (Bars)",
+    minval = 1,
+    group = cooldownGroupInput,
+    tooltip = "Number of bars to stop trading after 2 CONSECUTIVE losing trades."
+)
+
+bool showCooldownInput = input.bool(
+    defval = true,
+    title = "Show Cooldown Label",
+    group = displayGroupInput
+)
+
+string initialSlTypeInput = input.string(
+    defval = SL_TYPE_PCT,
+    title = "Initial SL Type",
+    options = [SL_TYPE_PCT, SL_TYPE_PREV],
+    group = riskGroupInput,
+    tooltip = "Percentage: stop from entry price. Previous Low: stop uses the prior bar's low from the setup."
+)
+
+float stopLossPctInput = input.float(
+    defval = 3.0,
+    title = "Stop Loss %",
+    minval = 0.0,
+    step = 0.1,
+    group = riskGroupInput,
+    tooltip = "Stop loss percent used when Initial SL Type = Percentage."
+)
+
+int startTimeInput = input.time(
+    defval = timestamp("01 Sep 2000 13:30 +0000"),
+    title = "Backtesting Start Time",
+    group = backtestGroupInput,
+    tooltip = "Trades will only be taken after this timestamp."
+)
+
+int endTimeInput = input.time(
+    defval = timestamp("30 Sep 2099 19:30 +0000"),
+    title = "Backtesting End Time",
+    group = backtestGroupInput,
+    tooltip = "Trades will only be taken before this timestamp."
+)
+
+bool showPivotsInput = input.bool(
+    defval = true,
+    title = "Show Pivot Levels",
+    group = displayGroupInput,
+    tooltip = "Plots daily pivot resistance levels (R1–R5) and mid-levels."
+)
+
+bool showOrbInput = input.bool(
+    defval = true,
+    title = "Show ORB High",
+    group = displayGroupInput,
+    tooltip = "Plots the opening range high after the opening session ends."
+)
+
+bool showStopInput = input.bool(
+    defval = true,
+    title = "Show Stop Line",
+    group = displayGroupInput,
+    tooltip = "Plots the active stop level while in position."
+)
+
+// ─────────────────────────────────────────────────────────────
+// Functions
+// ─────────────────────────────────────────────────────────────
+isNewBar(string res) =>
+    series int t = time(res)
+    not na(t) and (na(t[1]) or t > t[1])
+
+// ─────────────────────────────────────────────────────────────
+// Calculations
+// ─────────────────────────────────────────────────────────────
+bool newDay = isNewBar("D")
+bool isExchangeDayEnd = time_close == time_close("D")
+bool timeOk = time > startTimeInput and time < endTimeInput
+
+// ORB session flags
+string orbSessionString = openingSessionInput + ":1234567"
+bool inOrbSession = not na(time(timeframe.period, orbSessionString))
+bool orbSessionStart = inOrbSession and not inOrbSession[1]
+bool orbSessionJustEnded = not inOrbSession and inOrbSession[1]
+
+// Real position state
+bool inPosition = strategy.position_size > 0
+bool justEntered = inPosition and not inPosition[1]
+
+// Track ORB high + ensure it’s only valid for the current day
+var float orbHigh = na
+var bool  orbBuiltToday = false
+
+if newDay
+    orbHigh := na
+    orbBuiltToday := false
+
+if orbSessionStart
+    orbHigh := high
+else if inOrbSession
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+
+if orbSessionJustEnded and not na(orbHigh)
+    orbBuiltToday := true
+
+bool orbReadyToday = orbBuiltToday and not na(orbHigh)
+
+// Daily pivots (previous day values)
+series float prevCloseD = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+series float prevHighD  = request.security(syminfo.tickerid, "D", high[1],  lookahead = barmerge.lookahead_on)
+series float prevLowD   = request.security(syminfo.tickerid, "D", low[1],   lookahead = barmerge.lookahead_on)
+
+series float pivot  = (prevHighD + prevLowD + prevCloseD) / 3.0
+series float range1 = prevHighD - prevLowD
+
+series float r1 = pivot + pivot - prevLowD
+series float r2 = pivot + range1
+series float r3 = pivot * 2.0 + prevHighD - 2.0 * prevLowD
+series float r4 = pivot * 3.0 + prevHighD - 3.0 * prevLowD
+series float r5 = pivot * 4.0 + prevHighD - 4.0 * prevLowD
+
+series float r0_5 = orbHigh + math.abs(r1 - orbHigh) / 2.0
+series float r1_5 = r1 + math.abs(r1 - r2) / 2.0
+series float r2_5 = r2 + math.abs(r2 - r3) / 2.0
+series float r3_5 = r3 + math.abs(r3 - r4) / 2.0
+series float r4_5 = r4 + math.abs(r4 - r5) / 2.0
+
+// Entry rule (unchanged, but cannot trigger until ORB is built today)
+bool longSignal = orbReadyToday and open < orbHigh and high > orbHigh and r1 > orbHigh
+
+// Trade counter (keeps your “reset during ORB session, count outside” behavior)
+var int tradesCounter = 0
+tradesCounter := inOrbSession ? 0 : (longSignal and not inPosition ? tradesCounter[1] + 1 : tradesCounter[1])
+
+// ─────────────────────────────────────────────────────────────
+// 修复后的：连续亏损 & 冷却期逻辑（Pine Script v6 兼容）
+// ─────────────────────────────────────────────────────────────
+var int consecutiveLosses = 0
+var int cooldownCounter = 0
+bool inCooldown = cooldownCounter > 0
+
+// 用 strategy.netprofit 正确判断盈亏（Pine Script v6 标准方法）
+float currentNetProfit = strategy.netprofit
+float prevNetProfit = strategy.netprofit[1]
+bool tradeClosed = currentNetProfit != prevNetProfit
+bool lastTradeWasLoss = tradeClosed and currentNetProfit < prevNetProfit
+
+// 统计连续亏损
+if tradeClosed
+    consecutiveLosses := lastTradeWasLoss ? consecutiveLosses + 1 : 0
+
+// 连续2次亏损触发冷却期
+if consecutiveLosses >= 2 and not inCooldown
+    cooldownCounter := cooldownBarsInput
+    consecutiveLosses := 0 // 触发后重置计数器
+
+// 每根K线递减冷却期
+if inCooldown
+    cooldownCounter := cooldownCounter - 1
+
+// 每日重置
+if newDay
+    consecutiveLosses := 0
+    cooldownCounter := 0
+
+// ─────────────────────────────────────────────────────────────
+// Modified Entry Rule: Block Trades During Cooldown
+// ─────────────────────────────────────────────────────────────
+bool canEnter = not inPosition and tradesCounter[1] < maxTradesPerDayInput and not inCooldown
+
+// Capture setup low for "Previous Low" mode (from the setup bar)
+var float prevLowAtSetup = na
+if longSignal and canEnter
+    prevLowAtSetup := low[1]
+
+// Capture true fill price on entry (prevents stop above entry)
+var float entryPrice = na
+if justEntered
+    entryPrice := strategy.position_avg_price
+else if not inPosition
+    entryPrice := na
+
+// Initial stop (anchored correctly)
+// - Percentage uses actual fill price
+// - Previous Low uses stored setup low
+float slPct = stopLossPctInput > 0 ? stopLossPctInput / 100.0 : 99999.0
+
+float initialStopRaw =
+     initialSlTypeInput == SL_TYPE_PCT  ? (entryPrice * (1.0 - slPct)) :
+     initialSlTypeInput == SL_TYPE_PREV ? prevLowAtSetup :
+     na
+
+// Clamp so initial stop can never be above the entry
+float initialStop = (inPosition and not na(entryPrice) and not na(initialStopRaw)) ? math.min(initialStopRaw, entryPrice) : na
+
+// Trailing ladder (same logic, only active while in position)
+var float trailLong = 0.0
+
+if justEntered
+    trailLong := 0.0
+else if not inPosition
+    trailLong := 0.0
+else
+    float prevTrail = nz(trailLong[1], 0.0)
+    trailLong :=
+         high > r5   and r4   > prevTrail ? r4   :
+         high > r4_5 and r3_5 > prevTrail ? r3_5 :
+         high > r4   and r3   > prevTrail ? r3   :
+         high > r3_5 and r2_5 > prevTrail ? r2_5 :
+         high > r3   and r2   > prevTrail ? r2   :
+         high > r2_5 and r1_5 > prevTrail ? r1_5 :
+         high > r2   and r1   > prevTrail ? r1   :
+         high > r1_5 and r0_5 > prevTrail ? r0_5 :
+         high > r0_5 and orbHigh > prevTrail ? orbHigh :
+         prevTrail
+
+// Final stop while in position
+series float slLong = inPosition ? math.max(initialStop, trailLong) : na
+
+// Exchange day end cleanup
+if isExchangeDayEnd
+    strategy.close_all(comment = "DayEnd", alert_message = "EndofDay SELL ALERT")
+    strategy.cancel("long")
+    orbHigh := na
+    orbBuiltToday := false
+    trailLong := 0.0
+    tradesCounter := 0
+    prevLowAtSetup := na
+    entryPrice := na
+    consecutiveLosses := 0
+    cooldownCounter := 0
+
+// ─────────────────────────────────────────────────────────────
+// Strategy Calls
+// ─────────────────────────────────────────────────────────────
+if orbReadyToday and canEnter and timeOk and open < orbHigh
+    strategy.entry("long", strategy.long, stop = orbHigh, alert_message = "BUY ALERT")
+
+// Preserve your “cancel if not triggered next bar” behavior
+if (longSignal and canEnter)[1]
+    strategy.cancel("long")
+
+// Always keep stop working while in position
+strategy.exit(
+    "SL/TP",
+    from_entry = "long",
+    stop = inPosition ? slLong : na,
+    alert_message = "SELL ALERT"
+)
+
+// ─────────────────────────────────────────────────────────────
+// Visuals
+// ─────────────────────────────────────────────────────────────
+// Cooldown Label
+if showCooldownInput and inCooldown
+    label.new(bar_index, high, "COOLDOWN\n" + str.tostring(cooldownCounter) + " bars left", color=COOLDOWN_COLOR, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+series float r1Plot  = showPivotsInput and not newDay ? r1   : na
+series float r2Plot  = showPivotsInput and not newDay ? r2   : na
+series float r3Plot  = showPivotsInput and not newDay ? r3   : na
+series float r4Plot  = showPivotsInput and not newDay ? r4   : na
+series float r5Plot  = showPivotsInput and not newDay ? r5   : na
+
+series float r05Plot = showPivotsInput and not newDay ? r0_5 : na
+series float r15Plot = showPivotsInput and not newDay ? r1_5 : na
+series float r25Plot = showPivotsInput and not newDay ? r2_5 : na
+series float r35Plot = showPivotsInput and not newDay ? r3_5 : na
+series float r45Plot = showPivotsInput and not newDay ? r4_5 : na
+
+series float orbPlot  = showOrbInput and orbReadyToday ? orbHigh : na
+series float stopPlot = showStopInput and inPosition ? slLong : na
+
+plot(r1Plot, style = plot.style_linebr, title = "R1")
+plot(r2Plot, style = plot.style_linebr, title = "R2")
+plot(r3Plot, style = plot.style_linebr, title = "R3")
+plot(r4Plot, style = plot.style_linebr, title = "R4")
+plot(r5Plot, style = plot.style_linebr, title = "R5")
+
+plot(r05Plot, style = plot.style_linebr, color = color.new(NEUTRAL_COLOR, 0), title = "R0.5")
+plot(r15Plot, style = plot.style_linebr, color = color.new(NEUTRAL_COLOR, 0), title = "R1.5")
+plot(r25Plot, style = plot.style_linebr, color = color.new(NEUTRAL_COLOR, 0), title = "R2.5")
+plot(r35Plot, style = plot.style_linebr, color = color.new(NEUTRAL_COLOR, 0), title = "R3.5")
+plot(r45Plot, style = plot.style_linebr, color = color.new(NEUTRAL_COLOR, 0), title = "R4.5")
+
+plot(orbPlot, title = "ORB High", style = plot.style_linebr, color = color.new(BULL_COLOR, 0), linewidth = 2)
+plot(stopPlot, title = "Stop", style = plot.style_linebr, color = color.new(STOP_COLOR, 0))

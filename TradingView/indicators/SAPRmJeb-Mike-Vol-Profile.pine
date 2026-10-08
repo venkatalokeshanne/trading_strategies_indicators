@@ -1,0 +1,561 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Leviathan
+
+//@version=6
+indicator("Mike Vol Profile", shorttitle="MikeVP", overlay=true, max_boxes_count=500, max_bars_back=1000)
+
+//==========================
+//Inputs
+//==========================
+sessionType = input.string('Daily', 'Session Type', options=['Tokyo','London','New York','Daily','Weekly', 'Monthly', 'Quarterly', 'Yearly'])
+
+showProf = input.bool(true, 'Show Volume Profile', group='Display')
+showSbox = input.bool(false, 'Show Session Box (dashed outline)', group='Display')
+showPoc = input.bool(true, 'Show POC', group='Display')
+showVA = input.bool(true, 'Show VAH and VAL', group='Display')
+showVAb = input.bool(false, 'Show Value Area Box', group='Display')
+showCur = input.bool(true, 'Show Live Zone', group='Display')
+showLabels = input.bool(true, 'Show Session Lables', group='Display')
+showLineLabels = input.bool(true, 'Show POC/VAH/VAL Labels', group='Display')
+showFx = input.bool(false, 'Show Forex Sessions (no profile)', group='Display')
+maxHistProfiles = input.int(2, 'Historical Complete Profiles to Show', minval=0, tooltip='Number of completed session profiles kept on chart, in addition to the current developing one', group='Display')
+sessionTz = input.string('America/New_York', 'Session Timezone', tooltip='Timezone used to determine when Daily/Weekly/Monthly/Quarterly/Yearly sessions begin', group='Display')
+dailyStartHour = input.int(0, 'Session Start Hour (0-23)', minval=0, maxval=23, tooltip='Hour, in Session Timezone, at which a new session begins. 0 = midnight. 18 = 6:00 PM (e.g. futures Globex day)', group='Display')
+extendLiveLinesBars = input.int(5, 'Extend Live POC/VAH/VAL Lines (bars)', minval=0, tooltip='Extends the current/live POC, VAH and VAL lines this many bars past the current price', group='Display')
+extendRecentLevels = input.bool(true, 'Extend Most-Recent Historical POC/VAH/VAL to Present', tooltip='Like a Previous Day High/Low indicator: the POC/VAH/VAL of the most recently COMPLETED session keeps tracking forward toward current price instead of staying frozen at the old session boundary, until the next session completes and replaces it', group='Display')
+drawAheadBars = input.int(6, 'Draw Ahead (Bars)', minval=0, tooltip='How many bars ahead of current price the extending most-recent POC/VAH/VAL lines/labels reach', group='Display')
+resolution = input.int(30, 'Resolution', minval=5, tooltip='The higher the value, the more refined of a profile, but less profiles shown on chart', group='Volume Profile Settings')
+profWidthPct = input.float(29, 'Profile Width %', minval=5, maxval=100, tooltip='How far the volume profile bars extend across the session, as a % of the session width. Higher = wider bars. (29 approximates the original fixed width)', group='Volume Profile Settings')
+VAwid = input.int(70, 'Value Area Volume %', minval=1, maxval=100, group='Volume Profile Settings')
+dispMode = input.string('Mode 2', 'Bar Mode', ['Mode 1', 'Mode 2', 'Mode 3'], group='Volume Profile Settings')
+volType = input.string('Volume', 'Profile Data Type', options=['Volume', 'Open Interest'], group='Volume Profile Settings')
+smoothVol = input.bool(false, 'Smooth Volume Data', tooltip='Useful for assets that have very large spikes in volume over large bars - helps create better profiles', group='Volume Profile Settings')
+dataTf = ''
+
+bullCol = input.color(color.rgb(76, 175, 79, 50), 'Up Volume', group='Appearance')
+bearCol = input.color(color.rgb(255, 82, 82, 50), 'Down Volume', group='Appearance')
+VAbCol = input.color(color.rgb(107, 159, 255, 90), 'Value Area Box', group='Appearance' )
+pocCol = input.color(color.red, 'POC Color', group='Appearance')
+pocWid = input.int(1, 'POC Thickness', group='Appearance')
+vahCol = input.color(color.aqua, 'VAH', inline='h', group='Appearance')
+vahWid = input.int(1, 'Thickness', inline='h', group='Appearance')
+valCol = input.color(color.aqua, 'VAL', inline='l', group='Appearance')
+valWid = input.int(1, 'Thickness', inline='l', group='Appearance')
+lineLabelSize = input.string('Small', 'POC/VAH/VAL Label Size', options=['Tiny', 'Small', 'Normal', 'Large', 'Huge'], group='Appearance')
+lineLabelTextColor = input.color(color.white, 'POC/VAH/VAL Label Text Color', group='Appearance')
+boxBg = input.color(color.rgb(255, 153, 0, 100), 'Box', inline='m', group='Appearance')
+boxWid = input.int(1, 'Thickness', inline='m', group='Appearance')
+
+//==========================
+//Constants / Variable Declaration
+//========================== 
+var int zoneStart = 0
+var int tokyoStart = 0
+var int londonStart = 0
+var int nyStart = 0
+int lookback = bar_index - zoneStart
+var activeZone = false
+
+var vpGreen = array.new_float(resolution, 0)
+var vpRed = array.new_float(resolution, 0)
+var zoneBounds = array.new_float(resolution, 0)
+
+var float[] ltfOpen =  array.new_float(0)
+var float[] ltfClose =  array.new_float(0)
+var float[] ltfHigh =  array.new_float(0)
+var float[] ltfLow =  array.new_float(0)
+var float[] ltfVolume = array.new_float(0)
+
+var box[] histBoxes = array.new_box(0)
+var line[] histLines = array.new_line(0)
+var label[] histLabels = array.new_label(0)
+var int[] histBoxCounts = array.new_int(0)
+var int[] histLineCounts = array.new_int(0)
+var int[] histLabelCounts = array.new_int(0)
+
+var label lastStaticPocLab = na
+var label lastStaticVahLab = na
+var label lastStaticValLab = na
+
+string userSymbol = syminfo.prefix + ":" + syminfo.ticker
+string openInterestTicker = str.format("{0}_OI", userSymbol)
+string timeframe = syminfo.type == "futures" and timeframe.isintraday ? "1D" : timeframe.period
+deltaOi = request.security(openInterestTicker, timeframe, close-close[1], ignore_invalid_symbol = true)
+
+vol() =>
+    out = smoothVol ? ta.ema(volume, 5) : volume
+    if volType == 'Open Interest'
+        out := deltaOi
+    out
+
+[dO, dC, dH, dL, dV] = request.security_lower_tf(syminfo.tickerid, dataTf, [open, close, high, low, vol()])
+
+//==========================
+//Functions
+//==========================
+resetProfile(bool enable) =>
+    if enable
+        array.fill(vpGreen, 0)
+        array.fill(vpRed, 0)
+        array.clear(ltfOpen)
+        array.clear(ltfHigh)
+        array.clear(ltfLow)
+        array.clear(ltfClose)
+        array.clear(ltfVolume)
+
+profHigh = ta.highest(high, lookback+1)[1]
+profLow = ta.lowest(low, lookback+1)[1]
+
+tr = ta.atr(1)
+atr = ta.atr(14)
+
+get_vol(y11, y12, y21, y22, height, vol) =>
+    nz(math.max(math.min(math.max(y11, y12), math.max(y21, y22)) - math.max(math.min(y11, y12), math.min(y21, y22)), 0) * vol / height)
+
+profileAdd(o, h, l, c, v, g, w) =>
+    zoneDist = array.new_float(resolution, 0)
+    distSum = 0.0
+    for i = 0 to array.size(vpGreen) - 1
+        zoneTop = array.get(zoneBounds, i)
+        zoneBot = zoneTop - g
+
+        body_top = math.max(c, o)
+        body_bot = math.min(c, o)
+        itsgreen = c >= o
+
+        topwick = h - body_top
+        bottomwick = body_bot - l
+        body = body_top - body_bot
+
+        bodyvol = body * v / (2 * topwick + 2 * bottomwick + body)
+        topwickvol = 2 * topwick * v / (2 * topwick + 2 * bottomwick + body)
+        bottomwickvol = 2 * bottomwick * v / (2 * topwick + 2 * bottomwick + body)
+
+        if volType == 'Volume'
+            array.set(vpGreen, i, array.get(vpGreen, i) + (itsgreen ? get_vol(zoneBot, zoneTop, body_bot, body_top, body, bodyvol) : 0) + get_vol(zoneBot, zoneTop, body_top, h, topwick, topwickvol) / 2 + get_vol(zoneBot, zoneTop, body_bot, l, bottomwick, bottomwickvol) / 2)
+            array.set(vpRed, i, array.get(vpRed, i) + (itsgreen ? 0 : get_vol(zoneBot, zoneTop, body_bot, body_top, body, bodyvol)) + get_vol(zoneBot, zoneTop, body_top, h, topwick, topwickvol) / 2 + get_vol(zoneBot, zoneTop, body_bot, l, bottomwick, bottomwickvol) / 2)
+        else if volType == 'Open Interest'
+            if v > 0    
+                array.set(vpGreen, i, array.get(vpGreen, i) + get_vol(zoneBot, zoneTop, body_bot, body_top, body, v))
+            if v < 0
+                array.set(vpRed, i, array.get(vpRed, i) + get_vol(zoneBot, zoneTop, body_bot, body_top, body, -v))
+
+calcSession(bool update) =>
+    array.fill(vpGreen, 0)
+    array.fill(vpRed, 0)
+    if bar_index > lookback and update
+        gap = (profHigh - profLow) / resolution
+        for i = 0 to resolution - 1
+            array.set(zoneBounds, i, profHigh - gap * i)
+        if array.size(ltfOpen) > 0
+            for j = 0 to array.size(ltfOpen) - 1    
+                profileAdd(array.get(ltfOpen, j), array.get(ltfHigh, j), array.get(ltfLow, j), array.get(ltfClose, j), array.get(ltfVolume, j), gap, 1)
+
+pocLevel() =>
+    float maxVol = 0
+    int levelInd = 0
+    for i = 0 to array.size(vpRed) - 1
+        if array.get(vpRed, i) + array.get(vpGreen, i) > maxVol
+            maxVol := array.get(vpRed, i) + array.get(vpGreen, i)
+            levelInd := i
+    
+    float outLevel = na
+    if levelInd != array.size(vpRed) - 1
+        outLevel := array.get(zoneBounds, levelInd) - (array.get(zoneBounds, levelInd) - array.get(zoneBounds, levelInd+1)) / 2
+    outLevel
+
+valueLevels(float poc) =>
+    float gap = (profHigh - profLow) / resolution
+    float volSum = array.sum(vpRed) + array.sum(vpGreen)
+    float volCnt = 0
+    
+    float vah = profHigh
+    float val = profLow
+
+    int pocInd = 0
+    for i = 0 to array.size(zoneBounds)-2
+        if array.get(zoneBounds, i) >= poc and array.get(zoneBounds, i + 1) < poc
+            pocInd := i
+    
+    volCnt += (array.get(vpRed, pocInd) + array.get(vpGreen, pocInd))
+    for i = 1 to array.size(vpRed)
+        if pocInd + i >= 0 and pocInd + i < array.size(vpRed)    
+            volCnt += (array.get(vpRed, pocInd + i) + array.get(vpGreen, pocInd + i))
+            if volCnt >= volSum * (VAwid/100)    
+                break 
+            else
+                val := array.get(zoneBounds, pocInd + i) - gap
+        if pocInd - i >= 0 and pocInd - i < array.size(vpRed)    
+            volCnt += (array.get(vpRed, pocInd - i) + array.get(vpGreen, pocInd - i))
+            if volCnt >= volSum * (VAwid/100)    
+                break 
+            else
+                vah := array.get(zoneBounds, pocInd - i)
+
+    [val, vah]
+
+trimHistoryTo(int target) =>
+    while array.size(histBoxCounts) > target
+        bCount = array.shift(histBoxCounts)
+        lCount = array.shift(histLineCounts)
+        labCount = array.shift(histLabelCounts)
+        if bCount > 0
+            for i = 1 to bCount
+                b = array.shift(histBoxes)
+                box.delete(b)
+        if lCount > 0
+            for i = 1 to lCount
+                l = array.shift(histLines)
+                line.delete(l)
+        if labCount > 0
+            for i = 1 to labCount
+                lb = array.shift(histLabels)
+                label.delete(lb)
+
+labelSize() =>
+    switch lineLabelSize
+        'Tiny' => size.tiny
+        'Small' => size.small
+        'Normal' => size.normal
+        'Large' => size.large
+        'Huge' => size.huge
+        => size.small
+
+updateRecentLevels(bool newSessionCompleted, float sessionLeftMax, float poc, float vah, float val) =>
+    var line pocLineRecent = na
+    var line vahLineRecent = na
+    var line valLineRecent = na
+    var label pocLabRecent = na
+    var label vahLabRecent = na
+    var label valLabRecent = na
+
+    aheadX = bar_index + drawAheadBars
+
+    if newSessionCompleted
+        line.delete(pocLineRecent)
+        line.delete(vahLineRecent)
+        line.delete(valLineRecent)
+        label.delete(pocLabRecent)
+        label.delete(vahLabRecent)
+        label.delete(valLabRecent)
+        if showPoc
+            pocLineRecent := line.new(int(sessionLeftMax), poc, aheadX, poc, color=color.new(pocCol, 0), width=pocWid)
+            if showLineLabels
+                pocLabRecent := label.new(aheadX, poc, "POC", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+        if showVA
+            vahLineRecent := line.new(int(sessionLeftMax), vah, aheadX, vah, color=vahCol, width=vahWid)
+            valLineRecent := line.new(int(sessionLeftMax), val, aheadX, val, color=valCol, width=valWid)
+            if showLineLabels
+                vahLabRecent := label.new(aheadX, vah, "VAH", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+                valLabRecent := label.new(aheadX, val, "VAL", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+    else
+        if not na(pocLineRecent)
+            line.set_x2(pocLineRecent, aheadX)
+        if not na(vahLineRecent)
+            line.set_x2(vahLineRecent, aheadX)
+        if not na(valLineRecent)
+            line.set_x2(valLineRecent, aheadX)
+        if not na(pocLabRecent)
+            label.set_x(pocLabRecent, aheadX)
+        if not na(vahLabRecent)
+            label.set_x(vahLabRecent, aheadX)
+        if not na(valLabRecent)
+            label.set_x(valLabRecent, aheadX)
+    
+    nz(0.0)
+
+drawCurZone(bool update, bool delete) =>
+    var line pocLine = na
+    var line vahLine = na
+    var line valLine = na
+    var box outBox = na
+    var label sessionLab = na
+    var label pocLab = na
+    var label vahLab = na
+    var label valLab = na
+
+    var redBoxes = array.new_box(array.size(vpRed), na)
+    var greenBoxes = array.new_box(array.size(vpRed), na)
+
+    if bar_index > lookback and update and array.sum(vpGreen) + array.sum(vpRed) > 0
+        if not na(pocLine)
+            line.delete(pocLine)
+        if not na(vahLine)
+            line.delete(vahLine)
+        if not na(valLine)
+            line.delete(valLine)
+        if not na(outBox)
+            box.delete(outBox)
+        if not na(sessionLab)
+            label.delete(sessionLab)
+        if not na(pocLab)
+            label.delete(pocLab)
+        if not na(vahLab)
+            label.delete(vahLab)
+        if not na(valLab)
+            label.delete(valLab)
+
+        for i = 0 to array.size(redBoxes) - 1
+            if not na(array.get(redBoxes, i))
+                box.delete(array.get(redBoxes, i))
+                box.delete(array.get(greenBoxes, i))
+
+        gap = (profHigh - profLow) / resolution
+        float leftMax = bar_index[lookback]
+        float sessionSpan = (bar_index - 1) - leftMax
+        float rightMax = leftMax + sessionSpan * (profWidthPct / 100)
+        float rightMaxVol = array.max(vpGreen)+array.max(vpRed)
+        float buffer = gap / 10
+        if showLabels
+            sessionLab := label.new((bar_index - 1 + int(leftMax))/2, profHigh, sessionType, color=color.rgb(0,0,0,100), textcolor=chart.fg_color)
+        if showProf
+            for i = 0 to array.size(vpRed) - 1
+                greenEnd = int(leftMax + (rightMax - leftMax) * (array.get(vpGreen, i) / rightMaxVol))
+                redEnd = int(greenEnd + (rightMax - leftMax) * (array.get(vpRed, i) / rightMaxVol))
+                if dispMode == 'Mode 2'
+                    array.set(greenBoxes, i, box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0))
+                    array.set(redBoxes, i, box.new(greenEnd, array.get(zoneBounds, i) - buffer, redEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bearCol, border_width=0))
+                else if dispMode == 'Mode 1'
+                    array.set(greenBoxes, i, box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0))
+                else 
+                    array.set(greenBoxes, i, box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0))
+                    array.set(redBoxes, i, box.new(int(leftMax)-redEnd+greenEnd, array.get(zoneBounds, i) - buffer, int(leftMax), array.get(zoneBounds, i) - gap + buffer, bgcolor=bearCol, border_width=0))
+        
+        if showSbox
+            outBox := box.new(int(leftMax), profHigh, bar_index-1, profLow, chart.fg_color, boxWid, line.style_dashed, bgcolor=boxBg)
+
+        poc = pocLevel()
+        [val, vah] = valueLevels(poc)
+        if showPoc
+            line.delete(pocLine)
+            pocLine := line.new(int(leftMax), poc, bar_index-1+extendLiveLinesBars, poc, color=color.new(pocCol, 0), width=pocWid)
+            label.delete(pocLab)
+            if showLineLabels
+                pocLab := label.new(bar_index-1+extendLiveLinesBars, poc, "POC", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+        if showVA
+            line.delete(vahLine)
+            line.delete(valLine)            
+            vahLine := line.new(int(leftMax), vah, bar_index-1+extendLiveLinesBars, vah, color=vahCol, width=vahWid)
+            valLine := line.new(int(leftMax), val, bar_index-1+extendLiveLinesBars, val, color=valCol, width=valWid)
+            label.delete(vahLab)
+            label.delete(valLab)
+            if showLineLabels
+                vahLab := label.new(bar_index-1+extendLiveLinesBars, vah, "VAH", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+                valLab := label.new(bar_index-1+extendLiveLinesBars, val, "VAL", color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+        if showVAb
+            box.new(int(leftMax), vah, bar_index-1, val, border_color=color.rgb(54, 58, 69, 100), bgcolor=VAbCol)
+
+    if delete
+        box.delete(outBox)
+        line.delete(pocLine)
+        line.delete(vahLine)
+        line.delete(valLine)
+        label.delete(pocLab)
+        label.delete(vahLab)
+        label.delete(valLab)
+        for i = 0 to array.size(greenBoxes)-1
+            box.delete(array.get(greenBoxes, i))
+        for i = 0 to array.size(redBoxes)-1
+            box.delete(array.get(redBoxes, i))
+
+drawForexBox(int startBar, string title, float top, float bottom) =>
+    box.new(startBar, top, bar_index-1, bottom, chart.fg_color, boxWid, line.style_dashed, bgcolor=boxBg)
+    if showLabels    
+        label.new((bar_index - 1 + startBar)/2, top, title, color=color.rgb(0,0,0,100), textcolor=chart.fg_color)
+
+updateIntra(o, h, l, c, v) =>
+    if array.size(o) > 0
+        for i = 0 to array.size(o) - 1
+            array.push(ltfOpen, array.get(o, i))
+            array.push(ltfHigh,array.get(h, i)) 
+            array.push(ltfLow,array.get(l, i)) 
+            array.push(ltfClose,array.get(c, i)) 
+            array.push(ltfVolume,array.get(v, i))
+
+//==========================
+// Execution Logic
+//==========================
+adjTime = time - dailyStartHour * 60 * 60 * 1000
+adjYear = year(adjTime, sessionTz)
+adjMonth = month(adjTime, sessionTz)
+adjDay = dayofmonth(adjTime, sessionTz)
+adjWeek = weekofyear(adjTime, sessionTz)
+
+newDaily = adjDay != adjDay[1] or adjMonth != adjMonth[1] or adjYear != adjYear[1]
+newWeekly = adjWeek != adjWeek[1] or adjYear != adjYear[1]
+newMonthly = adjMonth != adjMonth[1] or adjYear != adjYear[1]
+newYearly = adjYear != adjYear[1]
+newQuarterly = (adjMonth != adjMonth[1] or adjYear != adjYear[1]) and (adjMonth - 1) % 3 == 0
+
+utcHour = hour(time(timeframe.period, '0000-2400', 'GMT'), 'GMT')
+
+newTokyo = utcHour != utcHour[1] + 1 and utcHour != utcHour[1]
+endTokyo = utcHour >= 9 and utcHour[1] < 9
+
+newLondon = utcHour >= 7 and utcHour[1] < 7
+endLondon = utcHour >= 16 and utcHour[1] < 16
+
+newNewYork = utcHour >= 13 and utcHour[1] < 13
+endNewYork = utcHour >= 22 and utcHour[1] < 22
+
+newSession = switch sessionType
+    'Tokyo' => newTokyo
+    'London' => newLondon
+    'New York' => newNewYork
+    'Daily' => newDaily
+    'Weekly' => newWeekly
+    'Monthly' => newMonthly
+    'Yearly' => newYearly
+    'Quarterly' => newQuarterly
+    => newDaily
+
+zoneEnd = switch sessionType
+    'Tokyo' => endTokyo
+    'London' => endLondon
+    'New York' => endNewYork
+    'Daily' => newDaily
+    'Weekly' => newWeekly
+    'Monthly' => newMonthly
+    'Yearly' => newYearly
+    'Quarterly' => newQuarterly
+    => newDaily
+
+isForex = showFx
+
+calcSession(zoneEnd or (barstate.islast and showCur))
+
+if bar_index > lookback and zoneEnd and array.sum(vpGreen) + array.sum(vpRed) > 0
+    gap = (profHigh - profLow) / resolution
+    float leftMax = bar_index[lookback]
+    float sessionSpan = (bar_index - 1) - leftMax
+    float rightMax = leftMax + sessionSpan * (profWidthPct / 100)
+    float rightMaxVol = array.max(vpGreen)+array.max(vpRed)
+    float buffer = gap / 10
+
+    int boxesAdded = 0
+    int linesAdded = 0
+    int labelsAdded = 0
+
+    trimHistoryTo(math.max(maxHistProfiles - 1, 0))
+
+    if showLabels
+        lab = label.new((bar_index - 1 + int(leftMax))/2, profHigh, sessionType, color=color.rgb(0,0,0,100), textcolor=chart.fg_color)
+        array.push(histLabels, lab)
+        labelsAdded += 1
+    if showProf
+        for i = 0 to array.size(vpRed) - 1
+            greenEnd = int(leftMax + (rightMax - leftMax) * (array.get(vpGreen, i) / rightMaxVol))
+            redEnd = int(greenEnd + (rightMax - leftMax) * (array.get(vpRed, i) / rightMaxVol))
+            if dispMode == 'Mode 2'
+                b1 = box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0)
+                b2 = box.new(greenEnd, array.get(zoneBounds, i) - buffer, redEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bearCol, border_width=0)
+                array.push(histBoxes, b1)
+                array.push(histBoxes, b2)
+                boxesAdded += 2
+            else if dispMode == 'Mode 1'
+                b1 = box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0)
+                array.push(histBoxes, b1)
+                boxesAdded += 1
+            else 
+                b1 = box.new(int(leftMax), array.get(zoneBounds, i) - buffer, greenEnd, array.get(zoneBounds, i) - gap + buffer, bgcolor=bullCol, border_width=0)
+                b2 = box.new(int(leftMax)-redEnd+greenEnd, array.get(zoneBounds, i) - buffer, int(leftMax), array.get(zoneBounds, i) - gap + buffer, bgcolor=bearCol, border_width=0)
+                array.push(histBoxes, b1)
+                array.push(histBoxes, b2)
+                boxesAdded += 2
+
+    if showSbox
+        outlineBox = box.new(int(leftMax), profHigh, bar_index-1, profLow, chart.fg_color, boxWid, line.style_dashed, bgcolor=boxBg)
+        array.push(histBoxes, outlineBox)
+        boxesAdded += 1
+
+    poc = pocLevel()
+    [val, vah] = valueLevels(poc)
+
+    if maxHistProfiles > 0
+        if showPoc
+            pocL = line.new(int(leftMax), poc, bar_index-1, poc, color=color.new(pocCol, 0), width=pocWid)
+            array.push(histLines, pocL)
+            linesAdded += 1
+            if showLineLabels
+                string lblTxt = extendRecentLevels ? "" : "POC"
+                pocLab = label.new(bar_index-1, poc, lblTxt, color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+                array.push(histLabels, pocLab)
+                labelsAdded += 1
+                
+                if extendRecentLevels and not na(lastStaticPocLab)
+                    label.set_text(lastStaticPocLab, "POC")
+                lastStaticPocLab := pocLab
+
+        if showVA
+            vahL = line.new(int(leftMax), vah, bar_index-1, vah, color=vahCol, width=vahWid)
+            valL = line.new(int(leftMax), val, bar_index-1, val, color=valCol, width=valWid)
+            array.push(histLines, vahL)
+            array.push(histLines, valL)
+            linesAdded += 2
+            if showLineLabels
+                string lblTxtVah = extendRecentLevels ? "" : "VAH"
+                string lblTxtVal = extendRecentLevels ? "" : "VAL"
+                vahLab = label.new(bar_index-1, vah, lblTxtVah, color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+                valLab = label.new(bar_index-1, val, lblTxtVal, color=color(na), textcolor=lineLabelTextColor, style=label.style_label_left, textalign=text.align_left, size=labelSize())
+                array.push(histLabels, vahLab)
+                array.push(histLabels, valLab)
+                labelsAdded += 2
+                
+                if extendRecentLevels and not na(lastStaticVahLab)
+                    label.set_text(lastStaticVahLab, "VAH")
+                if extendRecentLevels and not na(lastStaticValLab)
+                    label.set_text(lastStaticValLab, "VAL")
+                
+                lastStaticVahLab := vahLab
+                lastStaticValLab := valLab
+
+    if showVAb
+        vabBox = box.new(int(leftMax), vah, bar_index-1, val, border_color=color.rgb(54, 58, 69, 100), bgcolor=VAbCol)
+        array.push(histBoxes, vabBox)
+        boxesAdded += 1
+
+    array.push(histBoxCounts, boxesAdded)
+    array.push(histLineCounts, linesAdded)
+    array.push(histLabelCounts, labelsAdded)
+
+drawCurZone(barstate.islast and not zoneEnd and showCur and activeZone, zoneEnd)
+
+if extendRecentLevels
+    if zoneEnd and bar_index > lookback and array.sum(vpGreen) + array.sum(vpRed) > 0
+        _recentPoc = pocLevel()
+        [_recentVal, _recentVah] = valueLevels(_recentPoc)
+        updateRecentLevels(true, float(bar_index[lookback]), _recentPoc, _recentVah, _recentVal)
+    else
+        updateRecentLevels(false, float(na), float(na), float(na), float(na))
+
+resetProfile(newSession)
+updateIntra(dO, dH, dL, dC, dV)
+
+if zoneEnd 
+    activeZone := false
+
+if newSession
+    zoneStart := bar_index
+    activeZone := true
+
+if newLondon
+    londonStart := bar_index 
+if newTokyo
+    tokyoStart := bar_index 
+if newNewYork
+    nyStart := bar_index
+
+londonHigh = ta.highest(high, bar_index-londonStart+1)
+tokyoHigh = ta.highest(high, bar_index-tokyoStart+1)
+nyHigh = ta.highest(high, bar_index-nyStart+1)
+
+londonLow = ta.lowest(low, bar_index-londonStart+1)
+tokyoLow = ta.lowest(low, bar_index-tokyoStart+1)
+nyLow = ta.lowest(low, bar_index-nyStart+1)
+
+if endLondon and isForex
+    drawForexBox(londonStart, 'London', londonHigh, londonLow)
+if endNewYork and isForex
+    drawForexBox(nyStart, 'New York', nyHigh, nyLow)
+if endTokyo and isForex
+    drawForexBox(tokyoStart, 'Tokyo', tokyoHigh, tokyoLow)

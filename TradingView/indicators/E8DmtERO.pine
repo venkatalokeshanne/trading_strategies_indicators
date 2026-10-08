@@ -1,0 +1,1174 @@
+//@version=6
+indicator("Swing Pressure Model v1.43", overlay=true, max_labels_count=500)
+
+// ============================================================
+// INPUTS
+// ============================================================
+
+// Trend
+int fastLength = input.int(10, "Fast MA", minval=1, group="Trend")
+int slowLength = input.int(50, "Slow MA", minval=1, group="Trend")
+
+// Pressure
+int pressureFast = input.int(3, "Pressure Fast Length", minval=1, group="Pressure")
+int pressureLong = input.int(27, "Pressure Normalize Length", minval=5, group="Pressure")
+float vphQualityLimit = input.float(20.0, "VPH Quality Limit", minval=1, group="Pressure")
+
+// Volume
+int volumeAvgLength = input.int(20, "Volume Average Length", minval=2, group="Volume")
+float strongRvol = input.float(1.3, "Strong Relative Volume", minval=0.5, step=0.1, group="Volume")
+
+// Divergence
+int divergenceLength = input.int(5, "Divergence Length", minval=2, group="Divergence")
+float divergenceThreshold = input.float(10.0, "VPO Divergence Threshold", minval=1, group="Divergence")
+
+// Black K
+int blackLookback = input.int(10, "Previous Completed K Lookback", minval=1, group="Risk")
+int normalBlackThreshold = input.int(5, "Normal Black K Threshold", minval=1, group="Risk")
+int strictBlackThreshold = input.int(3, "Black K Threshold When Market < MA20", minval=1, group="Risk")
+float blackDropPercent = input.float(2.0, "Black K Drop %", minval=0.1, step=0.1, group="Risk")
+
+// Market
+string marketMode = input.string("Auto", "Market Mode", options=["Auto", "Manual"], group="Market")
+string manualMarketSymbol = input.symbol("TWSE:TAIEX", "Manual Market Index", group="Market")
+string marketTimeframe = input.timeframe("D", "Market Timeframe", group="Market")
+int marketMA20Length = input.int(20, "Market MA20", minval=1, group="Market")
+int marketMA50Length = input.int(50, "Market MA50", minval=1, group="Market")
+
+// Cost Zone
+int costZoneLookback = input.int(20, "Volume Cost Lookback", minval=5, group="Cost Zone")
+float costZonePercent = input.float(1.5, "Cost Zone Width %", minval=0.1, step=0.1, group="Cost Zone")
+int costConfirmDays = input.int(2, "Cost Break/Up Confirm Days", minval=1, maxval=5, group="Cost Zone")
+bool showCostZone = input.bool(true, "Show Cost Zone", group="Cost Zone")
+
+// Correlation
+int correlationLookback = input.int(200, "Correlation Lookback", minval=50, group="Correlation")
+
+// Risk Management
+int atrLength = input.int(14, "ATR Length", minval=1, group="Risk Mgmt")
+float atrStopMult = input.float(2.0, "Initial ATR Stop Mult", minval=0.1, step=0.1, group="Risk Mgmt")
+float atrTrailMult = input.float(3.0, "Trailing ATR Mult", minval=0.1, step=0.1, group="Risk Mgmt")
+
+// Display
+bool showEarlySignals = input.bool(false, "Show TURN+ / TURN-", group="Display")
+bool showStatusTable = input.bool(true, "Show Status Table", group="Display")
+
+
+// ============================================================
+// AUTO MARKET SYMBOL
+// ============================================================
+
+string autoMarketSymbol =
+     syminfo.prefix == "TWSE" or syminfo.prefix == "TPEX" ? "TWSE:TAIEX" :
+     syminfo.prefix == "NASDAQ" or syminfo.prefix == "NYSE" or syminfo.prefix == "AMEX" ? "SP:SPX" :
+     syminfo.prefix == "SSE" ? "SSE:000001" :
+     syminfo.prefix == "SZSE" ? "SZSE:399001" :
+     syminfo.prefix == "HKEX" ? "HSI:HSI" :
+     "SP:SPX"
+
+string activeMarketSymbol =
+     marketMode == "Auto" ? autoMarketSymbol : manualMarketSymbol
+
+
+// ============================================================
+// MOVING AVERAGES
+// ============================================================
+
+float fastMA = ta.sma(close, fastLength)
+float slowMA = ta.sma(close, slowLength)
+
+bool stockTrendUp = fastMA > slowMA
+
+plot(fastMA, "Fast MA", color=color.blue)
+plot(slowMA, "Slow MA", color=color.orange)
+
+
+// ============================================================
+// MARKET DATA
+// ============================================================
+
+float marketClose =
+     request.security(
+         activeMarketSymbol,
+         marketTimeframe,
+         close,
+         lookahead=barmerge.lookahead_off)
+
+float marketMA20 =
+     request.security(
+         activeMarketSymbol,
+         marketTimeframe,
+         ta.sma(close, marketMA20Length),
+         lookahead=barmerge.lookahead_off)
+
+float marketMA50 =
+     request.security(
+         activeMarketSymbol,
+         marketTimeframe,
+         ta.sma(close, marketMA50Length),
+         lookahead=barmerge.lookahead_off)
+
+bool marketDataOK =
+     not na(marketClose) and
+     not na(marketMA20) and
+     not na(marketMA50)
+
+bool marketAbove20MA =
+     marketDataOK and marketClose > marketMA20
+
+bool marketAbove50MA =
+     marketDataOK and marketClose > marketMA50
+
+bool marketBelow20MA =
+     marketDataOK and marketClose < marketMA20
+
+bool marketBelow50MA =
+     marketDataOK and marketClose < marketMA50
+
+bool marketAllowLong =
+     marketAbove20MA or marketAbove50MA
+
+
+// ============================================================
+// BLACK K
+// Previous completed bars only.
+// ============================================================
+
+f_countBlackBars(int length, float dropPercent) =>
+    int count = 0
+
+    for i = 1 to length
+        if bar_index >= i
+            bool blackK =
+                 close[i] <= open[i] * (1 - dropPercent / 100)
+
+            if blackK
+                count += 1
+
+    count
+
+int effectiveBlackCount =
+     f_countBlackBars(
+         blackLookback,
+         blackDropPercent)
+
+int activeBlackThreshold =
+     marketBelow20MA ?
+     strictBlackThreshold :
+     normalBlackThreshold
+
+bool blackDangerZone =
+     effectiveBlackCount >= activeBlackThreshold
+
+bool blackDangerStart =
+     blackDangerZone and
+     not blackDangerZone[1]
+
+
+// ============================================================
+// MARKET STATE
+// ============================================================
+
+bool marketRecoverCross20 =
+     ta.crossover(marketClose, marketMA20)
+
+bool marketRecoverCross50 =
+     ta.crossover(marketClose, marketMA50)
+
+bool marketRecovered =
+     marketAbove20MA and
+     marketAbove50MA and
+     (marketRecoverCross20 or marketRecoverCross50)
+
+bool defenseMode =
+     marketBelow20MA and
+     marketBelow50MA and
+     blackDangerZone
+
+string marketState =
+     not marketDataOK ? "NO DATA" :
+     defenseMode ? "DEFENSE" :
+     marketBelow50MA ? "RISK" :
+     marketBelow20MA ? "CAUTION" :
+     marketRecovered ? "RECOVER" :
+     "NORMAL"
+
+
+// ============================================================
+// BUY / SELL PRESSURE
+// ============================================================
+
+float safeVolume =
+     nz(volume, 0)
+
+float barRange =
+     high - low
+
+float BP =
+     barRange > 0 ?
+     safeVolume * (close - low) / barRange :
+     0
+
+float SP =
+     barRange > 0 ?
+     safeVolume * (high - close) / barRange :
+     0
+
+float TPV = BP + SP
+float BPV = BP
+float SPV = SP
+
+float BPVavg =
+     ta.ema(
+         ta.ema(BPV, pressureFast),
+         pressureFast)
+
+float SPVavg =
+     ta.ema(
+         ta.ema(SPV, pressureFast),
+         pressureFast)
+
+float TPVavg =
+     ta.ema(
+         ta.wma(TPV, pressureFast),
+         pressureFast)
+
+
+// ============================================================
+// VPO RAW
+// ============================================================
+
+float vpoRaw =
+     TPVavg != 0 ?
+     ((BPVavg - SPVavg) / TPVavg) * 100 :
+     0
+
+
+// ============================================================
+// VPO NORMALIZED
+// ============================================================
+
+float avgVolume =
+     ta.ema(safeVolume, pressureLong)
+
+float avgBP =
+     ta.ema(BP, pressureLong)
+
+float avgSP =
+     ta.ema(SP, pressureLong)
+
+float VN =
+     avgVolume != 0 ?
+     safeVolume / avgVolume :
+     1
+
+float BPN =
+     avgBP != 0 ?
+     BP / avgBP * VN * 100 :
+     0
+
+float SPN =
+     avgSP != 0 ?
+     SP / avgSP * VN * 100 :
+     0
+
+float TPN = BPN + SPN
+
+float nbf =
+     ta.ema(
+         ta.wma(BPN, pressureFast),
+         pressureFast)
+
+float nsf =
+     ta.ema(
+         ta.wma(SPN, pressureFast),
+         pressureFast)
+
+float tpf =
+     ta.ema(
+         ta.wma(TPN, pressureFast),
+         pressureFast)
+
+float vpoNorm =
+     tpf != 0 ?
+     ((nbf - nsf) / tpf) * 100 :
+     0
+
+
+// ============================================================
+// VPH / PRESSURE QUALITY
+// ============================================================
+
+float VPH =
+     vpoRaw - vpoNorm
+
+float vphAbs =
+     math.abs(VPH)
+
+float pressureQuality =
+     math.max(
+         0.5,
+         math.min(
+             1.0,
+             1 - vphAbs / (2 * vphQualityLimit)))
+
+// ============================================================
+// PRESSURE MOMENTUM
+// ============================================================
+
+float vpoChange3 =
+     vpoRaw - vpoRaw[3]
+
+float vpoChange5 =
+     vpoRaw - vpoRaw[5]
+
+bool pressureRising3 =
+     vpoRaw > vpoRaw[1] and
+     vpoRaw[1] > vpoRaw[2]
+
+bool pressureFalling3 =
+     vpoRaw < vpoRaw[1] and
+     vpoRaw[1] < vpoRaw[2]
+
+
+// ============================================================
+// RELATIVE VOLUME
+// ============================================================
+
+float volumeAverage =
+     ta.sma(volume, volumeAvgLength)
+
+float rvol =
+     volumeAverage > 0 ?
+     nz(volume, 0) / volumeAverage :
+     1
+
+
+// ============================================================
+// DIVERGENCE
+// ============================================================
+
+float priceChangeDiv =
+     not na(close[divergenceLength]) ?
+     close / close[divergenceLength] - 1 :
+     0
+
+float pressureChangeDiv =
+     vpoRaw - nz(vpoRaw[divergenceLength])
+
+bool bullishPressureDivergence =
+     priceChangeDiv < 0 and
+     pressureChangeDiv >= divergenceThreshold
+
+bool bearishPressureDivergence =
+     priceChangeDiv > 0 and
+     pressureChangeDiv <= -divergenceThreshold
+
+
+// ============================================================
+// VOLUME WEIGHTED COST ZONE
+// ============================================================
+
+float costNumerator =
+     math.sum(hlc3 * volume, costZoneLookback)
+
+float costDenominator =
+     math.sum(volume, costZoneLookback)
+
+float volumeCost =
+     costDenominator > 0 ?
+     costNumerator / costDenominator :
+     na
+
+float costZoneUpper =
+     volumeCost * (1 + costZonePercent / 100)
+
+float costZoneLower =
+     volumeCost * (1 - costZonePercent / 100)
+
+int aboveCostCount = 0
+int belowCostCount = 0
+
+for i = 0 to costConfirmDays - 1
+
+    if not na(costZoneUpper[i]) and
+       close[i] > costZoneUpper[i]
+
+        aboveCostCount += 1
+
+    if not na(costZoneLower[i]) and
+       close[i] < costZoneLower[i]
+
+        belowCostCount += 1
+
+bool costUpCondition =
+     aboveCostCount >= costConfirmDays
+
+bool costBreakCondition =
+     belowCostCount >= costConfirmDays
+
+bool costUpSignal =
+     costUpCondition and
+     not costUpCondition[1]
+
+bool costBreakSignal =
+     costBreakCondition and
+     not costBreakCondition[1]
+
+
+// ============================================================
+// COST ZONE DISPLAY
+// ============================================================
+
+costUpperPlot =
+     plot(
+         showCostZone ? costZoneUpper : na,
+         "Cost Zone Upper",
+         color=color.new(color.purple, 70))
+
+costLowerPlot =
+     plot(
+         showCostZone ? costZoneLower : na,
+         "Cost Zone Lower",
+         color=color.new(color.purple, 70))
+
+plot(
+     showCostZone ? volumeCost : na,
+     "Volume Cost",
+     color=color.purple,
+     linewidth=1)
+
+fill(
+     costUpperPlot,
+     costLowerPlot,
+     color=color.new(color.purple, 92))
+
+
+// ============================================================
+// SCORES
+// ============================================================
+
+// Trend +/-25
+float trendScore = 0
+
+trendScore +=
+     close > fastMA ? 10 : -10
+
+trendScore +=
+     fastMA > slowMA ? 15 : -15
+
+
+// Pressure +/-25
+float pressureScore = 0
+
+pressureScore +=
+     vpoRaw > 0 ? 15 : -15
+
+pressureScore +=
+     vpoChange3 > 0 ? 10 : -10
+
+pressureScore *= pressureQuality
+
+
+// Volume +/-15
+float volumeScore = 0
+
+if vpoChange3 > 0
+    volumeScore :=
+         rvol >= strongRvol ? 15 :
+         rvol >= 1.0 ? 10 :
+         5
+else
+    volumeScore :=
+         rvol >= strongRvol ? -15 :
+         rvol >= 1.0 ? -10 :
+         -5
+
+
+// Divergence +/-20
+float divergenceScore =
+     bullishPressureDivergence ? 20 :
+     bearishPressureDivergence ? -20 :
+     0
+
+
+// Market +/-15
+float marketScore =
+     marketAbove20MA and marketAbove50MA ? 15 :
+     marketAbove20MA or marketAbove50MA ? 5 :
+     -15
+
+
+// ============================================================
+// SWING STRENGTH
+// ============================================================
+
+float rawStrength =
+     trendScore +
+     pressureScore +
+     volumeScore +
+     divergenceScore +
+     marketScore
+
+float swingStrength =
+     math.max(
+         -100,
+         math.min(100, rawStrength))
+
+float strengthChange3 =
+     swingStrength - swingStrength[3]
+
+float strengthChange5 =
+     swingStrength - swingStrength[5]
+
+
+// ============================================================
+// EARLY TURN
+// ============================================================
+
+bool earlyTurnUp =
+     swingStrength > -20 and
+     strengthChange3 >= 20 and
+     pressureRising3
+
+bool earlyTurnDown =
+     swingStrength < 20 and
+     strengthChange3 <= -20 and
+     pressureFalling3
+
+
+// ============================================================
+// POSITION STATE
+// ============================================================
+
+var bool inPosition = false
+var float entryPrice = na
+var float activeStop = na
+var int suggestedSize = 0
+
+
+// ============================================================
+// PRE-BUY
+//
+// PRE-BUY = developing bullish setup.
+// It is NOT a formal BUY.
+//
+// Requirements:
+// Swing       15 ~ <30
+// Delta 3     >= +20
+// Delta 5     > 0
+// VPO         > 0
+// Price       > Fast MA
+// Market      Allows Long
+// ============================================================
+
+bool preBuy =
+     marketAllowLong and
+     swingStrength >= 15 and
+     swingStrength < 30 and
+     strengthChange3 >= 20 and
+     strengthChange5 > 0 and
+     vpoRaw > 0 and
+     close > fastMA
+
+
+// ============================================================
+// BUY
+// Formal confirmation remains unchanged.
+// ============================================================
+
+bool strongMomentum =
+     not na(high[1]) and
+     close > high[1]
+
+bool buySignal =
+     marketAllowLong and
+     swingStrength >= 30 and
+     swingStrength[1] < 30 and
+     strengthChange3 > 0 and
+     vpoRaw > 0 and
+     strongMomentum
+
+
+// ============================================================
+// ADD
+// ============================================================
+
+bool addSignal =
+     inPosition and
+     not buySignal and
+     marketAllowLong and
+     stockTrendUp and
+     close > fastMA and
+     swingStrength >= 60 and
+     swingStrength[1] < 60 and
+     strengthChange3 > 0 and
+     vpoRaw > 0 and
+     pressureRising3
+
+
+// ============================================================
+// SELL
+// ============================================================
+
+bool priceWeakening =
+     close < fastMA
+
+bool pressureWeakening =
+     vpoRaw < 0 and
+     strengthChange3 < 0
+
+bool sellCondition =
+     swingStrength <= -20 and
+     priceWeakening and
+     pressureWeakening
+
+bool sellSignal =
+     sellCondition and
+     not sellCondition[1]
+
+
+// ============================================================
+// EXIT
+// ============================================================
+
+bool severeInternalWeakness =
+     swingStrength <= -50 and
+     vpoRaw < 0 and
+     pressureFalling3
+
+bool severeMarketRisk =
+     marketBelow50MA and
+     blackDangerZone
+
+bool structuralCostBreak =
+     costBreakCondition and
+     swingStrength < -30
+
+bool exitCondition =
+     severeInternalWeakness and
+     (severeMarketRisk or structuralCostBreak)
+
+bool exitSignal =
+     exitCondition and
+     not exitCondition[1]
+
+
+// ============================================================
+// ATR RISK MANAGEMENT
+// ============================================================
+
+float atr =
+     ta.atr(atrLength)
+
+if buySignal and not inPosition
+    inPosition := true
+    entryPrice := close
+    activeStop := close - atrStopMult * atr
+    suggestedSize := swingStrength >= 60 ? 2 : 1
+
+if addSignal
+    suggestedSize := 2
+
+if inPosition
+    float newTrail =
+         close - atrTrailMult * atr
+
+    activeStop :=
+         math.max(
+             activeStop,
+             newTrail)
+
+bool stopHit =
+     inPosition and
+     close < activeStop
+
+if stopHit or sellSignal or exitSignal
+    inPosition := false
+    entryPrice := na
+    activeStop := na
+    suggestedSize := 0
+
+
+// ============================================================
+// HOLD QUALITY
+// ============================================================
+
+int holdQuality =
+     swingStrength >= 70 ? 3 :
+     swingStrength >= 40 ? 2 :
+     swingStrength >= 20 ? 1 :
+     swingStrength >= 0 ? 0 :
+     swingStrength >= -40 ? -1 :
+     -2
+
+string holdText =
+     holdQuality == 3 ? "STRONG HOLD" :
+     holdQuality == 2 ? "HOLD" :
+     holdQuality == 1 ? "WATCH" :
+     holdQuality == 0 ? "REDUCE" :
+     holdQuality == -1 ? "WEAK" :
+     "EXIT RISK"
+
+string costState =
+     na(volumeCost) ? "NO DATA" :
+     close > costZoneUpper ? "ABOVE" :
+     close < costZoneLower ? "BELOW" :
+     "INSIDE"
+
+
+// ============================================================
+// CORRELATION
+// ============================================================
+
+float return5 =
+     not na(close[5]) ?
+     close / close[5] - 1 :
+     na
+
+float return10 =
+     not na(close[10]) ?
+     close / close[10] - 1 :
+     na
+
+float return15 =
+     not na(close[15]) ?
+     close / close[15] - 1 :
+     na
+
+float return20 =
+     not na(close[20]) ?
+     close / close[20] - 1 :
+     na
+
+float strengthCorr5 =
+     ta.correlation(
+         swingStrength[5],
+         return5,
+         correlationLookback)
+
+float strengthCorr10 =
+     ta.correlation(
+         swingStrength[10],
+         return10,
+         correlationLookback)
+
+float strengthCorr15 =
+     ta.correlation(
+         swingStrength[15],
+         return15,
+         correlationLookback)
+
+float strengthCorr20 =
+     ta.correlation(
+         swingStrength[20],
+         return20,
+         correlationLookback)
+
+float vpoCorr5 =
+     ta.correlation(
+         vpoRaw[5],
+         return5,
+         correlationLookback)
+
+float vpoCorr10 =
+     ta.correlation(
+         vpoRaw[10],
+         return10,
+         correlationLookback)
+
+float vpoCorr15 =
+     ta.correlation(
+         vpoRaw[15],
+         return15,
+         correlationLookback)
+
+float vpoCorr20 =
+     ta.correlation(
+         vpoRaw[20],
+         return20,
+         correlationLookback)
+
+
+// ============================================================
+// MAIN SIGNALS
+// ============================================================
+
+plotshape(
+     buySignal,
+     title="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     text="BUY",
+     color=color.green,
+     textcolor=color.white,
+     size=size.normal)
+
+plotshape(
+     addSignal,
+     title="ADD",
+     style=shape.labelup,
+     location=location.belowbar,
+     text="ADD",
+     color=color.blue,
+     textcolor=color.white,
+     size=size.normal)
+
+plotshape(
+     sellSignal,
+     title="SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     text="SELL",
+     color=color.red,
+     textcolor=color.white,
+     size=size.small)
+
+plotshape(
+     exitSignal,
+     title="EXIT",
+     style=shape.labeldown,
+     location=location.abovebar,
+     text="EXIT",
+     color=color.black,
+     textcolor=color.white,
+     size=size.normal)
+
+plotshape(
+     stopHit,
+     title="STOP",
+     style=shape.xcross,
+     location=location.abovebar,
+     text="STOP",
+     color=color.maroon,
+     textcolor=color.white,
+     size=size.small)
+
+plotshape(
+     costUpSignal,
+     title="COST UP",
+     style=shape.labelup,
+     location=location.belowbar,
+     text="COST UP",
+     color=color.teal,
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     costBreakSignal,
+     title="COST BREAK",
+     style=shape.labeldown,
+     location=location.abovebar,
+     text="COST BREAK",
+     color=color.purple,
+     textcolor=color.white,
+     size=size.tiny)
+
+
+// ============================================================
+// TRAILING STOP
+// ============================================================
+
+plot(
+     inPosition ? activeStop : na,
+     "Trailing Stop",
+     color=color.new(color.maroon, 30),
+     style=plot.style_linebr,
+     linewidth=1)
+
+
+// ============================================================
+// OPTIONAL EARLY SIGNALS
+// ============================================================
+
+plotshape(
+     showEarlySignals and earlyTurnUp,
+     title="TURN+",
+     style=shape.triangleup,
+     location=location.belowbar,
+     text="TURN+",
+     color=color.aqua,
+     textcolor=color.black,
+     size=size.tiny)
+
+plotshape(
+     showEarlySignals and earlyTurnDown,
+     title="TURN-",
+     style=shape.triangledown,
+     location=location.abovebar,
+     text="TURN-",
+     color=color.orange,
+     textcolor=color.white,
+     size=size.tiny)
+
+
+// ============================================================
+// SIGNAL STATUS
+//
+// Priority:
+// EXIT > SELL > ADD > BUY > PRE-BUY > NEUTRAL
+// ============================================================
+
+string signalText =
+     exitSignal ? "EXIT" :
+     sellSignal ? "SELL" :
+     addSignal ? "ADD" :
+     buySignal ? "BUY" :
+     preBuy ? "PRE-BUY" :
+     "NEUTRAL"
+
+
+// ============================================================
+// SIGNAL VISUAL STYLE
+// ============================================================
+
+color signalBg =
+     exitSignal ? color.new(color.black, 15) :
+     sellSignal ? color.new(color.red, 35) :
+     addSignal ? color.new(color.blue, 35) :
+     buySignal ? color.new(color.green, 30) :
+     preBuy ? color.new(color.orange, 50) :
+     color.new(color.black, 100)
+
+color signalTextColor =
+     exitSignal ? color.white :
+     sellSignal ? color.white :
+     addSignal ? color.white :
+     buySignal ? color.white :
+     preBuy ? color.white :
+     color.gray
+
+
+// ============================================================
+// STATUS TABLE
+//
+// Right-bottom compact display.
+// Market and Cost intentionally omitted.
+// ============================================================
+
+var table statusTable =
+     table.new(
+         position.bottom_right,
+         2,
+         6,
+         border_width=0)
+
+if barstate.islast and showStatusTable
+
+    // SIGNAL
+    table.cell(
+         statusTable,
+         0,
+         0,
+         "Signal",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         0,
+         signalText,
+         text_color=signalTextColor,
+         bgcolor=signalBg,
+         text_size=size.normal)
+
+    // HOLD
+    table.cell(
+         statusTable,
+         0,
+         1,
+         "Hold",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         1,
+         holdText,
+         text_size=size.normal)
+
+    // SWING
+    table.cell(
+         statusTable,
+         0,
+         2,
+         "Swing",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         2,
+         str.tostring(
+             swingStrength,
+             "#.0"),
+         text_size=size.normal)
+
+    // DELTA 3 / DELTA 5
+    table.cell(
+         statusTable,
+         0,
+         3,
+         "Δ3 / Δ5",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         3,
+         str.tostring(
+             strengthChange3,
+             "#.0") +
+         " / " +
+         str.tostring(
+             strengthChange5,
+             "#.0"),
+         text_size=size.normal)
+
+    // VPO
+    table.cell(
+         statusTable,
+         0,
+         4,
+         "VPO",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         4,
+         str.tostring(
+             vpoRaw,
+             "#.0"),
+         text_size=size.normal)
+
+    // POSITION
+    string positionText =
+         inPosition ?
+         "LONG " +
+         str.tostring(
+             entryPrice,
+             "#.##") :
+         "FLAT"
+
+    table.cell(
+         statusTable,
+         0,
+         5,
+         "Position",
+         text_size=size.normal)
+
+    table.cell(
+         statusTable,
+         1,
+         5,
+         positionText,
+         text_size=size.normal)
+
+
+// ============================================================
+// DATA WINDOW
+// ============================================================
+
+plot(swingStrength, "Swing Strength", display=display.data_window)
+plot(strengthChange3, "Strength Change 3D", display=display.data_window)
+plot(strengthChange5, "Strength Change 5D", display=display.data_window)
+
+plot(vpoRaw, "VPO Raw", display=display.data_window)
+plot(vpoNorm, "VPO Normalized", display=display.data_window)
+plot(vpoChange3, "VPO Change 3D", display=display.data_window)
+plot(vpoChange5, "VPO Change 5D", display=display.data_window)
+
+plot(VPH, "VPH", display=display.data_window)
+plot(pressureQuality * 100, "Pressure Quality %", display=display.data_window)
+plot(rvol, "Relative Volume", display=display.data_window)
+
+plot(trendScore, "Trend Score", display=display.data_window)
+plot(pressureScore, "Pressure Score", display=display.data_window)
+plot(volumeScore, "Volume Score", display=display.data_window)
+plot(divergenceScore, "Divergence Score", display=display.data_window)
+plot(marketScore, "Market Score", display=display.data_window)
+
+plot(volumeCost, "Volume Weighted Cost", display=display.data_window)
+plot(costZoneUpper, "Cost Zone Upper", display=display.data_window)
+plot(costZoneLower, "Cost Zone Lower", display=display.data_window)
+
+plot(effectiveBlackCount, "Previous Black K Count", display=display.data_window)
+plot(activeBlackThreshold, "Active Black K Threshold", display=display.data_window)
+
+plot(holdQuality, "Hold Quality", display=display.data_window)
+
+plot(entryPrice, "Entry Price", display=display.data_window)
+plot(activeStop, "Active Stop", display=display.data_window)
+plot(suggestedSize, "Suggested Size", display=display.data_window)
+plot(atr, "ATR", display=display.data_window)
+
+plot(strengthCorr5, "Strength Corr 5D", display=display.data_window)
+plot(strengthCorr10, "Strength Corr 10D", display=display.data_window)
+plot(strengthCorr15, "Strength Corr 15D", display=display.data_window)
+plot(strengthCorr20, "Strength Corr 20D", display=display.data_window)
+
+plot(vpoCorr5, "VPO Corr 5D", display=display.data_window)
+plot(vpoCorr10, "VPO Corr 10D", display=display.data_window)
+plot(vpoCorr15, "VPO Corr 15D", display=display.data_window)
+plot(vpoCorr20, "VPO Corr 20D", display=display.data_window)
+
+
+// ============================================================
+// ALERTS
+// ============================================================
+
+alertcondition(
+     preBuy,
+     "PRE-BUY",
+     "Swing Pressure PRE-BUY setup detected.")
+
+alertcondition(
+     buySignal,
+     "BUY",
+     "Swing Pressure BUY signal.")
+
+alertcondition(
+     addSignal,
+     "ADD",
+     "Swing Pressure ADD signal.")
+
+alertcondition(
+     sellSignal,
+     "SELL",
+     "Swing Pressure SELL signal.")
+
+alertcondition(
+     exitSignal,
+     "EXIT",
+     "Swing Pressure EXIT signal.")
+
+alertcondition(
+     stopHit,
+     "STOP",
+     "Trailing ATR stop hit. Exit position.")
+
+alertcondition(
+     costUpSignal,
+     "COST UP",
+     "Price confirmed above Volume Cost Zone.")
+
+alertcondition(
+     costBreakSignal,
+     "COST BREAK",
+     "Price confirmed below Volume Cost Zone.")
+
+alertcondition(
+     earlyTurnUp,
+     "TURN+",
+     "Early strengthening detected.")
+
+alertcondition(
+     earlyTurnDown,
+     "TURN-",
+     "Early weakening detected.")
+
+alertcondition(
+     blackDangerStart,
+     "Black K Risk",
+     "Previous completed Black K count entered danger zone.")

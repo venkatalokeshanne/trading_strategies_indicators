@@ -1,0 +1,700 @@
+//@version=6
+// Combined: Inversion FVG + Volume Gaps [Custom v4]  +  Volume Gaps & Imbalances (Zeiierman)
+// FVG / inversion-FVG is a widely used ICT/SMC charting idea (see e.g. LuxAlgo's and
+// Zeiierman's public "Inversion Fair Value Gaps" indicators for two popular takes on it,
+// and Zeiierman's "Volume Gaps & Imbalances" for a volume-profile take on zero-volume zones).
+// The Inversion FVG section below is an independent reimplementation of that concept with
+// its own logic, data structures, and an added relative-volume layer. The Volume Profile /
+// Zero-Volume Zones / Delta Summary section is Zeiierman's original script, merged in with
+// a "vg_" namespace prefix and a fix so its cleanup no longer deletes the FVG script's own
+// boxes/labels (the original indiscriminately cleared every box and label on the chart).
+indicator("Inversion FVG + Volume Gaps [Custom v4] + Volume Profile [Zeiierman]", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+
+
+// ============================== INPUTS ==============================
+grpFVG = "Fair Value Gaps"
+showBullFVG   = input.bool(true, "Show Bullish FVG", group=grpFVG)
+showBearFVG   = input.bool(true, "Show Bearish FVG", group=grpFVG)
+useATRFilter  = input.bool(false, "Filter by Minimum Gap Size", group=grpFVG)
+atrLen        = input.int(14, "ATR Length", group=grpFVG)
+atrMult       = input.float(0.25, "Min Gap Size (x ATR)", minval=0.0, step=0.05, group=grpFVG)
+mitigationSrc = input.string("Wick", "Mitigation / Retest Price Source", options=["Wick", "Close"], group=grpFVG)
+maxZones      = input.int(60, "Max Zones Tracked", minval=5, maxval=200, group=grpFVG)
+
+grpFrac = "Fractal Filter"
+useFracFilter = input.bool(false, "Require FVG Near a Swing Point", group=grpFrac, tooltip="Only accepts a new FVG if it forms close to a recently confirmed swing high/low.")
+fracLen       = input.int(2, "Fractal Length", minval=1, maxval=10, group=grpFrac)
+fracNear      = input.int(3, "Max Distance From Swing (bars)", minval=0, maxval=20, group=grpFrac)
+
+grpIFVG = "Inversion FVG (iFVG)"
+showIFVG        = input.bool(true, "Show Inversion Zones", group=grpIFVG)
+removeOnFullMit = input.bool(true, "Remove Zone After Full Mitigation", group=grpIFVG)
+dispNum         = input.int(5, "Show Last N Inversions", minval=1, maxval=50, group=grpIFVG, tooltip="Limits how many of the most recent inverted zones stay drawn on the chart.")
+
+grpDist = "Distance & Fade"
+useDistFilter = input.bool(false, "Hide Zones Far From Price", group=grpDist)
+maxDistATR    = input.float(50.0, "Max Distance (x ATR)", minval=1.0, maxval=500.0, group=grpDist)
+fadeWithAge   = input.bool(false, "Fade Older Zones", group=grpDist)
+
+grpMid = "Midline"
+showMidline = input.bool(true, "Show Zone Midline", group=grpMid)
+midColor    = input.color(#787b86, "Midline Color", group=grpMid)
+
+grpSig = "Retest Signals"
+showRetestSignals  = input.bool(true, "Show Retest Arrows", group=grpSig)
+alertRetestSignals = input.bool(false, "Alert on Retest Signal", group=grpSig)
+
+grpVol = "Volume Imbalance"
+showVolImb   = input.bool(true, "Show 2-Candle Volume Imbalance", group=grpVol)
+showVolLabel = input.bool(true, "Tag FVGs With Relative Volume", group=grpVol)
+volMALen     = input.int(50, "Volume MA Length", group=grpVol)
+highVolMult  = input.float(1.5, "High-Volume Multiplier", minval=1.0, step=0.1, group=grpVol)
+maxViBoxes   = input.int(200, "Max Volume-Imbalance Boxes Kept", minval=10, maxval=300, group=grpVol)
+
+grpZVG = "Volume Gaps (Zero-Volume Zones)"
+showZVG     = input.bool(true, "Show Zero-Volume Price Zones", group=grpZVG, tooltip="Highlights price zones where no volume traded at all during the lookback window.")
+zvgLookback = input.int(200, "Lookback Bars", minval=20, maxval=500, group=grpZVG)
+zvgRows     = input.int(50, "Price Rows", minval=10, maxval=100, group=grpZVG)
+zvgColor    = input.color(color.new(color.navy, 55), "Zero-Volume Zone Color", group=grpZVG)
+showDeltaTint  = input.bool(true, "Tint Traded Rows by Buy/Sell Delta", group=grpZVG, tooltip="Colors non-empty price rows by whether buy or sell volume (by candle direction) dominated within that row.")
+deltaBuyColor  = input.color(color.new(color.teal, 80), "Delta Buy-Dominant", group=grpZVG)
+deltaSellColor = input.color(color.new(color.red, 80), "Delta Sell-Dominant", group=grpZVG)
+
+grpCol = "Colors"
+bullColor    = input.color(color.new(color.teal, 75), "Bullish FVG", group=grpCol)
+bearColor    = input.color(color.new(color.red, 75), "Bearish FVG", group=grpCol)
+bullInvColor = input.color(color.new(color.orange, 60), "Bullish iFVG", group=grpCol)
+bearInvColor = input.color(color.new(color.purple, 60), "Bearish iFVG", group=grpCol)
+viColor      = input.color(color.new(color.blue, 82), "Volume Imbalance", group=grpCol)
+
+grpAlerts = "Alerts"
+alertNewFVG  = input.bool(false, "Alert: New FVG", group=grpAlerts)
+alertNewIFVG = input.bool(false, "Alert: FVG Inverted", group=grpAlerts)
+
+grpDisp = "Display"
+showTable = input.bool(true, "Show Info Table", group=grpDisp)
+
+// ============================== TYPES ==============================
+type Zone
+    box   b
+    label lbl
+    line  mid
+    bool  isBull
+    bool  inverted
+    float top
+    float bot
+    int   startBar
+
+var array<Zone> zones   = array.new<Zone>()
+var array<box>  viBoxes = array.new<box>()
+var array<box>  zvgBoxes = array.new<box>()
+
+// ============================== HELPERS ==============================
+// Falls back to a cumulative average true range early in history, before ta.atr(atrLen) is defined.
+atrVal = nz(ta.atr(atrLen), ta.cum(high - low) / (bar_index + 1))
+volMA  = ta.sma(volume, volMALen)
+
+gapOK(sz) =>
+    not useATRFilter or sz >= atrVal * atrMult
+
+f_volTag(v) =>
+    hv = v >= highVolMult
+    str.tostring(v, "#.##") + "x" + (hv ? " \u26A1" : "")
+
+// Fractal / swing filter
+pivotLo   = ta.pivotlow(low, fracLen, fracLen)
+pivotHi   = ta.pivothigh(high, fracLen, fracLen)
+loFracBar = ta.valuewhen(not na(pivotLo), bar_index - fracLen, 0)
+hiFracBar = ta.valuewhen(not na(pivotHi), bar_index - fracLen, 0)
+
+f_nearSwing(fracBar) =>
+    not na(fracBar) and (bar_index - fracBar) <= fracNear
+
+bullFracOK = not useFracFilter or f_nearSwing(loFracBar)
+bearFracOK = not useFracFilter or f_nearSwing(hiFracBar)
+
+// Zone coloring: base color by role, optionally faded with age and/or hidden by distance
+f_zoneBaseColor(Zone z) =>
+    z.inverted ? (z.isBull ? bearInvColor : bullInvColor) : (z.isBull ? bullColor : bearColor)
+
+f_finalColor(Zone z) =>
+    base   = f_zoneBaseColor(z)
+    age    = bar_index - z.startBar
+    faded  = fadeWithAge ? color.new(base, math.min(95.0, color.t(base) + (math.min(age, 100) / 100.0) * (95.0 - color.t(base)))) : base
+    dist   = close > z.top ? close - z.top : close < z.bot ? z.bot - close : 0.0
+    hidden = useDistFilter and not na(atrVal) and dist > atrVal * maxDistATR
+    hidden ? color.new(faded, 100) : faded
+
+// ============================== FVG DETECTION ==============================
+bullGap  = low > high[2]
+bearGap  = high < low[2]
+bullSize = low - high[2]
+bearSize = low[2] - high
+
+isNewBull = showBullFVG and bullGap and gapOK(bullSize) and bullFracOK
+isNewBear = showBearFVG and bearGap and gapOK(bearSize) and bearFracOK
+
+gapVol    = volume + volume[1] + volume[2]
+gapVolMA  = volMA * 3
+gapRelVol = gapVolMA > 0 ? gapVol / gapVolMA : 1.0
+
+if isNewBull
+    top = low
+    bot = high[2]
+    mid = math.avg(top, bot)
+    b   = box.new(left=bar_index[2], top=top, right=bar_index, bottom=bot, border_color=color.new(bullColor, 40), bgcolor=bullColor)
+    lbl = showVolLabel ? label.new(x=bar_index, y=bot, text=f_volTag(gapRelVol), style=label.style_label_up, color=color.new(color.white, 100), textcolor=bullColor, size=size.tiny) : na
+    ln  = showMidline ? line.new(x1=bar_index[2], y1=mid, x2=bar_index, y2=mid, color=midColor, style=line.style_dashed) : na
+    array.push(zones, Zone.new(b, lbl, ln, true, false, top, bot, bar_index[2]))
+    if alertNewFVG
+        alert("New Bullish FVG on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+if isNewBear
+    top = low[2]
+    bot = high
+    mid = math.avg(top, bot)
+    b   = box.new(left=bar_index[2], top=top, right=bar_index, bottom=bot, border_color=color.new(bearColor, 40), bgcolor=bearColor)
+    lbl = showVolLabel ? label.new(x=bar_index, y=top, text=f_volTag(gapRelVol), style=label.style_label_down, color=color.new(color.white, 100), textcolor=bearColor, size=size.tiny) : na
+    ln  = showMidline ? line.new(x1=bar_index[2], y1=mid, x2=bar_index, y2=mid, color=midColor, style=line.style_dashed) : na
+    array.push(zones, Zone.new(b, lbl, ln, false, false, top, bot, bar_index[2]))
+    if alertNewFVG
+        alert("New Bearish FVG on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+// Trim oldest zone if we exceed the tracked maximum
+if array.size(zones) > maxZones
+    old = array.shift(zones)
+    box.delete(old.b)
+    if not na(old.lbl)
+        label.delete(old.lbl)
+    if not na(old.mid)
+        line.delete(old.mid)
+
+// ============================== MITIGATION / INVERSION / RETEST ==============================
+bullRetestSignal   = false
+bearRetestSignal   = false
+newBullIfvg        = false
+newBearIfvg        = false
+bullIfvgMitigated  = false
+bearIfvgMitigated  = false
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        z = array.get(zones, i)
+
+        if not z.inverted
+            if z.isBull and close < z.bot
+                // bullish FVG broken -> invert to bearish (was support, now resistance)
+                if showIFVG
+                    array.set(zones, i, Zone.new(z.b, z.lbl, z.mid, z.isBull, true, z.top, z.bot, z.startBar))
+                    box.set_bgcolor(z.b, bearInvColor)
+                    box.set_border_color(z.b, color.new(bearInvColor, 30))
+                    if not na(z.lbl)
+                        label.set_text(z.lbl, "iFVG")
+                        label.set_textcolor(z.lbl, bearInvColor)
+                    newBearIfvg := true
+                    if alertNewIFVG
+                        alert("Bullish FVG inverted on " + syminfo.ticker, alert.freq_once_per_bar_close)
+                else if removeOnFullMit
+                    box.delete(z.b)
+                    if not na(z.lbl)
+                        label.delete(z.lbl)
+                    if not na(z.mid)
+                        line.delete(z.mid)
+                    array.remove(zones, i)
+                else
+                    box.set_right(z.b, bar_index)
+                    box.set_bgcolor(z.b, f_finalColor(z))
+                    if not na(z.mid)
+                        line.set_x2(z.mid, bar_index)
+            else if (not z.isBull) and close > z.top
+                // bearish FVG broken -> invert to bullish (was resistance, now support)
+                if showIFVG
+                    array.set(zones, i, Zone.new(z.b, z.lbl, z.mid, z.isBull, true, z.top, z.bot, z.startBar))
+                    box.set_bgcolor(z.b, bullInvColor)
+                    box.set_border_color(z.b, color.new(bullInvColor, 30))
+                    if not na(z.lbl)
+                        label.set_text(z.lbl, "iFVG")
+                        label.set_textcolor(z.lbl, bullInvColor)
+                    newBullIfvg := true
+                    if alertNewIFVG
+                        alert("Bearish FVG inverted on " + syminfo.ticker, alert.freq_once_per_bar_close)
+                else if removeOnFullMit
+                    box.delete(z.b)
+                    if not na(z.lbl)
+                        label.delete(z.lbl)
+                    if not na(z.mid)
+                        line.delete(z.mid)
+                    array.remove(zones, i)
+                else
+                    box.set_right(z.b, bar_index)
+                    box.set_bgcolor(z.b, f_finalColor(z))
+                    if not na(z.mid)
+                        line.set_x2(z.mid, bar_index)
+            else
+                box.set_right(z.b, bar_index)
+                box.set_bgcolor(z.b, f_finalColor(z))
+                if not na(z.mid)
+                    line.set_x2(z.mid, bar_index)
+        else
+            // already inverted: check for a retest/rejection signal, then check for full mitigation
+            if z.isBull
+                // acting as resistance now
+                refSrc = mitigationSrc == "Wick" ? high[1] : close[1]
+                if close < z.bot and refSrc >= z.bot and refSrc < z.top
+                    bearRetestSignal := true
+                    if showRetestSignals
+                        label.new(x=bar_index, y=z.top, text="\u25BC", style=label.style_label_down, color=color.new(color.white, 100), textcolor=bearInvColor, size=size.small)
+            else
+                // acting as support now
+                refSrc = mitigationSrc == "Wick" ? low[1] : close[1]
+                if close > z.top and refSrc <= z.top and refSrc > z.bot
+                    bullRetestSignal := true
+                    if showRetestSignals
+                        label.new(x=bar_index, y=z.bot, text="\u25B2", style=label.style_label_up, color=color.new(color.white, 100), textcolor=bullInvColor, size=size.small)
+
+            if z.isBull and close > z.top
+                bearIfvgMitigated := true
+                if removeOnFullMit
+                    box.delete(z.b)
+                    if not na(z.lbl)
+                        label.delete(z.lbl)
+                    if not na(z.mid)
+                        line.delete(z.mid)
+                    array.remove(zones, i)
+                else
+                    box.set_right(z.b, bar_index)
+                    box.set_bgcolor(z.b, f_finalColor(z))
+                    if not na(z.mid)
+                        line.set_x2(z.mid, bar_index)
+            else if (not z.isBull) and close < z.bot
+                bullIfvgMitigated := true
+                if removeOnFullMit
+                    box.delete(z.b)
+                    if not na(z.lbl)
+                        label.delete(z.lbl)
+                    if not na(z.mid)
+                        line.delete(z.mid)
+                    array.remove(zones, i)
+                else
+                    box.set_right(z.b, bar_index)
+                    box.set_bgcolor(z.b, f_finalColor(z))
+                    if not na(z.mid)
+                        line.set_x2(z.mid, bar_index)
+            else
+                box.set_right(z.b, bar_index)
+                box.set_bgcolor(z.b, f_finalColor(z))
+                if not na(z.mid)
+                    line.set_x2(z.mid, bar_index)
+
+if alertRetestSignals and (bullRetestSignal or bearRetestSignal)
+    alert((bullRetestSignal ? "Bullish" : "Bearish") + " iFVG retest signal on " + syminfo.ticker, alert.freq_once_per_bar_close)
+
+alertcondition(isNewBull, title="New Bullish FVG", message="A new bullish FVG formed")
+alertcondition(isNewBear, title="New Bearish FVG", message="A new bearish FVG formed")
+alertcondition(newBullIfvg, title="New Bullish iFVG", message="A bearish FVG inverted to bullish")
+alertcondition(newBearIfvg, title="New Bearish iFVG", message="A bullish FVG inverted to bearish")
+alertcondition(bullRetestSignal, title="Bullish iFVG Retest", message="Bullish iFVG retested - possible long signal")
+alertcondition(bearRetestSignal, title="Bearish iFVG Retest", message="Bearish iFVG retested - possible short signal")
+alertcondition(bullIfvgMitigated, title="Bullish iFVG Mitigated", message="A bullish iFVG was fully mitigated")
+alertcondition(bearIfvgMitigated, title="Bearish iFVG Mitigated", message="A bearish iFVG was fully mitigated")
+
+// ============================== DISPLAY LIMIT (Show Last N Inversions) ==============================
+if showIFVG and array.size(zones) > 0
+    invIdx = array.new<int>()
+    for i = 0 to array.size(zones) - 1
+        if array.get(zones, i).inverted
+            array.push(invIdx, i)
+    excess = array.size(invIdx) - dispNum
+    if excess > 0
+        for k = excess - 1 to 0
+            idx = array.get(invIdx, k)
+            zk  = array.get(zones, idx)
+            box.delete(zk.b)
+            if not na(zk.lbl)
+                label.delete(zk.lbl)
+            if not na(zk.mid)
+                line.delete(zk.mid)
+            array.remove(zones, idx)
+
+// ============================== VOLUME IMBALANCE (2-candle) ==============================
+if showVolImb
+    bullVI = math.min(open, close) > math.max(open[1], close[1]) and low <= high[1]
+    bearVI = math.max(open, close) < math.min(open[1], close[1]) and high >= low[1]
+    if bullVI
+        array.push(viBoxes, box.new(left=bar_index[1], top=math.min(open, close), right=bar_index, bottom=math.max(open[1], close[1]), border_color=na, bgcolor=viColor))
+    if bearVI
+        array.push(viBoxes, box.new(left=bar_index[1], top=math.min(open[1], close[1]), right=bar_index, bottom=math.max(open, close), border_color=na, bgcolor=viColor))
+    if array.size(viBoxes) > maxViBoxes
+        box.delete(array.shift(viBoxes))
+
+// ============================== VOLUME GAPS (Zero-Volume Zones) ==============================
+if showZVG and barstate.islast
+    if array.size(zvgBoxes) > 0
+        for i = 0 to array.size(zvgBoxes) - 1
+            box.delete(array.get(zvgBoxes, i))
+        array.clear(zvgBoxes)
+
+    hiZ  = ta.highest(high, zvgLookback)
+    loZ  = ta.lowest(low, zvgLookback)
+    step = (hiZ - loZ) / zvgRows
+
+    if step > 0
+        for r = 0 to zvgRows - 1
+            rowLo   = loZ + step * r
+            rowHi   = rowLo + step
+            volSum  = 0.0
+            bullVol = 0.0
+            bearVol = 0.0
+            for off = 0 to zvgLookback - 1
+                p = close[off]
+                if p >= rowLo and p < rowHi
+                    volSum += volume[off]
+                    if close[off] > open[off]
+                        bullVol += volume[off]
+                    else
+                        bearVol += volume[off]
+            if volSum == 0
+                array.push(zvgBoxes, box.new(left=bar_index - zvgLookback, top=rowHi, right=bar_index, bottom=rowLo, border_color=na, bgcolor=zvgColor))
+            else if showDeltaTint
+                rowColor = bullVol >= bearVol ? deltaBuyColor : deltaSellColor
+                array.push(zvgBoxes, box.new(left=bar_index - zvgLookback, top=rowHi, right=bar_index, bottom=rowLo, border_color=na, bgcolor=rowColor))
+
+// ============================== DASHBOARD ==============================
+var table infoTable = table.new(position.top_right, 2, 4, border_width=1)
+
+if showTable and barstate.islast
+    bullCount = 0
+    bearCount = 0
+    invCount  = 0
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            zz = array.get(zones, i)
+            if zz.inverted
+                invCount += 1
+            else if zz.isBull
+                bullCount += 1
+            else
+                bearCount += 1
+    table.cell(infoTable, 0, 0, "iFVG + Volume", text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 60))
+    table.cell(infoTable, 1, 0, "", bgcolor=color.new(color.gray, 60))
+    table.cell(infoTable, 0, 1, "Bullish FVG", text_color=bullColor, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(bullCount), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 2, "Bearish FVG", text_color=bearColor, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(bearCount), text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 0, 3, "Inverted (iFVG)", text_color=color.orange, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(invCount), text_color=color.white, text_size=size.small)
+
+//=====================================================================================================================
+// Volume Gaps & Imbalances (Zeiierman) - Volume Profile / Zero-Volume Zones / Delta Summary
+//=====================================================================================================================
+
+// ~~ Tooltips {
+var string vg_t1  = "Number of historical bars used to build the volume profile and zero-volume gaps.\nHigher = smoother, more stable profile but heavier on performance."
+var string vg_t2  = "Number of price rows (bins) between the highest and lowest price in the lookback range.\nHigher = more detailed profile, lower = more compact."
+var string vg_t3  = "Price source used when assigning each bar to a price row in the profile (e.g. HLC3, Close)."
+var string vg_t4  = "Horizontal width in bars for the main volume profile drawn to the right of price."
+var string vg_t5  = "Fill color for the bullish portion of each price row (bars where Close > Open)."
+var string vg_t6  = "Fill color for the bearish portion of each price row (bars where Close <= Open)."
+var string vg_t7  = "Background color used to highlight zero-volume price gaps (no traded volume in that row)."
+var string vg_t8  = "Number of stacked sections in the delta panel.\nEach section aggregates Buy/Sell delta for a vertical slice of the full profile."
+var string vg_t9  = "Horizontal width in bars of the delta summary panel."
+var string vg_t10 = "Horizontal gap, in bars, between the main volume profile and the delta panel."
+var string vg_t11 = "Show or hide the Δ (delta) percentage text inside each delta bar."
+var string vg_t12 = "Color used when delta is positive in a section (Buy volume > Sell volume)."
+var string vg_t13 = "Color used when delta is negative in a section (Sell volume > Buy volume)."
+var string vg_t14 = "Background color of the delta panel and neutral areas when there is little or no delta."
+var string vg_t15 = "Text color for the Δ percentage labels inside the delta bars."
+var string vg_t16 = "Minimum visual size of any non-zero delta bar as a fraction of the panel width.\nUse a larger value to keep small deltas visible."
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Settings {
+// ~~ Settings {
+vg_prd         = input.int(200, "Lookback", minval = 50, maxval = 2000, tooltip = vg_t1, group = "Profile Settings")
+vg_rows        = input.int(50, "Rows", minval = 10, maxval = 100, inline = "a", tooltip = vg_t2, group = "Profile Settings")
+vg_src         = input.source(hlc3, "", inline = "a", tooltip = vg_t1 + "\n\n" + vg_t2 + "\n\n" + vg_t3, group = "Profile Settings")
+
+vg_width       = input.int(100, "Profile Placement", minval = 1, maxval = 500, tooltip = vg_t4, group = "Profile Styling")
+vg_bull_color  = input.color(color.new(color.blue, 30), "Bull Color", inline = "prof_set", tooltip = vg_t5, group = "Profile Styling")
+vg_bear_color  = input.color(color.new(color.orange, 30), "Bear Color", inline = "prof_set", tooltip = vg_t6, group = "Profile Styling")
+vg_zone_color  = input.color(color.new(color.navy, 50), "Zero-Volume Zone", inline = "prof_set", tooltip = vg_t5 + "\n\n" + vg_t6 + "\n\n" + vg_t7, group = "Profile Styling")
+
+vg_sum_sections   = input.int(20, "Summary Sections", minval = 1, maxval = 100, tooltip = vg_t8, group = "Delta Summary")
+vg_sum_panel_w    = input.int(40, "Summary Width", minval = 10, maxval = 200, tooltip = vg_t9, group = "Delta Summary")
+vg_sum_gap_x      = input.int(4,  "Gap From Profile", minval = 1, maxval = 50, tooltip = vg_t10, group = "Delta Summary")
+vg_sum_show_label = input.bool(true, "Show Delta Text", tooltip = vg_t11, group = "Delta Summary")
+
+vg_delta_pos_color  = input.color(color.new(color.lime, 20), "Delta Buy Color", tooltip = vg_t12, group = "Delta Styling")
+vg_delta_neg_color  = input.color(color.new(color.red,  20), "Delta Sell Color", tooltip = vg_t13, group = "Delta Styling")
+vg_delta_neutral_bg = input.color(color.new(color.gray, 90), "Delta Neutral BG", tooltip = vg_t14, group = "Delta Styling")
+vg_delta_text_color = input.color(color.white, "Delta Text Color", tooltip = vg_t15, group = "Delta Styling")
+vg_delta_min_frac   = input.float(0.2, "Delta Min Size (fraction of width)", minval = 0.0, maxval = 1.0, step = 0.1, tooltip = vg_t16, group = "Delta Styling")
+//~~}
+
+// ~~ Variables {
+vg_b = bar_index
+
+vg_lvls        = array.new<float>()
+vg_bull_vols   = array.new<float>()
+vg_bear_vols   = array.new<float>()
+vg_zone        = array.new<box>()
+var array<box> vg_ownBoxes = array.new<box>()
+//~~}
+
+// ~~ Main {
+vg_hi = ta.highest(high, vg_prd)
+vg_lo = ta.lowest(low, vg_prd)
+
+if barstate.islast
+    // Clear only this script's own previously drawn boxes (never touches other indicators' drawings)
+    if vg_ownBoxes.size() > 0
+        for e in vg_ownBoxes
+            e.delete()
+        vg_ownBoxes.clear()
+
+    //Profile Range Box
+    vg_rangeBox = box.new(
+         chart.point.from_index(vg_b-vg_prd,vg_hi),
+         chart.point.from_index(vg_b+vg_width,vg_lo),
+         color.new(chart.fg_color,50),
+         2,
+         line.style_dotted,
+         bgcolor = color(na)
+     )
+    vg_ownBoxes.push(vg_rangeBox)
+
+    // Build levels
+    step = (vg_hi - vg_lo) / vg_rows
+    for i = vg_lo to vg_hi by step
+        vg_lvls.push(i)
+        vg_bull_vols.push(0.0)
+        vg_bear_vols.push(0.0)
+
+    // Volume assignment
+    for i = vg_prd to 0
+        price   = vg_src[i]
+        is_bull = close[i] > open[i]
+        for j = 0 to vg_lvls.size() - 2
+            levelLow  = vg_lvls.get(j)
+            levelHigh = vg_lvls.get(j + 1)
+            if price > levelLow and price <= levelHigh
+                if is_bull
+                    vg_bull_vols.set(j, vg_bull_vols.get(j) + volume[i])
+                else
+                    vg_bear_vols.set(j, vg_bear_vols.get(j) + volume[i])
+                break
+
+    // Calculate maxVol based on total volumes
+    maxVol = 0.0
+    for i = 0 to vg_lvls.size() - 2
+        vol_i = vg_bull_vols.get(i) + vg_bear_vols.get(i)
+        if vol_i > maxVol
+            maxVol := vol_i
+
+    // Create profile
+    for i = 0 to vg_lvls.size() - 2
+        bull_i = vg_bull_vols.get(i)
+        bear_i = vg_bear_vols.get(i)
+        vol_i  = bull_i + bear_i
+        norm_v = maxVol > 0 ? math.round((vol_i / maxVol) * vg_width) : 0
+
+        if norm_v > 0
+            norm_bull  = bull_i > 0 ? math.round((bull_i / vol_i) * norm_v) : 0
+            norm_bear  = norm_v - norm_bull
+            left_start = vg_b + vg_width - norm_v
+
+            // Draw bull box
+            if norm_bull > 0
+                vg_bullBox = box.new(
+                     left   = left_start,
+                     top    = vg_lvls.get(i + 1),
+                     right  = left_start + norm_bull,
+                     bottom = vg_lvls.get(i),
+                     border_color = color.new(chart.fg_color,90),
+                     bgcolor = vg_bull_color
+                 )
+                vg_ownBoxes.push(vg_bullBox)
+
+            // Draw bear box
+            if norm_bear > 0
+                vg_bearBox = box.new(
+                     left   = left_start + norm_bull,
+                     top    = vg_lvls.get(i + 1),
+                     right  = vg_b + vg_width,
+                     bottom = vg_lvls.get(i),
+                     border_color = color.new(chart.fg_color,90),
+                     bgcolor = vg_bear_color
+                 )
+                vg_ownBoxes.push(vg_bearBox)
+
+        // Zero-volume zone
+        if vol_i == 0
+            zeroBox = box.new(
+                 left   = vg_b - vg_prd,
+                 top    = vg_lvls.get(i + 1),
+                 right  = vg_b,
+                 bottom = vg_lvls.get(i),
+                 border_color = na,
+                 bgcolor = vg_zone_color
+             )
+            vg_zone.push(zeroBox)
+
+    //Zone merge
+    if vg_zone.size() > 1
+        i = 0
+        while i < vg_zone.size()
+            currentBox = vg_zone.get(i)
+            currentTop = currentBox.get_top()
+
+            // Look ahead to find the end of consecutive touching zones
+            j = i + 1
+            while j < vg_zone.size()
+                nextBox = vg_zone.get(j)
+                if math.abs(nextBox.get_bottom() - currentTop) > 1e-10
+                    break
+                currentTop := nextBox.get_top()
+                j += 1
+
+            chainLength = j - i
+
+            if chainLength > 1
+                // Merge all boxes into one big box
+                firstBox = vg_zone.get(i)
+                lastBox  = vg_zone.get(j - 1)
+
+                mergedBox = box.new(
+                     left   = vg_b - vg_prd,
+                     top    = lastBox.get_top(),
+                     right  = vg_b,
+                     bottom = firstBox.get_bottom(),
+                     border_color = na,
+                     bgcolor = vg_zone_color
+                 )
+
+                // Delete old boxes (from last to first to preserve indices while removing)
+                for k = j - 1 to i by 1
+                    boxToDelete = vg_zone.get(k)
+                    boxToDelete.delete()
+                    vg_zone.remove(k)
+
+                // Insert the merged box
+                vg_zone.insert(i, mergedBox)
+
+                // Next iteration starts right after the newly inserted merged box
+                i += 1
+            else
+                // No merge needed, move to next
+                i += 1
+    
+    // Adjust left edges of final zones
+    if vg_zone.size()>0
+        float epsilon = 1e-10
+        for ii = 0 to vg_zone.size() - 1
+            currentBox = vg_zone.get(ii)
+            ztop = currentBox.get_top()
+            zbot = currentBox.get_bottom()
+            left_idx = vg_b - vg_prd
+            for off = vg_prd to 0 by 1
+                if low[off] <= ztop + epsilon and high[off] >= zbot - epsilon or
+                   high[off] >= zbot - epsilon and low[off] <= zbot + epsilon or
+                   low[off] <= zbot + epsilon and high[off] >= ztop - epsilon
+                    left_idx := vg_b - off
+                    break
+            currentBox.set_left(left_idx)
+
+    // Track final zero-volume zone boxes so they get cleared on the next redraw
+    if vg_zone.size() > 0
+        for zz in vg_zone
+            vg_ownBoxes.push(zz)
+
+    // Delta
+    lvlCount = vg_lvls.size()
+    rowsUsed = lvlCount > 0 ? lvlCount - 1 : 0
+
+    if rowsUsed > 0 and vg_sum_sections > 0
+        // rows per section
+        secRows = math.max(1, math.floor(rowsUsed / vg_sum_sections))
+
+        baseLeft  = vg_b + vg_width + vg_sum_gap_x
+        baseRight = baseLeft + vg_sum_panel_w
+
+        for s = 0 to vg_sum_sections - 1
+            startIdx = s * secRows
+            endIdx   = s == vg_sum_sections - 1 ? rowsUsed - 1 : math.min(rowsUsed - 1, (s + 1) * secRows - 1)
+
+            if startIdx > endIdx
+                continue
+
+            segBull = 0.0
+            segBear = 0.0
+
+            for j = startIdx to endIdx
+                segBull += vg_bull_vols.get(j)
+                segBear += vg_bear_vols.get(j)
+
+            segTot = segBull + segBear
+            if segTot <= 0
+                continue
+
+            // vertical range of this section
+            segTop    = vg_lvls.get(endIdx + 1)
+            segBottom = vg_lvls.get(startIdx)
+
+            vg_neutralBox = box.new(
+                 left   = baseLeft,
+                 top    = segTop,
+                 right  = baseRight,
+                 bottom = segBottom,
+                 border_color = color.new(chart.fg_color, 70),
+                 bgcolor = vg_delta_neutral_bg
+             )
+            vg_ownBoxes.push(vg_neutralBox)
+
+            // Delta: (Bull - Bear) as % of total => [-100, +100]
+            deltaPct = (segBull - segBear) / segTot * 100.0
+
+            // bar length: abs(delta), with minimum visual size
+            float barLenFrac = 0.0
+            float barLen     = 0.0
+
+            if deltaPct != 0
+                norm       = math.abs(deltaPct) / 100.0
+                barLenFrac := math.max(vg_delta_min_frac, math.min(1.0, norm))
+                barLen     := vg_sum_panel_w * barLenFrac
+            else
+                barLenFrac := 0.0
+                barLen     := 0.0
+
+            // coordinates for the delta bar (always from the left)
+            float dLeft  = baseLeft
+            float dRight = baseLeft + barLen
+
+            // choose color by sign
+            colDelta = vg_delta_neutral_bg
+            if deltaPct > 0
+                colDelta := vg_delta_pos_color
+            else if deltaPct < 0
+                colDelta := vg_delta_neg_color
+
+            // if delta is exactly 0, still draw a very small neutral bar
+            if deltaPct == 0
+                dRight := baseLeft + 1
+
+            // Delta bar (cast x-coordinates to int for box.new)
+            deltaBox = box.new(
+                 left   = int(math.round(dLeft)),
+                 top    = segTop,
+                 right  = int(math.round(dRight)),
+                 bottom = segBottom,
+                 border_color = color.new(chart.fg_color, 20),
+                 bgcolor = colDelta
+             )
+            vg_ownBoxes.push(deltaBox)
+
+            // Text inside the delta bar
+            if vg_sum_show_label
+                txt = "Δ " + str.tostring(deltaPct, "#.0") + "%"
+                box.set_text(deltaBox, txt)
+                box.set_text_color(deltaBox, vg_delta_text_color)
+                box.set_text_halign(deltaBox, text.align_center)
+                box.set_text_valign(deltaBox, text.align_center)
+//~~}

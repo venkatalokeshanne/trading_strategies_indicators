@@ -1,0 +1,173 @@
+//@version=6
+// =============================================================================
+//  Session Opening Range  —  Break & Retest  (first 15-minute candle)
+//
+//  Asia    18:00 – 18:15  (red)
+//  London  03:00 – 03:15  (yellow)
+//  New York 09:30 – 09:45 (navy)
+//
+//  For every session the HIGH and LOW of its first 15-minute candle are drawn
+//  as horizontal levels. A level is BROKEN only when a candle BODY closes
+//  beyond it (a wick alone does not count). The breaking candle is then
+//  highlighted GREEN (bullish break of the high) or RED (bearish break of the
+//  low). When price RETESTS the broken level a marker is printed:
+//        High level broken up  -> trend bullish -> bull + star
+//        Low  level broken down-> trend bearish -> bear + star
+//
+//  Times are read in the selected timezone. Default "America/New_York" follows
+//  EST/EDT automatically (i.e. the sessions stay at the correct local clock
+//  time all year). Use "Etc/GMT+5" if you want a fixed EST.
+//
+//  Built for chart timeframes of 15 minutes or LOWER (1m / 3m / 5m / 15m).
+// =============================================================================
+indicator("Session ORB — Break & Retest", shorttitle="ORB B&R", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ------------------------------ General inputs ------------------------------
+gGen = "General"
+tz           = input.string("America/New_York", "Session timezone", options=["America/New_York","America/Chicago","America/Los_Angeles","Europe/London","Etc/GMT+5","Etc/GMT+4"], group=gGen, tooltip="Session open times below are read in this timezone. 'America/New_York' follows EST/EDT automatically. Choose 'Etc/GMT+5' for a fixed EST all year.")
+extBars      = input.int(0, "Max line extension (bars, 0 = until next session)", minval=0, group=gGen, tooltip="0 keeps extending the level to the right until that session reopens the next day. Set a number to freeze the line after N bars.")
+showBreak    = input.bool(true,  "Highlight breaking candle", group=gGen)
+showRetest   = input.bool(true,  "Show break-&-retest markers (bull/bear + star)", group=gGen)
+showName     = input.bool(true,  "Show session name on levels", group=gGen)
+bullBreakCol = input.color(color.green, "Bullish break candle color", group=gGen)
+bearBreakCol = input.color(color.red,   "Bearish break candle color", group=gGen)
+mkSize       = input.string("normal", "Marker size", options=["tiny","small","normal","large"], group=gGen)
+
+// -------------------------------- Asia --------------------------------------
+gA  = "Asia  (18:00 – 18:15)"
+aOn = input.bool(true,        "Show Asia",        group=gA)
+aCol= input.color(color.red,  "Asia color",       group=gA)
+aW  = input.int(2, "Asia line width",  minval=1, maxval=10, group=gA)
+aS  = input.string("Solid",   "Asia line style",  options=["Solid","Dashed","Dotted"], group=gA)
+
+// -------------------------------- London ------------------------------------
+gL  = "London  (03:00 – 03:15)"
+lOn = input.bool(true,           "Show London",       group=gL)
+lCol= input.color(color.yellow,  "London color",      group=gL)
+lW  = input.int(2, "London line width", minval=1, maxval=10, group=gL)
+lS  = input.string("Solid",      "London line style", options=["Solid","Dashed","Dotted"], group=gL)
+
+// ------------------------------- New York -----------------------------------
+gN  = "New York  (09:30 – 09:45)"
+nOn = input.bool(true,          "Show New York",       group=gN)
+nCol= input.color(color.navy,   "New York color",      group=gN)
+nW  = input.int(3, "New York line width", minval=1, maxval=10, group=gN)
+nS  = input.string("Solid",     "New York line style", options=["Solid","Dashed","Dotted"], group=gN)
+
+// ------------------------------- Helpers ------------------------------------
+f_lineStyle(string s) =>
+    switch s
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+f_mkSize(string s) =>
+    switch s
+        "tiny"  => size.tiny
+        "small" => size.small
+        "large" => size.large
+        => size.normal
+
+// ---------------------------- Session object --------------------------------
+type ORB
+    string name
+    int    openMin        // minutes-of-day of the session open, in `tz`
+    bool   enabled
+    color  col
+    int    lwidth
+    string lstyle
+    // --- runtime state ---
+    float  hi = na
+    float  lo = na
+    int    startIdx = na
+    line   hiLine = na
+    line   loLine = na
+    label  nameLbl = na
+    bool   inWin = false
+    bool   locked = false
+    bool   hiBroken = false
+    bool   hiRetested = false
+    bool   loBroken = false
+    bool   loRetested = false
+
+var array<ORB> sessions = array.new<ORB>()
+if barstate.isfirst
+    array.push(sessions, ORB.new(name="Asia",   openMin=18*60,   enabled=aOn, col=aCol, lwidth=aW, lstyle=f_lineStyle(aS)))
+    array.push(sessions, ORB.new(name="London", openMin=3*60,    enabled=lOn, col=lCol, lwidth=lW, lstyle=f_lineStyle(lS)))
+    array.push(sessions, ORB.new(name="NY",     openMin=9*60+30, enabled=nOn, col=nCol, lwidth=nW, lstyle=f_lineStyle(nS)))
+
+// -------------------------------- Engine ------------------------------------
+hNY     = hour(time, tz)
+mNY     = minute(time, tz)
+curMin  = hNY * 60 + mNY
+lblSize = f_mkSize(mkSize)
+
+color gBarCol = na   // recomputed every bar -> only colors the actual break bar
+
+for i = 0 to array.size(sessions) - 1
+    ORB s = array.get(sessions, i)
+    if s.enabled
+        inWinNow = curMin >= s.openMin and curMin < s.openMin + 15
+
+        // ---- accumulate the first 15-minute candle of the session ----
+        if inWinNow and not s.inWin
+            // window just opened: start a fresh opening range + reset state
+            s.hi := high
+            s.lo := low
+            s.startIdx := bar_index
+            s.locked := false
+            s.hiBroken := false
+            s.hiRetested := false
+            s.loBroken := false
+            s.loRetested := false
+        else if inWinNow
+            s.hi := math.max(s.hi, high)
+            s.lo := math.min(s.lo, low)
+
+        // ---- window just closed: draw the two levels ----
+        if not inWinNow and s.inWin and not na(s.hi)
+            s.hiLine := line.new(s.startIdx, s.hi, bar_index, s.hi, xloc=xloc.bar_index, color=s.col, width=s.lwidth, style=s.lstyle)
+            s.loLine := line.new(s.startIdx, s.lo, bar_index, s.lo, xloc=xloc.bar_index, color=s.col, width=s.lwidth, style=s.lstyle)
+            if showName
+                s.nameLbl := label.new(s.startIdx, s.hi, s.name, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=color.new(s.col, 20), textcolor=color.white, size=size.small)
+            s.locked := true
+
+        s.inWin := inWinNow
+
+        // ---- after levels exist: extend, detect break, detect retest ----
+        if s.locked and not na(s.hiLine)
+            x2 = extBars == 0 ? bar_index : math.min(bar_index, s.startIdx + extBars)
+            line.set_x2(s.hiLine, x2)
+            line.set_x2(s.loLine, x2)
+
+            // ===== HIGH level : bullish break & retest =====
+            // retest is checked FIRST so the break candle itself can't self-trigger it
+            if s.hiBroken and not s.hiRetested and low <= s.hi
+                s.hiRetested := true
+                if showRetest
+                    label.new(bar_index, low, "🐂⭐", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=lblSize, tooltip=s.name + " high — break & retest (bullish)")
+            brokeHi = close > s.hi   // body must close above the level (wick alone ignored)
+            if not s.hiBroken and brokeHi
+                s.hiBroken := true
+                if showBreak
+                    gBarCol := bullBreakCol
+
+            // ===== LOW level : bearish break & retest =====
+            if s.loBroken and not s.loRetested and high >= s.lo
+                s.loRetested := true
+                if showRetest
+                    label.new(bar_index, high, "🐻⭐", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=lblSize, tooltip=s.name + " low — break & retest (bearish)")
+            brokeLo = close < s.lo   // body must close below the level (wick alone ignored)
+            if not s.loBroken and brokeLo
+                s.loBroken := true
+                if showBreak
+                    gBarCol := bearBreakCol
+
+// highlight the breaking candle (na = leave candle its normal color)
+barcolor(showBreak ? gBarCol : na)
+
+// gentle nudge if the chart timeframe is above 15 minutes
+var label warnLbl = na
+if timeframe.in_seconds() > 900 and barstate.islast
+    label.delete(warnLbl)
+    warnLbl := label.new(bar_index, high, "Use a 15-minute chart or lower for accurate opening ranges", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_down, color=color.orange, textcolor=color.black, size=size.small)

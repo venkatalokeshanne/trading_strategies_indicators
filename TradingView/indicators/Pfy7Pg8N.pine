@@ -1,0 +1,539 @@
+//@version=6
+indicator("ATK/DEF HTF Regime Combo — Monthly", overlay=true, precision=0, max_labels_count=500, max_lines_count=500, max_boxes_count=200)
+
+// ============================================================================
+// 1. INPUT PARAMETERS
+// ============================================================================
+length_ma20 = input.int(20, "MA20 Period", minval=1)
+length_ma50 = input.int(50, "MA50 Period", minval=1)
+length_dmi = input.int(14, "DMI Length", minval=1)
+length_rsi = input.int(14, "RSI Period", minval=1)
+length_atr = input.int(14, "ATR Period", minval=1)
+length_bb = input.int(20, "Bollinger Period", minval=1)
+mult_bb = input.float(2.0, "Bollinger StdDev", minval=0.5, step=0.1)
+length_vol_ma = input.int(12, "Volume MA Period", minval=1)
+length_cmf = input.int(21, "CMF Period", minval=1)
+length_mfi = input.int(14, "MFI Period", minval=1)
+lookback_res = input.int(12, "S/R Lookback", minval=3)
+
+// ===== Swing High/Low Parameters =====
+leftBars = input.int(5, "Left Bars", minval=1, group="=== Swing Points ===")
+rightBars = input.int(5, "Right Bars", minval=1, group="=== Swing Points ===")
+showLabels = input.bool(true, "Show Pivot Labels", group="=== Swing Points ===")
+
+// ===== FIFO Management =====
+max_objects = input.int(50, "Max Objects (FIFO)", minval=10, maxval=200, group="=== FIFO Management ===")
+
+// ============================================================================
+// 2. FIFO QUEUE MANAGEMENT
+// ============================================================================
+var int[] label_bars = array.new_int()
+var label[] label_objects = array.new_label()
+var int[] line_bars = array.new_int()
+var line[] line_objects = array.new_line()
+var int[] box_bars = array.new_int()
+var box[] box_objects = array.new_box()
+
+// FIFO: add label
+fifo_add_label(label_obj, bar_idx) =>
+    array.push(label_objects, label_obj)
+    array.push(label_bars, bar_idx)
+    while array.size(label_objects) > max_objects
+        old = array.shift(label_objects)
+        array.shift(label_bars)
+        label.delete(old)
+
+// FIFO: add line
+fifo_add_line(line_obj, bar_idx) =>
+    array.push(line_objects, line_obj)
+    array.push(line_bars, bar_idx)
+    while array.size(line_objects) > max_objects
+        old = array.shift(line_objects)
+        array.shift(line_bars)
+        line.delete(old)
+
+// FIFO: add box
+fifo_add_box(box_obj, bar_idx) =>
+    array.push(box_objects, box_obj)
+    array.push(box_bars, bar_idx)
+    while array.size(box_objects) > max_objects
+        old = array.shift(box_objects)
+        array.shift(box_bars)
+        box.delete(old)
+
+// FIFO: cleanup objects older than max_objects bars
+fifo_cleanup() =>
+    // Clean labels
+    idx = array.size(label_bars) - 1
+    while idx >= 0
+        if array.get(label_bars, idx) < bar_index - max_objects
+            lbl = array.remove(label_objects, idx)
+            array.remove(label_bars, idx)
+            label.delete(lbl)
+        idx := idx - 1
+    
+    // Clean lines
+    idx := array.size(line_bars) - 1
+    while idx >= 0
+        if array.get(line_bars, idx) < bar_index - max_objects
+            ln = array.remove(line_objects, idx)
+            array.remove(line_bars, idx)
+            line.delete(ln)
+        idx := idx - 1
+    
+    // Clean boxes
+    idx := array.size(box_bars) - 1
+    while idx >= 0
+        if array.get(box_bars, idx) < bar_index - max_objects
+            bx = array.remove(box_objects, idx)
+            array.remove(box_bars, idx)
+            box.delete(bx)
+        idx := idx - 1
+
+// ============================================================================
+// 3. BASE INDICATORS
+// ============================================================================
+ma20 = ta.sma(close, length_ma20)
+ma50 = ta.sma(close, length_ma50)
+[di_plus, di_minus, adx_val] = ta.dmi(length_dmi, length_dmi)
+rsi_val = ta.rsi(close, length_rsi)
+atr_val = ta.atr(length_atr)
+atr_ma = ta.sma(atr_val, length_vol_ma)
+
+basis = ta.sma(close, length_bb)
+dev = mult_bb * ta.stdev(close, length_bb)
+bb_upper = basis + dev
+bb_lower = basis - dev
+bb_width = (bb_upper - bb_lower) / basis
+bb_width_ma = ta.sma(bb_width, length_vol_ma)
+
+vol_ma = ta.sma(volume, length_vol_ma)
+
+ad = (high == low) ? 0 : ((2 * close - high - low) / (high - low)) * volume
+sum_ad = math.sum(ad, length_cmf)
+sum_vol = math.sum(volume, length_cmf)
+cmf_val = sum_vol == 0 ? 0 : sum_ad / sum_vol
+
+mfi_val = ta.mfi(close, length_mfi)
+ma20_slope = ta.change(ma20, 1)
+prev_rsi = rsi_val[1]
+prev_bb_width = bb_width[1]
+prev_bb_width_ma = bb_width_ma[1]
+
+// ============================================================================
+// 4. SCORING FUNCTIONS
+// ============================================================================
+f_direction() =>
+    if close > ma20 and ma20 > ma50 and ma20_slope > 0
+        90
+    else if close > ma20 and ma20 > ma50
+        75
+    else if close > ma20 and ma20 < ma50
+        55
+    else if close < ma20 and ma20 > ma50
+        40
+    else if close < ma20 and ma20 < ma50 and ma20_slope < 0
+        15
+    else if close < ma20 and ma20 < ma50
+        25
+    else
+        50
+
+f_trend_strength() =>
+    if adx_val > 40
+        90
+    else if adx_val >= 30
+        75
+    else if adx_val >= 22
+        55
+    else if adx_val >= 18
+        35
+    else if adx_val >= 14
+        20
+    else
+        5
+
+f_momentum() =>
+    if rsi_val >= 65 and rsi_val <= 80 and rsi_val > prev_rsi
+        90
+    else if rsi_val >= 55 and rsi_val < 65 and rsi_val > prev_rsi
+        75
+    else if rsi_val >= 45 and rsi_val < 55
+        55
+    else if rsi_val >= 35 and rsi_val < 45 and rsi_val < prev_rsi
+        35
+    else if rsi_val >= 20 and rsi_val < 35
+        20
+    else if rsi_val < 20 or rsi_val > 80
+        5
+    else
+        50
+
+f_volatility() =>
+    float ratio = atr_val / atr_ma
+    if ratio > 1.5
+        90
+    else if ratio > 1.2
+        75
+    else if ratio >= 0.8
+        55
+    else if ratio >= 0.6
+        35
+    else if ratio >= 0.4
+        20
+    else
+        5
+
+f_density() =>
+    float ratio = bb_width / bb_width_ma
+    bool squeeze_2m = bb_width < bb_width_ma * 0.6 and prev_bb_width < prev_bb_width_ma * 0.6
+    if squeeze_2m
+        85
+    else if bb_width < bb_width_ma * 0.5
+        90
+    else if bb_width < bb_width_ma * 0.6
+        75
+    else if bb_width < bb_width_ma * 0.75
+        55
+    else if bb_width >= bb_width_ma * 0.75 and bb_width <= bb_width_ma * 1.25
+        40
+    else if bb_width > bb_width_ma * 1.25
+        20
+    else
+        50
+
+f_breakout() =>
+    bool is_true_breakout = (close > bb_upper or close < bb_lower) and volume > vol_ma * 1.5
+    bool is_testing = (high > bb_upper or low < bb_lower) and not (close > bb_upper or close < bb_lower)
+    bool is_fake = (high > bb_upper or low < bb_lower) and (close <= bb_upper and close >= bb_lower) and volume > vol_ma * 1.3
+    bool near_edge = (bb_upper - close) / bb_upper < 0.01 or (close - bb_lower) / close < 0.01
+    if is_true_breakout
+        90
+    else if is_testing
+        75
+    else if near_edge
+        55
+    else if is_fake
+        30
+    else
+        15
+
+f_probability() =>
+    int up_count = 0
+    for i = 1 to 12
+        if close[i] > close[i+1]
+            up_count := up_count + 1
+    float win_rate = up_count / 12.0 * 100
+    if win_rate > 70
+        90
+    else if win_rate >= 60
+        75
+    else if win_rate >= 45
+        55
+    else if win_rate >= 30
+        35
+    else if win_rate >= 20
+        20
+    else
+        5
+
+f_energy() =>
+    float ratio = volume / vol_ma
+    if ratio > 2.0
+        90
+    else if ratio > 1.5
+        75
+    else if ratio > 1.2
+        55
+    else if ratio >= 0.7
+        40
+    else if ratio >= 0.5
+        25
+    else
+        10
+
+f_radar() =>
+    bool bull_engulf = close > open and close[1] < open[1] and close > open[1] and open < close[1]
+    bool bear_engulf = close < open and close[1] > open[1] and close < open[1] and open > close[1]
+    bool hammer = close > open and (high - low) > (close - open) * 2 and (close - low) / (high - low) > 0.6
+    bool shooting_star = close < open and (high - low) > (open - close) * 2 and (high - close) / (high - low) > 0.6
+    bool doji = math.abs(close - open) / (high - low) < 0.1 and (high - low) > 0
+    if bull_engulf or bear_engulf
+        90
+    else if hammer or shooting_star
+        75
+    else if doji
+        40
+    else
+        25
+
+f_flow() =>
+    if cmf_val > 0.10 and mfi_val > 60
+        90
+    else if cmf_val > 0.05 and mfi_val >= 50
+        75
+    else if cmf_val >= -0.03 and cmf_val <= 0.05 and mfi_val >= 40 and mfi_val < 50
+        55
+    else if cmf_val >= -0.10 and cmf_val < -0.03
+        35
+    else if cmf_val < -0.10 and mfi_val < 30
+        20
+    else if cmf_val < -0.20 and mfi_val < 20
+        5
+    else
+        50
+
+f_concentration() =>
+    float highest = ta.highest(high, lookback_res)
+    float lowest = ta.lowest(low, lookback_res)
+    float price_range = highest - lowest
+    if price_range == 0
+        50
+    float price_position = (close - lowest) / price_range * 100
+    int low_zone_count = 0
+    int high_zone_count = 0
+    for i = 0 to lookback_res - 1
+        float pos_i = (close[i] - lowest) / price_range * 100
+        if pos_i < 30
+            low_zone_count := low_zone_count + 1
+        if pos_i > 70
+            high_zone_count := high_zone_count + 1
+    if price_position < 30 and low_zone_count >= 6
+        90
+    else if price_position < 30 and low_zone_count >= 3
+        75
+    else if price_position >= 30 and price_position <= 70
+        55
+    else if price_position > 70 and high_zone_count >= 3
+        30
+    else if price_position > 70 and high_zone_count >= 6
+        15
+    else
+        50
+
+f_pressure() =>
+    float nearest_res = ta.highest(high, lookback_res)
+    float nearest_sup = ta.lowest(low, lookback_res)
+    float dist_to_res = (nearest_res - close) / close * 100
+    float dist_to_sup = (close - nearest_sup) / close * 100
+    float min_dist = math.min(dist_to_res, dist_to_sup)
+    if min_dist < 1
+        90
+    else if min_dist < 3
+        75
+    else if min_dist < 5
+        55
+    else if min_dist < 10
+        35
+    else
+        15
+
+// ============================================================================
+// 5. CALCULATE COMBO SCORES
+// ============================================================================
+c1_dir = f_direction()
+c1_trend = f_trend_strength()
+c1_mom = f_momentum()
+c1_vol = f_volatility()
+c1_score = (c1_dir + c1_trend + c1_mom + c1_vol) / 4
+
+c2_density = f_density()
+c2_breakout = f_breakout()
+c2_prob = f_probability()
+c2_energy = f_energy()
+c2_score = (c2_density + c2_breakout + c2_prob + c2_energy) / 4
+
+c3_radar = f_radar()
+c3_flow = f_flow()
+c3_concentration = f_concentration()
+c3_pressure = f_pressure()
+c3_score = (c3_radar + c3_flow + c3_concentration + c3_pressure) / 4
+
+total_score = (c1_score + c2_score + c3_score) / 3
+
+// ============================================================================
+// 6. STATE LABELS
+// ============================================================================
+get_c1_label(score) =>
+    if score >= 80
+        "Strong Bull"
+    else if score >= 60
+        "Weak Bull"
+    else if score >= 40
+        "Neutral"
+    else if score >= 20
+        "Weak Bear"
+    else
+        "Strong Bear"
+
+get_c2_label(score) =>
+    if score >= 80
+        "High Breakout"
+    else if score >= 60
+        "Moderate Active"
+    else if score >= 40
+        "Normal Active"
+    else if score >= 20
+        "Low Activity"
+    else
+        "Extreme Dull"
+
+get_c3_label(score) =>
+    if score >= 80
+        "Strong Inflow"
+    else if score >= 60
+        "Moderate Inflow"
+    else if score >= 40
+        "Capital Split"
+    else if score >= 20
+        "Moderate Outflow"
+    else
+        "Strong Outflow"
+
+get_grade(score) =>
+    if score >= 80
+        "A"
+    else if score >= 60
+        "B"
+    else if score >= 40
+        "C"
+    else if score >= 20
+        "D"
+    else
+        "E"
+
+get_grade_color(score) =>
+    if score >= 80
+        color.green
+    else if score >= 60
+        color.lime
+    else if score >= 40
+        color.yellow
+    else if score >= 20
+        color.orange
+    else
+        color.red
+
+// ============================================================================
+// 7. TABLE (Bottom Right)
+// ============================================================================
+if barstate.islast
+    sz = size.small
+    var table tbl = table.new(position.bottom_right, columns=8, rows=6,
+                              bgcolor=color.rgb(0,0,0, 92), border_color=color.gray, border_width=1)
+    
+    table.cell(tbl, 0, 0, " ATK/DEF HTF Regime Combo — Monthly", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 2, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 3, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 4, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 5, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 6, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    table.cell(tbl, 7, 0, "", text_color=color.yellow, bgcolor=color.rgb(40,20,0), text_size=sz)
+    
+    table.cell(tbl, 0, 1, "Module", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 1, "Factor 1", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 2, 1, "Factor 2", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 3, 1, "Factor 3", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 4, 1, "Factor 4", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 5, 1, "SCORE", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 6, 1, "State", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 7, 1, "Grade", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    
+    c1_bg = color.from_gradient(c1_score, 0, 100, color.red, color.green)
+    table.cell(tbl, 0, 2, "C1", text_color=color.orange, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 2, "Dir "+str.tostring(c1_dir, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c1_dir, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 2, 2, "Trend "+str.tostring(c1_trend, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c1_trend, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 3, 2, "Mom "+str.tostring(c1_mom, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c1_mom, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 4, 2, "Vol "+str.tostring(c1_vol, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c1_vol, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 5, 2, str.tostring(c1_score, "#")+"%", text_color=color.white, bgcolor=c1_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 6, 2, get_c1_label(c1_score), text_color=color.white, bgcolor=c1_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 7, 2, get_grade(c1_score), text_color=get_grade_color(c1_score), bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    
+    c2_bg = color.from_gradient(c2_score, 0, 100, color.red, color.green)
+    table.cell(tbl, 0, 3, "C2", text_color=color.aqua, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 3, "Dens "+str.tostring(c2_density, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c2_density, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 2, 3, "Brk "+str.tostring(c2_breakout, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c2_breakout, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 3, 3, "Prob "+str.tostring(c2_prob, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c2_prob, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 4, 3, "Enr "+str.tostring(c2_energy, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c2_energy, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 5, 3, str.tostring(c2_score, "#")+"%", text_color=color.white, bgcolor=c2_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 6, 3, get_c2_label(c2_score), text_color=color.white, bgcolor=c2_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 7, 3, get_grade(c2_score), text_color=get_grade_color(c2_score), bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    
+    c3_bg = color.from_gradient(c3_score, 0, 100, color.red, color.green)
+    table.cell(tbl, 0, 4, "C3", text_color=color.yellow, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 4, "Rad "+str.tostring(c3_radar, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c3_radar, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 2, 4, "Flow "+str.tostring(c3_flow, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c3_flow, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 3, 4, "Conc "+str.tostring(c3_concentration, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c3_concentration, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 4, 4, "Pres "+str.tostring(c3_pressure, "#")+"%", text_color=color.white, bgcolor=color.from_gradient(c3_pressure, 0, 100, color.red, color.green), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 5, 4, str.tostring(c3_score, "#")+"%", text_color=color.white, bgcolor=c3_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 6, 4, get_c3_label(c3_score), text_color=color.white, bgcolor=c3_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 7, 4, get_grade(c3_score), text_color=get_grade_color(c3_score), bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    
+    total_bg = color.from_gradient(total_score, 0, 100, color.red, color.green)
+    table.cell(tbl, 0, 5, "Total", text_color=color.yellow, bgcolor=color.rgb(30,30,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 1, 5, "C1:"+str.tostring(c1_score,"#")+"%", text_color=color.white, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 2, 5, "C2:"+str.tostring(c2_score,"#")+"%", text_color=color.white, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 3, 5, "C3:"+str.tostring(c3_score,"#")+"%", text_color=color.white, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 4, 5, "Total", text_color=color.yellow, bgcolor=color.rgb(20,20,30), text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 5, 5, str.tostring(total_score,"#")+"%", text_color=color.white, bgcolor=total_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 6, 5, get_grade(total_score), text_color=get_grade_color(total_score), bgcolor=total_bg, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 7, 5, "", text_color=color.gray, bgcolor=color.rgb(20,20,30), text_size=sz)
+
+// ============================================================================
+// 8. PLOT MOVING AVERAGES
+// ============================================================================
+plot(ma20, "MA20", color=color.new(color.blue, 70), linewidth=1)
+plot(ma50, "MA50", color=color.new(color.red, 70), linewidth=1)
+
+// ============================================================================
+// 9. PLOT SWING HIGHS & LOWS (FIFO Managed)
+// ============================================================================
+swingHigh = ta.pivothigh(leftBars, rightBars)
+swingLow = ta.pivotlow(leftBars, rightBars)
+
+if showLabels and not na(swingHigh)
+    lbl = label.new(bar_index[rightBars], swingHigh,
+                    text="🔴 RESISTANCE\n" + str.tostring(swingHigh, "#.##"),
+                    color=color.rgb(200,0,0, 85), textcolor=color.white,
+                    style=label.style_label_down, size=size.small)
+    fifo_add_label(lbl, bar_index)
+
+if showLabels and not na(swingLow)
+    lbl = label.new(bar_index[rightBars], swingLow,
+                    text="🟢 SUPPORT\n" + str.tostring(swingLow, "#.##"),
+                    color=color.rgb(0,150,0, 85), textcolor=color.white,
+                    style=label.style_label_up, size=size.small)
+    fifo_add_label(lbl, bar_index)
+
+// ============================================================================
+// 10. FIFO CLEANUP
+// ============================================================================
+fifo_cleanup()
+
+// ============================================================================
+// 11. SWING CONNECTION LINES (FIFO Managed)
+// ============================================================================
+var float last_swing_high_price = na
+var int last_swing_high_bar = na
+
+if not na(swingHigh)
+    if not na(last_swing_high_price)
+        ln = line.new(last_swing_high_bar, last_swing_high_price, 
+                      bar_index[rightBars], swingHigh,
+                      color=color.new(color.red, 60), width=1, style=line.style_dashed)
+        fifo_add_line(ln, bar_index)
+    last_swing_high_price := swingHigh
+    last_swing_high_bar := bar_index[rightBars]
+
+var float last_swing_low_price = na
+var int last_swing_low_bar = na
+
+if not na(swingLow)
+    if not na(last_swing_low_price)
+        ln = line.new(last_swing_low_bar, last_swing_low_price,
+                      bar_index[rightBars], swingLow,
+                      color=color.new(color.green, 60), width=1, style=line.style_dashed)
+        fifo_add_line(ln, bar_index)
+    last_swing_low_price := swingLow
+    last_swing_low_bar := bar_index[rightBars]

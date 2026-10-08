@@ -1,0 +1,360 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator('Range Commander ORB [JOAT]', shorttitle='ORB [JOAT]', overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ═════════════════════════════════ INPUTS ═══════════════════════════════════
+
+// ── Opening Range ──
+orbSession = input.session('0930-0945', 'Opening Range Window', group = 'Opening Range',
+     tooltip = 'The session window that defines the opening range.\n\nDefault 09:30–09:45 New York = classic 15-minute ORB. Set 0930-1000 for a 30-minute ORB.')
+orbTZ = input.string('America/New_York', 'Time Zone', group = 'Opening Range',
+     options = ['America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Europe/London', 'Europe/Berlin', 'Asia/Tokyo', 'Asia/Hong_Kong', 'Australia/Sydney', 'UTC'],
+     tooltip = 'Time zone the opening-range window is evaluated in.')
+extendUntilClose = input.bool(true, 'Extend Levels To End Of Day', group = 'Opening Range',
+     tooltip = 'When enabled, range rails and targets extend until the daily session rolls over. When disabled, they extend a fixed bar count.')
+extendBars = input.int(60, 'Fixed Extension (bars)', minval = 5, maxval = 480, group = 'Opening Range',
+     tooltip = 'Extension length used when "Extend To End Of Day" is off.')
+
+// ── Breakouts ──
+breakoutMode = input.string('Close Beyond Range', 'Breakout Trigger', options = ['Close Beyond Range', 'Wick Beyond Range'], group = 'Breakouts',
+     tooltip = 'Close Beyond Range → requires a full candle close outside the OR (cleaner).\nWick Beyond Range → first touch outside triggers (faster).')
+onePerSide = input.bool(true, 'Only First Breakout Per Side', group = 'Breakouts',
+     tooltip = 'Stamps only the first breakout in each direction per day — keeps the chart immaculate.')
+showRetests = input.bool(true, 'Mark Range Retests', group = 'Breakouts',
+     tooltip = 'After a breakout, marks the first return to the broken range edge with a subtle diamond.')
+minRangeATR = input.float(0.0, 'Min Range Size (× ATR)', minval = 0.0, maxval = 5.0, step = 0.1, group = 'Breakouts',
+     tooltip = 'Ignore breakout days whose opening range is smaller than this multiple of ATR — filters dead opens. 0 = no filter.')
+
+// ── Targets ──
+showTargets = input.bool(true, 'Show Measured-Move Targets', group = 'Targets',
+     tooltip = 'Projects ±0.5R, ±1R and ±1.5R rails, where R = opening-range height.')
+tgt1Mult = input.float(0.5, 'Target 1 (× range)', minval = 0.1, step = 0.1, group = 'Targets')
+tgt2Mult = input.float(1.0, 'Target 2 (× range)', minval = 0.1, step = 0.1, group = 'Targets')
+tgt3Mult = input.float(1.5, 'Target 3 (× range)', minval = 0.1, step = 0.1, group = 'Targets')
+showMidline = input.bool(true, 'Show Range Midline', group = 'Targets')
+
+// ── Visuals ──
+bullBreakColor = input.color(#2962ff, 'Bull Breakout Color', group = 'Visuals')
+bearBreakColor = input.color(#787b86, 'Bear Breakout Color', group = 'Visuals',
+     tooltip = 'Default slate grey keeps the downside understated — swap for red if you prefer classic contrast.')
+boxColor = input.color(#2962ff, 'Range Box Color', group = 'Visuals')
+boxTransp = input.int(88, 'Range Box Transparency', minval = 0, maxval = 100, group = 'Visuals')
+railTransp = input.int(25, 'Rail Transparency', minval = 0, maxval = 100, group = 'Visuals')
+tgtTransp = input.int(55, 'Target Rail Transparency', minval = 0, maxval = 100, group = 'Visuals')
+showDayDivider = input.bool(false, 'Show Session Start Divider', group = 'Visuals')
+keepHistoryDays = input.int(5, 'Keep Last N Days On Chart', minval = 1, maxval = 20, group = 'Visuals',
+     tooltip = 'Older opening-range drawings are removed beyond this many days.')
+
+// ── Command Dashboard ──
+showDash = input.bool(true, 'Show Command Dashboard', group = 'Command Dashboard')
+dashPos = input.string('Top Right', 'Dashboard Position',
+     options = ['Top Left', 'Top Right', 'Bottom Left', 'Bottom Right', 'Top Center', 'Bottom Center', 'Middle Left', 'Middle Right'],
+     group = 'Command Dashboard')
+dashSize = input.string('Normal', 'Dashboard Text Size', options = ['Tiny', 'Small', 'Normal', 'Large'], group = 'Command Dashboard')
+
+// ══════════════════════════════ SESSION LOGIC ═══════════════════════════════
+
+bool inORB = not na(time(timeframe.period, orbSession, orbTZ))
+bool orbStart = inORB and not inORB[1]
+bool orbEnd = not inORB and inORB[1]
+bool newDay = ta.change(time('D')) != 0
+
+float atrDaily = ta.atr(14)
+
+// ─── Per-day state ───
+var float orHigh = na
+var float orLow = na
+var bool orLocked = false
+var bool brokeUp = false
+var bool brokeDown = false
+var bool retestedUp = false
+var bool retestedDown = false
+var bool tgt1Hit = false
+var bool tgt2Hit = false
+var bool tgt3Hit = false
+var int orStartBar = na
+
+// ─── Drawing handles for the current day ───
+var box orBox = na
+var line railHigh = na
+var line railLow = na
+var line railMid = na
+var line tU1 = na
+var line tU2 = na
+var line tU3 = na
+var line tD1 = na
+var line tD2 = na
+var line tD3 = na
+var label lblHigh = na
+var label lblLow = na
+
+// ─── History management ───
+var array<box> oldBoxes = array.new<box>()
+var array<line> oldLines = array.new<line>()
+var array<label> oldLabels = array.new<label>()
+
+f_archive() =>
+    if not na(orBox)
+        array.push(oldBoxes, orBox)
+    if not na(railHigh)
+        array.push(oldLines, railHigh)
+    if not na(railLow)
+        array.push(oldLines, railLow)
+    if not na(railMid)
+        array.push(oldLines, railMid)
+    if not na(tU1)
+        array.push(oldLines, tU1)
+    if not na(tU2)
+        array.push(oldLines, tU2)
+    if not na(tU3)
+        array.push(oldLines, tU3)
+    if not na(tD1)
+        array.push(oldLines, tD1)
+    if not na(tD2)
+        array.push(oldLines, tD2)
+    if not na(tD3)
+        array.push(oldLines, tD3)
+    if not na(lblHigh)
+        array.push(oldLabels, lblHigh)
+    if not na(lblLow)
+        array.push(oldLabels, lblLow)
+    // trim history: each day archives ≤ 1 box, ≤ 9 lines, ≤ 2 labels
+    while array.size(oldBoxes) > keepHistoryDays
+        box.delete(array.shift(oldBoxes))
+    while array.size(oldLines) > keepHistoryDays * 9
+        line.delete(array.shift(oldLines))
+    while array.size(oldLabels) > keepHistoryDays * 2
+        label.delete(array.shift(oldLabels))
+
+// ─── Opening range capture ───
+if orbStart
+    f_archive()
+    orHigh := high
+    orLow := low
+    orLocked := false
+    brokeUp := false
+    brokeDown := false
+    retestedUp := false
+    retestedDown := false
+    tgt1Hit := false
+    tgt2Hit := false
+    tgt3Hit := false
+    orStartBar := bar_index
+    orBox := box.new(bar_index, high, bar_index + 1, low,
+         border_color = color.new(boxColor, 35), border_width = 1,
+         bgcolor = color.new(boxColor, boxTransp))
+    railHigh := na
+    railLow := na
+    railMid := na
+    tU1 := na
+    tU2 := na
+    tU3 := na
+    tD1 := na
+    tD2 := na
+    tD3 := na
+    lblHigh := na
+    lblLow := na
+
+if inORB and not na(orHigh)
+    orHigh := math.max(orHigh, high)
+    orLow := math.min(orLow, low)
+    if not na(orBox)
+        box.set_top(orBox, orHigh)
+        box.set_bottom(orBox, orLow)
+        box.set_right(orBox, bar_index + 1)
+
+// ─── Lock the range & project rails ───
+float orRange = orHigh - orLow
+bool rangeBigEnough = minRangeATR <= 0 or (not na(atrDaily) and orRange >= atrDaily * minRangeATR)
+
+if orbEnd and not na(orHigh) and not orLocked
+    orLocked := true
+    if not na(orBox)
+        box.set_right(orBox, bar_index)
+    railHigh := line.new(bar_index, orHigh, bar_index + 1, orHigh, color = color.new(bullBreakColor, railTransp), width = 2)
+    railLow := line.new(bar_index, orLow, bar_index + 1, orLow, color = color.new(bearBreakColor, railTransp), width = 2)
+    if showMidline
+        railMid := line.new(bar_index, (orHigh + orLow) / 2, bar_index + 1, (orHigh + orLow) / 2,
+             color = color.new(#787b86, 60), width = 1, style = line.style_dashed)
+    if showTargets
+        tU1 := line.new(bar_index, orHigh + orRange * tgt1Mult, bar_index + 1, orHigh + orRange * tgt1Mult, color = color.new(bullBreakColor, tgtTransp), style = line.style_dotted)
+        tU2 := line.new(bar_index, orHigh + orRange * tgt2Mult, bar_index + 1, orHigh + orRange * tgt2Mult, color = color.new(bullBreakColor, tgtTransp), style = line.style_dotted)
+        tU3 := line.new(bar_index, orHigh + orRange * tgt3Mult, bar_index + 1, orHigh + orRange * tgt3Mult, color = color.new(bullBreakColor, tgtTransp), style = line.style_dotted)
+        tD1 := line.new(bar_index, orLow - orRange * tgt1Mult, bar_index + 1, orLow - orRange * tgt1Mult, color = color.new(bearBreakColor, tgtTransp), style = line.style_dotted)
+        tD2 := line.new(bar_index, orLow - orRange * tgt2Mult, bar_index + 1, orLow - orRange * tgt2Mult, color = color.new(bearBreakColor, tgtTransp), style = line.style_dotted)
+        tD3 := line.new(bar_index, orLow - orRange * tgt3Mult, bar_index + 1, orLow - orRange * tgt3Mult, color = color.new(bearBreakColor, tgtTransp), style = line.style_dotted)
+    lblHigh := label.new(bar_index, orHigh, 'OR HIGH ' + str.tostring(orHigh, format.mintick),
+         style = label.style_label_left, color = color.new(#000000, 100), textcolor = color.new(bullBreakColor, 10), size = size.small)
+    lblLow := label.new(bar_index, orLow, 'OR LOW ' + str.tostring(orLow, format.mintick),
+         style = label.style_label_left, color = color.new(#000000, 100), textcolor = color.new(bearBreakColor, 10), size = size.small)
+
+// ─── Extend live rails ───
+if orLocked
+    bool stillExtending = extendUntilClose ? true : bar_index - orStartBar <= extendBars
+    if stillExtending and not newDay
+        if not na(railHigh)
+            line.set_x2(railHigh, bar_index)
+        if not na(railLow)
+            line.set_x2(railLow, bar_index)
+        if not na(railMid)
+            line.set_x2(railMid, bar_index)
+        if not na(tU1)
+            line.set_x2(tU1, bar_index)
+        if not na(tU2)
+            line.set_x2(tU2, bar_index)
+        if not na(tU3)
+            line.set_x2(tU3, bar_index)
+        if not na(tD1)
+            line.set_x2(tD1, bar_index)
+        if not na(tD2)
+            line.set_x2(tD2, bar_index)
+        if not na(tD3)
+            line.set_x2(tD3, bar_index)
+        if not na(lblHigh)
+            label.set_x(lblHigh, bar_index)
+        if not na(lblLow)
+            label.set_x(lblLow, bar_index)
+
+// ─── Breakout detection ───
+float upTrigger = breakoutMode == 'Close Beyond Range' ? close : high
+float dnTrigger = breakoutMode == 'Close Beyond Range' ? close : low
+
+bool breakUpNow = orLocked and not inORB and rangeBigEnough and upTrigger > orHigh and (not onePerSide or not brokeUp)
+bool breakDownNow = orLocked and not inORB and rangeBigEnough and dnTrigger < orLow and (not onePerSide or not brokeDown)
+
+if breakUpNow
+    brokeUp := true
+if breakDownNow
+    brokeDown := true
+
+// ─── Measured-move target tracking ───
+if orLocked and not na(orRange) and orRange > 0
+    if brokeUp
+        tgt1Hit := tgt1Hit or high >= orHigh + orRange * tgt1Mult
+        tgt2Hit := tgt2Hit or high >= orHigh + orRange * tgt2Mult
+        tgt3Hit := tgt3Hit or high >= orHigh + orRange * tgt3Mult
+    if brokeDown
+        tgt1Hit := tgt1Hit or low <= orLow - orRange * tgt1Mult
+        tgt2Hit := tgt2Hit or low <= orLow - orRange * tgt2Mult
+        tgt3Hit := tgt3Hit or low <= orLow - orRange * tgt3Mult
+
+// ─── Retest detection ───
+bool retestUpNow = showRetests and brokeUp and not retestedUp and not breakUpNow and low <= orHigh and close > orLow
+bool retestDownNow = showRetests and brokeDown and not retestedDown and not breakDownNow and high >= orLow and close < orHigh
+if retestUpNow
+    retestedUp := true
+if retestDownNow
+    retestedDown := true
+
+// ─── Markers ───
+plotshape(breakUpNow, title = 'ORB Breakout Up', style = shape.labelup, location = location.belowbar,
+     color = bullBreakColor, text = 'ORB ▲', textcolor = color.white, size = size.tiny)
+plotshape(breakDownNow, title = 'ORB Breakout Down', style = shape.labeldown, location = location.abovebar,
+     color = bearBreakColor, text = 'ORB ▼', textcolor = color.white, size = size.tiny)
+plotshape(retestUpNow, title = 'Retest Of OR High', style = shape.diamond, location = location.belowbar,
+     color = color.new(bullBreakColor, 35), size = size.tiny)
+plotshape(retestDownNow, title = 'Retest Of OR Low', style = shape.diamond, location = location.abovebar,
+     color = color.new(bearBreakColor, 35), size = size.tiny)
+
+bgcolor(showDayDivider and orbStart ? color.new(#787b86, 82) : na, title = 'Session Start Divider')
+
+// ═══════════════════════════ COMMAND DASHBOARD ══════════════════════════════
+
+finalDashPos =
+     dashPos == 'Top Left' ? position.top_left :
+     dashPos == 'Top Right' ? position.top_right :
+     dashPos == 'Bottom Left' ? position.bottom_left :
+     dashPos == 'Bottom Right' ? position.bottom_right :
+     dashPos == 'Top Center' ? position.top_center :
+     dashPos == 'Bottom Center' ? position.bottom_center :
+     dashPos == 'Middle Left' ? position.middle_left :
+     dashPos == 'Middle Right' ? position.middle_right : position.top_right
+finalDashSize =
+     dashSize == 'Tiny' ? size.tiny :
+     dashSize == 'Small' ? size.small :
+     dashSize == 'Large' ? size.large : size.normal
+
+f_rangeGauge(float x) =>
+    int seg = math.round(math.max(math.min(x / 2.0, 1.0), 0.0) * 8)
+    string g = ''
+    for i = 1 to 8
+        g += i <= seg ? '▰' : '▱'
+    g
+
+var table dash = na
+if barstate.islast and showDash
+    if not na(dash)
+        table.delete(dash)
+        dash := na
+    dash := table.new(finalDashPos, columns = 3, rows = 10, bgcolor = color.new(#131722, 8),
+         border_width = 1, border_color = color.new(#000000, 100),
+         frame_width = 2, frame_color = color.new(boxColor, 30))
+
+    color rowBg = color.new(#181c27, 22)
+    color rowBgAlt = color.new(#12161f, 22)
+    color lblCol = color.new(color.white, 18)
+
+    string statusTxt = timeframe.isdwm ? 'INTRADAY ONLY' :
+         inORB ? '● FORMING' :
+         not orLocked ? '○ WAITING' :
+         brokeUp and brokeDown ? 'BROKEN BOTH' :
+         brokeUp ? 'BROKEN ▲' :
+         brokeDown ? 'BROKEN ▼' : 'LOCKED — INSIDE'
+    color statusBg = inORB ? color.new(#f0b90b, 55) :
+         brokeUp and not brokeDown ? color.new(bullBreakColor, 40) :
+         brokeDown and not brokeUp ? color.new(bearBreakColor, 40) :
+         orLocked ? color.new(boxColor, 60) : rowBg
+
+    float rangeATRx = not na(atrDaily) and atrDaily > 0 and not na(orRange) ? orRange / atrDaily : na
+    string rangeQuality = na(rangeATRx) ? '—' : rangeATRx >= 1.5 ? 'WIDE' : rangeATRx >= 0.7 ? 'NORMAL' : 'TIGHT'
+    float orMid = not na(orHigh) and not na(orLow) ? (orHigh + orLow) / 2 : na
+
+    // ── Title band ──
+    table.cell(dash, 0, 0, '◫ RANGE COMMANDER', text_color = color.white, bgcolor = color.new(boxColor, 22), text_size = finalDashSize)
+    table.cell(dash, 1, 0, '', bgcolor = color.new(boxColor, 22), text_size = finalDashSize)
+    table.cell(dash, 2, 0, syminfo.ticker + ' · ' + timeframe.period, text_color = color.new(color.white, 10), bgcolor = color.new(boxColor, 22), text_size = finalDashSize)
+    // ── Gradient accent strip ──
+    table.cell(dash, 0, 1, '', bgcolor = color.new(boxColor, 80), text_size = size.tiny)
+    table.cell(dash, 1, 1, '', bgcolor = color.new(boxColor, 55), text_size = size.tiny)
+    table.cell(dash, 2, 1, '', bgcolor = color.new(boxColor, 25), text_size = size.tiny)
+    // ── Status ──
+    table.cell(dash, 0, 2, 'Status', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 2, statusTxt, text_color = color.white, bgcolor = statusBg, text_size = finalDashSize)
+    table.cell(dash, 2, 2, breakoutMode == 'Close Beyond Range' ? 'close trigger' : 'wick trigger', text_color = color.new(color.white, 40), bgcolor = rowBg, text_size = finalDashSize)
+    // ── OR levels ──
+    table.cell(dash, 0, 3, 'OR High', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 3, na(orHigh) ? '—' : str.tostring(orHigh, format.mintick), text_color = color.new(bullBreakColor, 10), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 3, brokeUp ? '✓ broken' : '● intact', text_color = brokeUp ? bullBreakColor : color.new(color.white, 45), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 0, 4, 'OR Low', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 4, na(orLow) ? '—' : str.tostring(orLow, format.mintick), text_color = color.new(bearBreakColor, 10), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 4, brokeDown ? '✓ broken' : '● intact', text_color = brokeDown ? bearBreakColor : color.new(color.white, 45), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 0, 5, 'Midline', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 5, na(orMid) ? '—' : str.tostring(orMid, format.mintick), text_color = color.new(color.white, 25), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 5, na(orMid) ? '' : close > orMid ? 'price above' : 'price below', text_color = na(orMid) ? color.new(color.white, 45) : close > orMid ? bullBreakColor : bearBreakColor, bgcolor = rowBgAlt, text_size = finalDashSize)
+    // ── Range quality ──
+    table.cell(dash, 0, 6, 'Range Height', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 6, na(orRange) ? '—' : str.tostring(orRange, format.mintick), text_color = color.new(color.white, 10), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 6, na(rangeATRx) ? '' : f_rangeGauge(rangeATRx) + ' ' + rangeQuality, text_color = rangeQuality == 'WIDE' ? color.new(#f0b90b, 10) : color.new(boxColor, 15), bgcolor = rowBg, text_size = finalDashSize)
+    // ── Targets ──
+    string tgtTxt = (tgt1Hit ? 'T1 ✓' : 'T1 —') + '  ' + (tgt2Hit ? 'T2 ✓' : 'T2 —') + '  ' + (tgt3Hit ? 'T3 ✓' : 'T3 —')
+    table.cell(dash, 0, 7, 'Targets Hit', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 7, tgtTxt, text_color = tgt1Hit ? color.new(#f0b90b, 10) : color.new(color.white, 40), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 7, '±' + str.tostring(tgt1Mult, '0.0#') + 'R/' + str.tostring(tgt2Mult, '0.0#') + 'R/' + str.tostring(tgt3Mult, '0.0#') + 'R', text_color = color.new(color.white, 40), bgcolor = rowBgAlt, text_size = finalDashSize)
+    // ── Retests ──
+    table.cell(dash, 0, 8, 'Retests (▲ / ▼)', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 8, (retestedUp ? '✓' : '—') + ' / ' + (retestedDown ? '✓' : '—'), text_color = color.new(color.white, 20), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 8, showRetests ? 'diamonds on' : 'diamonds off', text_color = color.new(color.white, 45), bgcolor = rowBg, text_size = finalDashSize)
+    // ── Window ──
+    table.cell(dash, 0, 9, 'OR Window', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 9, orbSession, text_color = color.new(boxColor, 10), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 9, orbTZ, text_color = color.new(color.white, 40), bgcolor = rowBgAlt, text_size = finalDashSize)
+
+// ════════════════════════════════ ALERTS ════════════════════════════════════
+
+alertcondition(breakUpNow, title = 'ORB Breakout Up', message = '[JOAT] Range Commander — {{ticker}} broke ABOVE the opening range @ {{close}} ({{interval}})')
+alertcondition(breakDownNow, title = 'ORB Breakout Down', message = '[JOAT] Range Commander — {{ticker}} broke BELOW the opening range @ {{close}} ({{interval}})')
+alertcondition(retestUpNow, title = 'OR High Retest', message = '[JOAT] Range Commander — {{ticker}} retesting broken OR High ({{interval}})')
+alertcondition(retestDownNow, title = 'OR Low Retest', message = '[JOAT] Range Commander — {{ticker}} retesting broken OR Low ({{interval}})')
+alertcondition(orbEnd, title = 'Opening Range Locked', message = '[JOAT] Range Commander — opening range locked on {{ticker}}')

@@ -1,0 +1,238 @@
+//@version=6
+indicator("RSI Smart Divergence [josseliani]", overlay=false, max_lines_count=300, max_labels_count=300)
+//====================================================
+// INPUTS
+//====================================================
+groupRsi = "RSI Settings"
+rsiLen = input.int(14, "RSI Length", minval=1, group=groupRsi)
+src = input.source(close, "Source", group=groupRsi)
+overbought = input.float(70.0, "Overbought Level", group=groupRsi)
+oversold = input.float(30.0, "Oversold Level", group=groupRsi)
+
+groupDiv = "Smart Divergence Settings"
+modeZone = input.bool(true, "Zone oversold / overbought", group=groupDiv,
+     tooltip="Marks divergences only in oversold/overbought RSI zones.\nThe two modes can show different signals. Enable both if you want all of them.")
+modeRegular = input.bool(false, "Regular", group=groupDiv,
+     tooltip="Regular divergences with stricter adjacent-pivot rules.\nThe two modes can show different signals. Enable both if you want all of them.")
+pivotLeft = input.int(3, "Pivot Left", minval=1, group=groupDiv,
+     tooltip="Bars to the left to confirm a swing. Higher = fewer, stronger pivots.")
+pivotRight = input.int(3, "Pivot Right", minval=1, group=groupDiv,
+     tooltip="Bars to the right to confirm a swing (signal delay). Triangles appear on the confirmation bar.")
+maxBarsBetweenPoints = input.int(80, "Max bars between points", minval=5, group=groupDiv,
+     tooltip="Maximum bar distance between the two divergence points.")
+showOscDivLines = input.bool(true, "Draw divergence line on RSI", group=groupDiv)
+showPriceDivLines = input.bool(true, "Draw divergence line on price chart", group=groupDiv)
+maxDivLines = input.int(50, "Max divergence lines", minval=1, maxval=150, group=groupDiv)
+
+groupView = "Display"
+showLevels = input.bool(true, "Show RSI levels", group=groupView)
+showBgZones = input.bool(false, "Color overbought/oversold background", group=groupView)
+
+colBull = color.lime
+colBear = color.red
+lineStyle = line.style_dashed
+
+// Zone mode uses the original ±3 price search (same as the first published logic).
+zonePriceRadius = 3
+
+//====================================================
+// RSI + PIVOTS
+//====================================================
+rsi = ta.rsi(src, rsiLen)
+rsiPivotLow = ta.pivotlow(rsi, pivotLeft, pivotRight)
+rsiPivotHigh = ta.pivothigh(rsi, pivotLeft, pivotRight)
+
+//====================================================
+// FUNCTIONS
+//====================================================
+// Highest high / lowest low within ±radius of the RSI pivot bar (always returns a value).
+f_priceLowNear(int centerOffset, int radius) =>
+    int startOffset = math.max(centerOffset - radius, 0)
+    int endOffset = centerOffset + radius
+    float bestLow = low[startOffset]
+    int bestBar = bar_index - startOffset
+    for i = startOffset to endOffset
+        if low[i] < bestLow
+            bestLow := low[i]
+            bestBar := bar_index - i
+    [bestLow, bestBar]
+
+f_priceHighNear(int centerOffset, int radius) =>
+    int startOffset = math.max(centerOffset - radius, 0)
+    int endOffset = centerOffset + radius
+    float bestHigh = high[startOffset]
+    int bestBar = bar_index - startOffset
+    for i = startOffset to endOffset
+        if high[i] > bestHigh
+            bestHigh := high[i]
+            bestBar := bar_index - i
+    [bestHigh, bestBar]
+
+// Regular only: nothing between the two glued price vertices may stick out above/below them.
+f_noHighPopsBetween(int barA, float priceA, int barB, float priceB) =>
+    int leftBar = math.min(barA, barB)
+    int rightBar = math.max(barA, barB)
+    float cap = math.max(priceA, priceB)
+    bool clean = true
+    int leftOff = bar_index - leftBar
+    int rightOff = bar_index - rightBar
+    if leftOff - rightOff > 1
+        for off = rightOff + 1 to leftOff - 1
+            if high[off] > cap
+                clean := false
+    clean
+
+f_noLowPopsBetween(int barA, float priceA, int barB, float priceB) =>
+    int leftBar = math.min(barA, barB)
+    int rightBar = math.max(barA, barB)
+    float floor_ = math.min(priceA, priceB)
+    bool clean = true
+    int leftOff = bar_index - leftBar
+    int rightOff = bar_index - rightBar
+    if leftOff - rightOff > 1
+        for off = rightOff + 1 to leftOff - 1
+            if low[off] < floor_
+                clean := false
+    clean
+
+f_addLine(line[] arr, line ln, int maxCount) =>
+    array.push(arr, ln)
+    if array.size(arr) > maxCount
+        line.delete(array.shift(arr))
+
+f_drawDiv(line[] oscArr, line[] priceArr, int maxCount, bool showOsc, bool showPrice, int r1, float y1, int r2, float y2, int p1, float py1, int p2, float py2, color col) =>
+    if showOsc
+        f_addLine(oscArr, line.new(r1, y1, r2, y2, xloc=xloc.bar_index, extend=extend.none, color=col, style=lineStyle, width=1), maxCount)
+    if showPrice
+        f_addLine(priceArr, line.new(p1, py1, p2, py2, xloc=xloc.bar_index, extend=extend.none, color=col, style=lineStyle, width=1, force_overlay=true), maxCount)
+
+//====================================================
+// STATE
+//====================================================
+var float zBullRsi = na
+var int zBullRsiBar = na
+var float zBullPrice = na
+var int zBullPriceBar = na
+var float zBearRsi = na
+var int zBearRsiBar = na
+var float zBearPrice = na
+var int zBearPriceBar = na
+
+var float pBullRsi = na
+var int pBullRsiBar = na
+var float pBullPrice = na
+var int pBullPriceBar = na
+var float pBearRsi = na
+var int pBearRsiBar = na
+var float pBearPrice = na
+var int pBearPriceBar = na
+
+var line[] oscLines = array.new_line()
+var line[] priceLines = array.new_line()
+
+bullDiv = false
+bearDiv = false
+var float bullSignalY = na
+var float bearSignalY = na
+bullSignalY := na
+bearSignalY := na
+
+// Regular: wider window so price line locks to the real local extreme near the RSI pivot
+regularPriceRadius = pivotLeft + pivotRight
+
+//====================================================
+// BULLISH
+//====================================================
+if barstate.isconfirmed and not na(rsiPivotLow)
+    float currRsi = rsi[pivotRight]
+    int currRsiBar = bar_index - pivotRight
+    bool currInOs = currRsi < oversold
+
+    // ----- Zone (original): both in OS, skip mid-zone pivots, price ±3 -----
+    if modeZone
+        [zPrice, zPriceBar] = f_priceLowNear(pivotRight, zonePriceRadius)
+        bool prevOk = not na(zBullRsi) and not na(zBullRsiBar) and not na(zBullPrice) and not na(zBullPriceBar)
+        int bars = prevOk ? currRsiBar - zBullRsiBar : 0
+        bool inWin = prevOk and bars > 0 and bars <= maxBarsBetweenPoints
+        if currInOs and inWin and currRsi > zBullRsi and zPrice < zBullPrice
+            bullDiv := true
+            bullSignalY := rsi
+            f_drawDiv(oscLines, priceLines, maxDivLines, showOscDivLines, showPriceDivLines, zBullRsiBar, zBullRsi, currRsiBar, currRsi, zBullPriceBar, zBullPrice, zPriceBar, zPrice, colBull)
+        if currInOs
+            zBullRsi := currRsi
+            zBullRsiBar := currRsiBar
+            zBullPrice := zPrice
+            zBullPriceBar := zPriceBar
+
+    // ----- Regular: adjacent RSI pivots; glue to local price extreme; no pivot between -----
+    if modeRegular
+        [rPrice, rPriceBar] = f_priceLowNear(pivotRight, regularPriceRadius)
+        bool prevOk = not na(pBullRsi) and not na(pBullPrice) and not na(pBullRsiBar) and not na(pBullPriceBar)
+        int bars = prevOk ? currRsiBar - pBullRsiBar : 0
+        bool inWin = prevOk and bars > 0 and bars <= maxBarsBetweenPoints
+        bool priceStruct = inWin and currRsi > pBullRsi and rPrice < pBullPrice
+        bool pathClean = priceStruct and f_noLowPopsBetween(pBullPriceBar, pBullPrice, rPriceBar, rPrice)
+        if pathClean
+            bullDiv := true
+            bullSignalY := rsi
+            f_drawDiv(oscLines, priceLines, maxDivLines, showOscDivLines, showPriceDivLines, pBullRsiBar, pBullRsi, currRsiBar, currRsi, pBullPriceBar, pBullPrice, rPriceBar, rPrice, colBull)
+        pBullRsi := currRsi
+        pBullRsiBar := currRsiBar
+        pBullPrice := rPrice
+        pBullPriceBar := rPriceBar
+
+//====================================================
+// BEARISH
+//====================================================
+if barstate.isconfirmed and not na(rsiPivotHigh)
+    float currRsi = rsi[pivotRight]
+    int currRsiBar = bar_index - pivotRight
+    bool currInOb = currRsi > overbought
+
+    // ----- Zone (original): both in OB, skip mid-zone pivots, price ±3 -----
+    if modeZone
+        [zPrice, zPriceBar] = f_priceHighNear(pivotRight, zonePriceRadius)
+        bool prevOk = not na(zBearRsi) and not na(zBearRsiBar) and not na(zBearPrice) and not na(zBearPriceBar)
+        int bars = prevOk ? currRsiBar - zBearRsiBar : 0
+        bool inWin = prevOk and bars > 0 and bars <= maxBarsBetweenPoints
+        if currInOb and inWin and currRsi < zBearRsi and zPrice > zBearPrice
+            bearDiv := true
+            bearSignalY := rsi
+            f_drawDiv(oscLines, priceLines, maxDivLines, showOscDivLines, showPriceDivLines, zBearRsiBar, zBearRsi, currRsiBar, currRsi, zBearPriceBar, zBearPrice, zPriceBar, zPrice, colBear)
+        if currInOb
+            zBearRsi := currRsi
+            zBearRsiBar := currRsiBar
+            zBearPrice := zPrice
+            zBearPriceBar := zPriceBar
+
+    // ----- Regular: adjacent RSI pivots; glue to local price extreme; no pivot between -----
+    if modeRegular
+        [rPrice, rPriceBar] = f_priceHighNear(pivotRight, regularPriceRadius)
+        bool prevOk = not na(pBearRsi) and not na(pBearPrice) and not na(pBearRsiBar) and not na(pBearPriceBar)
+        int bars = prevOk ? currRsiBar - pBearRsiBar : 0
+        bool inWin = prevOk and bars > 0 and bars <= maxBarsBetweenPoints
+        bool priceStruct = inWin and currRsi < pBearRsi and rPrice > pBearPrice
+        bool pathClean = priceStruct and f_noHighPopsBetween(pBearPriceBar, pBearPrice, rPriceBar, rPrice)
+        if pathClean
+            bearDiv := true
+            bearSignalY := rsi
+            f_drawDiv(oscLines, priceLines, maxDivLines, showOscDivLines, showPriceDivLines, pBearRsiBar, pBearRsi, currRsiBar, currRsi, pBearPriceBar, pBearPrice, rPriceBar, rPrice, colBear)
+        pBearRsi := currRsi
+        pBearRsiBar := currRsiBar
+        pBearPrice := rPrice
+        pBearPriceBar := rPriceBar
+
+//====================================================
+// PLOTS
+//====================================================
+plot(rsi, "RSI", color=color.aqua, linewidth=2)
+plot(showLevels ? overbought : na, "Overbought", color=color.new(color.red, 40), linewidth=1)
+plot(showLevels ? 50 : na, "Middle", color=color.new(color.gray, 70), linewidth=1)
+plot(showLevels ? oversold : na, "Oversold", color=color.new(color.lime, 40), linewidth=1)
+bgcolor(showBgZones and rsi > overbought ? color.new(color.red, 92) : na)
+bgcolor(showBgZones and rsi < oversold ? color.new(color.green, 92) : na)
+plotshape(bullDiv ? bullSignalY : na, title="Bullish RSI Divergence", style=shape.triangleup, location=location.absolute, color=color.lime, size=size.tiny)
+plotshape(bearDiv ? bearSignalY : na, title="Bearish RSI Divergence", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)
+
+alertcondition(bullDiv, title="Bullish RSI Divergence", message="Bullish RSI Divergence on {{ticker}} {{interval}}")
+alertcondition(bearDiv, title="Bearish RSI Divergence", message="Bearish RSI Divergence on {{ticker}} {{interval}}")

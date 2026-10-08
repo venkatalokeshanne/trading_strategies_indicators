@@ -1,0 +1,871 @@
+//@version=6
+indicator(
+     title            = "NQ/MNQ 1-Minute Scalping Toolkit",
+     shorttitle       = "NQ/MNQ scalping",
+     overlay          = true,
+     max_labels_count = 500,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_bars_back    = 5000)
+
+//══════════════════════════════════════
+// INPUTS
+//══════════════════════════════════════
+string insightsGroup = "Insights"
+
+showDestroyedZonesInput = input.bool(true, "Show destroyed zones", group = insightsGroup)
+renderHoursInput = input.float(24.0, "Render all insights from last N hours", minval = 1, step = 1, group = insightsGroup)
+emaFastLengthInput = input.int(9, "Fast EMA length", minval = 1, group = insightsGroup)
+emaSlowLengthInput = input.int(21, "Slow EMA length", minval = 1, group = insightsGroup)
+
+int renderWindowMs = int(renderHoursInput * 60.0 * 60.0 * 1000.0)
+bool inGlobalRenderWindow = time >= last_bar_time - renderWindowMs
+
+//══════════════════════════════════════
+// STATIC SETTINGS
+//══════════════════════════════════════
+seqWickLen = 2
+int   effectiveAtrLen        = 2
+float zoneSensitivityStatic  = 1.0
+float zoneHeightATR     = 0.25
+float mergePadATR       = 0.10
+bool  useWickExtremes   = true
+int   maxZones          = 50
+int   maxDestroyedZones = 100
+
+bool  showMoveBubbles    = true
+bool  showBubbleText     = true
+float bubbleRelVolThresh = 1.25
+float bubbleOffsetATR    = 0.18
+
+color bullColor = #00E676
+color bearColor = #FF5252
+
+//══════════════════════════════════════
+// CANDLE TYPE SETTINGS
+//══════════════════════════════════════
+sweepLookback = 5
+largeBody     = 0.65
+largeWick     = 0.45
+highVol       = 1.4
+
+//══════════════════════════════════════
+// FUNCTIONS
+//══════════════════════════════════════
+f_fmt_money(float x) =>
+    float ax = math.abs(x)
+    string sign = x < 0 ? "-" : ""
+
+    ax >= 1000000000 ? sign + "$" + str.tostring(ax / 1000000000.0, "#.##") + "B" :
+     ax >= 1000000   ? sign + "$" + str.tostring(ax / 1000000.0, "#.##") + "M" :
+     ax >= 1000      ? sign + "$" + str.tostring(ax / 1000.0, "#.##") + "K" :
+                       sign + "$" + str.tostring(ax, "#.##")
+
+f_visible_by_time(int bornTime) =>
+    not na(bornTime) and bornTime >= last_bar_time - renderWindowMs
+
+f_set_zone_style(box bx, int side, float strength) =>
+    int transp = strength >= 8 ? 75 : strength >= 5 ? 80 : 86
+    color bg   = side == 1 ? color.new(bullColor, transp) : color.new(bearColor, transp)
+
+    box.set_bgcolor(bx, bg)
+    box.set_border_width(bx, 0)
+
+f_bar_core() =>
+    float _avgVol   = ta.sma(volume, 12)
+    float _relVol   = _avgVol > 0 ? volume / _avgVol : 0.0
+    bool  _isEvent  = _relVol >= 1.6
+    bool  _isZone   = _relVol >= zoneSensitivityStatic
+
+    float _barRange = math.max(high - low, syminfo.mintick)
+    float _body     = math.abs(close - open)
+    float _bodyEff  = _body / _barRange
+    float _closePos = (close - low) / _barRange
+    bool  _isDoji   = close == open
+
+    float _buyStrength  = _closePos * _bodyEff
+    float _sellStrength = (1.0 - _closePos) * _bodyEff
+
+    bool _isBuyDominance  = _isEvent and not _isDoji and _buyStrength >= 0.55 and _buyStrength > _sellStrength
+    bool _isSellDominance = _isEvent and not _isDoji and _sellStrength >= 0.55 and _sellStrength > _buyStrength
+    bool _isBattle        = _isEvent and not _isBuyDominance and not _isSellDominance and _bodyEff <= 0.45
+
+    [_relVol, _isZone, _bodyEff, _closePos, _isBuyDominance, _isSellDominance, _isBattle]
+
+f_add_or_merge_zone(
+     box[] zones,
+     float[] tops,
+     float[] bottoms,
+     int[] bornBars,
+     int[] bornTimes,
+     int[] sides,
+     float[] strengths,
+     int side,
+     float top,
+     float bottom,
+     float strength,
+     float mergePad) =>
+
+    bool merged = false
+
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            int zSide     = array.get(sides, i)
+            float zTop    = array.get(tops, i)
+            float zBottom = array.get(bottoms, i)
+            int zBorn     = array.get(bornBars, i)
+            int zBornTime = array.get(bornTimes, i)
+            box zBox      = array.get(zones, i)
+
+            bool overlap = bottom <= zTop + mergePad and top >= zBottom - mergePad
+            bool visibleNow = f_visible_by_time(zBornTime)
+
+            // An expired hidden zone must not absorb a fresh zone signal.
+            if zSide == side and overlap and visibleNow
+                float mergedTop      = math.max(zTop, top)
+                float mergedBottom   = math.min(zBottom, bottom)
+                float mergedStrength = math.max(array.get(strengths, i), strength) + 0.50
+
+                array.set(tops, i, mergedTop)
+                array.set(bottoms, i, mergedBottom)
+                array.set(strengths, i, mergedStrength)
+
+                if na(zBox)
+                    zBox := box.new(left = zBorn, top = mergedTop, right = bar_index, bottom = mergedBottom)
+                    array.set(zones, i, zBox)
+
+                box.set_left(zBox, zBorn)
+                box.set_right(zBox, bar_index)
+                box.set_top(zBox, mergedTop)
+                box.set_bottom(zBox, mergedBottom)
+                f_set_zone_style(zBox, zSide, mergedStrength)
+
+                merged := true
+                break
+
+    if not merged
+        bool visibleNow = f_visible_by_time(time)
+        box newBox = visibleNow ? box.new(left = bar_index, top = top, right = bar_index + 1, bottom = bottom) : na
+
+        array.push(zones, newBox)
+        array.push(tops, top)
+        array.push(bottoms, bottom)
+        array.push(bornBars, bar_index)
+        array.push(bornTimes, time)
+        array.push(sides, side)
+        array.push(strengths, strength)
+
+        if not na(newBox)
+            f_set_zone_style(newBox, side, strength)
+
+f_trim_zones(
+     box[] zones,
+     float[] tops,
+     float[] bottoms,
+     int[] bornBars,
+     int[] bornTimes,
+     int[] sides,
+     float[] strengths,
+     int maxZones) =>
+
+    while array.size(zones) > maxZones
+        box oldBox = array.get(zones, 0)
+
+        if not na(oldBox)
+            box.delete(oldBox)
+
+        array.remove(zones, 0)
+        array.remove(tops, 0)
+        array.remove(bottoms, 0)
+        array.remove(bornBars, 0)
+        array.remove(bornTimes, 0)
+        array.remove(sides, 0)
+        array.remove(strengths, 0)
+
+f_trim_destroyed_zones(box[] zones, int[] destroyedTimes, int maxZones) =>
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            int destroyedTime = array.get(destroyedTimes, i)
+
+            if not f_visible_by_time(destroyedTime)
+                box.delete(array.get(zones, i))
+                array.remove(zones, i)
+                array.remove(destroyedTimes, i)
+
+    while array.size(zones) > maxZones
+        box.delete(array.shift(zones))
+        array.shift(destroyedTimes)
+
+//══════════════════════════════════════
+// CORE CALCULATIONS
+//══════════════════════════════════════
+float atrVal = nz(ta.atr(effectiveAtrLen), high - low)
+
+[relVolFlow, isZoneFlow, bodyEffFlow, closePosFlow, isBuyDominanceFlow, isSellDominanceFlow, isBattleFlow] = f_bar_core()
+
+float closeBiasFlow      = (closePosFlow - 0.5) * 2.0
+float rawDominanceFlow   = closeBiasFlow * bodyEffFlow
+float volumeWeightFlow   = math.min(relVolFlow / 1.6, 2.0)
+float dominanceScoreFlow = rawDominanceFlow * volumeWeightFlow
+float smoothedScoreFlow  = ta.ema(dominanceScoreFlow, 3)
+
+float upperWickFlow = high - math.max(open, close)
+float lowerWickFlow = math.min(open, close) - low
+float wickRangeFlow = math.max(high - low, syminfo.mintick)
+
+float upperWickPctFlow = upperWickFlow / wickRangeFlow
+float lowerWickPctFlow = lowerWickFlow / wickRangeFlow
+
+float candleDollarAmount = volume * close * syminfo.pointvalue
+
+//══════════════════════════════════════
+// CURRENT TIMEFRAME BUY / SELL ZONES
+//══════════════════════════════════════
+float buyAnchor      = useWickExtremes ? low  : math.min(open, close)
+float sellAnchor     = useWickExtremes ? high : math.max(open, close)
+float zoneHalfHeight = atrVal * zoneHeightATR
+float mergePad       = atrVal * mergePadATR
+
+float newBuyTop       = buyAnchor + zoneHalfHeight
+float newBuyBottom    = buyAnchor - zoneHalfHeight
+float newSellTop      = sellAnchor + zoneHalfHeight
+float newSellBottom   = sellAnchor - zoneHalfHeight
+float newZoneStrength = relVolFlow * math.abs(smoothedScoreFlow) * 4.0
+
+var box[]   activeZones    = array.new_box()
+var float[] activeTop      = array.new_float()
+var float[] activeBottom   = array.new_float()
+var int[]   activeBornBars = array.new_int()
+var int[]   activeBornTime = array.new_int()
+var int[]   activeSide     = array.new_int()
+var float[] activeStrength = array.new_float()
+
+var box[] destroyedZones = array.new_box()
+var int[] destroyedTimes = array.new_int()
+
+if array.size(activeZones) > 0
+    for i = array.size(activeZones) - 1 to 0
+        box zBox      = array.get(activeZones, i)
+        float zTop    = array.get(activeTop, i)
+        float zBottom = array.get(activeBottom, i)
+        int zBorn     = array.get(activeBornBars, i)
+        int zBornTime = array.get(activeBornTime, i)
+        int zSide     = array.get(activeSide, i)
+        float zStr    = array.get(activeStrength, i)
+
+        bool invalid =
+             barstate.isconfirmed and
+             bar_index > zBorn and
+             (zSide == 1 ? close < zBottom : close > zTop)
+
+        if invalid
+
+            if showDestroyedZonesInput
+                if not na(zBox)
+                    box.set_right(zBox, bar_index)
+                    box.set_bgcolor(zBox, color.new(color.gray, 88))
+                    box.set_border_color(zBox, color.new(color.gray, 60))
+                    box.set_border_style(zBox, line.style_dashed)
+                    array.push(destroyedZones, zBox)
+                    array.push(destroyedTimes, time)
+            else
+                if not na(zBox)
+                    box.delete(zBox)
+
+            array.remove(activeZones, i)
+            array.remove(activeTop, i)
+            array.remove(activeBottom, i)
+            array.remove(activeBornBars, i)
+            array.remove(activeBornTime, i)
+            array.remove(activeSide, i)
+            array.remove(activeStrength, i)
+        else
+            bool visibleNow = f_visible_by_time(zBornTime)
+
+            if visibleNow
+                if na(zBox)
+                    zBox := box.new(left = zBorn, top = zTop, right = bar_index, bottom = zBottom)
+                    array.set(activeZones, i, zBox)
+
+                box.set_left(zBox, zBorn)
+                box.set_right(zBox, bar_index)
+                box.set_top(zBox, zTop)
+                box.set_bottom(zBox, zBottom)
+                f_set_zone_style(zBox, zSide, zStr)
+            else
+                if not na(zBox)
+                    box.delete(zBox)
+                    array.set(activeZones, i, na)
+
+bool localNewZone =
+     barstate.isconfirmed and
+     isZoneFlow and
+     (isBuyDominanceFlow or isSellDominanceFlow)
+
+if localNewZone
+    if isBuyDominanceFlow
+        f_add_or_merge_zone(activeZones, activeTop, activeBottom, activeBornBars, activeBornTime, activeSide, activeStrength, 1, newBuyTop, newBuyBottom, newZoneStrength, mergePad)
+
+    if isSellDominanceFlow
+        f_add_or_merge_zone(activeZones, activeTop, activeBottom, activeBornBars, activeBornTime, activeSide, activeStrength, -1, newSellTop, newSellBottom, newZoneStrength, mergePad)
+
+    f_trim_zones(activeZones, activeTop, activeBottom, activeBornBars, activeBornTime, activeSide, activeStrength, maxZones)
+
+f_trim_destroyed_zones(destroyedZones, destroyedTimes, maxDestroyedZones)
+
+//══════════════════════════════════════
+// BUBBLES
+//══════════════════════════════════════
+var label[] bubbleLabels   = array.new_label()
+var int[]   bubbleBornTimes = array.new_int()
+
+f_trim_bubbles(label[] labels, int[] bornTimes) =>
+    if array.size(labels) > 0
+        for i = array.size(labels) - 1 to 0
+            int bBornTime = array.get(bornTimes, i)
+
+            if not f_visible_by_time(bBornTime)
+                label oldLabel = array.get(labels, i)
+
+                if not na(oldLabel)
+                    label.delete(oldLabel)
+
+                array.remove(labels, i)
+                array.remove(bornTimes, i)
+
+bool bigBuyerMove =
+     showMoveBubbles and
+     relVolFlow >= bubbleRelVolThresh and
+     (isBuyDominanceFlow or (isBattleFlow and lowerWickPctFlow >= 0.30))
+
+bool bigSellerMove =
+     showMoveBubbles and
+     relVolFlow >= bubbleRelVolThresh and
+     (isSellDominanceFlow or (isBattleFlow and upperWickPctFlow >= 0.30))
+
+string buyerBubbleText =
+     showBubbleText
+     ? f_fmt_money(candleDollarAmount)
+     : ""
+
+string sellerBubbleText =
+     showBubbleText
+     ? f_fmt_money(candleDollarAmount)
+     : ""
+
+color buyerBubbleColor = color.new(bullColor, 50)
+color sellerBubbleColor = color.new(bearColor, 50)
+
+if barstate.isconfirmed and inGlobalRenderWindow and bigBuyerMove
+    label newBubble = label.new(
+         bar_index,
+         low - atrVal * bubbleOffsetATR,
+         buyerBubbleText,
+         style     = label.style_circle,
+         color     = buyerBubbleColor,
+         textcolor = color.black,
+         size      = size.tiny)
+
+    array.push(bubbleLabels, newBubble)
+    array.push(bubbleBornTimes, time)
+
+if barstate.isconfirmed and inGlobalRenderWindow and bigSellerMove
+    label newBubble = label.new(
+         bar_index,
+         high + atrVal * bubbleOffsetATR,
+         sellerBubbleText,
+         style     = label.style_circle,
+         color     = sellerBubbleColor,
+         textcolor = color.black,
+         size      = size.tiny)
+
+    array.push(bubbleLabels, newBubble)
+    array.push(bubbleBornTimes, time)
+
+f_trim_bubbles(bubbleLabels, bubbleBornTimes)
+
+
+//══════════════════════════════════════
+// SEQUENTIAL SAME-LEVEL WICK LINES
+//══════════════════════════════════════
+float wickToleranceStatic = 0.5
+float minUpperWickStatic  = 0.0
+float minLowerWickStatic  = 0.0
+int   wickLineWidthStatic = 2
+int   maxWickLinesStatic  = 100
+
+var line[]  resistanceLines  = array.new_line()
+var float[] resistancePrices = array.new_float()
+var int[]   resistanceTimes  = array.new_int()
+var label[] resistanceLabels = array.new_label()
+var line[]  supportLines     = array.new_line()
+var float[] supportPrices    = array.new_float()
+var int[]   supportTimes     = array.new_int()
+var label[] supportLabels    = array.new_label()
+
+f_trim_line_levels(line[] lines, float[] prices, int[] bornTimes, label[] labels, int maxCount) =>
+    if array.size(lines) > 0
+        for i = array.size(lines) - 1 to 0
+            if not f_visible_by_time(array.get(bornTimes, i))
+                line.delete(array.get(lines, i))
+                label.delete(array.get(labels, i))
+                array.remove(lines, i)
+                array.remove(prices, i)
+                array.remove(bornTimes, i)
+                array.remove(labels, i)
+
+    while array.size(lines) > maxCount
+        line.delete(array.shift(lines))
+        label.delete(array.shift(labels))
+        array.shift(prices)
+        array.shift(bornTimes)
+
+float seqBodyHigh = math.max(open, close)
+float seqBodyLow  = math.min(open, close)
+
+float seqUpperWick = high - seqBodyHigh
+float seqLowerWick = seqBodyLow - low
+
+bool hasSeqUpperWick = seqUpperWick > minUpperWickStatic and seqUpperWick > seqLowerWick
+bool hasSeqLowerWick = seqLowerWick > minLowerWickStatic and seqLowerWick > seqUpperWick
+
+float upperRange = ta.highest(high, seqWickLen) - ta.lowest(high, seqWickLen)
+float lowerRange = ta.highest(low, seqWickLen) - ta.lowest(low, seqWickLen)
+
+bool upperSequence = true
+bool lowerSequence = true
+
+for i = 0 to seqWickLen - 1
+    upperSequence := upperSequence and hasSeqUpperWick[i]
+    lowerSequence := lowerSequence and hasSeqLowerWick[i]
+
+upperSequence := upperSequence and upperRange <= wickToleranceStatic
+lowerSequence := lowerSequence and lowerRange <= wickToleranceStatic
+
+float upperLevel = ta.highest(high, seqWickLen)
+float lowerLevel = ta.lowest(low, seqWickLen)
+
+if barstate.isconfirmed and inGlobalRenderWindow and upperSequence
+    line newResistance = line.new(
+         bar_index - seqWickLen + 1,
+         upperLevel,
+         bar_index,
+         upperLevel,
+         extend = extend.none,
+         color  = color.red,
+         width  = wickLineWidthStatic)
+
+    array.push(resistanceLines, newResistance)
+    array.push(resistancePrices, upperLevel)
+    array.push(resistanceTimes, time)
+
+    label newResistanceLabel = label.new(
+         bar_index,
+         upperLevel,
+         "Liquidation",
+         style     = label.style_label_left,
+         color     = color.new(color.white, 100),
+         textcolor = color.red,
+         size      = size.small)
+
+    array.push(resistanceLabels, newResistanceLabel)
+
+if barstate.isconfirmed and inGlobalRenderWindow and lowerSequence
+    line newSupport = line.new(
+         bar_index - seqWickLen + 1,
+         lowerLevel,
+         bar_index,
+         lowerLevel,
+         extend = extend.none,
+         color  = color.lime,
+         width  = wickLineWidthStatic)
+
+    array.push(supportLines, newSupport)
+    array.push(supportPrices, lowerLevel)
+    array.push(supportTimes, time)
+
+    label newSupportLabel = label.new(
+         bar_index,
+         lowerLevel,
+         "Liquidation",
+         style     = label.style_label_left,
+         color     = color.new(color.white, 100),
+         textcolor = color.lime,
+         size      = size.small)
+
+    array.push(supportLabels, newSupportLabel)
+
+f_trim_line_levels(resistanceLines, resistancePrices, resistanceTimes, resistanceLabels, maxWickLinesStatic)
+f_trim_line_levels(supportLines, supportPrices, supportTimes, supportLabels, maxWickLinesStatic)
+
+// Keep active liquidation lines ending at current bar
+if array.size(resistanceLines) > 0
+    for i = array.size(resistanceLines) - 1 to 0
+        line l = array.get(resistanceLines, i)
+        float lv = array.get(resistancePrices, i)
+        label lineLabel = array.get(resistanceLabels, i)
+
+        line.set_x2(l, bar_index)
+        label.set_x(lineLabel, bar_index)
+        label.set_y(lineLabel, lv)
+
+        bool bodyTouches = seqBodyLow <= lv and seqBodyHigh >= lv
+
+        if bodyTouches
+            line.delete(l)
+            label.delete(lineLabel)
+            array.remove(resistanceLines, i)
+            array.remove(resistancePrices, i)
+            array.remove(resistanceTimes, i)
+            array.remove(resistanceLabels, i)
+
+if array.size(supportLines) > 0
+    for i = array.size(supportLines) - 1 to 0
+        line l = array.get(supportLines, i)
+        float lv = array.get(supportPrices, i)
+        label lineLabel = array.get(supportLabels, i)
+
+        line.set_x2(l, bar_index)
+        label.set_x(lineLabel, bar_index)
+        label.set_y(lineLabel, lv)
+
+        bool bodyTouches = seqBodyLow <= lv and seqBodyHigh >= lv
+
+        if bodyTouches
+            line.delete(l)
+            label.delete(lineLabel)
+            array.remove(supportLines, i)
+            array.remove(supportPrices, i)
+            array.remove(supportTimes, i)
+            array.remove(supportLabels, i)
+
+//══════════════════════════════════════
+// ORB UP / DOWN - FIRST 15 MINUTES OF EACH SESSION
+// Fixed UTC+0 session schedule
+//══════════════════════════════════════
+int orbMinutes = 15
+color orbColor = color.blue
+int orbWidth = 2
+int maxOrbSessionsPerMarket = 10
+string orbTimezone = "Etc/UTC"
+
+f_orb_values(string sess) =>
+    bool inSess = not na(time("", sess, orbTimezone))
+    bool newSess = inSess and not inSess[1]
+
+    var int startTime = na
+    var int endTime = na
+    var float orbHigh = na
+    var float orbLow = na
+    var float sessionOpen = na
+
+    if newSess
+        startTime := time
+        endTime := time_close
+        orbHigh := high
+        orbLow := low
+        sessionOpen := open
+
+    if inSess and not na(startTime)
+        endTime := time_close
+
+        bool building = time < startTime + orbMinutes * 60 * 1000
+
+        if building
+            orbHigh := math.max(orbHigh, high)
+            orbLow := math.min(orbLow, low)
+
+    [startTime, endTime, orbHigh, orbLow, sessionOpen]
+
+f_same_orb_day(int firstTime, int secondTime) =>
+    not na(firstTime) and
+     not na(secondTime) and
+     year(firstTime, orbTimezone) == year(secondTime, orbTimezone) and
+     month(firstTime, orbTimezone) == month(secondTime, orbTimezone) and
+     dayofmonth(firstTime, orbTimezone) == dayofmonth(secondTime, orbTimezone)
+
+f_orb_session(string sess, string name) =>
+    [startTime, endTime, orbHigh, orbLow, sessionOpen] = request.security(
+         syminfo.tickerid,
+         "1",
+         f_orb_values(sess),
+         lookahead = barmerge.lookahead_off)
+
+    bool newOrb = not na(startTime) and (na(startTime[1]) or startTime != startTime[1])
+
+    var line[] upLines = array.new_line()
+    var line[] downLines = array.new_line()
+    var line[] openLines = array.new_line()
+    var label[] upLabels = array.new_label()
+    var label[] downLabels = array.new_label()
+    var label[] openLabels = array.new_label()
+    var int[] orbStartTimes = array.new_int()
+
+    if newOrb and f_visible_by_time(startTime)
+        array.push(upLines, line.new(x1 = startTime, y1 = orbHigh, x2 = endTime, y2 = orbHigh, xloc = xloc.bar_time, color = orbColor, width = orbWidth))
+        array.push(downLines, line.new(x1 = startTime, y1 = orbLow, x2 = endTime, y2 = orbLow, xloc = xloc.bar_time, color = orbColor, width = orbWidth))
+        array.push(openLines, line.new(x1 = startTime, y1 = sessionOpen, x2 = endTime, y2 = sessionOpen, xloc = xloc.bar_time, color = orbColor, width = orbWidth))
+
+        array.push(upLabels, label.new(x = endTime, y = orbHigh, xloc = xloc.bar_time, text = name + " ORB Up", style = label.style_label_left, color = color.new(color.white, 100), textcolor = orbColor, size = size.small))
+        array.push(downLabels, label.new(x = endTime, y = orbLow, xloc = xloc.bar_time, text = name + " ORB Down", style = label.style_label_left, color = color.new(color.white, 100), textcolor = orbColor, size = size.small))
+        array.push(openLabels, label.new(x = endTime, y = sessionOpen, xloc = xloc.bar_time, text = name + " Open", style = label.style_label_left, color = color.new(color.white, 100), textcolor = orbColor, size = size.small))
+        array.push(orbStartTimes, startTime)
+
+    if array.size(orbStartTimes) > 0
+        for i = array.size(orbStartTimes) - 1 to 0
+            if not f_visible_by_time(array.get(orbStartTimes, i))
+                line.delete(array.get(upLines, i))
+                line.delete(array.get(downLines, i))
+                line.delete(array.get(openLines, i))
+                label.delete(array.get(upLabels, i))
+                label.delete(array.get(downLabels, i))
+                label.delete(array.get(openLabels, i))
+
+                array.remove(upLines, i)
+                array.remove(downLines, i)
+                array.remove(openLines, i)
+                array.remove(upLabels, i)
+                array.remove(downLabels, i)
+                array.remove(openLabels, i)
+                array.remove(orbStartTimes, i)
+
+    while array.size(orbStartTimes) > maxOrbSessionsPerMarket
+        line.delete(array.shift(upLines))
+        line.delete(array.shift(downLines))
+        line.delete(array.shift(openLines))
+        label.delete(array.shift(upLabels))
+        label.delete(array.shift(downLabels))
+        label.delete(array.shift(openLabels))
+        array.shift(orbStartTimes)
+
+    if array.size(orbStartTimes) > 0 and not na(endTime)
+        int latest = array.size(orbStartTimes) - 1
+
+        if array.get(orbStartTimes, latest) == startTime
+            line latestUpLine = array.get(upLines, latest)
+            line latestDownLine = array.get(downLines, latest)
+            line latestOpenLine = array.get(openLines, latest)
+            label latestUpLabel = array.get(upLabels, latest)
+            label latestDownLabel = array.get(downLabels, latest)
+            label latestOpenLabel = array.get(openLabels, latest)
+
+            line.set_x2(latestUpLine, endTime)
+            line.set_y1(latestUpLine, orbHigh)
+            line.set_y2(latestUpLine, orbHigh)
+
+            line.set_x2(latestDownLine, endTime)
+            line.set_y1(latestDownLine, orbLow)
+            line.set_y2(latestDownLine, orbLow)
+
+            line.set_x2(latestOpenLine, endTime)
+            line.set_y1(latestOpenLine, sessionOpen)
+            line.set_y2(latestOpenLine, sessionOpen)
+
+            label.set_x(latestUpLabel, endTime)
+            label.set_y(latestUpLabel, orbHigh)
+
+            label.set_x(latestDownLabel, endTime)
+            label.set_y(latestDownLabel, orbLow)
+
+            label.set_x(latestOpenLabel, endTime)
+            label.set_y(latestOpenLabel, sessionOpen)
+
+    // Extend every ORB and open level from the current UTC day to the latest bar.
+    if array.size(orbStartTimes) > 0
+        for i = 0 to array.size(orbStartTimes) - 1
+            int orbStartTime = array.get(orbStartTimes, i)
+
+            if f_same_orb_day(orbStartTime, last_bar_time)
+                line.set_x2(array.get(upLines, i), last_bar_time)
+                line.set_x2(array.get(downLines, i), last_bar_time)
+                line.set_x2(array.get(openLines, i), last_bar_time)
+
+                label.set_x(array.get(upLabels, i), last_bar_time)
+                label.set_x(array.get(downLabels, i), last_bar_time)
+                label.set_x(array.get(openLabels, i), last_bar_time)
+
+// UTC sessions
+f_orb_session("0000-0800", "Asia")
+f_orb_session("0800-1330", "London")
+f_orb_session("1330-2100", "New York")
+
+
+//══════════════════════════════════════
+// PREVIOUS DAY HIGH / LOW - CURRENT DAY ONLY
+//══════════════════════════════════════
+float prevDayHigh = request.security(
+     syminfo.tickerid,
+     "D",
+     high[1],
+     lookahead = barmerge.lookahead_on)
+
+float prevDayLow = request.security(
+     syminfo.tickerid,
+     "D",
+     low[1],
+     lookahead = barmerge.lookahead_on)
+
+bool newDay = ta.change(time("D")) != 0
+
+var line prevDayHighLine = na
+var line prevDayLowLine = na
+var label prevDayHighLabel = na
+var label prevDayLowLabel = na
+var int prevDayInsightTime = na
+
+if newDay or barstate.isfirst
+    if not na(prevDayHighLine)
+        line.delete(prevDayHighLine)
+    if not na(prevDayLowLine)
+        line.delete(prevDayLowLine)
+    if not na(prevDayHighLabel)
+        label.delete(prevDayHighLabel)
+    if not na(prevDayLowLabel)
+        label.delete(prevDayLowLabel)
+
+    prevDayHighLine := na
+    prevDayLowLine := na
+    prevDayHighLabel := na
+    prevDayLowLabel := na
+    prevDayInsightTime := time
+
+    if f_visible_by_time(prevDayInsightTime)
+        prevDayHighLine := line.new(
+             bar_index,
+             prevDayHigh,
+             bar_index,
+             prevDayHigh,
+             color = color.purple,
+             width = 2)
+
+        prevDayLowLine := line.new(
+             bar_index,
+             prevDayLow,
+             bar_index,
+             prevDayLow,
+             color = color.purple,
+             width = 2)
+
+        prevDayHighLabel := label.new(
+             bar_index,
+             prevDayHigh,
+             "Previous Day High",
+             style = label.style_label_left,
+             color = color.new(color.white, 100),
+             textcolor = color.purple,
+             size = size.small)
+
+        prevDayLowLabel := label.new(
+             bar_index,
+             prevDayLow,
+             "Previous Day Low",
+             style = label.style_label_left,
+             color = color.new(color.white, 100),
+             textcolor = color.purple,
+             size = size.small)
+
+if not f_visible_by_time(prevDayInsightTime)
+    if not na(prevDayHighLine)
+        line.delete(prevDayHighLine)
+        prevDayHighLine := na
+    if not na(prevDayLowLine)
+        line.delete(prevDayLowLine)
+        prevDayLowLine := na
+    if not na(prevDayHighLabel)
+        label.delete(prevDayHighLabel)
+        prevDayHighLabel := na
+    if not na(prevDayLowLabel)
+        label.delete(prevDayLowLabel)
+        prevDayLowLabel := na
+
+if not na(prevDayHighLine) and not na(prevDayLowLine)
+    line.set_x2(prevDayHighLine, bar_index)
+    line.set_x2(prevDayLowLine, bar_index)
+
+    label.set_x(prevDayHighLabel, bar_index)
+    label.set_y(prevDayHighLabel, prevDayHigh)
+
+    label.set_x(prevDayLowLabel, bar_index)
+    label.set_y(prevDayLowLabel, prevDayLow)
+
+
+//══════════════════════════════════════
+// VWAP
+//══════════════════════════════════════
+color vwapColor = color.yellow
+float vwapValue = ta.vwap(hlc3)
+
+plot(
+     inGlobalRenderWindow ? vwapValue : na,
+     title = "VWAP",
+     color = vwapColor,
+     linewidth = 2)
+
+var label vwapLabel = na
+
+if na(vwapLabel) and not na(vwapValue)
+    vwapLabel := label.new(
+         bar_index,
+         vwapValue,
+         "VWAP",
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = vwapColor,
+         size = size.small)
+
+if not na(vwapLabel) and not na(vwapValue)
+    label.set_x(vwapLabel, bar_index)
+    label.set_y(vwapLabel, vwapValue)
+
+
+//══════════════════════════════════════
+// CUSTOM FAST / SLOW EMA
+//══════════════════════════════════════
+color emaFastColor = color.aqua
+color emaSlowColor = color.orange
+
+float fastEma = ta.ema(close, emaFastLengthInput)
+float slowEma = ta.ema(close, emaSlowLengthInput)
+
+plot(
+     inGlobalRenderWindow ? fastEma : na,
+     title     = "Fast EMA",
+     color     = emaFastColor,
+     linewidth = 2)
+
+plot(
+     inGlobalRenderWindow ? slowEma : na,
+     title     = "Slow EMA",
+     color     = emaSlowColor,
+     linewidth = 2)
+
+var label emaFastLabel = na
+var label emaSlowLabel = na
+
+if na(emaFastLabel) and not na(fastEma)
+    emaFastLabel := label.new(
+         bar_index,
+         fastEma,
+         "EMA " + str.tostring(emaFastLengthInput),
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = emaFastColor,
+         size = size.small)
+
+if na(emaSlowLabel) and not na(slowEma)
+    emaSlowLabel := label.new(
+         bar_index,
+         slowEma,
+         "EMA " + str.tostring(emaSlowLengthInput),
+         style = label.style_label_left,
+         color = color.new(color.white, 100),
+         textcolor = emaSlowColor,
+         size = size.small)
+
+if not na(emaFastLabel) and not na(fastEma)
+    label.set_x(emaFastLabel, bar_index)
+    label.set_y(emaFastLabel, fastEma)
+
+if not na(emaSlowLabel) and not na(slowEma)
+    label.set_x(emaSlowLabel, bar_index)
+    label.set_y(emaSlowLabel, slowEma)

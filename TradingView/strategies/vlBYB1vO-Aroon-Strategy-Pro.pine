@@ -1,0 +1,126 @@
+//@version=6
+strategy("Aroon Strategy Pro - Whale Edition", overlay=true, max_boxes_count=500, max_lines_count=500, initial_capital=10000)
+
+// --- Inputs ---
+grp_trade  = "Trade Management"
+length     = input.int(14, "Aroon Length", minval=1, group=grp_trade)
+rr_ratio   = input.float(1.5, "Risk:Reward Ratio", minval=0.1, group=grp_trade)
+sl_pips    = input.float(20.0, "Fixed SL (Pips/Points)", minval=1.0, group=grp_trade)
+tp_ticks   = input.int(2, "Ticks Beyond TP to Trigger", minval=0, group=grp_trade, tooltip="Price must move this many ticks past the TP line to close in profit.")
+
+grp_be     = "Break Even"
+use_be     = input.bool(true, "Enable Break Even?", group=grp_be)
+be_at_rr   = input.float(1.0, "Move to BE at RR", minval=0.1, group=grp_be)
+
+grp_trend  = "Trend Filter (SMA + EMA)"
+use_filter = input.bool(true, "Use Trend Filter?", group=grp_trend)
+sma_len    = input.int(290, "SMA Length", minval=1, group=grp_trend)
+ema_len    = input.int(200, "EMA Length", minval=1, group=grp_trend)
+
+// --- Trend Filter Logic ---
+sma_val = ta.sma(close, sma_len)
+ema_val = ta.ema(close, ema_len)
+
+// Conditions: Long only if price > SMA AND price > EMA. Short only if price < SMA AND price < EMA.
+trend_long  = not use_filter or (close > sma_val and close > ema_val)
+trend_short = not use_filter or (close < sma_val and close < ema_val)
+
+// --- Aroon Calculation ---
+upper = 100 * (ta.highestbars(high, length + 1) + length) / length
+lower = 100 * (ta.lowestbars(low, length + 1) + length) / length
+
+// --- Trade State Variables ---
+var int wins = 0
+var int losses = 0
+var int bes = 0
+var bool in_trade = false
+var int trade_dir = 0 
+var float entry_price = 0.0
+var float sl_price = 0.0
+var float tp_price = 0.0 
+var float be_trigger_price = 0.0
+var int last_trade_exit_bar = 0 // FIX: Prevents immediate double-entry
+
+var line l_entry = na
+var line l_sl = na
+var line l_tp = na
+
+// --- 1. TRADE MANAGEMENT (Moved up to process exits BEFORE new entries) ---
+if in_trade
+    // Extend Lines continuously while trade is running
+    line.set_x2(l_entry, bar_index)
+    line.set_x2(l_sl, bar_index)
+    line.set_x2(l_tp, bar_index)
+
+    // Break Even Logic
+    if use_be
+        if (trade_dir == 1 and high >= be_trigger_price) or (trade_dir == -1 and low <= be_trigger_price)
+            sl_price := entry_price
+            line.set_y1(l_sl, sl_price)
+            line.set_y2(l_sl, sl_price)
+            line.set_color(l_sl, color.orange)
+
+    // Check for TP/SL Hit
+    float tp_trigger = tp_price + (trade_dir * tp_ticks * syminfo.mintick)
+    bool hit_tp = (trade_dir == 1 and high >= tp_trigger) or (trade_dir == -1 and low <= tp_trigger)
+    bool hit_sl = (trade_dir == 1 and low <= sl_price) or (trade_dir == -1 and high >= sl_price)
+
+    if hit_tp
+        wins += 1
+        label.new(bar_index, high, "WIN", color=color.green, style=label.style_label_down, textcolor=color.white)
+        strategy.close("Trade", comment="WIN")
+        in_trade := false
+        last_trade_exit_bar := bar_index
+    else if hit_sl
+        if sl_price == entry_price
+            bes += 1
+            label.new(bar_index, high, "BE", color=color.orange, style=label.style_label_down)
+            strategy.close("Trade", comment="BE")
+        else
+            losses += 1
+            label.new(bar_index, low, "LOSS", color=color.red, style=label.style_label_up, textcolor=color.white)
+            strategy.close("Trade", comment="LOSS")
+        in_trade := false
+        last_trade_exit_bar := bar_index
+
+// --- 2. SIGNAL LOGIC ---
+// Added bar_index check to prevent entering a new trade on the same bar or next bar of an exit
+can_enter = (bar_index > last_trade_exit_bar + 1) 
+
+long_signal  = ta.crossunder(lower, upper) and not in_trade and trend_long and can_enter
+short_signal = ta.crossover(lower, upper) and not in_trade and trend_short and can_enter
+
+// --- 3. EXECUTION ---
+if (long_signal or short_signal) and barstate.isconfirmed
+    in_trade := true
+    entry_price := close
+    trade_dir := long_signal ? 1 : -1
+    
+    float tick_val = syminfo.mintick * 10 
+    sl_price := entry_price - (trade_dir * sl_pips * tick_val)
+    tp_price := entry_price + (trade_dir * sl_pips * tick_val * rr_ratio)
+    be_trigger_price := entry_price + (trade_dir * sl_pips * tick_val * be_at_rr)
+
+    l_entry := line.new(bar_index, entry_price, bar_index + 1, entry_price, color=color.new(color.gray, 0), width=2)
+    l_sl    := line.new(bar_index, sl_price, bar_index + 1, sl_price, color=color.new(color.red, 0), width=2)
+    l_tp    := line.new(bar_index, tp_price, bar_index + 1, tp_price, color=color.new(color.green, 0), width=2)
+    
+    if long_signal
+        strategy.entry("Trade", strategy.long)
+    else
+        strategy.entry("Trade", strategy.short)
+
+// --- Visual Aids ---
+plot(use_filter ? sma_val : na, "SMA Filter", color=color.new(color.blue, 50))
+plot(use_filter ? ema_val : na, "EMA Filter", color=color.new(color.yellow, 50))
+
+// --- Dashboard ---
+var table stats_table = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 70), border_width=1)
+if barstate.islast
+    table.cell(stats_table, 0, 0, "Trade Stats", text_color=color.white)
+    table.cell(stats_table, 0, 1, "Wins: ", text_color=color.green, text_halign=text.align_left)
+    table.cell(stats_table, 1, 1, str.tostring(wins), text_color=color.green)
+    table.cell(stats_table, 0, 2, "Losses: ", text_color=color.red, text_halign=text.align_left)
+    table.cell(stats_table, 1, 2, str.tostring(losses), text_color=color.red)
+    table.cell(stats_table, 0, 3, "BE: ", text_color=color.orange, text_halign=text.align_left)
+    table.cell(stats_table, 1, 3, str.tostring(bes), text_color=color.orange)

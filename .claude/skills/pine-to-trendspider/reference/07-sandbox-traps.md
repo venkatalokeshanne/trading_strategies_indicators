@@ -24,10 +24,34 @@ ignored **forever**, even if it runs later.
 `register_signal(): signal "Green" already exists`. Give signals distinct names —
 `'Green light'`, `'Long Entry'`.
 
-## 3. `new` is banned outright [VERIFIED]
+## The authoritative rules [VERIFIED — extracted from TrendSpider's validator]
+
+§3, §4 and §11 below come from `validateScriptSyntax` in TrendSpider's own client engine,
+captured by `tools/extract_engine_rules.js` into **`tools/trendspider_rules.json`**. The
+lint loads that file, so it rejects exactly what TrendSpider rejects. When TrendSpider
+changes, re-run `node tools/extract_engine_rules.js` (needs the local engine bundle) and
+commit the new JSON.
+
+The validator: wraps the script as `(async () => { … })()`, parses it with acorn at
+`ecmaVersion: 2020`, then walks the tokens:
+
+- a **banned keyword** (`import`, `new`, `this`) anywhere → error;
+- a **banned name** (30 of them) as any name token → error;
+- a **reserved identifier** (122 names) as the token directly after `function`, `const`,
+  `let`, `class` or `var`, or as the single name directly before `=>` → error.
+
+## 3. `new`, `this`, `import` and 30 names are banned [VERIFIED]
 
 `Using "new" in scripts is not currently allowed`. That rules out `new Array`, `new Map`,
-`new Set`, `new Date`, `new Error`, `new RegExp` and any class instantiation.
+`new Set`, `new Date`, `new Error`, `new RegExp` and any class instantiation. `this` and
+`import` are banned the same way.
+
+Banned names (also as properties): `fetch`, `XMLHttpRequest`, `WebSocket`, `Request`,
+`Worker`, `EventSource`, `BackgroundFetchManager`, `addEventListener`, `removeEventListener`,
+`dispatchEvent`, `postMessage`, `EventTarget`, `onmessage`, `onmessageerror`, `onerror`,
+`eval`, `Function`, `importScripts`, `require`, `setTimeout`, `setInterval`,
+`setImmediate`, `requestAnimationFrame`, `Proxy`, `URL`, `WebAssembly`, `globalThis`,
+`self`, `__proto__`, `prototype`.
 
 | Instead of | Use |
 |---|---|
@@ -40,15 +64,19 @@ ignored **forever**, even if it runs later.
 ## 4. Built-in names are reserved [VERIFIED]
 
 Declaring a local with the same name as any built-in global throws
-`"X" is a reserved identifier which can't be assigned`. Pine scripts are full of such names:
+`"X" is a reserved identifier which can't be assigned`. The full set is the 122 names in
+`tools/trendspider_rules.json → reservedIdentifiers`. The ones Pine scripts collide with
+most often:
 
 `open high low close volume time hl2 hlc3 ohlc4 sma ema wma rsi atr vwap stdev variance
-highest lowest sum shift line fill paint input current constants market indicators request
-library assert`
+highest lowest sum avg add sub mult div shift line fill paint input current constants market
+options indicators request library assert momentum supertrend prices candles`
 
-— and more. This list is **not exhaustive**. Rename defensively: `atrVal`, `rsiVal`,
-`emaFast`, `vwapLine`, `src`. If the editor raises the error for a name not listed here,
-add it to this file.
+Rename by suffixing: `atrVal`, `rsiVal`, `multVal`, `lineLevel`, `supertrendPine`.
+
+TrendSpider does **not** reject destructuring (`const [atr] = …`), a second name in a list
+(`let a, atr`) or a multi-parameter arrow (`(x, atr) => …`). They still shadow the
+built-in inside that scope; the lint warns.
 
 ## 5. Input titles have a length cap [VERIFIED]
 
@@ -85,12 +113,19 @@ The script runs in a Web Worker with a time limit. Avoid nested loops over long 
 `console.log` works for debugging; `debugger` needs
 `localStorage.forceNoCustomScriptingWorkerTimeout = 1` in the browser console first.
 
-## 11. JavaScript syntax support [VERIFY]
+## 11. JavaScript syntax support: ECMAScript 2020 [VERIFIED]
 
-The sandbox parser's support for newer syntax — `??`, `?.`, class fields, `Array.prototype.at`,
-`replaceAll` — is not confirmed. Write plain ES2017-style code: ternaries instead of `??`,
-explicit guards instead of `?.`, `arr[arr.length - 1]` instead of `.at(-1)`. When you confirm
-a feature works, record it here.
+The parser is acorn with `ecmaVersion: 2020`.
+
+| Allowed (ES2020 and earlier) | Fails to parse (ES2021+) |
+|---|---|
+| `??`, `?.`, `**`, spread, destructuring, arrow functions, template literals, `async`/`await`, `BigInt` literals | `??=`, `\|\|=`, `&&=` (logical assignment), `1_000` (numeric separators), class fields, `#private`, `static { }` blocks |
+
+Methods are not syntax: `Array.prototype.at`, `String.prototype.replaceAll`,
+`Object.hasOwn` parse fine and depend on the browser running the worker — assume a modern
+Chrome but prefer the older form in shared code (`arr[arr.length - 1]`, `split/join`).
+Node accepts everything above, so `node --check` passing is **not** proof; the lint
+checks the ES2021+ forms itself (LESSONS L3).
 
 ## 12. Saving can fail on TrendSpider's side [VERIFIED observed 2026-09-22]
 
@@ -98,8 +133,9 @@ On that date the scripting service returned **HTTP 500** to every attempt to *sa
 custom indicator (`POST /custom_scripting_webserver/1/scripts`), including a two-line test
 script — while **APPLY** worked and drew the indicator as an unsaved draft labelled
 "Current indicator". If Save fails with "Failed to create the indicator", it is not your
-code: the draft still proves the script runs. Tell the user, and keep the file in this repo
-so it can be pasted again once saving works.
+code: the draft still proves the script runs. Record it with
+`progress.py set <id> --ts-saved no --ts-save-error "HTTP 500"`, keep the file in this repo,
+and retry the save in a later session (`reference/09`, LESSONS L12).
 
 ## 13. Signal names can collide with TrendSpider's built-ins [VERIFIED]
 

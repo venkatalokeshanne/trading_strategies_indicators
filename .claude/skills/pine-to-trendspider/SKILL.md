@@ -18,11 +18,16 @@ script to be read and converted deliberately.
 
 ## Read these before converting anything
 
+**`LESSONS.md` first, in full, every session.** It lists every mistake made so far, the
+rule that replaces it and the check that now catches it. When you make or find a new
+mistake, adding it there (with a check) is part of fixing it — see the top of that file.
+
 The reference files hold the detail. Read the ones relevant to the script in front of you
 — for a strategy that is all of them.
 
 | File | Read it when |
 |---|---|
+| `LESSONS.md` | **Always, first.** Past mistakes and the checks that stop them recurring. |
 | `reference/01-execution-model.md` | **Always.** Per-bar vs whole-array, history `[n]`, `var`, `na`, recursion. |
 | `reference/02-function-map.md` | **Always.** Every `ta.*` / `math.*` / `str.*` mapping and its seeding traps. |
 | `reference/03-time-sessions-inputs.md` | The script uses `time`, sessions, `dayofweek`, `month`, or any `input.*`. |
@@ -31,7 +36,9 @@ The reference files hold the detail. Read the ones relevant to the script in fro
 | `reference/06-higher-timeframe-and-data.md` | `request.security`, other symbols, or `request.*` alt-data. |
 | `reference/07-sandbox-traps.md` | **Always.** TrendSpider-specific rules that fail silently or at save time. |
 | `reference/08-validation.md` | **Always**, before you call a conversion done. |
+| `reference/09-trendspider-live.md` | **Always.** Run, save as `_TV` and check every script in the user's TrendSpider. |
 | `templates/` | Skeletons for an indicator, a single-direction strategy, and shared helpers. |
+| `tools/trendspider_rules.json` | The exact reserved/banned names and language level, from TrendSpider's own validator. |
 
 Facts in these files are tagged:
 
@@ -45,6 +52,10 @@ Never invent a TrendSpider function. If a Pine built-in has no confirmed TrendSp
 equivalent, hand-roll it from confirmed primitives (`02-function-map.md` shows how).
 
 ## The procedure — follow every step, every time
+
+### 0. Start of session
+`git pull`; read `LESSONS.md`; `python tools/progress.py stats`; retry the save of any
+script recorded with a save error (`reference/09`); then `python tools/progress.py next`.
 
 ### 1. Read the whole script before writing a line
 Note the Pine version (`//@version=4|5|6`; v4 also uses `study()` and unprefixed functions).
@@ -81,6 +92,10 @@ data → computation → paints → signals. Keep **all** `paint()`, `fill()` an
 `register_signal()` calls unconditional, at top level, with fixed literal names
 (`07-sandbox-traps.md` explains why this is not optional).
 
+**Name it `<Original Title>_TV`** in `describe_indicator` — that is the name it is saved
+under in TrendSpider. Duplicates and split scripts: `reference/09` §Naming. Copy the same
+string into the header's `TrendSpider name` line.
+
 ### 6. Self-audit — the edge-case sweep
 Run the checklist at the end of this file against your output. Do not skip it; most
 silent bugs are caught here.
@@ -89,11 +104,31 @@ silent bugs are caught here.
 Follow `08-validation.md`: at minimum a syntax/sandbox check and a numeric spot-check
 against values read off TradingView for the same symbol, timeframe and bars.
 
-### 8. Record and push
+### 8. Live test and save in TrendSpider — every script, no exceptions
+Follow `reference/09-trendspider-live.md` in the user's logged-in Chrome: APPLY with no
+error, Save as the `_TV` name, confirm it in the "Yours" list, restore the chart, and for
+a strategy run the Strategy Tester. A TrendSpider server error on save is recorded and
+retried later; it does not block the commit.
+
+### 9. Gates, record and push
+A script is done only when **every** gate below has passed, each checked by looking at
+its artefact, not at an exit code (LESSONS L9):
+
+| Gate | Artefact to check |
+|---|---|
+| Lint | `python tools/lint_trendspider.py <file>` prints no `ERROR`; every `warn` resolved or listed as a deviation |
+| Oracle (where the engine is available) | `validation/<stem>/oracle_output.csv` exists, has rows, no runtime error |
+| Numbers | parity vs TradingView or an independent implementation (LESSONS L10) |
+| Live | APPLY report clean; screenshot taken (`reference/09` §4) |
+| Saved | POST 200 **and** `find.js` reports `saved: true` — or the 5xx recorded |
+| Tester (strategies) | trades count recorded |
+| Recorded | `python tools/progress.py set <id> … --status FULL\|PARTIAL` accepted (it re-checks the gates) |
+| Pushed | `git log origin/main -1` shows the commit |
+
 - Write the output to `converted/<id>-<slug>.trendspider.js`.
-- Update `progress/progress.json` for this script (status, deviations, validation).
-- **Commit and push to GitHub after every script** (see "Persisting progress"). The user
-  works across sessions and accounts; unpushed work is lost work.
+- **Commit and push after every script**:
+  `git add -A && git commit -m "Convert <slug>: <status>" && git push`. The user works
+  across sessions and accounts; unpushed work is lost work.
 
 ## Output file format
 
@@ -111,6 +146,8 @@ Every converted file starts with this header block, filled in completely:
  * Placement    : overlay | lower
  * Status       : FULL | PARTIAL | NOT CONVERTIBLE
  * Converted    : <YYYY-MM-DD> by Claude (pine-to-trendspider skill)
+ * TrendSpider name : <Original Title>_TV       (identical to the describe_indicator title)
+ * Live tested  : <YYYY-MM-DD> on <TICKER> <res> — saved in TrendSpider: yes | no (why)
  *
  * Deviations from the original (every one, or "none"):
  *   - <what differs, why, and the practical effect>
@@ -141,11 +178,14 @@ This repository is the source of truth across sessions and Claude accounts.
 2. At the start of a session: `git pull`, read `progress/progress.json`, and continue from
    the first script whose status is `pending`.
 3. If you improve a reference file (a [VERIFY] confirmed, a new trap found), commit that
-   separately with a message saying what you learnt.
-4. **Licensing:** this repo is public. Original Pine sources and their converted
-   derivatives are other authors' work. Do not commit `pine/` or `converted/` unless the
-   user has confirmed the repo is private or explicitly approved publishing; `.gitignore`
-   excludes them by default. Skill files, templates, references and `progress/` are fine.
+   separately with a message saying what you learnt. A new mistake goes into `LESSONS.md`
+   with its check, in a commit starting `Lesson NN:`.
+4. **What is committed:** the skill, tools, `progress/` and **every conversion in
+   `converted/`** (the user's instruction, 2026-10-08: every indicator and strategy is saved
+   in git and in TrendSpider). Keep the original author's credit and declared licence in
+   each header. The original Pine sources in `pine/` stay out of git until the user says
+   otherwise — the repository is public and 75 % of the sources declare no licence. Never
+   commit TrendSpider's engine bundle or market-data fixtures.
 
 ## Final self-audit checklist
 
@@ -183,9 +223,18 @@ Tick every line against your output before marking a script done.
       original, and the conversion made non-repainting.
 - [ ] Request count within limits (16 on a chart, **6** in scanner/Strategy Tester).
 
+**Built-ins**
+- [ ] Before hand-rolling, checked whether TrendSpider has it (`trendspider_rules.json`).
+- [ ] Every built-in substituted for a Pine function is in 02's measured table, and its
+      scale/argument-order/offset trap is handled (`momentum` n+1, `cmo` ×100, `tsi` ÷100
+      and swapped, `alma` swapped, `cci` ÷0.9999, `supertrend` hand-rolled) — lint
+      warnings acknowledged with `// pine-parity: <name>`.
+- [ ] No bare `pivot_high` / `pivot_low` / `fractal_*` in a signal — `shift(…, right)`.
+- [ ] Hand-rolled `ta.*` follows Pine's reference implementation, cited, and parity-checked.
+
 **Sandbox**
-- [ ] No `new` anywhere. No local name shadows a built-in (`atr`, `rsi`, `ema`, `vwap`,
-      `close`, `time`, …). Input titles under ~20 characters.
+- [ ] Lint clean: no `new`/`this`/`import`, no banned name, no reserved name declared, no
+      ES2021+ syntax. Input titles under ~20 characters.
 - [ ] Every `paint`/`fill`/`register_signal` runs unconditionally with a literal name;
       no paint name equals a signal name; ≤ 70 output series.
 - [ ] Not painting both overlay and lower from one script.
@@ -200,6 +249,13 @@ Tick every line against your output before marking a script done.
 - [ ] All `strategy()` settings (capital, sizing, commission, slippage) copied into the
       header's Tester section.
 
+**TrendSpider**
+- [ ] `describe_indicator` title ends in `_TV` and equals the header's `TrendSpider name`.
+- [ ] Live-tested in the user's TrendSpider: APPLY clean, saved, found in "Yours", chart
+      restored; strategies also run in the Strategy Tester (`reference/09`).
+
 **Record**
-- [ ] Header complete, every deviation listed, status set honestly.
-- [ ] `progress/progress.json` updated, committed and pushed.
+- [ ] Header complete, every deviation listed, status set honestly. NOT CONVERTIBLE names
+      the blocking feature and the approach tried (LESSONS L11).
+- [ ] Any new mistake added to `LESSONS.md` with a check.
+- [ ] `progress.py set … --status` accepted; committed and pushed; `git log origin/main -1`.

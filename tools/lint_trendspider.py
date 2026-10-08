@@ -1,15 +1,19 @@
 """
-Lint a converted TrendSpider script for syntax errors and sandbox-rule violations.
+Lint a converted TrendSpider script — validation level 2 (reference/08-validation.md).
 
-Validation level 2 in reference/08-validation.md. A lint, not a proof: it catches the
-mistakes that TrendSpider either rejects at run time or — worse — accepts silently.
+The sandbox rules come from tools/trendspider_rules.json, which is extracted from
+TrendSpider's OWN validator (tools/extract_engine_rules.js), so a check here errors exactly
+when TrendSpider would. Every past mistake recorded in the skill's LESSONS.md that can be
+caught mechanically has a check below, tagged with its lesson number.
 
-Usage:  python tools/lint_trendspider.py converted/<file>.trendspider.js [more files...]
-Exit status 1 if any ERROR was found.
+Usage:  python tools/lint_trendspider.py <file.js> [more...]
+Exit status 1 if any ERROR was found. A clean run is required before a script is pasted
+into TrendSpider.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -17,31 +21,41 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Windows consoles default to cp1252; never let a print() of "§" or "—" fail or garble.
-for _s in (sys.stdout, sys.stderr):
+for _s in (sys.stdout, sys.stderr):   # LESSON 8: cp1252 consoles must never break a run
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
-# Built-in globals that may not be redeclared (reference/07 §4). Not exhaustive.
-RESERVED = {
-    "open", "high", "low", "close", "volume", "time", "hl2", "hlc3", "ohlc4", "oc2", "wclose",
-    "body_top", "body_bottom", "sma", "ema", "wma", "rsi", "atr", "vwap", "stdev", "variance",
-    "absdev", "highest", "lowest", "sum", "momentum", "roc", "cmo", "linreg", "kama", "alma",
-    "hullma", "vwma", "wildma", "custwma", "stochastic", "psar", "vortex", "seqcount",
-    "fractal_high", "fractal_low", "shift", "series_of", "cut_series", "for_every",
-    "sliding_window_function", "add", "sub", "mult", "div", "max_of", "min_of",
-    "horizontal_line", "line", "fill", "paint", "paint_overlay", "paint_projection",
-    "paint_label_at_line", "color_candles", "color_cloud", "register_signal",
-    "describe_indicator", "input", "current", "constants", "market", "indicators", "request",
-    "library", "assert", "time_of", "time_difference", "bar_at", "land_points_onto_series",
-    "interpolate_sparse_series", "indexed_points_of",
-}
+RULES = json.loads((Path(__file__).with_name("trendspider_rules.json")).read_text(encoding="utf-8"))
+BANNED_KEYWORDS = set(RULES["bannedKeywords"])          # import, new, this
+BANNED_NAMES = set(RULES["bannedNames"])                # fetch, eval, setTimeout, URL, ...
+DECL_TOKENS = set(RULES["declarationTokens"])           # function, const, let, class, var
+RESERVED = set(RULES["reservedIdentifiers"])            # the 122 names in the script scope
 OUTPUT_CALLS = ("paint", "fill", "paint_overlay", "register_signal", "color_candles", "color_cloud")
-HEADER_FIELDS = ("Original", "Author", "Source URL", "Pine version", "Type", "Placement", "Status")
+LOOKAHEAD_BUILTINS = ("pivot_high", "pivot_low", "fractal_high", "fractal_low", "zigzag_points")
+# Built-ins whose scale, argument order or offset differ from Pine — measured on the oracle
+# (reference/02 §"TrendSpider built-ins measured against Pine", LESSONS L16).
+TRAP_BUILTINS = {
+    "momentum": "momentum(x, n) is x - x[n-1]; Pine ta.mom(x, n) = momentum(x, n + 1)",
+    "cmo": "cmo() is -1..1; Pine ta.cmo = mult(cmo(x, n), 100)",
+    "tsi": "tsi(x, LONG, SHORT) is x100; Pine ta.tsi(x, short, long) = div(tsi(x, long, short), 100)",
+    "alma": "alma(x, n, SIGMA, OFFSET) and floors the offset; Pine ta.alma(x, n, offset, sigma)",
+    "cci": "cci() is Pine x 0.9999; div(cci(x, n), 0.9999) for parity",
+    "supertrend": "supertrend() takes no parameters and flips on different bars from ta.supertrend; hand-roll",
+    "will_r": "will_r() is rounded to ~3 dp",
+    "stochastic": "stochastic() is rounded to 3 dp",
+    "stochastic_rsi": "stochastic_rsi() is rounded to ~3 dp",
+    "vwap": "vwap() uses ohlc4 and never resets; Pine ta.vwap is hlc3 per session — hand-roll",
+    "psar": "psar(MAXIMUM, ACCELERATION, START) — reverse of Pine ta.sar(start, inc, max)",
+    "wildma": "wildma/atr/rsi seed differently from Pine's SMA-seeded RMA — warm-up differs",
+}
+HEADER_FIELDS = ("Original", "Author", "Source URL", "Pine version", "Type", "Placement",
+                 "Status", "TrendSpider name")
+TV_SUFFIX = "_TV"
 
 
+# ─────────────────────────────────────────────────────────────── text preparation
 def strip_comments(src: str) -> str:
     """Remove // and /* */ comments, respecting string and template literals."""
     out, i, n, quote = [], 0, len(src), None
@@ -61,8 +75,7 @@ def strip_comments(src: str) -> str:
                 i += 1
         elif src.startswith("/*", i):
             j = src.find("*/", i + 2)
-            seg = src[i:(j + 2 if j != -1 else n)]
-            out.append("\n" * seg.count("\n"))
+            out.append("\n" * src[i:(j + 2 if j != -1 else n)].count("\n"))
             i = j + 2 if j != -1 else n
         else:
             out.append(c); i += 1
@@ -70,11 +83,14 @@ def strip_comments(src: str) -> str:
 
 
 def blank_strings(code: str) -> str:
-    """Replace string contents with spaces so structure checks don't trip on text."""
-    out, quote = [], None
-    for i, c in enumerate(code):
+    """String contents → spaces, so structural checks never trip on text."""
+    out, quote, i = [], None, 0
+    while i < len(code):
+        c = code[i]
         if quote:
-            if c == quote and code[i - 1] != "\\":
+            if c == "\\":
+                out.append("  "); i += 2; continue
+            if c == quote:
                 quote = None; out.append(c)
             else:
                 out.append("\n" if c == "\n" else " ")
@@ -82,40 +98,71 @@ def blank_strings(code: str) -> str:
             quote = c; out.append(c)
         else:
             out.append(c)
+        i += 1
     return "".join(out)
+
+
+TOKEN = re.compile(r"=>|[A-Za-z_$][\w$]*|\d[\d_.]*|\S")
+
+
+def tokens(struct: str):
+    for m in TOKEN.finditer(struct):
+        yield m.group(0), m.start()
 
 
 def line_of(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
 
 
+# ─────────────────────────────────────────────────────────────── block structure
 def block_kinds(code: str) -> list[tuple[int, int, str]]:
-    """(start, end, kind) for every brace block, kind from the text before '{'."""
     blocks, stack = [], []
     for i, c in enumerate(code):
         if c == "{":
-            head = code[max(0, i - 160):i]
-            m = re.search(r"(\bif\b|\belse\b|\bfor\b|\bwhile\b|\bdo\b|\bswitch\b|\bfunction\b|=>|\))\s*$",
-                          head.rstrip()) or re.search(r"\b(if|else|for|while|switch|function)\b[^;{}]*$", head)
+            head = code[max(0, i - 200):i].rstrip()
+            seg = head[head.rfind("\n") + 1:]
             kind = "block"
-            if m:
-                tok = m.group(1)
-                if tok in ("if", "else", "switch"):
-                    kind = "conditional"
-                elif tok in ("for", "while", "do"):
-                    kind = "loop"
-                elif tok in ("function", "=>"):
-                    kind = "function"
-                elif tok == ")":
-                    seg = head[head.rfind("\n") + 1:]
-                    kind = ("conditional" if re.search(r"\b(if|switch)\s*\(", seg) else
-                            "loop" if re.search(r"\b(for|while)\s*\(", seg) else
-                            "function" if "=>" in seg or "function" in seg else "block")
+            if re.search(r"\belse$", head) or re.search(r"\b(if|switch)\s*\(.*\)$", seg):
+                kind = "conditional"
+            elif re.search(r"\b(for|while)\s*\(.*\)$", seg) or re.search(r"\bdo$", head):
+                kind = "loop"
+            elif head.endswith("=>") or re.search(r"\bfunction\b[^{]*\)$", seg) or re.search(r"=>\s*$", head):
+                kind = "function"
+            elif re.search(r"[=(:,\[]\s*$", head) or head.endswith("return"):
+                kind = "object"
             stack.append((i, kind))
         elif c == "}" and stack:
-            start, kind = stack.pop()
-            blocks.append((start, i, kind))
+            s, k = stack.pop()
+            blocks.append((s, i, k))
     return blocks
+
+
+# ─────────────────────────────────────────────────────────────── the checks
+def sandbox_checks(struct: str, toks: list, errors: list[str], base: int = 0) -> None:
+    """TrendSpider's own validator rules plus ES2020 syntax. `base` offsets line numbers."""
+    line_of_ = lambda text, pos: line_of(text, pos) + base
+    # LESSON 3: the parser is ES2020. These newer forms fail to parse in TrendSpider.
+    for pat, what in ((r"\?\?=|\|\|=|&&=", "logical assignment (ES2021)"),
+                      (r"\b\d+_\d", "numeric separator (ES2021)"),
+                      (r"(?<![\w$])#[A-Za-z_$]", "private class member (ES2022)"),
+                      (r"\bstatic\s*\{", "class static block (ES2022)")):
+        for m in re.finditer(pat, struct):
+            errors.append(f"line {line_of_(struct, m.start())}: {what} — TrendSpider parses ES2020 only (07 §11)")
+
+    for k, (tok, pos) in enumerate(toks):
+        prev = toks[k - 1][0] if k > 0 else ""
+        nxt = toks[k + 1][0] if k + 1 < len(toks) else ""
+        ln = line_of_(struct, pos)
+        # LESSON 2: banned keywords — exactly TrendSpider's set (import, new, this)
+        if tok in BANNED_KEYWORDS and prev != ".":
+            errors.append(f"line {ln}: `{tok}` is not allowed in TrendSpider scripts (07 §3)")
+        # banned names — TrendSpider rejects these as any name token, properties included
+        if tok in BANNED_NAMES:
+            errors.append(f"line {ln}: `{tok}` is not allowed in TrendSpider scripts (07 §3)")
+        # LESSON 1: reserved identifier right after a declaration token, or before `=>`
+        if tok in RESERVED and (prev in DECL_TOKENS or nxt == "=>"):
+            errors.append(f"line {ln}: `{tok}` is a reserved TrendSpider identifier and can't be "
+                          f"declared (07 §4) — rename it, e.g. `{tok}Val`")
 
 
 def lint(path: Path) -> tuple[list[str], list[str]]:
@@ -123,51 +170,45 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
     errors, warns = [], []
     code = strip_comments(raw)
     struct = blank_strings(code)
+    toks = list(tokens(struct))
 
-    # 1. syntax via node --check, wrapped so top-level await is legal
+    # Syntax. TrendSpider wraps the script as (async() => { ... })() and parses it as
+    # ECMAScript 2020; node is newer, so ES2021+ forms are checked separately below.
     if shutil.which("node"):
         with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as tmp:
             tmp.write("(async () => {\n" + raw + "\n})();\n")
         proc = subprocess.run(["node", "--check", tmp.name], capture_output=True, text=True)
         Path(tmp.name).unlink(missing_ok=True)
         if proc.returncode != 0:
-            msg = proc.stderr.strip().splitlines()
-            errors.append("syntax: " + " | ".join(m for m in msg if m.strip())[:400])
+            msg = [m for m in proc.stderr.strip().splitlines() if m.strip()]
+            errors.append("syntax: " + " | ".join(msg)[:400])
     else:
         warns.append("node not found — syntax not checked")
 
-    # 2. `new` is banned
-    for m in re.finditer(r"\bnew\s+[A-Za-z_$]", struct):
-        errors.append(f"line {line_of(struct, m.start())}: `new` is banned in the sandbox (07 §3)")
+    sandbox_checks(struct, toks, errors)
 
-    # 3. reserved identifiers redeclared
-    for m in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", struct):
-        if m.group(1) in RESERVED:
-            errors.append(f"line {line_of(struct, m.start())}: `{m.group(1)}` shadows a reserved built-in (07 §4)")
-    for m in re.finditer(r"\b(?:const|let|var)\s*\[([^\]]*)\]", struct):
+    # Shadowing TrendSpider doesn't reject but that still hides a built-in.
+    for m in re.finditer(r"\b(?:const|let|var)\s*[\[{]([^\]}=]*)[\]}]", struct):
         for name in re.findall(r"[A-Za-z_$][\w$]*", m.group(1)):
             if name in RESERVED:
-                errors.append(f"line {line_of(struct, m.start())}: destructured `{name}` shadows a built-in")
+                warns.append(f"line {line_of(struct, m.start())}: destructured `{name}` shadows a built-in")
+    for m in re.finditer(r"\(([^()]*)\)\s*=>", struct):
+        for name in re.findall(r"[A-Za-z_$][\w$]*", m.group(1)):
+            if name in RESERVED:
+                warns.append(f"line {line_of(struct, m.start())}: parameter `{name}` shadows a built-in "
+                             f"inside this function")
 
-    # 4. unconfirmed modern syntax
-    for tok, why in (("??", "nullish coalescing"), ("?.", "optional chaining")):
-        for m in re.finditer(re.escape(tok), struct):
-            if tok == "?." and re.match(r"\?\.\d", struct[m.start():m.start() + 3]):
-                continue  # a ternary followed by a decimal, e.g. `x ?.5 : 1`
-            warns.append(f"line {line_of(struct, m.start())}: `{tok}` ({why}) — sandbox support unconfirmed (07 §11)")
-
-    # 5. input titles
+    # Input titles (07 §5).
     for m in re.finditer(r"\binput(?:\.\w+)?\(\s*(['\"])(.*?)\1", code):
         if len(m.group(2)) > 20:
             warns.append(f"line {line_of(code, m.start())}: input title {m.group(2)!r} is "
                          f"{len(m.group(2))} chars; keep under ~20 (07 §5)")
 
-    # 6. output calls inside conditionals / loops / functions
+    # Outputs must run unconditionally (07 §1).
     blocks = block_kinds(struct)
     for m in re.finditer(r"\b(" + "|".join(OUTPUT_CALLS) + r")\s*\(", struct):
-        pos = m.start()
+        pos, ln = m.start(), line_of(struct, m.start())
         kinds = [k for (s, e, k) in blocks if s < pos < e]
-        ln = line_of(struct, pos)
         if "conditional" in kinds:
             errors.append(f"line {ln}: `{m.group(1)}` inside a conditional — outputs must run "
                           f"unconditionally (07 §1)")
@@ -175,41 +216,83 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
             warns.append(f"line {ln}: `{m.group(1)}` inside a loop — fine ONLY if the loop count "
                          f"is a fixed constant (04 fixed-slot pattern)")
         elif "function" in kinds:
-            warns.append(f"line {ln}: `{m.group(1)}` inside a function — make sure that function "
-                         f"is called unconditionally, once")
+            warns.append(f"line {ln}: `{m.group(1)}` inside a function — that function must be "
+                         f"called unconditionally, once")
 
-    # 7. names: template literals, collisions, count
+    # Names: template literals, paint/signal collisions, the 70-series cap.
     for m in re.finditer(r"\bname\s*:\s*`", code):
         warns.append(f"line {line_of(code, m.start())}: paint name built from a template literal — "
                      f"must not depend on inputs or data (07 §1)")
-    paint_names = set(re.findall(r"\bname\s*:\s*(['\"])(.*?)\1", code))
-    paint_names = {n for _, n in paint_names}
+    paint_names = {n for _, n in re.findall(r"\bname\s*:\s*(['\"])(.*?)\1", code)}
     signal_names = {n for _, n in re.findall(r"\bregister_signal\s*\([^;]*?,\s*(['\"])(.*?)\1\s*\)", code)}
     for n in sorted(paint_names & signal_names):
-        errors.append(f"name {n!r} used for both a paint and a signal — they share one namespace (07 §2)")
-    n_out = len(re.findall(r"\bpaint\s*\(", struct))
-    if n_out > 70:
-        errors.append(f"{n_out} paint() calls — the limit is 70 output series (04)")
+        errors.append(f"name {n!r} used for both a paint and a signal — one namespace (07 §2)")
+    if len(re.findall(r"\bpaint\s*\(", struct)) > 70:
+        errors.append("more than 70 paint() calls — the limit is 70 output series (04)")
 
-    # 8. placement
+    # A shared-helpers file is not a conversion: only the sandbox checks above apply.
+    if "lint: helpers-library" in raw[:300]:
+        return errors, warns
+
+    # describe_indicator: exactly one, and the TrendSpider name ends in _TV.
+    describes = re.findall(r"\bdescribe_indicator\s*\(\s*(['\"])(.*?)\1", code)
     if len(re.findall(r"\bdescribe_indicator\s*\(", struct)) != 1:
         errors.append("expected exactly one describe_indicator(...) call")
+    for _, title in describes:
+        if not title.endswith(TV_SUFFIX):
+            errors.append(f"indicator name {title!r} must end with {TV_SUFFIX!r} — that is the name "
+                          f"it is saved under in TrendSpider (SKILL.md naming)")
+    hdr = re.search(r"TrendSpider name\s*:\s*(.+?)\s*(?:\*/)?\s*$", raw[:3000], re.M)
+    if hdr and describes and hdr.group(1).strip() != describes[0][1]:
+        errors.append(f"header 'TrendSpider name' {hdr.group(1).strip()!r} differs from describe_indicator "
+                      f"title {describes[0][1]!r} — they must be identical")
 
-    # 9. look-ahead and determinism
+    # LESSON 7: TrendSpider pivot/fractal built-ins mark the pivot bar itself — look-ahead.
+    for b in LOOKAHEAD_BUILTINS:
+        for m in re.finditer(r"\b" + b + r"\s*\(", struct):
+            before = struct[max(0, m.start() - 12):m.start()]
+            if "shift(" not in before:
+                warns.append(f"line {line_of(struct, m.start())}: `{b}` places its value ON the pivot "
+                             f"bar — look-ahead in any signal. Use shift({b}(src, l, r), r) for Pine "
+                             f"semantics (02 §Pivots)")
+
+    # Built-ins that differ from their Pine namesake: each use must be acknowledged.
+    # Silence one by putting `// pine-parity: <name>` on the same line, after checking it.
+    raw_lines = raw.splitlines()
+    for b, why in TRAP_BUILTINS.items():
+        for m in re.finditer(r"(?<![\w$.])" + b + r"\s*\(", struct):
+            ln = line_of(struct, m.start())
+            if f"pine-parity: {b}" not in (raw_lines[ln - 1] if ln <= len(raw_lines) else ""):
+                warns.append(f"line {ln}: {why}  (add `// pine-parity: {b}` once handled)")
+
+    # Look-ahead interpolation and non-determinism.
     for m in re.finditer(r"interpolate_sparse_series\s*\([^;]*?(['\"])linear\1", code):
-        warns.append(f"line {line_of(code, m.start())}: 'linear' interpolation looks ahead — use "
-                     f"'constant' for anything a signal depends on (06)")
+        warns.append(f"line {line_of(code, m.start())}: 'linear' interpolation looks ahead (06)")
     for m in re.finditer(r"\bMath\.random\s*\(", struct):
-        warns.append(f"line {line_of(struct, m.start())}: Math.random — output changes on every recompute (07 §9)")
+        warns.append(f"line {line_of(struct, m.start())}: Math.random — output changes every recompute (07 §9)")
 
-    # 10. header block
+    # Header block.
     head = raw[:3000]
     missing = [f for f in HEADER_FIELDS if f not in head]
     if "Converted from TradingView Pine Script" not in head or missing:
         warns.append(f"header block incomplete (SKILL.md 'Output file format'); missing: {missing or 'title line'}")
-    if "strategy" in head.lower() and "Strategy Tester settings" not in head:
+    if re.search(r"Type\s*:\s*strategy", head) and "Strategy Tester settings" not in head:
         warns.append("strategy conversion without a 'Strategy Tester settings' section in the header")
 
+    return errors, warns
+
+
+def lint_markdown(path: Path) -> tuple[list[str], list[str]]:
+    """Sandbox checks on every ```js block in a reference file — examples get copied (LESSONS L2).
+    A block whose first line contains `lint: skip` is a deliberate bad example and is skipped."""
+    raw = path.read_text(encoding="utf-8")
+    errors, warns = [], []
+    for m in re.finditer(r"^```(?:js|javascript)[ \t]*\n(.*?)^```", raw, re.M | re.S):
+        body = m.group(1)
+        if "lint: skip" in body.split("\n", 1)[0]:
+            continue
+        struct = blank_strings(strip_comments(body))
+        sandbox_checks(struct, list(tokens(struct)), errors, base=raw.count("\n", 0, m.start(1)))
     return errors, warns
 
 
@@ -218,7 +301,7 @@ def main(paths: list[str]) -> int:
         print(__doc__); return 2
     failed = False
     for p in paths:
-        errors, warns = lint(Path(p))
+        errors, warns = (lint_markdown if p.endswith(".md") else lint)(Path(p))
         print(f"\n{p}")
         for e in errors:
             print(f"   ERROR  {e}")

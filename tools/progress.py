@@ -6,6 +6,8 @@ continue where the last one stopped. It is bookkeeping, not a converter.
     python tools/progress.py stats     # counts by status, type and validation level
     python tools/progress.py next [N]  # the next N pending scripts, in queue order
     python tools/progress.py set <id> --status PARTIAL --validation oracle --notes "..."
+    python tools/progress.py set <id> --ts-name "RSI Divergence_TV" --live-tested AAPL:D                                       --ts-saved yes            # or: --ts-saved no --ts-save-error "HTTP 500"
+    python tools/progress.py check <id>  # the done-gates for one script (also run by `set --status`)
 
 Queue order: strategies before indicators, and within each, shortest source first — the
 simpler conversions come first and harden the reference files before the hard ones.
@@ -17,6 +19,7 @@ import argparse
 import datetime as dt
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +34,16 @@ PINE = ROOT / "pine"
 PROGRESS = ROOT / "progress" / "progress.json"
 STATUSES = ("pending", "in_progress", "FULL", "PARTIAL", "NOT CONVERTIBLE")
 LEVELS = ("none", "static", "syntax", "oracle", "tv-parity", "live")
+DONE = ("FULL", "PARTIAL")
+# Where the script lives in TrendSpider. Filled by the live test (reference/09).
+TS_FIELDS = {
+    "trendspider_name": None,       # the describe_indicator title, ending in _TV
+    "live_tested": None,            # "YYYY-MM-DD TICKER:RES" — APPLY ran with no console error
+    "trendspider_saved": None,      # True once it shows in the editor's "Yours" list
+    "trendspider_save_error": None, # e.g. "HTTP 500" when the save failed server-side (LESSONS L12)
+    "tester_run": None,             # strategies: "YYYY-MM-DD TICKER:RES trades=N"
+    "parity_evidence": None,        # path/summary of the TradingView comparison (LESSONS L10)
+}
 
 
 def load() -> dict:
@@ -91,6 +104,7 @@ def cmd_sync(_args) -> None:
             "converted_file": None,
             "deviations": [],
             "notes": "",
+            **TS_FIELDS,
         }
         added += 1
     save(data)
@@ -119,6 +133,47 @@ def cmd_stats(_args) -> None:
                           ("validation", LEVELS)):
         counts = {v: sum(1 for x in s if x.get(field) == v) for v in values}
         print(f"  {field:11} " + "  ".join(f"{k}: {v}" for k, v in counts.items() if v))
+    print(f"  trendspider saved: {sum(1 for x in s if x.get('trendspider_saved') is True)}   "
+          f"save failed (retry): {sum(1 for x in s if x.get('trendspider_save_error') and x.get('trendspider_saved') is not True)}")
+
+
+def gates(sid: str, s: dict) -> list[str]:
+    """Reasons this script may NOT be marked FULL/PARTIAL. Empty list = all gates pass."""
+    fails = []
+    f = s.get("converted_file")
+    path = ROOT / f if f else None
+    if not path or not path.exists():
+        fails.append(f"converted file missing: {f}")
+    else:
+        lint = subprocess.run([sys.executable, str(ROOT / "tools" / "lint_trendspider.py"), str(path)],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if lint.returncode != 0:
+            fails.append("lint has errors:\n" + "\n".join(l for l in lint.stdout.splitlines() if "ERROR" in l))
+        title = re.search(r"describe_indicator\s*\(\s*(['\"])(.*?)\1", path.read_text(encoding="utf-8"))
+        if title and s.get("trendspider_name") != title.group(2):
+            fails.append(f"trendspider_name {s.get('trendspider_name')!r} != describe_indicator title "
+                         f"{title.group(2)!r}")
+    if not (s.get("trendspider_name") or "").endswith("_TV"):
+        fails.append("trendspider_name must end with _TV")
+    if not s.get("live_tested"):
+        fails.append("no live TrendSpider test recorded (--live-tested), reference/09")
+    if s.get("trendspider_saved") is not True and not s.get("trendspider_save_error"):
+        fails.append("not saved in TrendSpider and no save error recorded (--ts-saved / --ts-save-error)")
+    if s.get("type") == "strategy" and not s.get("tester_run"):
+        fails.append("strategy without a Strategy Tester run (--tester-run)")
+    if s.get("validation") == "tv-parity" and not s.get("parity_evidence"):
+        fails.append("validation tv-parity claimed without --parity-evidence (LESSONS L10)")
+    return fails
+
+
+def cmd_check(args) -> None:
+    data = load()
+    s = data["scripts"].get(args.id) or sys.exit(f"unknown id {args.id}")
+    fails = gates(args.id, {**TS_FIELDS, **s})
+    print(f"{args.id}: " + ("all gates pass" if not fails else "BLOCKED"))
+    for x in fails:
+        print("  - " + x)
+    sys.exit(1 if fails else 0)
 
 
 def cmd_set(args) -> None:
@@ -140,6 +195,26 @@ def cmd_set(args) -> None:
         s["deviations"].extend(args.deviation)
     if args.notes is not None:
         s["notes"] = args.notes
+    for k, v in TS_FIELDS.items():
+        s.setdefault(k, v)
+    if args.ts_name:
+        s["trendspider_name"] = args.ts_name
+    if args.live_tested:
+        s["live_tested"] = f"{dt.date.today().isoformat()} {args.live_tested}"
+    if args.ts_saved:
+        s["trendspider_saved"] = args.ts_saved == "yes"
+        if s["trendspider_saved"]:
+            s["trendspider_save_error"] = None
+    if args.ts_save_error:
+        s["trendspider_save_error"] = f"{dt.date.today().isoformat()} {args.ts_save_error}"
+    if args.tester_run:
+        s["tester_run"] = f"{dt.date.today().isoformat()} {args.tester_run}"
+    if args.parity_evidence:
+        s["parity_evidence"] = args.parity_evidence
+    if s["status"] in DONE:
+        fails = gates(args.id, s)
+        if fails:
+            sys.exit(f"{args.id}: cannot be {s['status']} yet —\n  - " + "\n  - ".join(fails))
     s["last_change"] = dt.date.today().isoformat()
     save(data)
     print(f"{args.id}: {s['status']} / {s['validation']}")
@@ -155,7 +230,11 @@ def main() -> None:
     p.add_argument("id")
     p.add_argument("--status"); p.add_argument("--validation"); p.add_argument("--converted-file")
     p.add_argument("--deviation", action="append"); p.add_argument("--notes")
+    p.add_argument("--ts-name"); p.add_argument("--live-tested", metavar="TICKER:RES")
+    p.add_argument("--ts-saved", choices=("yes", "no")); p.add_argument("--ts-save-error")
+    p.add_argument("--tester-run", metavar='"TICKER:RES trades=N"'); p.add_argument("--parity-evidence")
     p.set_defaults(fn=cmd_set)
+    p = sub.add_parser("check"); p.add_argument("id"); p.set_defaults(fn=cmd_check)
     args = ap.parse_args()
     args.fn(args)
 

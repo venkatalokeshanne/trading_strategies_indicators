@@ -9,6 +9,8 @@
  * Placement    : overlay
  * Status       : FULL
  * Converted    : 2026-10-08 by Claude (pine-to-trendspider skill)
+ * TrendSpider name : Bollinger Bands_TV
+ * Live tested  : <YYYY-MM-DD> on <TICKER> <res> — saved in TrendSpider: yes | no (why)
  *
  * Deviations from the original:
  *   - none. ta.stdev defaults to biased (population); TrendSpider's stdev() is
@@ -24,7 +26,7 @@
  * All paint / fill / register_signal calls are top-level, unconditional, literal names.
  */
 
-describe_indicator('Bollinger Bands', 'overlay', { shortName: 'BB' });
+describe_indicator('Bollinger Bands_TV', 'overlay', { shortName: 'BB' });
 
 // ── Inputs ── short titles (< ~20 chars), Pine's exact defaults ───────────
 const length = input.number('Length', 20, { min: 1 });

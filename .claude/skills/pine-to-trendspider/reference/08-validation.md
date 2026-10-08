@@ -95,12 +95,12 @@ trades** → export, against your entry/exit signal bars (`oracle_output.csv` sh
 Differences that match a listed deviation (next-open fills, split long/short) are expected;
 anything else is a bug.
 
-## Level 5 — live in TrendSpider
+## Level 5 — live in TrendSpider (mandatory for every script)
 
-Paste the script into the Custom Indicator Editor, **APPLY**, check it draws, then **Save**.
-If Save fails with HTTP 500, see `07` §12 — the problem may be TrendSpider's, not yours.
-For strategies, wire the signals into the Strategy Tester exactly as the header says and
-confirm trades appear.
+Done in the user's logged-in Chrome, exactly as `09-trendspider-live.md` describes: APPLY
+with no error, Save under the `_TV` name, confirm it in the "Yours" list, restore the chart;
+strategies also get a Strategy Tester run. This level is **in addition to** levels 2–4,
+not a replacement: a script can draw and still be numerically wrong.
 
 ## Recording the result
 

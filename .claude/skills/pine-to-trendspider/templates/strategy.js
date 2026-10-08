@@ -9,6 +9,8 @@
  * Placement    : overlay
  * Status       : PARTIAL
  * Converted    : 2026-10-08 by Claude (pine-to-trendspider skill)
+ * TrendSpider name : EMA Cross ATR Strategy_TV
+ * Live tested  : <YYYY-MM-DD> on <TICKER> <res> — saved in TrendSpider: yes | no (why)
  *
  * The Pine original, in words:
  *   strategy.entry("L", strategy.long) on ta.crossover(ema9, ema21)
@@ -36,7 +38,7 @@
  * ───────────────────────────────────────────────────────────────────────
  */
 
-describe_indicator('EMA Cross ATR Strategy', 'overlay', { shortName: 'EMAX' });
+describe_indicator('EMA Cross ATR Strategy_TV', 'overlay', { shortName: 'EMAX' });
 
 // ── Inputs ────────────────────────────────────────────────────────────────
 const fastLen = input.number('Fast EMA', 9, { min: 1 });

@@ -1,3 +1,4 @@
+// lint: helpers-library — not a conversion; the lint skips the describe_indicator and header checks.
 // ─────────────────────────────────────────────────────────────────────────────
 // Pine-semantics helpers for TrendSpider scripts.
 //

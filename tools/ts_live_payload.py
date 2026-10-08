@@ -51,7 +51,7 @@ if (!isExample && currentName !== NAME) {
     .filter(e => e.offsetWidth && e.innerText && e.innerText.trim()).map(e => e.innerText.trim().slice(0, 200));
   result = ({
     loaded: view.state.doc.length === SRC.length,
-    previewLegend: [...document.querySelectorAll('.legend-item--custom_script_')].filter(e => e.offsetWidth)
+    previewLegend: [...document.querySelectorAll('[class*="legend-item--custom_script"]')].filter(e => e.offsetWidth)
       .map(e => e.innerText.trim().replace(/\s+/g, ' ').slice(0, 80)),
     errors: errorLike.slice(0, 5),
     console: consoleText.replace(/^Console\s*/, '').slice(0, 600),

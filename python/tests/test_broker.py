@@ -238,3 +238,21 @@ def test_metrics_basic():
     assert m["grossProfit"] == pytest.approx(4) and m["grossLoss"] == pytest.approx(2)
     assert m["profitFactor"] == pytest.approx(2) and m["riskReward"] == pytest.approx(2)
     assert m["netProfit"] == pytest.approx(2)
+
+
+def test_full_close_with_fractional_qty_leaves_nothing_open():
+    """Regression: x*100/100 lost an ulp, leaving a phantom 1e-9 position open."""
+    sym = SymbolInfo.make("TEST:X", "stock", mintick=0.01, qty_step=1e-9)
+    rows = [(100, 100, 100, 46.5875 + k * 0.01) for k in range(6)]
+
+    def body(s, st, i):
+        if i == 0:
+            st.entry("L", st.long)
+        if i == 2:
+            st.close("L")
+        if i == 3:
+            st.entry("L", st.long)
+    T = strat(body, default_qty_type="percent_of_equity", default_qty_value=100)
+    r = run(T, bars(rows), symbol=sym, timeframe="D")
+    assert len(r.broker.closed) == 1 and len(r.broker.open) == 1
+    assert all(t.qty > 1 for t in r.broker.closed)

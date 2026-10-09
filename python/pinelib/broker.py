@@ -46,6 +46,7 @@ class StrategyConfig:
     use_bar_magnifier: bool = False
     risk_free_rate: float = 2.0                # % per year, for Sharpe/Sortino
     currency: str = "USD"
+    path_mode: str = "pine"                    # pine | reverse (repaint audit: flip the intrabar path)
 
     @classmethod
     def from_decl(cls, decl: dict | None, pine_version: int = 5) -> "StrategyConfig":
@@ -328,7 +329,10 @@ class Broker:
             for (so, sh, sl, sc) in self.ltf[i]:
                 pts.extend(_ohlc_path(so, sh, sl, sc))
             return pts
-        return _ohlc_path(o, h, l, c)
+        path = _ohlc_path(o, h, l, c)
+        if self.cfg.path_mode == "reverse":
+            path = [path[0], path[2], path[1], path[3]]
+        return path
 
     def _walk(self, path: list[float], i: int) -> None:
         """Trigger stop/limit orders and exit brackets along the price path."""
@@ -427,6 +431,8 @@ class Broker:
         key = t.uid
         if not _isna(ex.qty):
             want = ex.qty
+        elif ex.qty_percent >= 100.0:
+            want = t.init_qty                    # exact: x*100/100 can lose an ulp (LESSONS P2)
         else:
             want = t.init_qty * ex.qty_percent / 100.0
         want = self.sym.round_qty(want) if want < t.init_qty else t.init_qty
@@ -507,8 +513,12 @@ class Broker:
         elif od.kind == "close":
             targets = [t for t in self.open if t.entry_id == od.id]
             total = sum(t.qty for t in targets)
-            want = total if _isna(od.qty) else min(total, od.qty)
-            want = want * od.qty_percent / 100.0 if _isna(od.qty) else want
+            if not _isna(od.qty):
+                want = min(total, od.qty)
+            elif od.qty_percent >= 100.0:
+                want = total                     # exact: x*100/100 can lose an ulp (LESSONS P2)
+            else:
+                want = total * od.qty_percent / 100.0
             self._reduce(targets, self.sym.round_qty(want) if want < total else total,
                          price, i, od.id, od.comment, slip_px=s)
         elif od.kind == "close_all":
@@ -562,6 +572,8 @@ class Broker:
             if remaining <= 1e-12:
                 break
             take = min(t.qty, remaining)
+            if t.qty - take < self.sym.qty_step * 0.5:
+                take = t.qty                     # never leave a sub-step residual open
             px = price - (slip_px * t.direction)
             self._close_trade(t, take, px, i, exit_id, comment)
             remaining -= take

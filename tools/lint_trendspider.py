@@ -231,10 +231,17 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
     for m in re.finditer(r"\bname\s*:\s*`", code):
         warns.append(f"line {line_of(code, m.start())}: paint name built from a template literal — "
                      f"must not depend on inputs or data (07 §1)")
-    paint_names = {n.lower() for _, n in re.findall(r"\bname\s*:\s*(['\"])(.*?)\1", code)}
-    signal_names = {n.lower() for _, n in re.findall(r"\bregister_signal\s*\([^;]*?,\s*(['\"])(.*?)\1\s*\)", code)}
-    for n in sorted(paint_names & signal_names):           # one case-insensitive namespace (L21)
+    # TrendSpider derives series ids from names case-insensitively and WITHOUT punctuation:
+    # "1H +2 sigma" and "1H -2 sigma" are the same id (L21, L22). Spaces DO count: the paint
+    # "InsideBar" and the signal "Inside Bar" coexist (97jd1jJ8 saved fine).
+    norm = lambda n: re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", n.lower())).strip()
+    paint_list = [norm(n) for _, n in re.findall(r"\bname\s*:\s*(['\"])(.*?)\1", code)]
+    signal_list = [norm(n) for _, n in re.findall(r"\bregister_signal\s*\([^;]*?,\s*(['\"])(.*?)\1\s*\)", code)]
+    paint_names, signal_names = set(paint_list), set(signal_list)
+    for n in sorted(paint_names & signal_names):
         errors.append(f"name {n!r} used for both a paint and a signal — one namespace (07 §2)")
+    for n in sorted({x for x in paint_list if paint_list.count(x) > 1} | {x for x in signal_list if signal_list.count(x) > 1}):
+        errors.append(f"names that differ only in case/punctuation collide ({n!r}) — TrendSpider ids ignore both (L22)")
     if len(re.findall(r"\bpaint\s*\(", struct)) > 70:
         errors.append("more than 70 paint() calls — the limit is 70 output series (04)")
 

@@ -288,3 +288,10 @@ case-insensitive namespace.
 between paint() and register_signal().
 **Gate.** lint_trendspider.py: `shift(x, -n)` is an ERROR; the paint/signal collision check
 compares names case-insensitively.
+
+## L22 — Series ids ignore punctuation: "+2 sigma" and "-2 sigma" collide
+**What happened.** zVUEQ3tM painted "1H +2 sigma" and "1H -2 sigma"; APPLY failed with
+`paint(): out series "1H -2 sigma" already exists` — the id drops punctuation (letters, digits and spaces remain).
+**Rule.** paint/signal names must differ in letters or digits, not only in + - ( ) etc.
+**Gate.** lint_trendspider.py normalises names (lower-case, punctuation removed, spaces kept) and reports
+collisions among paints, among signals, and between the two.

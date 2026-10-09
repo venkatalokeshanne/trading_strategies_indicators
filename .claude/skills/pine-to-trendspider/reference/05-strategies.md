@@ -27,9 +27,16 @@ in the file header. Both are part of the deliverable.
 - Built-in TrendSpider indicators may expose signals with the **same display name** as
   yours. Prefix signal names with the script's short name so the user picks the right one.
 
-[VERIFY] whether one Tester strategy can trade both long and short, how native `Stop loss`
-and `Take profit` are expressed (percent, price, ATR) and whether they fill intrabar at the
-level or at the next open. Record the answers here.
+**One direction per Tester strategy** [VERIFIED 2026-10-09]: the gear next to "N candles"
+("Set up trade cost and direction") offers Direction = **Long only** or **Short only** —
+nothing else. Execution price is fixed at **Next Open**. A Pine script that trades both
+ways (or stop-and-reverses) therefore gets two Tester runs: Long only with the
+`… Long Entry/Exit` signals, then Short only with `… Short Entry/Exit`
+(`ts_live_payload.py tester` / `tester-short`). Set the direction with a real click on the
+option — setting Angular's model from script desynchronises the select (LESSONS L17).
+
+[VERIFY] how native `Stop loss` and `Take profit` are expressed (percent, price, ATR) and
+whether they fill intrabar at the level or at the next open. Record the answers here.
 
 ## Choose an approach
 

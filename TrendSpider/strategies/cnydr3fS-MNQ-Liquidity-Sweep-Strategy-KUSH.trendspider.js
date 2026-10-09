@@ -10,7 +10,9 @@
  * Status       : FULL
  * Converted    : 2026-10-09 by Claude (pine-to-trendspider skill)
  * TrendSpider name : MNQ Liquidity Sweep Strategy_TV
- * Live tested  : <pending>
+ * Live tested  : 2026-10-09 on MSFT 5m — saved in TrendSpider: yes. Strategy Tester, 10,000
+ *                candles: Long only 23 trades, 61 % wins, net +15.8 %, max DD 4.2 %;
+ *                Short only 24 trades, 38 % wins, net -16.3 %, max DD 18.8 % (beta -0.48).
  *
  * The Pine original, in words:
  *   hh = highest(high, 20), ll = lowest(low, 20)

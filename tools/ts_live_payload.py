@@ -8,7 +8,8 @@ tool's javascript_exec on charts.trendspider.com and returns a small JSON report
     python tools/ts_live_payload.py apply  TrendSpider/strategies/X.trendspider.js   > apply.js
     python tools/ts_live_payload.py find   TrendSpider/strategies/X.trendspider.js   # is the _TV name already saved?
     python tools/ts_live_payload.py remove TrendSpider/strategies/X.trendspider.js   # take it off the chart after the test
-    python tools/ts_live_payload.py tester TrendSpider/strategies/X.trendspider.js   # strategies: wire signals, run Tester
+    python tools/ts_live_payload.py tester TrendSpider/strategies/X.trendspider.js   # strategies: wire Long signals, run Tester
+    python tools/ts_live_payload.py tester-short …                                     # Short side (set Direction = Short only first)
 
 The lint must be clean first; `apply` refuses a file that has lint errors.
 """
@@ -109,9 +110,12 @@ async function pickSignal(addBtn, signal) {
   const cond = near(vis('button.md-button, md-menu-item button').filter(b => b.textContent.trim() === 'Condition'), addBtn.getBoundingClientRect());
   cond.click(); await wait(1200);
   vis('.picker-menu__item').find(e => e.innerText.trim().split('\n')[0].trim() === 'Indicator').click(); await wait(1500);
-  const want = `${NAME}, ${signal} (on chart)`;
-  const row = vis('.picker-menu__item').find(e => e.innerText.trim() === want);
-  if (!row) throw new Error('signal not in picker: ' + want + ' — is the _TV indicator on the chart?');
+  // the picker label carries the input values: "<NAME> (20), <signal> (on chart)" (LESSONS L17)
+  const tail = `, ${signal} (on chart)`;
+  const isRow = txt => txt.startsWith(NAME) && txt.endsWith(tail)
+    && /^( \(.*\))?$/.test(txt.slice(NAME.length, txt.length - tail.length));
+  const row = vis('.picker-menu__item').find(e => isRow(e.innerText.trim()));
+  if (!row) throw new Error('signal not in picker: ' + NAME + tail + ' — is the _TV indicator on the chart?');
   row.click(); await wait(1500);
   vis('.picker-menu__item').find(e => e.innerText.trim() === 'Signal emerged').click(); await wait(1200);
   log.push('wired ' + signal);
@@ -155,19 +159,20 @@ def describe(src: str) -> tuple[str, str]:
     return name, short.group(2) if short else name
 
 
-def signals(src: str) -> tuple[str, str]:
-    """The script's entry and exit signal names (register_signal literals)."""
-    names = re.findall(r"register_signal\s*\([^;]*?,\s*(['\"])(.*?)\1\s*\)", src)
-    names = [n for _, n in names]
-    entry = next((n for n in names if n.endswith("Entry")), None)
-    exit_ = next((n for n in names if n.endswith("Exit")), None)
+def signals(src: str, side: str) -> tuple[str, str]:
+    """The script's entry and exit signal names (register_signal literals) for one side.
+    A Tester strategy is "Long only" or "Short only" (verified 2026-10-09), so a script with
+    both sides gets two runs: `tester` (long) and `tester-short` with Direction = Short only."""
+    names = [n for _, n in re.findall(r"register_signal\s*\([^;]*?,\s*(['\"])(.*?)\1\s*\)", src)]
+    pick = lambda suffix: next((n for n in names if n.endswith(f"{side} {suffix}")), None)
+    entry, exit_ = pick("Entry"), pick("Exit")
     if not (entry and exit_):
-        sys.exit(f"need one signal ending 'Entry' and one ending 'Exit'; found {names}")
+        sys.exit(f"need '<X> {side} Entry' and '<X> {side} Exit' signals; found {names}")
     return entry, exit_
 
 
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "find", "remove", "tester"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "find", "remove", "tester", "tester-short"):
         sys.exit(__doc__)
     mode, path = sys.argv[1], Path(sys.argv[2])
     src = path.read_text(encoding="utf-8")
@@ -180,8 +185,8 @@ def main() -> None:
         print(APPLY.replace("__SRC__", json.dumps(src)).replace("__NAME__", json.dumps(name)))
     elif mode == "find":
         print(FIND.replace("__NAME__", json.dumps(name)))
-    elif mode == "tester":
-        entry, exit_ = signals(src)
+    elif mode in ("tester", "tester-short"):
+        entry, exit_ = signals(src, "Short" if mode == "tester-short" else "Long")
         print(TESTER.replace("__NAME__", json.dumps(name)).replace("__ENTRY__", json.dumps(entry))
               .replace("__EXIT__", json.dumps(exit_)))
     else:

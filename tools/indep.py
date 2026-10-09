@@ -25,6 +25,28 @@ def _path(o: float, h: float, l: float, c: float) -> list[float]:
     return [o, h, l, c] if (h - o) < (o - l) else [o, l, h, c]
 
 
+def bracket_hit(o: float, h: float, l: float, c: float, pos: int, sl, tp):
+    """Fill price of the first bracket level (stop ``sl`` / target ``tp``, None or nan = absent)
+    touched on this bar's OHLC path by a position of direction ``pos``; None if neither."""
+    pts = _path(o, h, l, c)
+    for k, p in enumerate(pts):
+        prev = pts[k - 1] if k else p
+        lo, hi = min(prev, p), max(prev, p)
+        cands = []
+        for lvl, is_stop in ((sl, True), (tp, False)):
+            if lvl is None or lvl != lvl:
+                continue
+            adverse = (pos > 0) == is_stop      # long stop / short target are below
+            if k == 0:
+                if (adverse and p <= lvl) or (not adverse and p >= lvl):
+                    cands.append((0.0, p))
+            elif lo <= lvl <= hi and ((adverse and p < prev) or (not adverse and p > prev)):
+                cands.append((abs(lvl - prev), lvl))
+        if cands:
+            return min(cands)[1]
+    return None
+
+
 def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequence[float],
              orders: Callable[[int, int], list], *,
              stop: Callable[[int, int, float, int], float | None] | None = None,
@@ -59,24 +81,7 @@ def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequ
         if pos != 0 and (stop or target):
             sl = stop(i, pos, ep, eb) if stop else None
             tp = target(i, pos, ep, eb) if target else None
-            pts = _path(o[i], h[i], l[i], c[i])
-            hit = None
-            for k, p in enumerate(pts):
-                prev = pts[k - 1] if k else p
-                lo, hi = min(prev, p), max(prev, p)
-                cands = []
-                for lvl, is_stop in ((sl, True), (tp, False)):
-                    if lvl is None or lvl != lvl:
-                        continue
-                    adverse = (pos > 0) == is_stop      # long stop / short target are below
-                    if k == 0:
-                        if (adverse and p <= lvl) or (not adverse and p >= lvl):
-                            cands.append((0.0, p))
-                    elif lo <= lvl <= hi and ((adverse and p < prev) or (not adverse and p > prev)):
-                        cands.append((abs(lvl - prev), lvl))
-                if cands:
-                    hit = min(cands)[1]
-                    break
+            hit = bracket_hit(o[i], h[i], l[i], c[i], pos, sl, tp)
             if hit is not None:
                 trades.append((pos, eb, ep, i, hit))
                 pos = 0
@@ -190,3 +195,37 @@ def run_conversion(tv_id: str, df, symbol=None, tf: str = "D", **kw):
     from pinelib import SymbolInfo, run
     return run(load_conversion(tv_id), df, symbol=symbol or SymbolInfo.make("TEST:SYNTH", "crypto", qty_step=1e-9),
                timeframe=tf, **kw)
+
+
+def np_tr(h, l, c, handle_na=True):
+    h, l, c = (_np.asarray(x, float) for x in (h, l, c))
+    pc = _np.r_[_np.nan, c[:-1]]
+    tr = _np.fmax(h - l, _np.fmax(_np.abs(h - pc), _np.abs(l - pc)))
+    tr[0] = h[0] - l[0] if handle_na else _np.nan
+    return tr
+
+
+def np_atr(h, l, c, n):
+    return np_rma(np_tr(h, l, c, True), n)
+
+
+def np_rsi(x, n):
+    x = _np.asarray(x, float)
+    ch = _np.r_[_np.nan, _np.diff(x)]
+    u = _np.where(_np.isnan(ch), _np.nan, _np.maximum(ch, 0))
+    d = _np.where(_np.isnan(ch), _np.nan, _np.maximum(-ch, 0))
+    ru, rd = np_rma(u, n), np_rma(d, n)
+    with _np.errstate(divide="ignore", invalid="ignore"):
+        r = 100 - 100 / (1 + ru / rd)
+    r[(rd == 0) & ~_np.isnan(ru)] = 100.0
+    return r
+
+
+def np_stoch(c, h, l, n):
+    import pandas as pd
+    hh = pd.Series(h).rolling(n).max().to_numpy()
+    ll = pd.Series(l).rolling(n).min().to_numpy()
+    with _np.errstate(divide="ignore", invalid="ignore"):
+        k = 100 * (_np.asarray(c) - ll) / (hh - ll)
+    k[~_np.isfinite(k)] = _np.nan
+    return k

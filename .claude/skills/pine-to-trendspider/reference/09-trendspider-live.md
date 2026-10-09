@@ -136,6 +136,24 @@ What the snippet does, for doing it by hand:
 Don't save the Tester strategy unless the user asks — it can't be undone cleanly and isn't
 part of the conversion. Close the Tester without saving.
 
+
+### 8b. Faster Tester loop (proven 2026-10-09, ~4 calls per strategy)
+Page helpers installed once per page load in the browser tool (copy from the commit that added this note
+if the page reloaded): `window.__tester(NAME, ENTRY, EXIT)` = the `tester` payload as a function,
+`window.__results()` = the `results` payload, `window.__remove(SHORT)` = the `remove` payload.
+Add several saved `_TV` indicators to the chart first (**Manage Indicators button is the small "⋮" at
+about (464,22)** — NOT the "Indicators" button at (416,20), which toggles every indicator off; if that
+happens, click "Indicators" once more). In the dialog: type the name, click the dialog title once to
+blur the box, click the row (440,190), then APPLY (1146,664). The typed text must reach the search box:
+if the dialog did not open, keystrokes go to the chart (symbol search) — check the title still says
+AAPL 5 min. Per strategy: (1) click an empty chart area (900,120) then the tester's X (1516,19) —
+the first click only dismisses leftover pop-ups; (2) JS: click the leaf element "YES" in the
+"lose unsaved changes" dialog; (3) JS: click the bottom-bar "Strategy Tester" tab, then the
+"skip to point&click editor" link; real click on maximise (1432,474); (4) JS: `__tester` then wait
+~11 s then `__results()` (stay under the 45 s tool limit). A strategy with no exit signal: use its
+opposite-side entry signal as EXIT. When done, close the tester the same way and remove every
+indicator you added with `__remove`; the legend must match the user's original list.
+
 ### 9. Record
 ```bash
 python tools/progress.py set <id> --ts-name "<Title>_TV" --live-tested TICKER:RES --ts-saved yes \

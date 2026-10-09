@@ -222,6 +222,12 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
             warns.append(f"line {ln}: `{m.group(1)}` inside a function — that function must be "
                          f"called unconditionally, once")
 
+    # Higher-timeframe values landed at the HTF bar's OPEN without a one-bar lag = look-ahead (L23).
+    if re.search(r"\brequest\.history\s*\(", code) and re.search(r"\bland_points_onto_series\s*\(", code) \
+            and not re.search(r"\[\s*_?\w+\s*-\s*1\s*\]|\.slice\(\s*1\s*\)|myLag|prevCompleted", code):
+        warns.append("request.history data landed without a one-bar lag: a higher-timeframe bar's final value "
+                     "would show from its open (look-ahead) — shift by one HTF bar (LESSONS L23, reference/06)")
+
     # shift(x, -n) reads n bars into the FUTURE (positive = past): look-ahead (L21).
     for m in re.finditer(r"\bshift\s*\([^,()]+,\s*-\s*\d", code):
         errors.append(f"line {line_of(code, m.start())}: shift(..., -n) reads future bars — "

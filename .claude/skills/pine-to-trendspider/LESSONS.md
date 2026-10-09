@@ -295,3 +295,13 @@ compares names case-insensitively.
 **Rule.** paint/signal names must differ in letters or digits, not only in + - ( ) etc.
 **Gate.** lint_trendspider.py normalises names (lower-case, punctuation removed, spaces kept) and reports
 collisions among paints, among signals, and between the two.
+
+## L23 — TrendSpider-AI drafts land higher-timeframe values at the bar's open (look-ahead)
+**What happened.** Five AI drafts (nvf8Q6kq, zVUEQ3tM, yZ2mcxqj, cCH7ieax, and the SuperTrend
+Bot draft) took `request.history(..., 'D'|'60'|tf)` and landed each HTF value with
+`land_points_onto_series(htf.time, values, time, 'le'|'ge'|'eq')` unshifted — every chart bar
+saw its HTF bar's FINAL value from the HTF bar's open.
+**Rule.** Shift HTF values by one HTF bar before landing when the chart is on a lower
+timeframe (`values.map((v, k) => k ? values[k - 1] : null)`, or land at the next bar's time),
+as in reference/06. Note in the header that Pine shows it one chart bar earlier.
+**Gate.** lint_trendspider.py warns when request.history data is landed with no visible lag.

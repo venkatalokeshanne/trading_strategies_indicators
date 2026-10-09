@@ -229,3 +229,38 @@ def np_stoch(c, h, l, n):
         k = 100 * (_np.asarray(c) - ll) / (hh - ll)
     k[~_np.isfinite(k)] = _np.nan
     return k
+
+
+def np_wma(x, n):
+    x = _np.asarray(x, float)
+    w = _np.arange(1, n + 1, dtype=float)
+    out = _np.full(len(x), _np.nan)
+    for i in range(n - 1, len(x)):
+        out[i] = (x[i - n + 1:i + 1] * w).sum() / w.sum()
+    return out
+
+
+def np_supertrend(h, l, c, factor, n):
+    """Pine ta.supertrend reference: (line, direction), direction -1 = up-trend."""
+    h, l, c = (_np.asarray(v, float) for v in (h, l, c))
+    atr = np_atr(h, l, c, n)
+    src = (h + l) / 2
+    m = len(c)
+    up, lo = src + factor * atr, src - factor * atr
+    line, d = _np.full(m, _np.nan), _np.full(m, _np.nan)
+    for i in range(m):
+        plo = lo[i - 1] if i and not _np.isnan(lo[i - 1]) else 0.0
+        pup = up[i - 1] if i and not _np.isnan(up[i - 1]) else 0.0
+        pc = c[i - 1] if i else _np.nan
+        if not (lo[i] > plo or pc < plo):
+            lo[i] = plo
+        if not (up[i] < pup or pc > pup):
+            up[i] = pup
+        if i == 0 or _np.isnan(atr[i - 1]):
+            d[i] = 1
+        elif line[i - 1] == pup:
+            d[i] = -1 if c[i] > up[i] else 1
+        else:
+            d[i] = 1 if c[i] < lo[i] else -1
+        line[i] = lo[i] if d[i] == -1 else up[i]
+    return line, d

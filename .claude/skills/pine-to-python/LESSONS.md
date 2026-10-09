@@ -72,3 +72,16 @@ and "opened", so its stop vanished and the trade ran stopless. The independent c
 **Rule.** Exits are pruned only after all fills of a bar step are complete.
 **Check.** Broker regression test `test_exit_for_the_new_entry_survives_a_reversal`, and the
 independent checks in `python/checks/` (run with `tools/run_checks.py`).
+
+## P11 — Write files with the Write tool, never shell heredocs
+Two batches lost time when a multi-file bash heredoc died with "unexpected EOF while looking
+for matching `''" (Git Bash on Windows). Conversion and check files go through the Write tool,
+one call per file; bash is only for running lint/checks/progress.
+
+## P12 — v6 + 100 % of equity: entries refused on a gap up
+v6 defaults margin_long/short to 100. A percent_of_equity=100 order is sized at the signal
+close; if the next open is higher, qty × open > equity and the broker refuses the order
+(pinelib `_margin_blocks`, [VERIFY] against TradingView). Independent checks must model it:
+emit the entry only when `o[i+1] <= c[i]` (see python/checks/V1frjvgM.py). v5 and older
+default to margin 0 — no refusal, but a 100x setting can wipe the account (NWIwEuKt): check the
+signal logic with a strategy_overrides qty instead.

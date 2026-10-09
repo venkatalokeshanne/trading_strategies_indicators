@@ -149,3 +149,6 @@ The editor can poll a file from a local server ("Connect to local dev server"), 
 `trendspider_indicator.js` at `http://localhost:8000/` with CORS enabled, and re-apply it on
 every save. Port 8000 may already be in use by another local app — use whatever port the
 editor accepts. [VERIFY whether the port is configurable]
+
+## Output-series cap counts clouds too [VERIFIED live 2026-10-09]
+`Error in the script: Max amount of out series exceeded (70)` — every `paint`, every `color_cloud` (each adds series) and every signal count. A 5-category x 3-slot zone plotter (30 paints + 15 clouds) hit it; 2 zone categories x 3 slots (cloud) + 3 line categories x 3 slots (single line) fits. A paint and a signal may not share a name (case/punctuation-insensitive): 'Regime Change' paint vs 'Regime Change' signal fails lint.

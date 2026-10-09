@@ -105,7 +105,7 @@ are often only PARTIAL because the available history is shorter.
 | Pine | TrendSpider [VERIFIED name exists] | Notes |
 |---|---|---|
 | `request.financial` | `request.fundamental` | field names differ. [VERIFIED 2026-10-09 live] `request.fundamental(ticker, ['market_cap','net_income'], quarters)` works and returns `{field: [{reportdate (seconds), reportDateShort, year, quarter, value}]}` NEWEST FIRST; `shares_outstanding` is an `unknown_metric` error (approximate shares as market_cap / close at report date); probe a field with `assert(false, JSON.stringify(d))` |
-| `request.earnings` | `request.earnings` | [VERIFY fields] |
+| `request.earnings` | `request.earnings` | [VERIFIED 2026-10-09 live] `await request.earnings(current.ticker)` returns an array of events with `timestamp` (seconds), `isFuture`, `when`, `eps`, `eps_est`, `revenue`, `revenue_est`, `period`, `period_year`, `eps_surprise_percent`, `revenue_surprise_percent` (filter `!isFuture`) |
 | `request.dividends` | `request.dividends` | |
 | `request.splits` | `request.splits` | |
 | `request.economic` | `request.fred_series` | FRED series IDs, not TradingView economic codes [VERIFY mapping] |
@@ -117,4 +117,5 @@ value}]}`. [VERIFIED] Land their timestamps onto the chart with
 `land_points_onto_series(..., 'le')` exactly as for prices.
 
 ## Symbols that do NOT exist in TrendSpider [VERIFIED live 2026-10-09]
+Also unavailable: SHFE:AG1!, SHFE:AU1!, OANDA:XAGUSD, CRYPTOCAP:USDT.D, CRYPTOCAP:USDC.D, BTC_MARKETCAP (request.history throws or returns an error object). XAUUSD works. `request.fundamental` fields that work: revenue, gross_profit, operating_income_loss, net_income, market_cap, ebitda; these do not: pretax_income, operating_income, total_revenue.
 `request.history` throws for USDTHB, THB=X, FX:USDTHB, USD/THB, NIFTY, NSE:NIFTY, ^NSEI, SENSEX, BANKNIFTY, ^GSPC, SPX; it works for SPY and EURUSD. Probe a symbol with a throwaway script: `try { await request.history(s,'D') } catch(e) {}` then `assert(false, ...)` to print the result. `current.now` does not exist; use `library('moment-timezone').tz(zone)` for the wall clock.

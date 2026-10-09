@@ -278,3 +278,13 @@ use the TradingView listing title. The same name goes into progress (`--ts-name`
 save via `GET /authentication/1/api?path=/custom_scripting_webserver/1/scripts` (id + title),
 never via the search box, and never click Save twice.
 **Gate.** progress.py refuses generic names (my script / strategy / untitled ...).
+
+## L21 — TrendSpider-AI drafts: negative shift = look-ahead; names are case-insensitive
+**What happened.** (1) BaznTxS6's AI draft wrote Pine `high[2]` as `shift(high, -2)`, which
+reads two bars into the FUTURE. (2) TOzt8Wxp had a plot "Buy Signal" and a signal "BUY Signal":
+APPLY failed with `signal "BUY Signal" already exists` — paint and signal names share one
+case-insensitive namespace.
+**Rule.** Pine `x[n]` is `shift(x, n)` (positive). Never reuse a name, in any letter case,
+between paint() and register_signal().
+**Gate.** lint_trendspider.py: `shift(x, -n)` is an ERROR; the paint/signal collision check
+compares names case-insensitively.

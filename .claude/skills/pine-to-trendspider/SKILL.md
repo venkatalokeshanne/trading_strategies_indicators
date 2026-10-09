@@ -1,6 +1,6 @@
 ---
 name: pine-to-trendspider
-description: Convert a TradingView Pine Script indicator or strategy (v4, v5 or v6) into a TrendSpider custom JavaScript indicator, one script at a time, by hand and line by line — never with an automatic converter. Use whenever the user asks to port, translate, convert or rewrite Pine Script / a .pine file / a TradingView script for TrendSpider, or to continue the conversion backlog in this repo.
+description: Convert TradingView Pine Script indicators/strategies to TrendSpider custom JavaScript. Default route — review the TrendSpider-AI draft in TrendSpider/ai_drafts, fix only real faults, live-test and save as _TV in the user's TrendSpider; the full by-hand procedure is the fallback. Never an automatic converter of our own. Use whenever the user asks to port, translate, convert or rewrite Pine Script / a .pine file / a TradingView script for TrendSpider, or to continue the conversion backlog in this repo.
 ---
 
 # Pine Script → TrendSpider, by hand
@@ -15,6 +15,28 @@ be carried over.
 
 Do not write, use or suggest an automatic Pine→JS converter. The user has asked for each
 script to be read and converted deliberately.
+
+## DEFAULT ROUTE (user's decision, 2026-10-09): TrendSpider-AI draft → light review → live test
+
+The user chose speed with live verification over the full manual procedure. For every
+script that has a draft in `TrendSpider/ai_drafts/` (made by TrendSpider's own AI, offline,
+by `tools/ts_ai_drafts.py`), do ONLY this — full steps in `reference/10-trendspider-ai-prompt.md`:
+
+1. `python tools/ts_next_drafts.py 4` — the next pending drafts beside their Pine source.
+2. **Light review**: fix only what is actually wrong — the recurring AI-draft faults listed in
+   reference/10 and LESSONS L19–L23 (names/_TV, null comparisons on warm-up bars, labels that
+   print prices, undocumented options, TrendSpider `supertrend()`, negative `shift`,
+   higher-timeframe values landed at the bar's open, long input titles, time zones).
+   Do not re-derive or rewrite logic that is already right; no oracle/parity work.
+3. `tools/ts_header.py` adds the header → `tools/lint_trendspider.py` must have no ERROR.
+4. **The live test is the validation**: APPLY + Save in the user's TrendSpider through
+   `tools/ts_live_helper.js` (two scripts per browser call), saved as a meaningful `<Title>_TV`.
+5. `tools/progress.py set ... --validation live --status FULL|PARTIAL` (or NOT CONVERTIBLE
+   with a reason), commit and push after every group, and continue without asking.
+
+Strategies still need a Strategy Tester run before FULL (progress gate). Use the full
+procedure below only when there is no draft, the draft is unusable, or the script is too
+complex for a light review — and say so in the notes.
 
 ## Read these before converting anything
 

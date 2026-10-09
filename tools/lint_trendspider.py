@@ -200,7 +200,10 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
 
     # Input titles (07 §5).
     for m in re.finditer(r"\binput(?:\.\w+)?\(\s*(['\"])(.*?)\1", code):
-        if len(m.group(2)) > 20:
+        if len(m.group(2)) > 30:                    # live: 42 chars -> 'input(): name is too lengthy' (L19)
+            errors.append(f"line {line_of(code, m.start())}: input title {m.group(2)!r} is "
+                        f"{len(m.group(2))} chars; TrendSpider rejects long titles — keep <= 30 (LESSONS L19)")
+        elif len(m.group(2)) > 20:
             warns.append(f"line {line_of(code, m.start())}: input title {m.group(2)!r} is "
                          f"{len(m.group(2))} chars; keep under ~20 (07 §5)")
 

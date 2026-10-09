@@ -191,6 +191,8 @@ def gates(sid: str, s: dict) -> list[str]:
         if title and s.get("trendspider_name") != title.group(2):
             fails.append(f"trendspider_name {s.get('trendspider_name')!r} != describe_indicator title "
                          f"{title.group(2)!r}")
+    if re.match(r"(?i)^(my script|my strategy|untitled|strategy|indicator|script|test)\s*_TV$", s.get("trendspider_name") or ""):
+        fails.append("trendspider_name is generic — use the TradingView listing title instead (LESSONS L20)")
     if not (s.get("trendspider_name") or "").endswith("_TV"):
         fails.append("trendspider_name must end with _TV")
     if not s.get("live_tested"):

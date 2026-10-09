@@ -262,3 +262,19 @@ reference was vague.
 **Check.** Every seeding entry in 02's table states its measured formula and test;
 `progress.py` requires parity evidence for `tv-parity`; comparisons exclude 3 × the longest
 recursive length, stated in the header.
+
+## L19 — Long input titles are a runtime error, not a style issue
+**What happened.** I6NhpUws kept the Pine input title "Volume moving average length (visual
+only)" (42 chars). APPLY failed: `input(): name is too lengthy`. A 25-char title worked.
+**Rule.** Input titles must be <= 30 characters; shorten and note it under Deviations.
+**Gate.** lint_trendspider.py: title > 30 chars is an ERROR (21-30 stays a warning).
+
+## L20 — Meaningful TrendSpider names; check saves through the API
+**What happened.** Z1PSDV3J's Pine title is "My script" → saved as "My script_TV", meaningless
+in the user's list. Separately, the editor's search list did not show some saved names, so a
+save looked failed and was repeated: "Volume with Alert_TV" ended up saved three times.
+**Rule.** The TrendSpider name is the Pine title + "_TV", unless that title is generic — then
+use the TradingView listing title. The same name goes into progress (`--ts-name`). Verify a
+save via `GET /authentication/1/api?path=/custom_scripting_webserver/1/scripts` (id + title),
+never via the search box, and never click Save twice.
+**Gate.** progress.py refuses generic names (my script / strategy / untitled ...).

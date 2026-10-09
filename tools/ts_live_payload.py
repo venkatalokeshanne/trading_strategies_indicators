@@ -158,6 +158,42 @@ const stat = label => ((txt.match(new RegExp(label + '\\n([^\\n]+)')) || [])[1] 
    entry: (txt.match(/Entry Conditions:[\s\S]{0,110}/) || [''])[0].replace(/\n/g, ' | ') });
 """
 
+ONESHOT = r"""// oneshot: find -> (New indicator) -> APPLY -> Save if clean -> verify saved. One call.
+const SRC = __SRC__;
+const NAME = __NAME__;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const btn = t => [...document.querySelectorAll('button')].find(b => b.offsetWidth && b.textContent.trim() === t);
+const inp = document.querySelector('input[placeholder="Search for custom indicators"]');
+if (!inp) throw new Error('open the Custom Indicator Editor first');
+const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+const listed = async () => { set.call(inp, NAME); inp.dispatchEvent(new Event('input', { bubbles: true })); await sleep(1500);
+  const rows = inp.closest('div').parentElement.parentElement.innerText.split('\n').map(s => s.trim());
+  set.call(inp, ''); inp.dispatchEvent(new Event('input', { bubbles: true })); return rows.includes(NAME); };
+let out = { name: NAME };
+if (await listed()) { out.alreadySaved = true; }
+else {
+  let view = document.querySelector('.cm-content').cmView.view;
+  const cur = view.state.doc.toString();
+  const curName = (cur.match(/describe_indicator\s*\(\s*['"]([^'"]+)/) || [])[1] || '';
+  const blank = /Example colored MA/.test(cur) || cur.trim() === '';
+  if (!blank && !/_TV$/.test(curName)) { out.refused = 'editor holds ' + curName; }
+  else {
+    if (!blank) { const n = btn('New indicator') || btn('NEW INDICATOR'); if (n) n.click(); await sleep(2500);
+      const yes = [...document.querySelectorAll('button')].find(b => b.offsetWidth && /^(yes|discard)$/i.test(b.textContent.trim())); if (yes) { yes.click(); await sleep(1500); }
+      view = document.querySelector('.cm-content').cmView.view; }
+    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: SRC } });
+    btn('Apply').click(); await sleep(6000);
+    const pane = [...document.querySelectorAll('*')].find(e => e.children.length === 0 && e.textContent.trim() === 'Console');
+    out.console = pane ? pane.closest('div').parentElement.innerText.replace(/^Console\s*/, '').slice(0, 500) : '';
+    out.errors = [...document.querySelectorAll('[class*=error], [class*=Error], .cm-lintRange-error')].filter(e => e.offsetWidth && e.innerText && e.innerText.trim()).map(e => e.innerText.trim().slice(0, 200)).slice(0, 5);
+    out.legend = [...document.querySelectorAll('[class*="legend-item--custom_script"]')].filter(e => e.offsetWidth).map(e => e.innerText.trim().replace(/\s+/g, ' ').slice(0, 80));
+    out.loaded = view.state.doc.length === SRC.length;
+    if (out.loaded && !out.errors.length && !/error/i.test(out.console)) { btn('Save').click(); await sleep(4000); out.saved = await listed(); }
+  }
+}
+out;
+"""
+
 
 def describe(src: str) -> tuple[str, str]:
     m = re.search(r"describe_indicator\s*\(\s*(['\"])(.*?)\1(.*?)\)\s*;", src, re.S)
@@ -181,17 +217,17 @@ def signals(src: str, side: str) -> tuple[str, str]:
 
 
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "find", "remove", "tester", "tester-short", "results"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "oneshot", "find", "remove", "tester", "tester-short", "results"):
         sys.exit(__doc__)
     mode, path = sys.argv[1], Path(sys.argv[2])
     src = path.read_text(encoding="utf-8")
     name, short = describe(src)
-    if mode == "apply":
+    if mode in ("apply", "oneshot"):
         lint = subprocess.run([sys.executable, str(ROOT / "tools" / "lint_trendspider.py"), str(path)],
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
         if lint.returncode != 0:
             sys.exit("lint has errors — fix them before the live test:\n" + lint.stdout)
-        print(APPLY.replace("__SRC__", json.dumps(src)).replace("__NAME__", json.dumps(name)))
+        print((APPLY if mode == "apply" else ONESHOT).replace("__SRC__", json.dumps(src)).replace("__NAME__", json.dumps(name)))
     elif mode == "find":
         print(FIND.replace("__NAME__", json.dumps(name)))
     elif mode == "results":

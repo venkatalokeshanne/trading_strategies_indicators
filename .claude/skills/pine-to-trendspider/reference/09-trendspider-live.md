@@ -93,7 +93,22 @@ several. Its `before`/`after` lists must differ by exactly that one row.
 > match it through its own legend row's text.
 
 ### 8. Strategies: a Strategy Tester run
-Open **Strategy Tester** (React tab, same click as step 2). Build a new strategy:
+Proven 2026-10-09 on "Buy At Open / Sell At Close Every Bar_TV" (MSFT 5m, 10,000 candles,
+5,000 positions — exactly the predicted one trade every other bar).
+
+The saved `_TV` indicator must be **on the chart** (it is, straight after Save) — the
+Tester's picker only lists indicators on the chart. Then:
+1. Open **Strategy Tester** (React tab, same click as step 2) → **New strategy** →
+   **skip to point&click editor** → maximise the panel (⛶ top-right).
+2. Run `python tools/ts_live_payload.py tester <file>` and paste it. It wires Entry and
+   Exit, sets 10,000 candles, runs, and returns market, net %, asset %, positions, wins
+   and max drawdown. It uses DOM clicks only (LESSONS L17).
+3. Check `log` shows both signals wired, then screenshot the result.
+4. Then step 7 (remove the `_TV` indicator from the chart). The Tester leaves a
+   "Current strategy" legend row with only a show/hide toggle; it is TrendSpider's view of
+   the unsaved draft and disappears when another strategy loads — leave it.
+
+What the snippet does, for doing it by hand:
 - Entry: `Add a condition` → `Condition` → `Indicator` → search the `_TV` indicator →
   its `… Entry` signal → **Signal emerged**.
 - Exit: `Add an exit condition…` → **Script** (not "List of signals" — that is raw

@@ -224,3 +224,23 @@ is measured on the oracle before it is substituted for a Pine function.
 
 **Check.** Lint WARN on every call to a measured trap built-in, naming the exact fix; the
 warning is acknowledged with `// pine-parity: <name>` on the same line once handled.
+
+## L17 — Browser selectors that assume exact text or exact classes
+
+**What happened.** In the first real live test (2026-10-09) two snippets in
+`ts_live_payload.py` failed against TrendSpider's real DOM: the preview legend's class is
+`legend-item--custom_script_editor_study_model`, so the exact class selector
+`.legend-item--custom_script_` found nothing; and a legend row's text is `"BOSC\n522.197"`,
+so `startsWith("BOSC ")` found nothing. The remove snippet refused rather than guessing —
+the safety check worked — but the tool reported a drawn indicator as missing. Separately,
+coordinate clicks in the Strategy Tester raced its menu animations and landed on nothing.
+
+**Rule.** In browser snippets, match classes with `[class*="…"]`, normalise whitespace
+(`innerText.replace(/\s+/g, ' ')`) before comparing text, pick menu items by text **and**
+proximity to their trigger, and use DOM clicks, never coordinates, in TrendSpider menus.
+A snippet that can click something destructive must refuse unless it matches exactly one
+target.
+
+**Check.** All `ts_live_payload.py` snippets follow these rules; the `tester` mode wires the
+Strategy Tester entirely by DOM. Every new snippet is proven once on the live page before
+it is relied on (reference/09).

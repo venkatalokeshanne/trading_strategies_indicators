@@ -10,7 +10,9 @@
  * Status       : PARTIAL
  * Converted    : 2026-10-08 by Claude (pine-to-trendspider skill)
  * TrendSpider name : Buy At Open / Sell At Close Every Bar_TV
- * Live tested  : 2026-10-08 on MSFT 5m — saved in TrendSpider: yes (Tester run pending)
+ * Live tested  : 2026-10-09 on MSFT 5m — saved in TrendSpider: yes. Strategy Tester, 10,000
+ *                candles: 5,000 positions (one every other bar, as predicted), 50 % wins,
+ *                net +26.8 % vs +36.4 % buy-and-hold, max drawdown 4.4 %
  *
  * What the Pine original really does (read this before using it):
  *   The title promises "buy at the open, sell at the close of every bar". Pine cannot do

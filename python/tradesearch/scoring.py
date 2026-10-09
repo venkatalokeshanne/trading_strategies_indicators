@@ -20,6 +20,7 @@ GATE = {
     "min_bars": 500,
     "max_drawdown_percent": 80.0,
     "min_profit_factor": 1.0,
+    "min_net_profit_percent": 1.0,    # sub-viable: 1 share on $1M "profits" 0.0 %
     "recent_trade_days": 180,         # or a trade in the last quarter of the period
 }
 
@@ -33,8 +34,8 @@ def quality_gate(m: dict, repainting: bool, bars: int) -> tuple[bool, list[str]]
         reasons.append(f"fewer than {GATE['min_trades']} closed trades")
     if bars < GATE["min_bars"]:
         reasons.append(f"fewer than {GATE['min_bars']} bars of history")
-    if not _gt(m.get("netProfit"), 0):
-        reasons.append("not profitable")
+    if not _gt(m.get("netProfitPercent"), GATE["min_net_profit_percent"]):
+        reasons.append(f"net profit below {GATE['min_net_profit_percent']} % of capital")
     if not _gt(m.get("profitFactor"), GATE["min_profit_factor"]):
         reasons.append(f"profit factor ≤ {GATE['min_profit_factor']}")
     dd = m.get("maxDrawdownPercent")
@@ -72,7 +73,7 @@ def _lin(x: float, lo: float, hi: float) -> float:
 def consistency(m: dict, equity: list[float], trades: list[dict]) -> float:
     pos_months = _lin(m.get("positiveMonthsPercent"), 30.0, 80.0)
     eq = np.asarray([e for e in equity if e and e > 0], dtype=float)
-    if len(eq) > 10:
+    if len(eq) > 10 and float(np.std(eq)) > 0:        # a flat curve has no trend to measure
         y = np.log(eq)
         x = np.arange(len(y))
         r = np.corrcoef(x, y)[0, 1]

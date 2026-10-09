@@ -19,14 +19,15 @@ A converted script::
                 self.strategy.entry("L", self.strategy.long)
 """
 
-from . import color, metrics, pmath, ta
+from . import color, metrics, parray, pmath, pstr, ta
+from . import draw
 from .broker import LONG, SHORT, StrategyConfig
 from .core import NA, S, div, fixnan, fl, iff, na, nz, truthy
 from .runner import RunResult, Script, run, tf_seconds
 from .symbols import SymbolInfo
 
 __all__ = [
-    "Script", "run", "RunResult", "SymbolInfo", "StrategyConfig", "ta", "pmath", "color",
+    "Script", "run", "RunResult", "SymbolInfo", "StrategyConfig", "ta", "pmath", "color", "parray", "pstr", "draw",
     "metrics", "na", "nz", "div", "iff", "fixnan", "fl", "truthy", "S", "NA", "LONG",
     "SHORT", "tf_seconds",
 ]

@@ -119,11 +119,44 @@ def queue(data: dict) -> list:
                                          rank.get(kv[1]["type"], 2), kv[1]["source_chars"]))
 
 
+PY_STATUSES = ("pending", "in_progress", "FULL", "PARTIAL", "NOT CONVERTIBLE")
+PY_LEVELS = ("none", "smoke", "independent")
+
+
+def queue_py(data: dict) -> list:
+    rank = {"strategy": 0, "indicator": 1}
+    items = [(sid, s) for sid, s in data["scripts"].items()
+             if s.get("python_status", "pending") in ("pending", "in_progress")]
+    return sorted(items, key=lambda kv: (kv[1].get("python_status") != "in_progress",
+                                         rank.get(kv[1]["type"], 2), kv[1]["source_chars"]))
+
+
 def cmd_next(args) -> None:
-    for sid, s in queue(load())[: args.n]:
+    q = queue_py(load()) if args.python else queue(load())
+    for sid, s in q[: args.n]:
         print(f"{sid}  [{s['type']}, {s['pine_version']}, {s['source_chars']:,} chars]  {s['title']}")
         print(f"    file: {s['file']}")
         print(f"    url : {s['url']}")
+
+
+def py_gates(sid: str, s: dict) -> list[str]:
+    """Reasons a Python conversion may NOT be marked FULL/PARTIAL."""
+    fails = []
+    f = s.get("python_file")
+    path = ROOT / f if f else None
+    if not path or not path.exists():
+        return [f"python file missing: {f}"]
+    lint = subprocess.run([sys.executable, str(ROOT / "tools" / "lint_python.py"), str(path)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if lint.returncode != 0:
+        fails.append("lint_python has errors:\n" + "\n".join(l for l in lint.stdout.splitlines() if "ERROR" in l))
+    chk = subprocess.run([sys.executable, str(ROOT / "tools" / "py_check.py"), str(path)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if chk.returncode != 0:
+        fails.append("py_check failed:\n" + chk.stdout[-800:])
+    if s.get("python_status") == "FULL" and s.get("python_validation") != "independent":
+        fails.append("FULL needs --py-validation independent (LESSONS P0)")
+    return fails
 
 
 def cmd_stats(_args) -> None:
@@ -136,6 +169,10 @@ def cmd_stats(_args) -> None:
         print(f"  {field:11} " + "  ".join(f"{k}: {v}" for k, v in counts.items() if v))
     print(f"  trendspider saved: {sum(1 for x in s if x.get('trendspider_saved') is True)}   "
           f"save failed (retry): {sum(1 for x in s if x.get('trendspider_save_error') and x.get('trendspider_saved') is not True)}")
+    counts = {v: sum(1 for x in s if x.get("python_status", "pending") == v) for v in PY_STATUSES}
+    print("  python      " + "  ".join(f"{k}: {v}" for k, v in counts.items() if v))
+    vals = {v: sum(1 for x in s if x.get("python_validation", "none") == v) for v in PY_LEVELS}
+    print("  py valid.   " + "  ".join(f"{k}: {v}" for k, v in vals.items() if v))
 
 
 def gates(sid: str, s: dict) -> list[str]:
@@ -212,6 +249,30 @@ def cmd_set(args) -> None:
         s["tester_run"] = f"{dt.date.today().isoformat()} {args.tester_run}"
     if args.parity_evidence:
         s["parity_evidence"] = args.parity_evidence
+    py_changed = any(v is not None for v in (args.py_status, args.py_file, args.py_validation, args.py_notes))
+    if args.py_status:
+        if args.py_status not in PY_STATUSES:
+            sys.exit(f"py-status must be one of {PY_STATUSES}")
+        s["python_status"] = args.py_status
+    if args.py_file:
+        s["python_file"] = args.py_file
+    if args.py_validation:
+        if args.py_validation not in PY_LEVELS:
+            sys.exit(f"py-validation must be one of {PY_LEVELS}")
+        s["python_validation"] = args.py_validation
+    if args.py_notes is not None:
+        s["python_notes"] = args.py_notes
+    if py_changed:
+        if s.get("python_status") in DONE:
+            fails = py_gates(args.id, s)
+            if fails:
+                sys.exit(f"{args.id}: Python conversion cannot be {s['python_status']} yet —\n  - " + "\n  - ".join(fails))
+        if s.get("python_status") == "NOT CONVERTIBLE" and not (s.get("python_notes") or s.get("notes")):
+            sys.exit("NOT CONVERTIBLE needs --py-notes naming the blocking feature")
+        s["last_change"] = dt.date.today().isoformat()
+        save(data)
+        print(f"{args.id}: python {s.get('python_status')} / {s.get('python_validation', 'none')}")
+        return
     if s["status"] in DONE:
         fails = gates(args.id, s)
         if fails:
@@ -226,7 +287,8 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("sync").set_defaults(fn=cmd_sync)
     sub.add_parser("stats").set_defaults(fn=cmd_stats)
-    p = sub.add_parser("next"); p.add_argument("n", nargs="?", type=int, default=5); p.set_defaults(fn=cmd_next)
+    p = sub.add_parser("next"); p.add_argument("n", nargs="?", type=int, default=5)
+    p.add_argument("--python", action="store_true", help="the Python conversion queue"); p.set_defaults(fn=cmd_next)
     p = sub.add_parser("set")
     p.add_argument("id")
     p.add_argument("--status"); p.add_argument("--validation"); p.add_argument("--converted-file")
@@ -234,6 +296,8 @@ def main() -> None:
     p.add_argument("--ts-name"); p.add_argument("--live-tested", metavar="TICKER:RES")
     p.add_argument("--ts-saved", choices=("yes", "no")); p.add_argument("--ts-save-error")
     p.add_argument("--tester-run", metavar='"TICKER:RES trades=N"'); p.add_argument("--parity-evidence")
+    p.add_argument("--py-status"); p.add_argument("--py-file"); p.add_argument("--py-validation")
+    p.add_argument("--py-notes")
     p.set_defaults(fn=cmd_set)
     p = sub.add_parser("check"); p.add_argument("id"); p.set_defaults(fn=cmd_check)
     args = ap.parse_args()

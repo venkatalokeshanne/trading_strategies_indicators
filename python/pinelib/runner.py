@@ -199,6 +199,7 @@ class Script:
     PINE_VERSION = 5
     STRATEGY: dict | None = None          # strategy() arguments; None → indicator
     SOURCE: dict = {}                     # id, url, author, licence of the Pine original
+    MAX_LINES = MAX_BOXES = MAX_LABELS = MAX_POLYLINES = 50   # Pine's max_*_count
 
     def init(self) -> None:
         pass
@@ -450,6 +451,7 @@ class RunResult:
     broker: Broker | None
     symbol: SymbolInfo
     timeframe: str
+    drawings: Any = None
 
 
 @register_stop
@@ -479,6 +481,9 @@ def run(script_cls: type[Script], bars: pd.DataFrame, *, params: dict | None = N
     script.barstate = BarState(ctx)
     script._out = Outputs(ctx.n_bars)
     script.input = Inputs(script, params)
+    from .draw import Drawings
+    script.draw = Drawings(script_cls.MAX_LINES, script_cls.MAX_BOXES, script_cls.MAX_LABELS,
+                           script_cls.MAX_POLYLINES)
     script.open, script.high, script.low = ctx.open_s, ctx.high_s, ctx.low_s
     script.close, script.volume, script.time = ctx.close_s, ctx.volume_s, ctx.time_s
     script.hl2, script.hlc3, script.ohlc4, script.hlcc4 = ctx.hl2_s, ctx.hlc3_s, ctx.ohlc4_s, ctx.hlcc4_s
@@ -506,7 +511,7 @@ def run(script_cls: type[Script], bars: pd.DataFrame, *, params: dict | None = N
     finally:
         RT.ctx = prev
     return RunResult(script=script, bars=ctx.bars_df, outputs=script._out, inputs=script.input.defs,
-                     broker=broker, symbol=sym, timeframe=timeframe)
+                     broker=broker, symbol=sym, timeframe=timeframe, drawings=script.draw)
 
 
 # ─────────────────────────────────────────────────────────────── context construction

@@ -17,7 +17,8 @@ def make_bars(n: int = 1500, seed: int = 7, start: str = "2020-01-01", freq: str
     rng = np.random.default_rng(seed)
     ret = rng.normal(0.0004, 0.018, n)
     close = 100 * np.exp(np.cumsum(ret))
-    if flat_run:                                # a run of identical closes: ties, zero ranges
+    flat_run = flat_run and n > 210             # a run of identical closes: ties, zero ranges
+    if flat_run:
         close[200:206] = close[199]
     open_ = np.concatenate([[close[0]], close[:-1]]) * (1 + rng.normal(0, 0.004, n))
     high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.008, n)))

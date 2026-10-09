@@ -50,3 +50,30 @@ Then the full Pine source.
 - [ ] Live APPLY/Save as `<Title>_TV` (`09-trendspider-live.md`).
 
 Record what the AI got wrong in LESSONS.md so the prompt can be improved.
+
+## Working the AI drafts (procedure in use since 2026-10-09 — resume from here on any account)
+
+The drafts are generated offline by `tools/ts_ai_drafts.py` with the user's plain prompt
+(no extra rules): "Convert this TradingView Pine Script into a working TrendSpider custom
+JavaScript indicator that reproduces the Pine logic EXACTLY (same values, same signal bars),
+and map out the scanning and strategy signals." — drafts land in `TrendSpider/ai_drafts/`.
+
+Per group of ~4 scripts (light review only — the live test catches the rest):
+1. `python tools/ts_next_drafts.py 4` — next pending drafts with their Pine source.
+2. Fix only what is wrong. Recurring AI-draft faults: `_TV` missing / generic names (L20);
+   null comparisons on warm-up bars (`x > null` is true in JS); labels that print prices
+   instead of BUY/SELL text or icons; undocumented options (`style:'ladder'`, `hidden:true`,
+   `constants.empty_series`, `input.group`, `input.text`, 3rd arg of describe_indicator,
+   5th arg of fill, 7th of color_cloud); TrendSpider's `supertrend()` (use Pine's algorithm);
+   `shift(x, -n)` (look-ahead, L21); higher-timeframe values landed at the bar's open (L23);
+   input titles > 30 chars (L19); names colliding after punctuation is dropped (L22);
+   time zones taken from the exchange instead of the Pine's zone.
+   `for_every` callbacks DO receive `(…values, previousOutput, index)` — that is fine.
+3. Write the body, then `python tools/ts_header.py <id> <body.js> --from-ai --placement ... --words ... --dev ...`
+   → `TrendSpider/<kind>/<stem>.trendspider.js`; `python tools/lint_trendspider.py <file>`.
+4. Live: open charts.trendspider.com in Chrome on a free workspace (not the one the drafting
+   run uses), open the Custom Indicator Editor, paste `tools/ts_live_helper.js` once, then
+   `python tools/ts_batch_live.py <out.js> <file1> <file2>` and send its `R.push(...)` lines.
+5. `python tools/progress.py set <id> --converted-file <file> --ts-name "<name>_TV"
+   --live-tested AAPL:5m --ts-saved yes --validation live --status FULL|PARTIAL`, commit, push.
+   Not convertible (no data feed in TrendSpider, truncated source…): `--status "NOT CONVERTIBLE" --notes "..."`.

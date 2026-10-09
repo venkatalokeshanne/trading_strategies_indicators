@@ -49,7 +49,7 @@ formula is identical**. These facts come from running TrendSpider's real engine:
 
 | Indicator | TrendSpider engine [VERIFIED] | Pine |
 |---|---|---|
-| `ema` | seeds from the first value, not an SMA | reference implementation also seeds from the first value |
+| `ema` | **null for the first n−1 bars, then starts from the value at bar n−1** (not an SMA, not bar 0) — exact to 6e-14 on 3,000 bars, 2026-10-09 | Pine's documented example seeds from the first value; whether the built-in instead SMA-seeds is [VERIFY against a TradingView export]. Either way the series converge: signals were identical from bar 3 × n on |
 | `wildma` (RMA) | seeds from a single value | `ta.rma` seeds with an SMA of the first `length` values |
 | `atr` | Wilder smoothing that starts from 0 | `ta.rma` of true range, SMA-seeded |
 | `rsi` | seeds from a single value | RMA-based, SMA-seeded |

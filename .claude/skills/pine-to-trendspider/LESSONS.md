@@ -241,6 +241,24 @@ proximity to their trigger, and use DOM clicks, never coordinates, in TrendSpide
 A snippet that can click something destructive must refuse unless it matches exactly one
 target.
 
-**Check.** All `ts_live_payload.py` snippets follow these rules; the `tester` mode wires the
+**Check (L17).** All `ts_live_payload.py` snippets follow these rules; the `tester` mode wires the
 Strategy Tester entirely by DOM. Every new snippet is proven once on the live page before
 it is relied on (reference/09).
+
+## L18 — A fact recorded loosely ("seeds from the first value")
+
+**What happened.** Reference 02 said TrendSpider's `ema` "seeds from the first value". The
+independent check for 7YZu94L1 then disagreed with the engine (67 vs 81 entries). Measured
+exactly: `ema(x, n)` is **null for the first n−1 bars and starts from the value at bar
+n−1** (max diff 6e-14). The loose wording sent the check — and could send a hand-rolled
+EMA — the wrong way. Pine's own seed is still unconfirmed, but the trades agreed from bar
+3 × n on either way.
+
+**Rule.** Record engine behaviour as the exact formula you measured, with the test that
+proved it, never as a paraphrase. When an independent check disagrees, find out *which
+side* is wrong before touching the conversion — here the conversion was right and the
+reference was vague.
+
+**Check.** Every seeding entry in 02's table states its measured formula and test;
+`progress.py` requires parity evidence for `tv-parity`; comparisons exclude 3 × the longest
+recursive length, stated in the header.

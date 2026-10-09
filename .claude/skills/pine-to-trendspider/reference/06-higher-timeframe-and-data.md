@@ -104,7 +104,7 @@ are often only PARTIAL because the available history is shorter.
 
 | Pine | TrendSpider [VERIFIED name exists] | Notes |
 |---|---|---|
-| `request.financial` | `request.fundamental` | field names differ — [VERIFY] each field |
+| `request.financial` | `request.fundamental` | field names differ. [VERIFIED 2026-10-09 live] `request.fundamental(ticker, ['market_cap','net_income'], quarters)` works and returns `{field: [{reportdate (seconds), reportDateShort, year, quarter, value}]}` NEWEST FIRST; `shares_outstanding` is an `unknown_metric` error (approximate shares as market_cap / close at report date); probe a field with `assert(false, JSON.stringify(d))` |
 | `request.earnings` | `request.earnings` | [VERIFY fields] |
 | `request.dividends` | `request.dividends` | |
 | `request.splits` | `request.splits` | |

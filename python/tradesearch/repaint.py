@@ -48,7 +48,9 @@ def _trade_keys(broker, upto: int) -> tuple[list, list]:
 
 def replay(script_cls, bars: pd.DataFrame, symbol, timeframe: str, params: dict | None = None,
            full=None, cuts=CUTS) -> list[dict]:
-    full = full or run(script_cls, bars, params=params, symbol=symbol, timeframe=timeframe)
+    from .data import provider_for_scripts
+    dp = provider_for_scripts()
+    full = full or run(script_cls, bars, params=params, symbol=symbol, timeframe=timeframe, data_provider=dp)
     n = len(bars)
     entry_diff, exit_diff, value_diff = [], [], []
     for frac in cuts:
@@ -56,7 +58,7 @@ def replay(script_cls, bars: pd.DataFrame, symbol, timeframe: str, params: dict 
         if cut < 50:
             continue
         part = run(script_cls, bars.iloc[:cut].reset_index(drop=True), params=params, symbol=symbol,
-                   timeframe=timeframe)
+                   timeframe=timeframe, data_provider=dp)
         if full.broker is not None:
             # compare everything strictly before the truncated run's last bar: an order
             # placed ON the last bar fills on the next one, which the truncated run lacks
@@ -87,7 +89,7 @@ def replay(script_cls, bars: pd.DataFrame, symbol, timeframe: str, params: dict 
     ]
     if full.broker is not None:
         flipped = run(script_cls, bars, params=params, symbol=symbol, timeframe=timeframe,
-                      strategy_overrides={"path_mode": "reverse"})
+                      strategy_overrides={"path_mode": "reverse"}, data_provider=dp)
         a = [(t.exit_bar, round(t.exit_price, 8)) for t in full.broker.closed]
         b = [(t.exit_bar, round(t.exit_price, 8)) for t in flipped.broker.closed]
         changed = sum(1 for x, y in zip(a, b) if x != y) + abs(len(a) - len(b))

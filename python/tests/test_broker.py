@@ -256,3 +256,19 @@ def test_full_close_with_fractional_qty_leaves_nothing_open():
     r = run(T, bars(rows), symbol=sym, timeframe="D")
     assert len(r.broker.closed) == 1 and len(r.broker.open) == 1
     assert all(t.qty > 1 for t in r.broker.closed)
+
+
+def test_exit_for_the_new_entry_survives_a_reversal():
+    """Regression (found by an independent check): reversing short→long deleted the new long's
+    stop, because exits were pruned while the long was between 'pending' and 'open'."""
+    rows = [(100, 100, 100, 100), (100, 100, 100, 100), (101, 101, 101, 101), (101, 101, 95, 96), (96, 96, 96, 96)]
+
+    def body(s, st, i):
+        if i == 0:
+            st.entry("Short", st.short, qty=1)
+        if i == 1:
+            st.entry("Long", st.long, qty=1)
+            st.exit("Exit Long", "Long", stop=98)
+    b = trades(strat(body), rows)
+    long_t = [t for t in b.closed if t.direction > 0]
+    assert long_t and long_t[0].exit_bar == 3 and long_t[0].exit_price == 98

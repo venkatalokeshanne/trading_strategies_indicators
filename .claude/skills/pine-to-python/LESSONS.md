@@ -62,3 +62,13 @@ Pine's default sizing (1 contract) on $1M "profits" 0.0 % and makes monthly Shar
 **Rule.** The quality gate needs ≥ 1 % net profit; symbol-level aggregates use eligible
 backtests only.
 **Check.** `scoring.GATE["min_net_profit_percent"]`; test_quality_gate.
+
+## P10 — A reversal deleted the new entry's exit order (found in the broker)
+**What happened.** "Fast Scalper with Stops" reverses short→long and places
+`strategy.exit(..., "Long", stop=…)` on the same bar. Closing the short ran the
+"drop exits with no position" clean-up while the long was between "removed from pending"
+and "opened", so its stop vanished and the trade ran stopless. The independent check
+(247 vs 248 trades) exposed it.
+**Rule.** Exits are pruned only after all fills of a bar step are complete.
+**Check.** Broker regression test `test_exit_for_the_new_entry_survives_a_reversal`, and the
+independent checks in `python/checks/` (run with `tools/run_checks.py`).

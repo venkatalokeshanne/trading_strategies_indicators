@@ -293,9 +293,11 @@ class Broker:
             if od in self.pending:
                 self.pending.remove(od)
                 self._fill_market(od, o, i, slip=True)
+        self._prune_exits()                       # after ALL open fills (reversals included)
         # 2. the intrabar path
         path = self._path(i, o, h, l, c)
         self._walk(path, i)
+        self._prune_exits()
         for t in self.open:
             t.max_price = h if _isna(t.max_price) else max(t.max_price, h)
             t.min_price = l if _isna(t.min_price) else min(t.min_price, l)
@@ -307,6 +309,7 @@ class Broker:
             if od in self.pending:
                 self.pending.remove(od)
                 self._fill_market(od, c, i, slip=True)
+        self._prune_exits()
         # exits whose levels are already beyond the close when created on the entry bar
         # with process_orders_on_close are left to the next bar's path, as in Pine.
         h, l = self.d.high_arr[i], self.d.low_arr[i]
@@ -577,7 +580,8 @@ class Broker:
             px = price - (slip_px * t.direction)
             self._close_trade(t, take, px, i, exit_id, comment)
             remaining -= take
-        self._prune_exits()
+        # no _prune_exits() here: during a reversal the new entry is between "removed from
+        # pending" and "opened", and its exit order would be deleted (LESSONS P10)
 
     def _close_trade(self, t: OpenTrade, qty: float, price: float, i: int, exit_id: str, comment: str) -> None:
         pv = self.sym.pointvalue

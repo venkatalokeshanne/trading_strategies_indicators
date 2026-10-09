@@ -36,12 +36,14 @@ where silent bugs come from — don't.
    justified in a comment on that line.
 5. **Smoke + replay:** `python tools/py_check.py <file>` — runs on synthetic and cached real
    bars, reports trades/plots, and the repaint replay. No exceptions allowed.
-6. **Independent check** for FULL: an independent re-implementation of the trading rules (a
-   short pandas/numpy loop in the scratchpad, written from the Pine source, not from your
-   Python) must produce the same entry/exit bars on the same data (LESSONS P0). Record the
-   evidence with `--py-validation independent`.
+6. **Independent check** for FULL: write `python/checks/<id>.py` with `check() -> (ok, detail)`.
+   It computes the conditions with plain numpy/pandas FROM THE PINE SOURCE (helpers in
+   `tools/indep.py`: `bars`, `np_ema`, `np_rma`, `np_sma`, `np_cross_over/under`) and feeds
+   them to `indep.simulate` — a reference broker that shares no code with pinelib. Run
+   `python tools/run_checks.py <id>`; trades must be identical (LESSONS P0). Record with
+   `--py-validation independent`. Checks are committed: they are the evidence.
 7. **Record and push:**
-   `python tools/progress.py set <id> --py-status FULL|PARTIAL|"NOT CONVERTIBLE" --py-file <path> --py-validation smoke|independent --notes "..."`
+   `python tools/progress.py set <id> --py-status FULL|PARTIAL|"NOT CONVERTIBLE" --py-file <path> --py-validation smoke|independent --py-notes "..."`
    then `git add -A && git commit -m "Python: convert <id> <slug>: <status>" && git push`.
    Push after each script or a small batch (≤ 5) — never leave converted work unpushed.
 

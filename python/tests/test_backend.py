@@ -70,7 +70,7 @@ def test_api_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "CACHE_DIR", tmp_path / "cache")
     ref = data.SymbolRef("TEST:SYNTH", "crypto", "binance", "SYNTH", "Synthetic")
     data.save_cache(ref, "D", make_bars(n=1500))
-    monkeypatch.setattr(data, "find_symbol", lambda q, u=None: ref if "SYNTH" in q.upper() else None)
+    monkeypatch.setattr(data, "find_symbol", lambda q, u=None: ref)   # every symbol, incl. requested ones (VIX)
     url = f"sqlite:///{tmp_path / 't.db'}"
     ents = catalog.discover("strategies")
     results = [pipeline.job((str(e.path), ref.__dict__, "D", None, 1500, True,

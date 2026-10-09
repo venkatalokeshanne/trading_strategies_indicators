@@ -211,9 +211,25 @@ DEFAULT_UNIVERSE: list[SymbolRef] = [
 ]
 
 
+# Symbols scripts REQUEST (request.security) but which are not backtested themselves.
+AUXILIARY: list[SymbolRef] = [
+    SymbolRef("CBOE:VIX", "index", "yahoo", "^VIX", "CBOE Volatility Index"),
+    SymbolRef("TVC:VIX", "index", "yahoo", "^VIX", "CBOE Volatility Index"),
+    SymbolRef("TVC:DXY", "index", "yahoo", "DX-Y.NYB", "U.S. Dollar Index"),
+    SymbolRef("SP:SPX", "index", "yahoo", "^GSPC", "S&P 500 Index"),
+    SymbolRef("TVC:SPX", "index", "yahoo", "^GSPC", "S&P 500 Index"),
+    SymbolRef("NASDAQ:NDX", "index", "yahoo", "^NDX", "Nasdaq-100 Index"),
+    SymbolRef("TVC:US10Y", "index", "yahoo", "^TNX", "U.S. 10-year yield (x10)"),
+    SymbolRef("AMEX:SPY", "stock", "yahoo", "SPY", "SPDR S&P 500 ETF"),
+    SymbolRef("NASDAQ:QQQ", "stock", "yahoo", "QQQ", "Invesco QQQ Trust"),
+    SymbolRef("AMEX:IWM", "stock", "yahoo", "IWM", "iShares Russell 2000 ETF"),
+    SymbolRef("BINANCE:BTCUSDT", "crypto", "binance", "BTCUSDT", "Bitcoin / TetherUS"),
+]
+
+
 def find_symbol(query: str, universe: list[SymbolRef] | None = None) -> SymbolRef | None:
     q = query.strip().upper()
-    u = universe or DEFAULT_UNIVERSE
+    u = (universe or DEFAULT_UNIVERSE) + ([] if universe else AUXILIARY)
     for r in u:
         if r.tickerid.upper() == q:
             return r
@@ -221,3 +237,13 @@ def find_symbol(query: str, universe: list[SymbolRef] | None = None) -> SymbolRe
         if r.ticker.upper() == q or r.provider_symbol.upper() == q:
             return r
     return None
+
+
+def provider_for_scripts(n_bars: int = 20_000):
+    """``data_provider(symbol, timeframe)`` for pinelib's request.security on other symbols."""
+    def get(symbol: str, tf: str) -> pd.DataFrame:
+        ref = find_symbol(symbol)
+        if ref is None:
+            raise LookupError(f"no data source configured for {symbol!r} (add it to data.AUXILIARY)")
+        return fetch(ref, tf, bars=n_bars)
+    return get

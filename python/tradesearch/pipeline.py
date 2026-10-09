@@ -56,7 +56,8 @@ def job(args: tuple) -> dict:
         bars = bars.tail(n_bars).reset_index(drop=True)
         cls = catalog.load_script(Path(path))
         sym = _symbolinfo(ref_d)
-        res = run(cls, bars, params=params, symbol=sym, timeframe=tf)
+        res = run(cls, bars, params=params, symbol=sym, timeframe=tf,
+                  data_provider=data.provider_for_scripts(n_bars))
         m = metrics.compute(res)
         trades = metrics.trades_table(res)
         curves = metrics.curves(res, points=1500)

@@ -115,3 +115,6 @@ are often only PARTIAL because the available history is shorter.
 All `request.*` alt-data calls support server-side filters `{filters: [{field, filter,
 value}]}`. [VERIFIED] Land their timestamps onto the chart with
 `land_points_onto_series(..., 'le')` exactly as for prices.
+
+## Symbols that do NOT exist in TrendSpider [VERIFIED live 2026-10-09]
+`request.history` throws for USDTHB, THB=X, FX:USDTHB, USD/THB, NIFTY, NSE:NIFTY, ^NSEI, SENSEX, BANKNIFTY, ^GSPC, SPX; it works for SPY and EURUSD. Probe a symbol with a throwaway script: `try { await request.history(s,'D') } catch(e) {}` then `assert(false, ...)` to print the result. `current.now` does not exist; use `library('moment-timezone').tz(zone)` for the wall clock.

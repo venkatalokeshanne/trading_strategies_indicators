@@ -138,8 +138,7 @@ part of the conversion. Close the Tester without saving.
 
 
 ### 8b. Faster Tester loop (proven 2026-10-09, ~4 calls per strategy)
-Page helpers installed once per page load in the browser tool (copy from the commit that added this note
-if the page reloaded): `window.__tester(NAME, ENTRY, EXIT)` = the `tester` payload as a function,
+Page helpers: paste `tools/ts_tester_helpers.js` once per page load into the browser tool: `window.__tester(NAME, ENTRY, EXIT)` = the `tester` payload as a function,
 `window.__results()` = the `results` payload, `window.__remove(SHORT)` = the `remove` payload.
 Add several saved `_TV` indicators to the chart first (**Manage Indicators button is the small "⋮" at
 about (464,22)** — NOT the "Indicators" button at (416,20), which toggles every indicator off; if that

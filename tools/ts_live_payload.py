@@ -9,6 +9,7 @@ tool's javascript_exec on charts.trendspider.com and returns a small JSON report
     python tools/ts_live_payload.py find   TrendSpider/strategies/X.trendspider.js   # is the _TV name already saved?
     python tools/ts_live_payload.py remove TrendSpider/strategies/X.trendspider.js   # take it off the chart after the test
     python tools/ts_live_payload.py tester TrendSpider/strategies/X.trendspider.js   # strategies: wire Long signals, run Tester
+    python tools/ts_live_payload.py results <file>                                    # read the Tester summary after Run
     python tools/ts_live_payload.py tester-short …                                     # Short side (set Direction = Short only first)
 
 The lint must be clean first; `apply` refuses a file that has lint errors.
@@ -141,12 +142,20 @@ const pop = vis('.MuiPaper-root').filter(e => /Define your backtest/.test(e.inne
 const run = vis('button').find(b => b.textContent.trim() === 'Run');
 const rk = Object.keys(run).find(k => k.startsWith('__reactProps$'));
 rk && run[rk].onClick ? run[rk].onClick({ preventDefault(){}, stopPropagation(){}, currentTarget: run, target: run, nativeEvent: {} }) : run.click();
-await wait(15000);
+// The browser tool gives up after ~45 s, so this returns as soon as Run is clicked.
+// Wait ~15 s, then run the `results` snippet.
+log.push('run clicked — now wait ~15 s and run: ts_live_payload.py results');
+log;
+"""
+
+RESULTS = r"""// results: read the Strategy Tester's summary after a run. A negative beta on a
+// "Short only" run is the check that the direction setting really applied.
 const txt = document.body.innerText;
 const stat = label => ((txt.match(new RegExp(label + '\\n([^\\n]+)')) || [])[1] || null);
-({ log, candles: [...document.querySelectorAll('button')].map(b => b.textContent.trim()).find(x => /candles$/.test(x)),
-   market: stat('Market'), netPerf: stat('Net Perf, all'), assetPerf: stat('Asset Perf.'), positions: stat('Positions'),
-   wins: stat('Wins'), maxDD: stat('Max DD') });
+({ candles: [...document.querySelectorAll('button')].map(b => b.textContent.trim()).find(x => /candles$/.test(x)),
+   market: stat('Market'), netPerf: stat('Net Perf, all'), assetPerf: stat('Asset Perf.'),
+   beta: stat('Beta \\(vs Asset\\)'), positions: stat('Positions'), wins: stat('Wins'), maxDD: stat('Max DD'),
+   entry: (txt.match(/Entry Conditions:[\s\S]{0,110}/) || [''])[0].replace(/\n/g, ' | ') });
 """
 
 
@@ -172,7 +181,7 @@ def signals(src: str, side: str) -> tuple[str, str]:
 
 
 def main() -> None:
-    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "find", "remove", "tester", "tester-short"):
+    if len(sys.argv) != 3 or sys.argv[1] not in ("apply", "find", "remove", "tester", "tester-short", "results"):
         sys.exit(__doc__)
     mode, path = sys.argv[1], Path(sys.argv[2])
     src = path.read_text(encoding="utf-8")
@@ -185,6 +194,8 @@ def main() -> None:
         print(APPLY.replace("__SRC__", json.dumps(src)).replace("__NAME__", json.dumps(name)))
     elif mode == "find":
         print(FIND.replace("__NAME__", json.dumps(name)))
+    elif mode == "results":
+        print(RESULTS)
     elif mode in ("tester", "tester-short"):
         entry, exit_ = signals(src, "Short" if mode == "tester-short" else "Long")
         print(TESTER.replace("__NAME__", json.dumps(name)).replace("__ENTRY__", json.dumps(entry))

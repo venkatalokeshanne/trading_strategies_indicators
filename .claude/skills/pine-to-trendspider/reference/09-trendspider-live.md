@@ -96,14 +96,28 @@ several. Its `before`/`after` lists must differ by exactly that one row.
 Proven 2026-10-09 on "Buy At Open / Sell At Close Every Bar_TV" (MSFT 5m, 10,000 candles,
 5,000 positions — exactly the predicted one trade every other bar).
 
-The saved `_TV` indicator must be **on the chart** (it is, straight after Save) — the
-Tester's picker only lists indicators on the chart. Then:
-1. Open **Strategy Tester** (React tab, same click as step 2) → **New strategy** →
-   **skip to point&click editor** → maximise the panel (⛶ top-right).
-2. Run `python tools/ts_live_payload.py tester <file>` and paste it. It wires Entry and
-   Exit, sets 10,000 candles, runs, and returns market, net %, asset %, positions, wins
-   and max drawdown. It uses DOM clicks only (LESSONS L17).
-3. Check `log` shows both signals wired, then screenshot the result.
+The saved `_TV` indicator must be **on the chart** — the Tester's picker only lists
+indicators on the chart. Straight after Save it is, as long as you go to the Tester next.
+**Trap (2026-10-09):** clicking *New indicator*, loading another script, or reopening the
+editor removes it — the editor's preview is not a chart indicator. If it is missing, add it
+the way any indicator is added: the **⋮ "Manage Indicators"** button right of the toolbar's
+*Indicators* button (the *Indicators* button itself hides everything) → search the `_TV`
+name → click it → **APPLY**. Leave the user's other indicators in that dialog untouched.
+
+Then:
+1. Open **Strategy Tester** → **New strategy** → **skip to point&click editor** → maximise
+   the panel (⛶ top-right). A "lose unsaved changes" prompt naming a draft you created for
+   an earlier run is answered YES; it often appears twice (two stacked copies).
+2. Direction: new strategies are **Long only**. For the short side, open the gear ("Set up
+   trade cost and direction"), open *Direction* and click **Short only** with a real click
+   (wait for the popover to finish fading in), check it reads "Short only", then **APPLY**.
+   Never set it by script (LESSONS L17).
+3. Run `python tools/ts_live_payload.py tester <file>` (or `tester-short`) and paste it. It
+   wires Entry and Exit, sets 10,000 candles and clicks Run, using DOM clicks only. Wait
+   ~15 s, then paste `ts_live_payload.py results <file>` — the browser tool times out
+   after ~45 s, so the run and the read are separate.
+4. Check both signals were wired and, for a short run, that **beta is negative** (proof the
+   direction applied). Screenshot the result.
 4. Then step 7 (remove the `_TV` indicator from the chart). The Tester leaves a
    "Current strategy" legend row with only a show/hide toggle; it is TrendSpider's view of
    the unsaved draft and disappears when another strategy loads — leave it.

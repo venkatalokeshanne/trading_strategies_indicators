@@ -10,7 +10,11 @@
  * Status       : PARTIAL
  * Converted    : 2026-10-09 by Claude (pine-to-trendspider skill)
  * TrendSpider name : NQ EMA VWAP Strategy_TV
- * Live tested  : <pending>
+ * Live tested  : 2026-10-09 on MSFT 5m (extended hours) — saved in TrendSpider: yes.
+ *                VWAP resets checked live: every reset fell on the 04:00 New York bar
+ *                (TrendSpider's extended-session start). Strategy Tester, 10,000 candles:
+ *                Long only 65 trades, 34 % wins, net +26.4 %, max DD 5.9 %;
+ *                Short only 66 trades, 33 % wins, net -8.2 %, max DD 10.0 % (beta -0.26).
  *
  * The Pine original, in words:
  *   long  when EMA20 crosses above EMA50 and close > VWAP
@@ -24,7 +28,8 @@
  *     session start (current.session.start, or the extended session when the chart shows
  *     extended hours; every bar on daily and higher). Pine anchors on its own session
  *     calendar; on a symbol where TrendSpider's session start differs from TradingView's,
- *     the reset bar — and VWAP until the next reset — differ. [VERIFY on an NQ chart]
+ *     the reset bar — and VWAP until the next reset — differ. Verified on MSFT (resets at
+ *     the 04:00 extended-session start); [VERIFY] on an NQ chart against TradingView.
  *   - EMA warm-up: TrendSpider's ema(x, n) is empty for n-1 bars and starts from the value
  *     at bar n-1; Pine's starts differently. Signals agree after ~3 x 50 bars.
  *   - Daily and higher charts: every bar is its own session, so VWAP equals the close and

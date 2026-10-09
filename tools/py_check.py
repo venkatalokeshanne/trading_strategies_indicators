@@ -50,7 +50,15 @@ def main() -> int:
     for label, bars, sym, tf in runs:
         t0 = time.perf_counter()
         try:
-            res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
+            try:
+                res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
+            except LookupError:
+                if not label.startswith("synthetic"):
+                    raise
+                # the script requests a timeframe below daily (e.g. "240"): a daily synthetic
+                # chart cannot supply it, so run the synthetic pass on hourly bars instead
+                bars, tf, label = make_bars(n=3000, freq="1h", flat_run=False), "60", "synthetic 60"
+                res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
         except Exception as e:
             ok = False
             print(f"FAIL  {label}: {type(e).__name__}: {e}")

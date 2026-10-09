@@ -10,7 +10,8 @@
  * Status       : FULL
  * Converted    : 2026-10-09 by Claude (pine-to-trendspider skill)
  * TrendSpider name : Simple Long Only Bot_TV
- * Live tested  : <pending>
+ * Live tested  : 2026-10-09 on MSFT 5m — saved in TrendSpider: yes. Strategy Tester, 10,000
+ *                candles (Long only): 241 trades, 29 % wins, net +15.0 %, max DD 5.7 %.
  *
  * The Pine original, in words:
  *   buy  when close crosses above EMA50 while close > EMA200

@@ -56,6 +56,22 @@ class Engine:
                 except Exception: pass
 
 
+def free_ram_gb():
+    """Free physical memory (Windows GlobalMemoryStatusEx), no extra packages needed."""
+    import ctypes
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong), ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = MS(); m.dwLength = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m.ullAvailPhys / 2**30
+
+
+MIN_FREE_GB = 2.5     # an engine only takes a new dataset when this much RAM is free (5m data is ~9x daily)
+
+
 def claim(tf, sym):
     lock = ROOT / RES / tf / f"{sym}.lock"
     try:
@@ -125,7 +141,13 @@ def pick(val, keys):
 def worker(wid, port):
     eng = Engine(port)
     bad = json.loads((ROOT / "bad_strategies.json").read_text()) if (ROOT / "bad_strategies.json").exists() else {}
+    first = True
     while True:
+        if not first:
+            eng.stop()                                   # fresh engine per dataset: memory cannot build up
+            while free_ram_gb() < MIN_FREE_GB: time.sleep(30)
+            eng.start()
+        first = False
         job = None
         for tf in TF_ORDER:
             for csv in sorted((ROOT / "data" / tf).glob("*.csv")):

@@ -10,6 +10,7 @@
  * Status       : FULL
  * Converted    : 2026-10-10 by Claude (pine-to-trendspider skill), by hand
  * TrendSpider name : Trend Trail, Trailing Stop & Buy Sell Signals [LunqFX]_TV
+ * Live tested  : 2026-10-10 on INFQ 5m — APPLY clean, saved in TrendSpider: yes.
  *
  * The Pine original, in words: an ATR trailing stop that only exists while a trend regime
  * is "armed". The regime uses the Kaufman Efficiency Ratio, ranked against its own last 200

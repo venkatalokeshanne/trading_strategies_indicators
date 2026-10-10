@@ -65,20 +65,29 @@ def claim(tf, sym):
 
 
 def _agg(rets, bars, prefix):
+    """rets in EXIT order. net = SUM of the per-trade net % returns (commission in, the script's own sizing out).
+    Not compounded on purpose: many scripts hold several overlapping positions (pyramiding, scale-ins), and
+    compounding those as if each used the whole account in turn produces impossible figures. dd = largest
+    peak-to-trough fall of that running sum, in percentage points."""
     import statistics as st
     out = {prefix + "n": len(rets)}
     if not rets: return out
     pos = [r for r in rets if r > 0]; neg = [-r for r in rets if r <= 0]
+    cum, peak, dd = 0.0, 0.0, 0.0
+    for r in rets:
+        cum += r; peak = max(peak, cum); dd = max(dd, peak - cum)
+    eq = 1 + cum / 100
     out.update({prefix + "win": round(100 * len(pos) / len(rets), 2), prefix + "avg": round(st.fmean(rets), 4),
                 prefix + "med": round(st.median(rets), 4), prefix + "sum": round(sum(rets), 3),
                 prefix + "pf": round(sum(pos) / sum(neg), 4) if sum(neg) > 0 else None,
                 prefix + "avgwin": round(st.fmean(pos), 4) if pos else None,
                 prefix + "avgloss": round(-st.fmean(neg), 4) if neg else None,
-                prefix + "bars": round(st.fmean(bars), 1)})
+                prefix + "bars": round(st.fmean(bars), 1),
+                prefix + "net": round(100 * (eq - 1), 3), prefix + "dd": round(dd, 3)})
     return out
 
 
-def trade_stats(fs, handle, oos_bar, nbars):
+def trade_stats(fs, handle, oos_bar, nbars, dates):
     """Per-trade NET % return = pl / (entry_price * size): commission included, position size cancels out,
     so strategies with different sizing are comparable. Split at oos_bar by entry bar."""
     trades, off = [], 0
@@ -91,18 +100,21 @@ def trade_stats(fs, handle, oos_bar, nbars):
     for t in trades:
         den = (t.get("entry_price") or 0) * abs(t.get("size") or 0)
         if den <= 0 or t.get("exit_bar") is None: continue
-        rows.append((t["entry_bar"], 100 * t["pl"] / den, t["exit_bar"] - t["entry_bar"], t["type"]))
-    out = _agg([r for _, r, _, _ in rows], [b for _, _, b, _ in rows], "t_")
-    out.update(_agg([r for e, r, _, _ in rows if e < oos_bar], [b for e, _, b, _ in rows if e < oos_bar], "is_"))
-    out.update(_agg([r for e, r, _, _ in rows if e >= oos_bar], [b for e, _, b, _ in rows if e >= oos_bar], "oos_"))
-    out["t_long"] = sum(1 for *_, d in rows if d == "buy"); out["t_short"] = len(rows) - out["t_long"]
+        rows.append((t["entry_bar"], 100 * t["pl"] / den, t["exit_bar"] - t["entry_bar"], t["type"], t["exit_bar"]))
+    rows.sort(key=lambda x: (x[4], x[0]))                 # exit order, for the compounded equity curve
+    out = _agg([x[1] for x in rows], [x[2] for x in rows], "t_")
+    out.update(_agg([x[1] for x in rows if x[0] < oos_bar], [x[2] for x in rows if x[0] < oos_bar], "is_"))
+    out.update(_agg([x[1] for x in rows if x[0] >= oos_bar], [x[2] for x in rows if x[0] >= oos_bar], "oos_"))
+    out["oos_from"] = dates[oos_bar] if oos_bar < len(dates) else None
+    out["t_long"] = sum(1 for x in rows if x[3] == "buy"); out["t_short"] = len(rows) - out["t_long"]
     # TrendSpider-style depth: trades entered in the last D bars (same run; TrendSpider starts the strategy
     # fresh at the window start, so only a trade open across the window edge can differ)
     for depth in DEPTHS:
         if nbars <= depth: continue
-        sub = [(r, b) for e, r, b, _ in rows if e >= nbars - depth]
-        a = _agg([r for r, _ in sub], [b for _, b in sub], f"d{depth}_")
+        sub = [x for x in rows if x[0] >= nbars - depth]
+        a = _agg([x[1] for x in sub], [x[2] for x in sub], f"d{depth}_")
         out.update({k: v for k, v in a.items() if not k.endswith(("med", "avgwin", "avgloss"))})
+        out[f"d{depth}_from"] = dates[nbars - depth]
     return out
 
 
@@ -132,7 +144,8 @@ def worker(wid, port):
             for line in out.read_text(encoding="utf-8").splitlines():
                 try: done.add(json.loads(line)["strategy"])
                 except Exception: pass
-        nbars = sum(1 for _ in open(csv)) - 1
+        dates = [line.split(",", 3)[1] for line in open(csv)][1:]           # bar index -> date
+        nbars = len(dates)
         oos_bar = int(nbars * OOS_FRAC)
         t0 = time.time(); n = 0
         try:
@@ -154,7 +167,7 @@ def worker(wid, port):
                         rec.update(pick(full, KEEP)); rec["family"] = full.get("family")
                         rec["from"] = full.get("scope", {}).get("from_date"); rec["to"] = full.get("scope", {}).get("to_date")
                         if (full.get("total_trades") or 0) > 0:
-                            rec.update(trade_stats(eng.fs, full.get("handle", ""), oos_bar, nbars))
+                            rec.update(trade_stats(eng.fs, full.get("handle", ""), oos_bar, nbars, dates))
                         eng.fs.call("release_run", {"handle": full.get("handle", "")}, timeout=60)
                 except Exception as e:          # hang or crash: restart this engine, count it against the strategy
                     rec["error"] = f"timeout/crash: {type(e).__name__}"

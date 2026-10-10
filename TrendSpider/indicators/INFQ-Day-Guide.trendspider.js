@@ -20,6 +20,8 @@
  *  • Backtest of exactly these rules, 5m (train || test): PF 1.37 || 1.73, avg +0.39% || +0.47%
  *    per trade, ~40–48% winners; 15m: PF 1.15 || 1.80.
  *
+ * Labels: "SHORT 12.45" / "BUY 12.45" = setup, the number is the STOP; "× stop / × target /
+ * × close" = where the trade ended. Only VWAP and (on wide days) the range lines are drawn.
  * How to read it: the panel tells you the day type, whether there is a setup NOW, and while a
  * trade is open: its stop and where it ends (stop, target, or the 15:55 close). Signals print on
  * the bar close; the trade is assumed to start at the next bar's open.
@@ -39,8 +41,9 @@ const myWideCut = tS.number('Wide day: range vs ADR', 0.5, { min: 0.2, max: 1.5,
 const myStopPct = tS.number('Rejection stop beyond bar (%)', 0.3, { min: 0, max: 3, step: 0.1 });
 const myMaxDay = tS.number('Max setups per day', 2, { min: 1, max: 5 });
 const tV = input.tab('Visuals');
-const myShowBands = tV.boolean('VWAP and 2-sigma bands', true);
-const myShowRange = tV.boolean('Opening range lines', true);
+const myShowVwap = tV.boolean('VWAP line', true);
+const myShowBands = tV.boolean('2-sigma bands', false);
+const myShowRange = tV.boolean('Range lines (wide days)', true);
 const myShowPanel = tV.boolean('Guide panel', true);
 
 const myN = close.length;
@@ -103,13 +106,13 @@ for (let i = 0; i < myN; i++) {
     lastBarOfDay = nextT === null || (nextT.year * 1000 + nextT.dayOfYear) !== key || (nextT.hours * 60 + nextT.minutes) >= 960;
     if (side !== 0) {
         let why = null;
-        if (side === -1 && high[i] >= stop) why = 'EXIT stop';
-        else if (side === 1 && low[i] <= stop) why = 'EXIT stop';
-        else if (tgt !== null && side === -1 && low[i] <= tgt) why = 'EXIT target';
-        else if (tgt !== null && side === 1 && high[i] >= tgt) why = 'EXIT target';
-        else if (lastBarOfDay) why = 'EXIT close';
+        if (side === -1 && high[i] >= stop) why = 'stop';
+        else if (side === 1 && low[i] <= stop) why = 'stop';
+        else if (tgt !== null && side === -1 && low[i] <= tgt) why = 'target';
+        else if (tgt !== null && side === 1 && high[i] >= tgt) why = 'target';
+        else if (lastBarOfDay) why = 'close';
         myStopLine[i] = stop; mySide[i] = side;
-        if (why) { myExit[i] = true; myExitLbl[i] = why; side = 0; stop = null; tgt = null; }
+        if (why) { myExit[i] = true; myExitLbl[i] = '× ' + why; side = 0; stop = null; tgt = null; }
     }
 
     // setups: only when flat, 10:00–15:00, within the daily cap, next bar in the same session
@@ -126,29 +129,30 @@ for (let i = 0; i < myN; i++) {
         if (brkUp || brkDn) orFaded = true;                    // only the FIRST close outside counts
         if (myShorts && rejTop) {
             pending = -1; pStop = high[i] * (1 + myStopPct / 100); pTgt = null;
-            myShortLbl[i] = 'SHORT · stop ' + myFmt(pStop); myShort[i] = true; cnt++;
+            myShortLbl[i] = 'SHORT ' + myFmt(pStop); myShort[i] = true; cnt++;
         } else if (myLongs && wide && rejBot) {
             pending = 1; pStop = low[i] * (1 - myStopPct / 100); pTgt = null;
-            myBuyLbl[i] = 'BUY · stop ' + myFmt(pStop); myBuy[i] = true; cnt++;
+            myBuyLbl[i] = 'BUY ' + myFmt(pStop); myBuy[i] = true; cnt++;
         } else if (myOrFade && wide && brkUp) {
             pending = -1; pStop = orH + 0.5 * w; pTgt = orL;
-            myShortLbl[i] = 'SHORT fade · stop ' + myFmt(pStop) + ' · tgt ' + myFmt(pTgt); myShort[i] = true; cnt++;
+            myShortLbl[i] = 'SHORT ' + myFmt(pStop); myShort[i] = true; cnt++;
         } else if (myOrFade && wide && brkDn) {
             pending = 1; pStop = orL - 0.5 * w; pTgt = orH;
-            myBuyLbl[i] = 'BUY fade · stop ' + myFmt(pStop) + ' · tgt ' + myFmt(pTgt); myBuy[i] = true; cnt++;
+            myBuyLbl[i] = 'BUY ' + myFmt(pStop); myBuy[i] = true; cnt++;
         }
     }
 }
 
 // ── drawing
-paint(myShowBands ? myVwap : series_of(null), { name: 'VWAP line', color: GOLD, thickness: 2 });
+paint(myShowVwap ? myVwap : series_of(null), { name: 'VWAP line', color: 'rgba(245,158,11,0.7)', thickness: 1 });
 paint(myShowBands ? myUpB : series_of(null), { name: 'Upper band', color: 'rgba(239,68,68,0.55)', thickness: 1 });
 paint(myShowBands ? myLoB : series_of(null), { name: 'Lower band', color: 'rgba(34,197,94,0.55)', thickness: 1 });
-const myWideCol = myWide.map(wd => wd ? BLUE : MUTE);
-paint(myShowRange ? myOrH : series_of(null), { name: 'Range high', color: myWideCol, thickness: 1 });
-paint(myShowRange ? myOrL : series_of(null), { name: 'Range low', color: myWideCol, thickness: 1 });
-paint(myShowRange ? myOrM : series_of(null), { name: 'Range middle', color: 'rgba(148,163,184,0.5)', thickness: 1 });
-paint(myStopLine, { name: 'Trade stop', color: mySide.map(s => s === -1 ? DNC : UPC), thickness: 2 });
+// range lines only on wide days (the only days they are traded), nothing on normal days
+const myOrHw = for_every(myOrH, myWide, (v, wd) => myShowRange && wd ? v : null);
+const myOrLw = for_every(myOrL, myWide, (v, wd) => myShowRange && wd ? v : null);
+paint(myOrHw, { name: 'Range high', color: 'rgba(56,189,248,0.6)', thickness: 1 });
+paint(myOrLw, { name: 'Range low', color: 'rgba(56,189,248,0.6)', thickness: 1 });
+// (no stop line: TrendSpider joins it across trades; the stop is in the label and the panel)
 paint(myShortLbl, { name: 'Short labels', style: 'labels_above', color: DNC });
 paint(myBuyLbl, { name: 'Buy labels', style: 'labels_below', color: UPC });
 paint(myExitLbl, { name: 'Exit labels', style: 'labels_below', color: MUTE });
@@ -171,14 +175,11 @@ else if (stretchedUp) { nowTx = 'Do NOT chase — stretched above VWAP + 2σ'; n
 else if (stretchedDn) { nowTx = 'Do NOT short here — stretched below VWAP − 2σ'; nowCol = GOLD; }
 else { nowTx = 'WAIT — no setup'; nowCol = MUTE; }
 const dayTx = myOrH[L] === null ? 'Day type at 10:00' : myWide[L] ? 'WIDE day — fades work both ways' : 'NORMAL day — shorts at rejected highs only';
-paint_overlay('INFQ guide panel', { position: 'top_right' }, {
+paint_overlay('INFQ guide panel', { position: 'top_right', offset_x: -70, offset_y: 40 }, {
     rows: myShowPanel ? [
-        { cells: [{ text: 'INFQ Day Guide', color: INK }, { text: myFmt(close[L]), color: INK }] },
-        { cells: [{ text: 'Now', color: MUTE }, { text: nowTx, color: nowCol }] },
+                { cells: [{ text: 'Now', color: MUTE }, { text: nowTx, color: nowCol }] },
         { cells: [{ text: 'Day', color: MUTE }, { text: dayTx, color: myWide[L] ? BLUE : MUTE }] },
-        { cells: [{ text: 'VWAP · bands', color: MUTE }, { text: myFmt(myVwap[L]) + ' · ' + myFmt(myLoB[L]) + ' – ' + myFmt(myUpB[L]), color: INK }] },
-        { cells: [{ text: 'Range hi · lo', color: MUTE }, { text: myFmt(myOrH[L]) + ' · ' + myFmt(myOrL[L]), color: INK }] },
-        { cells: [{ text: 'Rule of thumb', color: MUTE }, { text: 'never buy a new high · sell the push that fails', color: MUTE }] }
+        { cells: [{ text: 'VWAP', color: MUTE }, { text: myFmt(myVwap[L]), color: INK }] }
     ] : []
 });
 

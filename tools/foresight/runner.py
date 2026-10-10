@@ -16,6 +16,7 @@ TF_ORDER = ["daily", "1h", "15m", "5m"]
 STRATS = STRATS[:int(os.environ.get("LIMIT", 10**6))]
 RES = os.environ.get("RESULTS", "results")
 OOS_FRAC = 0.7
+DEPTHS = (1000, 2000, 3000, 4000)        # bars, as in the TrendSpider backtests
 KEEP = ["ntrade", "total_trades", "total_return_pct", "profit_all", "profit_factor", "win_rate_all", "sharpe", "sortino",
         "mdd", "expectancy", "expectancy_tstat", "sqn", "trades_per_month", "cagr", "buyhold_return_pct", "alpha_vs_buyhold",
         "avg_win", "avg_loss", "payoff_ratio", "max_consec_wins", "max_consec_losses", "time_in_market", "winning_months",
@@ -77,7 +78,7 @@ def _agg(rets, bars, prefix):
     return out
 
 
-def trade_stats(fs, handle, oos_bar):
+def trade_stats(fs, handle, oos_bar, nbars):
     """Per-trade NET % return = pl / (entry_price * size): commission included, position size cancels out,
     so strategies with different sizing are comparable. Split at oos_bar by entry bar."""
     trades, off = [], 0
@@ -95,6 +96,13 @@ def trade_stats(fs, handle, oos_bar):
     out.update(_agg([r for e, r, _, _ in rows if e < oos_bar], [b for e, _, b, _ in rows if e < oos_bar], "is_"))
     out.update(_agg([r for e, r, _, _ in rows if e >= oos_bar], [b for e, _, b, _ in rows if e >= oos_bar], "oos_"))
     out["t_long"] = sum(1 for *_, d in rows if d == "buy"); out["t_short"] = len(rows) - out["t_long"]
+    # TrendSpider-style depth: trades entered in the last D bars (same run; TrendSpider starts the strategy
+    # fresh at the window start, so only a trade open across the window edge can differ)
+    for depth in DEPTHS:
+        if nbars <= depth: continue
+        sub = [(r, b) for e, r, b, _ in rows if e >= nbars - depth]
+        a = _agg([r for r, _ in sub], [b for _, b in sub], f"d{depth}_")
+        out.update({k: v for k, v in a.items() if not k.endswith(("med", "avgwin", "avgloss"))})
     return out
 
 
@@ -146,7 +154,7 @@ def worker(wid, port):
                         rec.update(pick(full, KEEP)); rec["family"] = full.get("family")
                         rec["from"] = full.get("scope", {}).get("from_date"); rec["to"] = full.get("scope", {}).get("to_date")
                         if (full.get("total_trades") or 0) > 0:
-                            rec.update(trade_stats(eng.fs, full.get("handle", ""), oos_bar))
+                            rec.update(trade_stats(eng.fs, full.get("handle", ""), oos_bar, nbars))
                         eng.fs.call("release_run", {"handle": full.get("handle", "")}, timeout=60)
                 except Exception as e:          # hang or crash: restart this engine, count it against the strategy
                     rec["error"] = f"timeout/crash: {type(e).__name__}"

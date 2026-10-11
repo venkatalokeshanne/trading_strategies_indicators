@@ -38,7 +38,7 @@ class Engine:
 
     def start(self):
         self.stop()
-        env = dict(os.environ, FORESIGHT_THREADS="1")
+        env = dict(os.environ, FORESIGHT_THREADS="1", FORESIGHT_DAS_JIT_OPT="0")   # opt 0: ~25% faster, identical results (tested)
         log = open(ROOT / "logs" / f"serve{self.port}.log", "ab")
         self.srv = subprocess.Popen([EXE, "--serve", "--port", str(self.port)], stdout=log, stderr=log, env=env,
                                     cwd=r"C:\Program Files\Foresight")

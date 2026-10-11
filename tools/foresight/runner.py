@@ -69,7 +69,8 @@ def free_ram_gb():
     return m.ullAvailPhys / 2**30
 
 
-MIN_FREE_GB = 2.5     # an engine only takes a new dataset when this much RAM is free (5m data is ~9x daily)
+MIN_FREE_GB = 2.5
+RECYCLE_EVERY = 250  # strategies per engine before a fresh engine (bounds memory; ~3 s each)     # an engine only takes a new dataset when this much RAM is free (5m data is ~9x daily)
 
 
 def claim(tf, sym):
@@ -177,9 +178,15 @@ def worker(wid, port):
             print(f"w{wid} {tf} {sym}: data load failed {e}", flush=True)
             eng.start(); (ROOT / RES / tf / f"{sym}.lock").unlink(missing_ok=True); continue
         with open(out, "a", encoding="utf-8") as fo:
+            since_restart = 0
             for sp in STRATS:
                 sid = Path(sp).name.split("-")[0].split(".")[0]
                 if sid in done or bad.get(sid, 0) >= 3: continue
+                if since_restart >= RECYCLE_EVERY:          # the engine keeps every compiled script: recycle it
+                    eng.start()
+                    eng.fs.call("load_session", {"script_path": str(ROOT / "loader.pine"), "data_path": str(csv)}, timeout=300)
+                    since_restart = 0
+                since_restart += 1
                 rec = {"strategy": sid, "file": Path(sp).name, "ticker": sym, "tf": tf, "bars": nbars}
                 try:
                     full = eng.fs.call("start_run", {"script_path": sp, "detail": "full"}, timeout=180)

@@ -234,7 +234,8 @@ def main() -> None:
         print(RESULTS)
     elif mode in ("tester", "tester-short"):
         entry, exit_ = signals(src, "Short" if mode == "tester-short" else "Long")
-        print(TESTER.replace("__NAME__", json.dumps(name)).replace("__ENTRY__", json.dumps(entry))
+        # the Tester's indicator picker lists a script by its shortName (when it has one), not its title (LESSONS L25)
+        print(TESTER.replace("__NAME__", json.dumps(short)).replace("__ENTRY__", json.dumps(entry))
               .replace("__EXIT__", json.dumps(exit_)))
     else:
         print(REMOVE.replace("__SHORT__", json.dumps(short)))

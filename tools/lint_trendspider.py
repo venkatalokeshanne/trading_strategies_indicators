@@ -228,6 +228,17 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
         warns.append("request.history data landed without a one-bar lag: a higher-timeframe bar's final value "
                      "would show from its open (look-ahead) — shift by one HTF bar (LESSONS L23, reference/06)")
 
+    # paint_overlay: the default order 'below_all' puts the panel beneath the chart's own drawing; TrendSpider's
+    # store scripts use 'above_all' and cell/table keys text/color/padding/fontWeight, background/fontSize/width
+    # (LESSONS L24). Warnings: whether either actually hides a panel is not confirmed.
+    for m in re.finditer(r"\bpaint_overlay\s*\(", code):
+        head = code[m.start():m.start() + 400]
+        if "above_all" not in head:
+            warns.append(f"line {line_of(code, m.start())}: paint_overlay without order: 'above_all' sits beneath "
+                         f"the chart's drawing (LESSONS L24)")
+    if "paint_overlay" in code and re.search(r"\bbackground_color\s*:", code):
+        warns.append("paint_overlay: TrendSpider's own scripts use `background`, not `background_color` (LESSONS L24)")
+
     # shift(x, -n) reads n bars into the FUTURE (positive = past): look-ahead (L21).
     for m in re.finditer(r"\bshift\s*\([^,()]+,\s*-\s*\d", code):
         errors.append(f"line {line_of(code, m.start())}: shift(..., -n) reads future bars — "

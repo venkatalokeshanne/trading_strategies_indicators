@@ -305,3 +305,23 @@ saw its HTF bar's FINAL value from the HTF bar's open.
 timeframe (`values.map((v, k) => k ? values[k - 1] : null)`, or land at the next bar's time),
 as in reference/06. Note in the header that Pine shows it one chart bar earlier.
 **Gate.** lint_trendspider.py warns when request.history data is landed with no visible lag.
+
+## L24 — A blank paint_overlay panel: check the tab before blaming the code
+**What happened.** iz6acv9B's results panel rendered as a 1x1 image in the editor preview. Cause: the
+Chrome tab was in the background (`document.visibilityState === 'hidden'`) — there EVERY overlay renders
+1x1, even a one-cell "hello" probe. With the tab visible, the saved indicator drew its panel.
+Along the way: TrendSpider's own store scripts (data/store_indicators/sources) use `order: 'above_all'`,
+table-level `background` / `fontSize` / `width` and cell `text` / `color` / `padding` / `fontWeight`; the
+`background_color` key in TrendSpider-AI drafts does not appear in them. The default order is
+`'below_all'` (beneath the chart's drawing). [VERIFY] whether 'below_all' or `background_color` alone
+ever hides a panel — not established.
+**Rule.** Judge an overlay only in a visible tab. Write panels the way the store scripts do:
+`paint_overlay(name, { position, order: 'above_all' }, { background, rows: [{ cells: [{ text, color }] }] })`.
+**Gate.** lint_trendspider.py WARNS on paint_overlay without `above_all`, and on `background_color`.
+
+## L25 — The Strategy Tester lists a script by its shortName
+**What happened.** The Tester payload looked for "<full _TV title>, VMC Long Entry (on chart)"; the
+picker shows "VMC WT (inputs…), VMC Long Entry (on chart)" — the `shortName` from describe_indicator.
+**Rule.** Match picker rows on the shortName (it falls back to the title when there is none).
+**Gate.** ts_live_payload.py `tester` / `tester-short` now use the shortName.
+

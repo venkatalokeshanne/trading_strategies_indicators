@@ -58,6 +58,17 @@ Run `find.js`. If `saved: true`, this is an **update**: open that saved script f
 [VERIFY the update flow on the first re-save]. Never open or overwrite a script whose name
 is not this script's `_TV` name.
 
+### 3b. Large scripts: deliver the file, don't retype it
+A browser-tool call that embeds a 20+ KB script is slow and easy to corrupt. The chart page may fetch
+from **`http://localhost:8000/trendspider_indicator.js`** — the origin TrendSpider's own "Connect to local
+dev server" uses (other ports and 127.0.0.1 are blocked by the page's policy; found 2026-10-13). Serve the
+`.trendspider.js` under that name with `Access-Control-Allow-Origin: *`, then in the page:
+`SRC = (await fetch('http://localhost:8000/trendspider_indicator.js', {cache: 'no-store'}).then(r => r.text())).replace(/
+/g, '
+')`
+and use it as apply.js does (CodeMirror stores `
+`; compare after normalising). Stop the server afterwards.
+
 ### 4. APPLY (runs the script, does not save)
 Run `apply.js`. It refuses if the editor holds some other non-example script — then click
 **New indicator** and run it again. Pass criteria, from its report:

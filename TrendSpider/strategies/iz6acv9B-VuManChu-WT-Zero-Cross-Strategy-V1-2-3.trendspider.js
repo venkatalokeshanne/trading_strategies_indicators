@@ -22,7 +22,7 @@
  * Deviations from the original:
  *   - Results panel and markers: exact. They use TrendSpider's own price data, so on a symbol whose data differs
  *     from TradingView's (adjustments, extended hours) the trades differ by that data, not by the logic.
- *   - Initial capital and tick size are inputs (1,000,000 and 0.01 by default: TradingView's default capital and a
+ *   - Initial capital and the tick are inputs (1,000,000 and 1 cent by default: TradingView's default capital and a
  *     US stock's tick); TrendSpider exposes neither.
  *   - Max drawdown in the panel is on closed trades (TradingView's also includes open-trade swings).
  *   - The Pine "SL Hit" alerts test the stop after the script has already cleared it, so on TradingView they never
@@ -49,6 +49,8 @@
 describe_indicator('VuManChu WT Zero Cross Strategy V1.2.3_TV', 'overlay', { shortName: 'VMC WT' });
 
 // ── Inputs (Pine defaults) ───────────────────────────────────────────────
+// Whole-number minimums and defaults: the mobile app validates number inputs in whole steps from the minimum,
+// so a decimal default or minimum (0.01, min 0.1 with 2) is flagged invalid there (LESSONS L26).
 const wtChLen = input.number('WT Channel Length', 9, { min: 1 });
 const wtAvgLen = input.number('WT Average Length', 27, { min: 1 });
 const wtMaLen = input.number('WT MA Length', 3, { min: 1 });
@@ -64,11 +66,12 @@ const tp5In = input.number('TP5 %', 50, { min: 1, max: 100 });
 const slOn = input.boolean('Stop Loss', true);
 const slTypeIn = input.select('Stop Loss Type', 'ATR', ['ATR', 'Fixed %', 'Both']);
 const atrLenIn = input.number('ATR Length', 14, { min: 1 });
-const atrMultIn = input.number('ATR Multiplier', 2, { min: 0.1 });
-const fixedPctIn = input.number('Fixed Stop %', 1, { min: 0.01 });
+const atrMultIn = input.number('ATR Multiplier', 2, { min: 0 });
+const fixedPctIn = input.number('Fixed Stop %', 1, { min: 0 });
 const capitalIn = input.number('Initial Capital', 1000000, { min: 1 });
-const qtyPctIn = input.number('Position % Equity', 2, { min: 0.01, max: 100 });
-const tickIn = input.number('Tick Size', 0.01, { min: 0 });
+const qtyPctIn = input.number('Position % Equity', 2, { min: 0, max: 100 });
+const tickCents = input.number('Tick (cents)', 1, { min: 0 });       // 1 = $0.01, a US stock's tick
+const tickIn = tickCents / 100;
 const showEma = input.boolean('Show EMA', true);
 const showArrows = input.boolean('Show Entry Arrows', true);
 const showDots = input.boolean('Show TP Dots', true);

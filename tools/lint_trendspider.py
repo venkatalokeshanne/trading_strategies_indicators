@@ -239,6 +239,14 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
     if "paint_overlay" in code and re.search(r"\bbackground_color\s*:", code):
         warns.append("paint_overlay: TrendSpider's own scripts use `background`, not `background_color` (LESSONS L24)")
 
+    # input.number with a decimal default or minimum is flagged invalid by the mobile app (L26).
+    for m in re.finditer(r"input\.number\s*\(\s*(['\"])(.*?)\s*,\s*([-\d.]+)\s*(?:,\s*\{([^}]*)\})?", code):
+        dflt, opts = m.group(3), m.group(4) or ""
+        mins = re.findall(r"min\s*:\s*([-\d.]+)", opts)
+        if "." in dflt or any("." in v for v in mins):
+            warns.append(f"line {line_of(code, m.start())}: input.number '{m.group(2)}' has a decimal default/min — "
+                         f"the mobile app flags it invalid (LESSONS L26)")
+
     # shift(x, -n) reads n bars into the FUTURE (positive = past): look-ahead (L21).
     for m in re.finditer(r"\bshift\s*\([^,()]+,\s*-\s*\d", code):
         errors.append(f"line {line_of(code, m.start())}: shift(..., -n) reads future bars — "

@@ -325,3 +325,14 @@ picker shows "VMC WT (inputs…), VMC Long Entry (on chart)" — the `shortName`
 **Rule.** Match picker rows on the shortName (it falls back to the title when there is none).
 **Gate.** ts_live_payload.py `tester` / `tester-short` now use the shortName.
 
+## L26 — Decimal number inputs are "invalid" in the mobile app
+**What happened.** iz6acv9B saved and ran on desktop, but adding it in the TrendSpider phone app gave
+"One or more indicator inputs have invalid values". Its number inputs had decimal defaults/minimums
+(`Tick Size` 0.01; `ATR Multiplier` 2 with min 0.1; `Fixed Stop %` 1 and `Position %` 2 with min 0.01).
+The likely rule (as an HTML number field with no step): valid values are min + whole steps, so a value
+that is not a whole number of steps from the minimum is flagged. input.number accepts only
+{ min, max, hide_in_legend } — no step. [VERIFY on the phone that the fixed version adds cleanly.]
+**Rule.** Number inputs: whole-number defaults and whole-number (or 0) minimums. Express small
+quantities in whole units (a tick in cents, a percentage as a whole number) and convert in code.
+**Gate.** lint_trendspider.py warns on input.number with a non-integer default or min.
+

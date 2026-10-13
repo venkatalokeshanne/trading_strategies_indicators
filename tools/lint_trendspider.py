@@ -240,7 +240,7 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
         warns.append("paint_overlay: TrendSpider's own scripts use `background`, not `background_color` (LESSONS L24)")
 
     # input.number with a decimal default or minimum is flagged invalid by the mobile app (L26).
-    for m in re.finditer(r"input\.number\s*\(\s*(['\"])(.*?)\s*,\s*([-\d.]+)\s*(?:,\s*\{([^}]*)\})?", code):
+    for m in re.finditer(r"input\.number\s*\(\s*(['\"])(.*?)\s*,\s*([-\d.]+)\s*(?:,\s*\{([^}]*)\})?", code):
         dflt, opts = m.group(3), m.group(4) or ""
         mins = re.findall(r"min\s*:\s*([-\d.]+)", opts)
         if "." in dflt or any("." in v for v in mins):

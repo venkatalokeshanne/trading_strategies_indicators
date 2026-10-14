@@ -236,8 +236,19 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
         if "above_all" not in head:
             warns.append(f"line {line_of(code, m.start())}: paint_overlay without order: 'above_all' sits beneath "
                          f"the chart's drawing (LESSONS L24)")
-    if "paint_overlay" in code and re.search(r"\bbackground_color\s*:", code):
-        warns.append("paint_overlay: TrendSpider's own scripts use `background`, not `background_color` (LESSONS L24)")
+    # only inside the paint_overlay call itself: paint_label_at_line legitimately takes background_color
+    for m in re.finditer(r"\bpaint_overlay\s*\(", code):
+        end = code.find("\n});", m.start())
+        if re.search(r"\bbackground_color\s*:", code[m.start():end if end > 0 else len(code)]):
+            warns.append("paint_overlay: TrendSpider's own scripts use `background`, not `background_color` (LESSONS L24)")
+
+    # The engine rejects style 'dashed' ("unknown style") and rgba() colours in at least columnrange paints (L27).
+    for m in re.finditer(r"\bstyle\s*:\s*['\"]dashed['\"]", code):
+        errors.append(f"line {line_of(code, m.start())}: style 'dashed' — TrendSpider's engine rejects it "
+                      f"(\"unknown style\"); use 'line' (LESSONS L27)")
+    for m in re.finditer(r"\bcolor\s*:\s*[^,\n]*\brgba\s*\(", code):     # a paint colour (overlay backgrounds work)
+        warns.append(f"line {line_of(code, m.start())}: rgba() colour — the engine rejected it in a columnrange paint "
+                     f"(\"invalid color\"); write #RRGGBBAA (LESSONS L27)")
 
     # input.number with a decimal default or minimum is flagged invalid by the mobile app (L26).
     for m in re.finditer(r"input\.number\s*\(\s*(['\"])(.*?)\1\s*,\s*([-\d.]+)\s*(?:,\s*\{([^}]*)\})?", code):

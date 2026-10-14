@@ -61,7 +61,7 @@ Styles available [VERIFIED]: `line`, `histogram`, `stacked_histogram`, `dotted` 
 |---|---|
 | `plotshape(cond, style=shape.triangleup, location=location.belowbar)` | `dotted` series holding a price (e.g. `low`) where `cond`, `null` elsewhere, `marker: 'triangle'` |
 | `plotshape(..., location=location.abovebar)` | same, holding `high`, `marker: 'triangle-down'` |
-| `plotshape(..., text="BUY")` | `labels_below` / `labels_above` style [VERIFY the data shape — text vs value] |
+| `plotshape(..., text="BUY")` | `labels_below` / `labels_above` style: a series of **strings** (text where shown, null elsewhere), `backgroundColor` option [VERIFIED in store scripts and NCEqAlgo] |
 | `plotchar(cond, char="•")` | `labels_above` / `labels_below` with the character |
 | `plotarrow(series)` | `dotted` with `triangle` / `triangle-down` |
 | `shape.circle`, `square`, `diamond` | matching `marker` |
@@ -75,13 +75,13 @@ Styles available [VERIFIED]: `line`, `histogram`, `stacked_histogram`, `dotted` 
 | Pine | TrendSpider |
 |---|---|
 | `hline(price, ...)` | `paint(horizontal_line(price), {...})` [VERIFIED `horizontal_line(value, fromIndex?, toIndex?)`] |
-| `hline` with `linestyle=hline.style_dashed/dotted` | no confirmed dashed-line option [VERIFY]; `dotted` is a *scatter* style, not a dashed line — don't conflate them |
+| `hline` with `linestyle=hline.style_dashed/dotted` | **no dashed style**: `style: 'dashed'` is rejected ("unknown style") [VERIFIED oracle, L27]; `dotted` is a *scatter* style, not a dashed line — draw it solid |
 | `fill(plot1, plot2, color)` | `const a = paint(...), b = paint(...); fill(a, b, color, opacity, 'title')` [VERIFIED] |
 | `fill(hline1, hline2)` | paint both as `horizontal_line`, then `fill` |
 | `fill` with gradient (`top_color`/`bottom_color`) | single colour — note it |
 | two-colour fill that flips when the lines cross | `color_cloud(s1, s2, colorAbove, colorBelow, name1, name2)` [VERIFIED] |
 | `barcolor(color)` | `color_candles(colorSeries)` [VERIFIED] |
-| `bgcolor(color)` | no confirmed equivalent. Options: a lower-pane `area` / `columnrange`, or omit. List as a deviation [VERIFY] |
+| `bgcolor(color)` | no background paint. Used in NCEqAlgo: a faint `columnrange` around each candle (`{high: high + ATR, low: low − ATR}`, colour series allowed) — list as a deviation |
 | `plotcandle(o, h, l, c)`, `plotbar(...)` | style `candles` [VERIFY the expected point shape] |
 
 Pine colour transparency: `color.new(c, 80)` → alpha `0.2`. (`a = 1 - transp / 100`.)
@@ -112,7 +112,7 @@ template names are accepted; if not, write the N calls out with literal names.]
 | Pine | TrendSpider | Notes |
 |---|---|---|
 | `line.new(x1, y1, x2, y2, extend=extend.right)` | `line(fromIndex, fromPrice, toIndex, toPrice, extendRight)` [VERIFIED] | Pine `x` may be `bar_index` or `time` (`xloc.bar_time`) — convert time to index |
-| `label.new(x, y, text)` | `paint_label_at_line(lineRef, atIndex, text, attributes)` [VERIFIED] — a label must hang off a painted line | |
+| `label.new(x, y, text)` | `paint_label_at_line(lineRef, atIndex, text, attributes)` [VERIFIED] — a label must hang off a painted line; attributes `color` (text), `background_color`, `vertical_align: 'top' / 'middle' / 'bottom'`. May be called in loops/conditionally (store scripts do); hang it off a transparent (`#00000000`) series holding the price | |
 | `box.new(left, top, right, bottom)` | `arearange` / `columnrange` with `{high, low}` points [VERIFIED styles], or two horizontal segments + `fill` | zones such as order blocks and FVGs |
 | `table.new` + `table.cell` | `paint_overlay(name, {position, offset_x, offset_y, parent, order}, {rows: [...]})` [VERIFIED] | rendered as a **static image**; sandboxed, no network |
 | `linefill.new(l1, l2, color)` | `fill(ref1, ref2, color)` | |

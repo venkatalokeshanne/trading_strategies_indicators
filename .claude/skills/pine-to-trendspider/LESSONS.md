@@ -336,3 +336,20 @@ that is not a whole number of steps from the minimum is flagged. input.number ac
 quantities in whole units (a tick in cents, a percentage as a whole number) and convert in code.
 **Gate.** lint_trendspider.py warns on input.number with a non-integer default or min.
 
+
+## L27 — The engine rejects style 'dashed' and rgba() paint colours
+**What happened.** NCEqAlgo (Neural Confluence Engine) ran in TrendSpider's own engine (oracle) and failed twice
+before any live test: `paint(): invalid color for "Squeeze active zone"` — a columnrange paint coloured with
+`rgba(240, 180, 41, 0.15)` — and `paint(): out series "Stop level" has unknown style "dashed"`.
+**Rule.** Paint colours as `#RRGGBB` or `#RRGGBBAA` (Pine `color.new(c, t)` → alpha byte `round(255 × (1 − t/100))`).
+There is no dashed line style; draw Pine's dashed lines solid (thinner) and say so. Overlay-table backgrounds
+in `rgba()` do work (iz6acv9B). Run the oracle before the live test — it found both in seconds.
+**Gate.** lint_trendspider.py: style 'dashed' is an ERROR; an rgba() paint `color:` is a warning.
+
+## L28 — Pine compares floats with a tolerance: ties in ta.dmi
+**What happened.** NCEqAlgo's ADX matched Foresight except in runs of bars that each started on a bar where the
+up-move and the down-move were equal in price (117.75 − 117.655 vs 117.29 − 117.195) but differed in the last
+bits in double precision. JavaScript picked one as larger; Pine treats them as equal, so neither is directional.
+**Rule.** In hand-rolled `ta.dmi` / `ta.adx`, compare the moves with a relative tolerance
+(`u - d > 1e-10 * max(|u|, |d|, 1)`). Expect the same wherever Pine code tests two computed prices for > / ==.
+**Gate.** Not lintable; the ta.dmi recipe in reference/02 carries the tolerance. Parity check found it.

@@ -138,7 +138,7 @@ const rmaPine = (src, n) => {
 |---|---|---|
 | `ta.sar(start, inc, max)` | `psar(maximum, acceleration, start)` | **argument order is reversed** — the most common silent bug in SAR ports |
 | `ta.supertrend(factor, atrLen)` | hand-roll (below) | returns `[value, direction]`; **direction < 0 means up-trend**. TrendSpider's `supertrend()` takes no parameters and flips on different bars [VERIFIED] — don't substitute it |
-| `ta.dmi(diLen, adxSmooth)` | hand-roll with `rmaPine` | returns `[plusDI, minusDI, adx]` |
+| `ta.dmi(diLen, adxSmooth)` | hand-roll with `rmaPine` | returns `[plusDI, minusDI, adx]`. Pine's reference: `up = change(high)`, `down = -change(low)`, `plusDM = up > down and up > 0 ? up : 0`, `trur = rma(ta.tr, len)`, `plus = fixnan(100 * rma(plusDM, len) / trur)`, `adx = 100 * rma(abs(plus - minus) / (plus + minus == 0 ? 1 : plus + minus), adxSmooth)`. **Compare `up`/`down` with a tolerance** (`up - down > 1e-10 * max(|up|, |down|, 1)`): Pine treats equal moves as equal (LESSONS L28). Matched Foresight exactly after warm-up (tools/parity/nce/core.js); the first ~200 bars differ ≤ 0.004 — Pine's exact seed is not reproduced |
 | `ta.vortex` | `vortex(n)` → `{positive, negative}` [VERIFIED] | |
 
 **Supertrend** (Pine semantics, including the inverted direction sign):
@@ -182,7 +182,7 @@ script hand-rolls its own, port that code instead of substituting this one.
 
 | Pine | TrendSpider | Notes |
 |---|---|---|
-| `ta.vwap` / `ta.vwap(src)` | **hand-roll** (below) | Pine resets every session and the built-in uses `hlc3`. TrendSpider's `vwap()` defaults to `ohlc4` and **does not reset** [VERIFIED] |
+| `ta.vwap` / `ta.vwap(src)` | **hand-roll** (below) | Pine resets every session and the built-in uses `hlc3`. TrendSpider's `vwap()` defaults to `ohlc4` and **does not reset** [VERIFIED]. With no volume yet in the session Pine gives **0** (Foresight, NCEqAlgo), not na |
 | `ta.vwap(src, anchor, mult)` (v5 anchored) | hand-roll, resetting when `anchor` is true | also returns bands when `mult` given |
 | `ta.obv` | hand-roll: running sum of `sign(change(close)) * volume` | |
 | `ta.accdist`, `ta.pvt`, `ta.nvi`, `ta.pvi` | hand-roll | |

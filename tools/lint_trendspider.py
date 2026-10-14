@@ -312,7 +312,9 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
         warns.append(f"line {line_of(struct, m.start())}: Math.random — output changes every recompute (07 §9)")
 
     # Header block.
-    head = raw[:3000]
+    # the whole leading /* ... */ header block (a long header pushes later sections past a fixed cut-off)
+    end = raw.find("*/") if raw.lstrip().startswith("/*") else -1
+    head = raw[:end + 2] if end > 0 else raw[:3000]
     missing = [f for f in HEADER_FIELDS if f not in head]
     if "Converted from TradingView Pine Script" not in head or missing:
         warns.append(f"header block incomplete (SKILL.md 'Output file format'); missing: {missing or 'title line'}")

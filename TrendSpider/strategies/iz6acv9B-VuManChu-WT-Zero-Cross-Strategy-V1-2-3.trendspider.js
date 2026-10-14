@@ -12,6 +12,34 @@
  * TrendSpider name : VuManChu WT Zero Cross Strategy V1.2.3_TV
  * Live tested  : 2026-10-13 on INFQ 15m — saved in TrendSpider: yes; Strategy Tester (Long only, 10,000 candles): 112 positions
  *
+ * The strategy in plain English:
+ *   1. WaveTrend. From the typical price (high + low + close) / 3: ESA = 9-bar EMA (a centre line); DE = 9-bar EMA of
+ *      how far price strays from it; CI = (price - ESA) / (0.015 x DE), how stretched price is (CCI-like).
+ *      WT1 = 27-bar EMA of CI (the main oscillator, roughly -100..+100); WT2 = 3-bar SMA of WT1 (slower line).
+ *      WT1 above 0 = upward momentum, below 0 = downward.
+ *   2. Entries (the green up / red down triangles). Long: WT1 crosses up through 0 after dipping to -10 or lower
+ *      ("Min Swing Before Cross"). Short: WT1 crosses down through 0 after peaking at +10 or higher. The minimum
+ *      swing ignores small wobbles around zero.
+ *   3. Trend filter (off by default): when on, longs only above the 200 EMA, shorts only below it. A signal
+ *      against the trend opens nothing but still closes an opposite trade. The yellow line is that EMA.
+ *   4. On a signal: close any opposite trade and enter at the bar's close (so it flips long <-> short).
+ *      Size = 2 % of current equity. Stop is set ONCE at entry and does not trail: entry -/+ 2 x ATR(14)
+ *      ("ATR"), 1 % from entry ("Fixed %"), or the tighter of the two ("Both"). The red line is the stop.
+ *   5. Take profits (the dots): while long, WT1 crosses down through WT2 with both above +60 (overbought) ->
+ *      sell 50 % of what is left; while short, WT1 crosses up through WT2 with both below -60 -> cover 50 %.
+ *      Up to 5 steps: 200 shares -> 100, 50, 25, 12, 6 sold, 7 left to ride.
+ *   6. A trade ends on: the stop (fills at the stop level, or at the open on a gap), an opposite signal (close and
+ *      reverse), and nothing else - the remainder after 5 take-profits waits for one of those two.
+ *   Example: WT1 dips to -35 then crosses 0 -> buy 200 at close 100, ATR 1.50 so stop 97.00. Overbought cross ->
+ *      sell 100; another -> sell 50. WT1 later crosses below 0 after peaking above +10 -> sell the last 50 and
+ *      short 200. Had price hit 97.00 first: whole position out, loss about 3 x 200 = 600 (0.06 % of capital).
+ *   Quirks kept exactly from the Pine script:
+ *     - if the entry bar's own low/high is already past the new stop, the script drops its "in a trade" state
+ *       but the position stays open - with no stop or take-profits until the next opposite signal;
+ *     - one action per bar: no take-profit on a bar that has an entry signal;
+ *     - a repeat signal in the same direction adds no shares but re-sets the stop from the new close.
+ *   Signals are roughly 3-4 a week on 15-minute charts; zoom out to see several.
+ *
  * How it works:
  *   The script re-runs the Pine strategy's own order logic bar by bar (process_orders_on_close fills at the close,
  *   the 50 % take-profit ladder, the ATR stop order that fills inside the bar, long/short reversals, 2 % of equity

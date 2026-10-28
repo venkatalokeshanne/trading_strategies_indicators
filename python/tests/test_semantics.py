@@ -123,3 +123,18 @@ def test_session_with_several_ranges_matches_any_of_them():
 
     run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
     assert out == [True, True, False, False, True, True, True, False]     # 09:30 10:30 | 11:30 12:30 | 13:30 14:30 15:30 | 16:30
+
+
+def test_utc_offset_time_zone_strings_are_accepted():
+    # "UTC+3", "GMT-5", "UTC+5:30" are valid Pine time zones; pandas only knows IANA names
+    t = pd.date_range("2024-03-04 12:00", periods=1, freq="1h", tz="UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append((self.hour(self.time, "UTC+3"), self.hour(self.time, "GMT-5"), self.minute(self.time, "UTC+5:30"),
+                        self.time_in_session("1500-1600", "UTC+3")))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    assert out == [(15, 7, 30, True)]

@@ -21,6 +21,18 @@ from .broker import LONG, SHORT, Broker, StrategyConfig
 from .core import NA, Context, DerivedSeries, Hist, PriceSeries, RT, callsite, fl, register_stop
 from .symbols import SymbolInfo
 
+def norm_tz(tz):
+    """Pine accepts "UTC+3", "GMT-5", "UTC+5:30" as well as IANA names; pandas needs a tzinfo for the former."""
+    import datetime as _dt
+    import re as _re
+    if isinstance(tz, str):
+        m = _re.fullmatch(r"(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?", tz.strip())
+        if m:
+            off = _dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+            return _dt.timezone(off if m.group(1) == "+" else -off)
+    return tz
+
+
 # ─────────────────────────────────────────────────────────────── timeframes
 def tf_seconds(tf: str) -> int:
     """TradingView timeframe string → seconds ("1", "60", "240", "D", "3D", "W", "M", "1S")."""
@@ -237,7 +249,7 @@ class Script:
     def _cal(self, t: Any, tz: str | None):
         if t is None:
             return self._ctx.cal_row(self._ctx.bar_index)
-        ts = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(tz or self.syminfo.timezone)
+        ts = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(norm_tz(tz or self.syminfo.timezone))
         return ts
 
     def year(self, t: Any = None, tz: str | None = None) -> int: return int(self._cal(t, tz).year)
@@ -259,7 +271,7 @@ class Script:
         y, mo, d, *rest = args
         h, mi, s = (list(rest) + [0, 0, 0])[:3]
         ts = pd.Timestamp(year=int(y), month=int(mo), day=int(d), hour=int(h), minute=int(mi),
-                          second=int(s), tz=tz)
+                          second=int(s), tz=norm_tz(tz))
         return int(ts.tz_convert("UTC").value // 1_000_000)
 
     def time_in_session(self, session: str, tz: str | None = None, t: Any = None) -> bool:
@@ -628,9 +640,9 @@ def _period_start_time(self: Context, tf: str) -> int:
 def _in_session(self: Context, session: str, tz: str, t: Any = None) -> bool:
     if t is None:
         loc = self.local.iloc[self.bar_index]
-        loc = loc.tz_convert(tz) if str(loc.tz) != tz else loc
+        loc = loc.tz_convert(norm_tz(tz)) if str(loc.tz) != tz else loc
     else:
-        loc = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(tz)
+        loc = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(norm_tz(tz))
     spec, _, days = session.partition(":")
     if days:
         pine_dow = (loc.dayofweek + 1) % 7 + 1

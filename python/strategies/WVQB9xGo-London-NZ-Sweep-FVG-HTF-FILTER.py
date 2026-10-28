@@ -48,8 +48,8 @@ class LondonNzSweepFvg(Script):
         return div(risk_value, risk) if risk > 0 else 0
 
     def on_bar(self):
-        htf_close = self.security(self.syminfo.tickerid, "60", lambda v: v.close)
-        htf_ma = self.security(self.syminfo.tickerid, "60", lambda v: ta.sma(v.close, 20))
+        htf_close = self.security(None, "60", lambda v: v.close)
+        htf_ma = self.security(None, "60", lambda v: ta.sma(v.close, 20))
         bull_bias = htf_close > htf_ma
         bear_bias = htf_close < htf_ma
         in_asia = not na(self.time_fn(None, "1300-1900", TZ))

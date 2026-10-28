@@ -43,10 +43,10 @@ class CjFuturesLowDrawdown(Script):
 
     def on_bar(self):
         ema = ta.ema(self.close, self.ema_length)
-        trend_close = self.security(self.syminfo.tickerid, self.trend_tf, lambda v: v.close)
-        trend_ema = self.security(self.syminfo.tickerid, self.trend_tf, lambda v: ta.ema(v.close, self.ema_length))
-        setup_close = self.security(self.syminfo.tickerid, self.setup_tf, lambda v: v.close)
-        setup_ema = self.security(self.syminfo.tickerid, self.setup_tf, lambda v: ta.ema(v.close, self.ema_length))
+        trend_close = self.security(None, self.trend_tf, lambda v: v.close)
+        trend_ema = self.security(None, self.trend_tf, lambda v: ta.ema(v.close, self.ema_length))
+        setup_close = self.security(None, self.setup_tf, lambda v: v.close)
+        setup_ema = self.security(None, self.setup_tf, lambda v: ta.ema(v.close, self.ema_length))
         bull_trend = trend_close > trend_ema and setup_close > setup_ema
         bear_trend = trend_close < trend_ema and setup_close < setup_ema
         in_session = not na(self.time_fn(None, self.session_input))

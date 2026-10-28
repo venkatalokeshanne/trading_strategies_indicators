@@ -1,6 +1,7 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01, T02 (T02 client verified against a fake HTTP layer only, see problems)
-Next ticket: T03 (calendar, data quality, coverage) — but first run the real T02 acceptance (below)
+Last ticket done: T01 (acceptance run and passed)
+IN PROGRESS, NOT DONE: T02 — code + fake-HTTP tests pass, but the real acceptance (2 symbols x 1 month, rerun fetches nothing) has NOT run
+Next ticket: finish T02 acceptance, then T03
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo (`trading_strategies_indicators`); PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable (multi-package flat layout), so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path instead of `pip install -e`.

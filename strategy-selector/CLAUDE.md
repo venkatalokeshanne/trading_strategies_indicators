@@ -15,7 +15,7 @@ Output of `python -m src.cli backtest --from D1 --to D2`: ≤15-line summary + f
 ## Session protocol (every session)
 1. Read `docs/STATE.md`, then ONLY the assigned ticket(s) `docs/tickets/Txx-*.md`. Never read the whole repo.
 2. Do the ticket inside its scope. 2–3 tickets per session max.
-3. Run the acceptance check; report ≤15 lines.
+3. Run the ticket's acceptance check for real (real data/APIs, not mocks). A ticket is marked done in STATE.md ONLY after that check passes; if it can't run, say so and leave the ticket in progress.
 4. Rewrite `docs/STATE.md` (≤40 lines: done, decisions, next ticket, problems).
 5. Commit `Txx: <what>`.
 

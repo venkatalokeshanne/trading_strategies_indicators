@@ -93,14 +93,15 @@ def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequ
              stop: Callable[[int, int, float, int], float | None] | None = None,
              target: Callable[[int, int, float, int], float | None] | None = None,
              on_close: bool = False, slip: float = 0.0,
-             trail: Callable[[int, int, float, int], tuple | None] | None = None, tick: float = 0.01) -> list[tuple]:
+             trail: Callable[[int, int, float, int], tuple | None] | None = None, tick: float = 0.01,
+             log: list | None = None) -> list[tuple]:
     """Trades as (direction, entry_bar, entry_price, exit_bar, exit_price).
     ``trail(i, pos, entry_price, entry_bar) -> (points, offset)`` in TICKS (None = no trailing); ``tick`` = mintick.
     ``stop(i, pos, entry_price, entry_bar)`` / ``target(...)``: the bracket level working on
     bar i (None = none). ``on_close``: process_orders_on_close. ``slip``: price units added
     against the trader on market fills."""
     n = len(c)
-    trades: list[tuple] = []
+    trades: list[tuple] = log if log is not None else []     # ``log``: the same list, readable by orders() while the run is in progress
     pos, ep, eb = 0, math.nan, -1
     tst: dict = {}
     queue: list = []

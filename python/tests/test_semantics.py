@@ -138,3 +138,19 @@ def test_utc_offset_time_zone_strings_are_accepted():
 
     run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
     assert out == [(15, 7, 30, True)]
+
+
+def test_timestamp_beyond_year_2262_does_not_overflow():
+    # timestamp(9999, 1, 1, 23, 59) is a common "no end date" in Pine scripts; pandas nanoseconds overflow there
+    t = pd.date_range("2024-03-04 12:00", periods=1, freq="1h", tz="UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append((self.timestamp(9999, 1, 1, 23, 59), self.timestamp("UTC", 2024, 3, 4, 12, 0), self.timestamp(2024, 3, 4, 7, 0)))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    far, now, local = out[0]
+    assert far > 253_000_000_000_000                                                        # year 9999, in milliseconds
+    assert now == int(t[0]) and local == int(t[0])                                          # 07:00 New York == 12:00 UTC (EST)

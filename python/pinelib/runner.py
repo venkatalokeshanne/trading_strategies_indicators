@@ -272,7 +272,7 @@ class Script:
         h, mi, s = (list(rest) + [0, 0, 0])[:3]
         ts = pd.Timestamp(year=int(y), month=int(mo), day=int(d), hour=int(h), minute=int(mi),
                           second=int(s), tz=norm_tz(tz))
-        return int(ts.tz_convert("UTC").value // 1_000_000)
+        return int(round(ts.timestamp() * 1000))          # not .value: years beyond 2262 (timestamp(9999, ...)) overflow nanoseconds
 
     def time_in_session(self, session: str, tz: str | None = None, t: Any = None) -> bool:
         """``not na(time(timeframe.period, session))`` — bar start inside the session."""

@@ -5,6 +5,8 @@ from src import config
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 data_app = typer.Typer(no_args_is_help=True, help="Market data")
 app.add_typer(data_app, name="data")
+pine_app = typer.Typer(no_args_is_help=True, help="Pine strategy catalog")
+app.add_typer(pine_app, name="pine")
 
 
 @app.command()
@@ -71,6 +73,23 @@ def run_cmd(strategies: str = typer.Option(..., help="script file names/paths in
     out.parent.mkdir(exist_ok=True)
     daily.groupby(["strategy", "symbol", "day"])["pnl"].sum().round(2).to_csv(out)
     typer.echo(f"per-day PnL -> {out}")
+
+
+@pine_app.command("triage")
+def triage(top: int = 30):
+    """Scan all Pine strategies -> data/catalog.json; summary + top list."""
+    import pandas as pd
+    from src.pine import triage as tr
+    cfg = config.load()
+    df = tr.build(cfg)
+    cfg["paths"]["catalog"].parent.mkdir(exist_ok=True)
+    cfg["paths"]["catalog"].write_text(df.reset_index().to_json(orient="records", indent=0))
+    pend = df[df["status"] == "pending"]
+    cfg["paths"]["runs"].mkdir(exist_ok=True)
+    pend[pend["priority"] > 0].head(100)[["title", "convertibility", "priority", "tf_hint", "direction", "lines", "dup_of"]].to_csv(cfg["paths"]["runs"] / "triage_top100.csv")
+    typer.echo(f"strategies={len(df)}  status: {df['status'].value_counts().to_dict()}")
+    typer.echo("pending by convertibility: " + str(pend["convertibility"].value_counts().to_dict()) + f"  dups={int((pend['dup_of'] != '').sum())}")
+    typer.echo(pend[pend["priority"] > 0].head(top)[["title", "convertibility", "priority"]].to_string(max_colwidth=60))
 
 
 if __name__ == "__main__":

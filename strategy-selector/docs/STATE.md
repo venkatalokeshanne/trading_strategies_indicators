@@ -1,15 +1,16 @@
 # STATE (rewrite each session, ≤40 lines)
-Last ticket done: T01 (acceptance run and passed)
-IN PROGRESS, NOT DONE: T02 — code + fake-HTTP tests pass, but the real acceptance (2 symbols x 1 month, rerun fetches nothing) has NOT run
-Next ticket: finish T02 acceptance, then T03
+Last tickets done: T01, T02 (both acceptance-tested for real)
+Next ticket: T03 (calendar, data quality, coverage)
 Decisions:
-- Project lives in `strategy-selector/` inside the helper repo (`trading_strategies_indicators`); PINE_REPO_PATH=.. (repo root).
-- helper `python/pyproject.toml` is not pip-installable (multi-package flat layout), so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path instead of `pip install -e`.
-- Cache: `data/cache/<SYM>/<YYYY-MM>.parquet` (UTC `time`, OHLCV) + `coverage.json` (weekdays already requested, so rerun fetches nothing). Today is never marked covered.
-- Pre-market: requested with `prepost=true`; if the plan rejects it the client falls back to RTH only and prints it.
-- Universe = 70 symbols (union of 3 lists, incl. QQQ). Cost tiers in config/default.yaml are my first guess (mega/large/volatile) — review.
-- Smoke: `python -m src.cli smoke` -> 999 trades on synthetic bars via the converted "Buy at open" strategy.
-Known problems:
-- api.twelvedata.com is blocked by this cloud sandbox's egress proxy, so real fetch was NOT run. Plan limits / history depth / pre-market availability still unknown.
-- To finish T02 acceptance, run locally: `python -m src.cli data fetch --symbols AAPL,IONQ --start 2024-03-01 --end 2024-03-29` twice (2nd must fetch 0), then record plan limits here. Or allow the host in the environment's network policy.
-Open questions: Twelve Data plan limits/history/pre-market.
+- Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
+- helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
+- Cache: `data/cache/<SYM>/<YYYY-MM>.parquet` (UTC `time`, OHLCV) + `coverage.json` (weekdays already requested; rerun fetches nothing). Today never marked covered.
+- Twelve Data returns the NEWEST `outputsize` bars of a range, so the client pages backward (moves end_date). Found by the real run, not by mocks.
+- Universe = 70 symbols (union of 3 lists incl. QQQ). Cost tiers in config/default.yaml are a first guess — review.
+Twelve Data plan facts (T02):
+- Pre/post-market NOT available (needs Pro) -> RTH only (09:30–15:59 ET). "premarket" checkpoint features must come from daily/prior-day data or another source.
+- Auth works on 6 keys; per-minute credit limit hit while probing (client backs off 61s per key on 429).
+- 1-min history reaches at least 2020-06 (AAPL), none at 2018-06 -> depth between; exact start not measured.
+- Acceptance run: AAPL, IONQ 2024-03: 7799/7795 rows, 20 days each; rerun 0 requests.
+Known problems: IONQ/AAPL minutes with 388–389 bars on some days (missing minutes) -> T03 quality check.
+Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

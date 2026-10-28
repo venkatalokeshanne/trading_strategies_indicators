@@ -15,7 +15,7 @@ def fake_http(calls, bad_key=None):
                     return {"code": 429, "message": "limit"}
                 s = pd.Timestamp(params["start_date"]); e = pd.Timestamp(params["end_date"])
                 idx = [t for t in pd.date_range(s, e, freq="1min")
-                       if t.weekday() < 5 and 570 <= t.hour * 60 + t.minute < 960 and t >= s][:int(params["outputsize"])]
+                       if t.weekday() < 5 and 570 <= t.hour * 60 + t.minute < 960 and t >= s][-int(params["outputsize"]):]
                 return {"values": [{"datetime": str(t), "open": "1", "high": "2", "low": "0.5", "close": "1", "volume": "10"} for t in idx]}
         return R()
     return http

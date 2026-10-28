@@ -41,6 +41,8 @@ def _request(keys: Keys, params: dict, http=requests.get) -> dict:
         code = j.get("code")
         if code == 429:                       # per-minute credit limit: this key rests until the minute rolls
             keys.back_off(k, 61)
+        elif code == 403 and "plan" in j.get("message", "").lower():
+            raise RuntimeError(f"twelvedata plan: {j['message']}")
         elif code in (401, 403):
             keys.back_off(k, 3600)
         elif code == 400 and "no data" in j.get("message", "").lower():
@@ -54,20 +56,21 @@ def _request(keys: Keys, params: dict, http=requests.get) -> dict:
 
 def fetch_range(keys: Keys, symbol: str, start: str, end: str, prepost: bool, size: int = 5000,
                 http=requests.get) -> pd.DataFrame:
-    """Bars in [start, end] (ET, 'YYYY-MM-DD HH:MM:SS'), paginated forward by outputsize."""
-    out, cur = [], start
+    """Bars in [start, end] (ET, 'YYYY-MM-DD HH:MM:SS'). The API returns the NEWEST `size` bars of
+    a range, so page backward by moving end_date to just before the oldest bar received."""
+    out, cur_end = [], end
     while True:
-        j = _request(keys, dict(symbol=symbol, interval="1min", start_date=cur, end_date=end,
+        j = _request(keys, dict(symbol=symbol, interval="1min", start_date=start, end_date=cur_end,
                                 outputsize=size, timezone=TZ, order="asc", prepost=str(prepost).lower(),
                                 format="JSON"), http)
         vals = j.get("values") or []
         if not vals:
             break
         out += vals
-        last = vals[-1]["datetime"]
         if len(vals) < size:
             break
-        cur = (datetime.fromisoformat(last) + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+        first = min(v["datetime"] for v in vals)
+        cur_end = (datetime.fromisoformat(first) - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
     if not out:
         return pd.DataFrame(columns=COLS)
     d = pd.DataFrame(out)
@@ -121,7 +124,7 @@ def fetch_symbol(cfg, keys: Keys, sym: str, start: str, end: str, http=requests.
         try:
             df = fetch_range(keys, sym, f"{a} 00:00:00", f"{b} 23:59:59", prepost, cfg["data"]["outputsize"], http)
         except RuntimeError as e:
-            if prepost and "prepost" in str(e).lower():     # plan has no extended hours -> RTH only
+            if prepost and "pre-market" in str(e).lower():     # plan has no extended hours -> RTH only
                 print(f"{sym}: plan lacks pre/post-market, falling back to RTH only")
                 cfg["data"]["extended_hours"] = prepost = False
                 df = fetch_range(keys, sym, f"{a} 00:00:00", f"{b} 23:59:59", prepost, cfg["data"]["outputsize"], http)

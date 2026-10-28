@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01-T05 (all acceptance-tested on real data)
-Next ticket: T06 (conversion wave 1 — done in the TV repo with its pine-to-python skill, 2-5 scripts/session from runs/triage_top100.csv) or T07 (bulk runner)
+Last tickets done: T01-T06 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
+Next ticket: T07 (bulk runner + DuckDB). Needs the full-universe 1m fetch first. T06.2 (next wave) starts at 9ZHBzpRZ in data/catalog.json priority order.
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
@@ -19,5 +19,10 @@ Costs: $0.005/share + slippage in bps by tier (mega 1, large 2, volatile 5; tick
 Real run: 3 strategies x AAPL,IONQ x gates open/open+10, Mar 2024: 12 jobs, rerun 12/12 cached, 1.2s. First run with 5-tick slippage made IONQ -38%/month — that was a cost-model artefact, fixed by the bps model.
 Caveat: a gated run differs from an ungated one for strategies that track state themselves (they think they entered). Inherent to gating.
 T05 triage (`src/pine/triage.py`, `cli pine triage`): static regex scan of 1053 strategies -> data/catalog.json (committed) + runs/triage_top100.csv. Status synced from progress.json python_status + python/strategies files: pending 1022, FULL 27, PARTIAL 2, NOT CONVERTIBLE 2. Pending: easy 492, medium 288, hard 235, skip 7 (dead/no entries/request.financial etc). 95 near-duplicates (5-gram Jaccard>=0.9) get priority x0.3. Priority = convertibility + intraday hints + US-market hints (-25 for crypto/forex/futures/India) + both directions + short + no request.security + has SL/TP. Heuristic: the top 100 are all US/index intraday, 45 explicit intraday, 93 both-direction. Re-run triage after each conversion wave to refresh status.
+T06 wave 1 (TV repo, pine-to-python skill): 15 reviewed -> 10 converted FULL + independently verified, 4 skipped with reason (config/skips.yaml), 1 not reached (9ZHBzpRZ).
+ Converted: 1dgKuDgW HNql4p3J jJnqvv1t 3Q98707C 75epRRh2 YnLk5B6z CzrYjKOp IaAxlKab rk7QowJp eWkFVSVF (5m New-York-clock checks, 29-1166 identical trades each). Parity vs a TradingView List of trades: NOT done (none supplied) -> "independent-reference verified, not TradingView-verified".
+ Real-data adapter smoke: 10 strategies x AAPL,IONQ Mar 2024 on 5m: 20/20 ran, no crash. 3Q98707C trades 18:00-02:59 NY only -> inert on RTH data; jJnqvv1t ~0-1 trade/month; eWkFVSVF never trades on 10m bars (see catalog `note`).
+ Found by the independent checks and fixed in the TV repo: (1) float(self.time) TypeError in pinelib, (2) var assigned from a series must be float()-frozen (new lint rule P13), (3) check harness sizing P15. Lessons P13-P15 added.
+ Catalog now: pending 1008, FULL 37, skipped 4, PARTIAL 2, NOT CONVERTIBLE 2.
 Known problems: full-universe fetch NOT run yet (70 symbols x years = many credits); do it before T07. Only AAPL/IONQ/SPCX/INFQ cached so far.
 Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

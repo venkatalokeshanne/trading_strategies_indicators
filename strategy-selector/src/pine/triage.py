@@ -4,6 +4,7 @@ import re
 from collections import Counter
 
 import pandas as pd
+import yaml
 
 from src import config
 
@@ -112,6 +113,9 @@ def build(cfg) -> pd.DataFrame:
         rows.append(dict(id=sid, file=m["file"], title=m["title"], pine_version=m["pine_version"], status=st,
                          convertibility=conv, priority=priority(f, conv), **{k: v for k, v in f.items() if k not in ("dead",)}))
     df = pd.DataFrame(rows).set_index("id")
+    sk = yaml.safe_load((config.ROOT / "config/skips.yaml").read_text())
+    df.loc[df.index.isin(sk["skipped"]) & (df["status"] == "pending"), "status"] = "skipped"
+    df["note"] = pd.Series({**sk["skipped"], **sk["notes"]}).reindex(df.index).fillna("")
     dup = dedupe(toks)
     df["dup_of"] = pd.Series(dup).reindex(df.index).fillna("")
     df.loc[df["dup_of"] != "", "priority"] = (df["priority"] * 0.3).round(1)

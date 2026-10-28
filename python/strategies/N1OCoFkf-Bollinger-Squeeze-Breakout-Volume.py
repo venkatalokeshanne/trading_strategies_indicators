@@ -20,7 +20,7 @@ Not carried over: the band plots, squeeze background, signal shapes and alertcon
 ────────────────────────────────────────────────────────────────────────
 """
 
-from pinelib import Script, color, div, ta
+from pinelib import Script, color, div, na, ta
 
 
 class BollingerSqueezeVolume(Script):
@@ -50,7 +50,8 @@ class BollingerSqueezeVolume(Script):
         vol_pass = self.volume > vol_ma
         atr_val = ta.atr(self.atr_len)
         sq_h = self.H("sq")
-        was_squeezed = bool(sq_h[1])
+        prev_sq = sq_h[1]
+        was_squeezed = False if na(prev_sq) else bool(prev_sq)
         sq_h.set(in_squeeze)
         st = self.strategy
         long_cond = was_squeezed and ta.crossover(self.close, bb_upper) and vol_pass and st.position_size == 0

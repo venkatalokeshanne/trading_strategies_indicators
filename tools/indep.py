@@ -381,3 +381,57 @@ def np_security_lookahead_off(values_per_period, pid, last_of):
         if p >= 0:
             out[j] = values_per_period[p]
     return out
+
+
+def simulate_pyr(o, h, l, c, orders, *, pyramiding: int = 1, stop=None, target=None, on_close: bool = False,
+                 log: list | None = None) -> list[tuple]:
+    """Multi-trade reference broker (1 unit per trade) for pyramiding strategies, written from Pine's documented rules and sharing no code with pinelib.
+    ``orders(i, pos)`` -> list of ("entry", d) | ("close", d) | ("close_all",), in source order; ``pos`` is the signed number of open trades.
+    entry: opposite trades are closed first (reversal); same-direction trades stack up to ``pyramiding`` (extra entries are ignored).
+    close d: closes every open trade of direction d; close_all: everything. Market orders fill at the next open (or at the signal close if ``on_close``).
+    ``stop(i, d, trades)`` / ``target(i, d, trades)``: the level working on bar i for the open trades of direction d (``trades`` = [(d, entry_bar, entry_price)]),
+    None = none; all open trades of that direction exit together at the first level the bar's path touches (a gap fills at the open).
+    Returns trades as (direction, entry_bar, entry_price, exit_bar, exit_price), appended in the order they close (oldest first within one close)."""
+    n = len(c)
+    trades: list[tuple] = log if log is not None else []
+    open_: list[tuple] = []
+    queue: list = []
+
+    def close_trades(sel, i, px):
+        nonlocal open_
+        for t in [t for t in open_ if sel(t)]:
+            trades.append((t[0], t[1], t[2], i, px))
+        open_ = [t for t in open_ if not sel(t)]
+
+    def fill(od, i, px):
+        nonlocal open_
+        if od[0] == "entry":
+            d = od[1]
+            if open_ and open_[0][0] == -d:
+                close_trades(lambda t: True, i, px)
+            elif open_ and len(open_) >= max(1, pyramiding):
+                return
+            open_.append((d, i, px))
+        elif od[0] == "close":
+            close_trades(lambda t: t[0] == od[1], i, px)
+        else:
+            close_trades(lambda t: True, i, px)
+
+    for i in range(n):
+        for od in queue:
+            fill(od, i, o[i])
+        queue = []
+        if open_ and (stop or target):
+            d = open_[0][0]
+            sl = stop(i, d, list(open_)) if stop else None
+            tp = target(i, d, list(open_)) if target else None
+            hit = bracket_hit(o[i], h[i], l[i], c[i], d, sl, tp)
+            if hit is not None:
+                close_trades(lambda t: True, i, hit)
+        emitted = orders(i, sum(t[0] for t in open_))
+        if on_close:
+            for od in emitted:
+                fill(od, i, c[i])
+        else:
+            queue = emitted
+    return trades

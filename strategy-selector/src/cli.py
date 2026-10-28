@@ -28,5 +28,25 @@ def fetch(universe: bool = typer.Option(False, "--universe"),
     twelvedata.fetch_many(cfg, syms, start, end)
 
 
+@data_app.command("check")
+def check(universe: bool = typer.Option(False, "--universe"),
+          symbols: str = typer.Option("", "--symbols", help="comma list")):
+    """Data quality + coverage table; bad days -> data/bad_days.csv, learn flag in data/coverage.csv."""
+    import pandas as pd
+    from src.data import quality
+    cfg = config.load()
+    syms = cfg["universe"] if universe else [x.strip().upper() for x in symbols.split(",") if x.strip()]
+    days, rows = [], []
+    for sym in syms:
+        t, s = quality.check_symbol(cfg, sym)
+        rows.append(s)
+        days.append(t[t["bad"]])
+    cov = pd.DataFrame(rows)
+    out = cfg["paths"]["cache"].parent
+    pd.concat(days).to_csv(out / "bad_days.csv", index=False)
+    cov.to_csv(out / "coverage.csv", index=False)
+    typer.echo(cov.to_string(index=False))
+
+
 if __name__ == "__main__":
     app()

@@ -330,8 +330,8 @@ def np_vwap(df, src, start_minutes: int = 9 * 60 + 30, tz: str = "America/New_Yo
     return out
 
 
-def np_adx(h, l, c, n):
-    """Pine ta.dmi(n, n) ADX from the textbook Wilder formulas (RMA of +DM/-DM over the RMA of tr; fixnan; RMA of |+DI - -DI|/sum)."""
+def np_dmi(h, l, c, n):
+    """Pine ta.dmi(n, n) -> (+DI, -DI, ADX) from the textbook Wilder formulas (RMA of +DM/-DM over the RMA of tr; fixnan; RMA of |+DI - -DI|/sum)."""
     h, l, c = (_np.asarray(v, float) for v in (h, l, c))
     up = _np.r_[_np.nan, _np.diff(h)]
     down = -_np.r_[_np.nan, _np.diff(l)]
@@ -350,4 +350,33 @@ def np_adx(h, l, c, n):
         plus = ffill(100 * np_rma(pdm, n) / trur)
         minus = ffill(100 * np_rma(mdm, n) / trur)
         tot = plus + minus
-        return np_rma(_np.abs(plus - minus) / _np.where(tot == 0, 1.0, tot), n) * 100
+        return plus, minus, np_rma(_np.abs(plus - minus) / _np.where(tot == 0, 1.0, tot), n) * 100
+
+
+def np_adx(h, l, c, n):
+    return np_dmi(h, l, c, n)[2]
+
+
+def np_periods(df, minutes: int, start_minutes: int = 9 * 60 + 30, tz: str = "America/New_York"):
+    """Higher-timeframe periods of intraday chart bars (pinelib/TradingView convention: blocks of ``minutes`` counted from the
+    session start, per trading day). Returns (pid, last_of): the period index of each chart bar and whether it is the LAST
+    chart bar of its period. request.security(..., lookahead off) shows a period's value on that last bar and the PREVIOUS
+    period's value on the earlier bars."""
+    import pandas as pd
+    ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(tz)
+    day = (ny - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
+    slot = (((ny.dt.hour * 60 + ny.dt.minute - start_minutes) % 1440) // minutes).to_numpy()
+    key = _np.array([f"{d}-{s}" for d, s in zip(day, slot)])
+    pid = _np.cumsum(_np.r_[True, key[1:] != key[:-1]]) - 1
+    last_of = _np.r_[key[1:] != key[:-1], True]
+    return pid, last_of
+
+
+def np_security_lookahead_off(values_per_period, pid, last_of):
+    """Map one value per higher-timeframe period back to chart bars (lookahead off)."""
+    out = _np.full(len(pid), _np.nan)
+    for j in range(len(pid)):
+        p = pid[j] if last_of[j] else pid[j] - 1
+        if p >= 0:
+            out[j] = values_per_period[p]
+    return out

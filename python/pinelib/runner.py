@@ -638,11 +638,14 @@ def _in_session(self: Context, session: str, tz: str, t: Any = None) -> bool:
             return False
     if spec in ("", "0000-0000", "24x7"):
         return True
-    a, b = spec.split("-")
     m = loc.hour * 60 + loc.minute
-    sa = int(a[:2]) * 60 + int(a[2:4])
-    sb = int(b[:2]) * 60 + int(b[2:4])
-    return (sa <= m < sb) if sa < sb else (m >= sa or m < sb)
+    for rng in spec.split(","):                       # "0930-1130,1330-1600": inside ANY of the ranges
+        a, b = rng.split("-")
+        sa = int(a[:2]) * 60 + int(a[2:4])
+        sb = int(b[:2]) * 60 + int(b[2:4])
+        if (sa <= m < sb) if sa < sb else (m >= sa or m < sb):
+            return True
+    return False
 
 
 Context.from_bars = classmethod(_from_bars)

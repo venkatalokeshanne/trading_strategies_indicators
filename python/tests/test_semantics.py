@@ -109,3 +109,17 @@ def test_time_series_converts_to_float_and_feeds_calendar_functions():
     # `time` is an int64 array: float(self.time) and self.hour(self.time, tz) used to raise TypeError
     out = _collect([1, 2], lambda s: (float(s.time), s.hour(s.time, "America/New_York")))
     assert out[0] == (1704067200000.0, 19) and isinstance(out[0][0], float)
+
+
+def test_session_with_several_ranges_matches_any_of_them():
+    # input.session("0930-1130,1330-1600") used to crash (split on '-' gave three parts)
+    t = pd.date_range("2024-03-04 09:30", periods=8, freq="1h", tz="America/New_York").tz_convert("UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append(self.time_in_session("0930-1130,1330-1600", "America/New_York"))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    assert out == [True, True, False, False, True, True, True, False]     # 09:30 10:30 | 11:30 12:30 | 13:30 14:30 15:30 | 16:30

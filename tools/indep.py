@@ -328,3 +328,26 @@ def np_vwap(df, src, start_minutes: int = 9 * 60 + 30, tz: str = "America/New_Yo
         pv, vv = pv + src[i] * v[i], vv + v[i]
         out[i] = pv / vv
     return out
+
+
+def np_adx(h, l, c, n):
+    """Pine ta.dmi(n, n) ADX from the textbook Wilder formulas (RMA of +DM/-DM over the RMA of tr; fixnan; RMA of |+DI - -DI|/sum)."""
+    h, l, c = (_np.asarray(v, float) for v in (h, l, c))
+    up = _np.r_[_np.nan, _np.diff(h)]
+    down = -_np.r_[_np.nan, _np.diff(l)]
+    pdm = _np.where(_np.isnan(up), _np.nan, _np.where((up > down) & (up > 0), up, 0.0))
+    mdm = _np.where(_np.isnan(down), _np.nan, _np.where((down > up) & (down > 0), down, 0.0))
+    trur = np_rma(np_tr(h, l, c, False), n)
+
+    def ffill(x):
+        out = x.copy()
+        for i in range(1, len(out)):
+            if _np.isnan(out[i]):
+                out[i] = out[i - 1]
+        return out
+
+    with _np.errstate(divide="ignore", invalid="ignore"):
+        plus = ffill(100 * np_rma(pdm, n) / trur)
+        minus = ffill(100 * np_rma(mdm, n) / trur)
+        tot = plus + minus
+        return np_rma(_np.abs(plus - minus) / _np.where(tot == 0, 1.0, tot), n) * 100

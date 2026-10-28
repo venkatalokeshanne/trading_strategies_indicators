@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01, T02, T03 (all acceptance-tested on real data)
-Next ticket: T05 (triage) or T04 (adapter) — T04 first per PLAN
+Last tickets done: T01, T02, T03, T04 (all acceptance-tested on real data)
+Next ticket: T05 (triage of pending Pine strategies)
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
@@ -14,5 +14,9 @@ Twelve Data plan facts (T02):
 - Acceptance run: AAPL, IONQ 2024-03: 7799/7795 rows, 20 days each; rerun 0 requests.
 T03: NYSE calendar via `exchange_calendars` (XNYS, early closes ok: 2023-11-24 = 210 min). `cli data check` -> table + data/bad_days.csv + data/coverage.csv (`learn` = days >= min_history_days=120). Flags: no_data, missing(>2%), zero_volume, dups, outside, jump(>25%/min, within day), gap(>40% overnight). Days before first bar are not judged.
 Real-data findings: Twelve Data has ~1-4% missing minutes on thin days (INFQ 10-24/390); IPO-day partial sessions flagged `missing` (expected). Real run caught nothing for split-like gaps (vendor bars are split-adjusted).
+T04 adapter (`src/adapter/daytrade.py`, `cli run`): subclass of the strategy; `strategy.entry/order` blocked unless bar-close >= gate and not on/after the day's penultimate bar, and entries/day < max (2); EOD = `cancel_all`+`close_all` on the penultimate bar so it fills at the OPEN of the day's last bar (15:55 for 5m) — no overnight. Bars are RTH 1m resampled to 5/10/15m aligned to 09:30, 30-day warmup before --start. Cache: data/results/<hash>.parquet keyed by script bytes, params, symbol, tf, gate, dates, costs, 1m data hash. Parallel via ProcessPoolExecutor.
+Costs: $0.005/share + slippage in bps by tier (mega 1, large 2, volatile 5; ticks = bps*median price, min 1) — REVIEW these guesses. Sizing overridden to $10k cash per entry so strategies compare on one scale (strategies' own qty is ignored unless they pass explicit qty).
+Real run: 3 strategies x AAPL,IONQ x gates open/open+10, Mar 2024: 12 jobs, rerun 12/12 cached, 1.2s. First run with 5-tick slippage made IONQ -38%/month — that was a cost-model artefact, fixed by the bps model.
+Caveat: a gated run differs from an ungated one for strategies that track state themselves (they think they entered). Inherent to gating.
 Known problems: full-universe fetch NOT run yet (70 symbols x years = many credits); do it before T07. Only AAPL/IONQ/SPCX/INFQ cached so far.
 Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

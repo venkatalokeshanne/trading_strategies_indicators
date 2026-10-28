@@ -47,18 +47,62 @@ def bracket_hit(o: float, h: float, l: float, c: float, pos: int, sl, tp):
     return None
 
 
+def exit_hit(o, h, l, c, pos, sl, tp, trail, st):
+    """Like bracket_hit, plus Pine's trailing stop. ``trail`` = (activation_price, offset_price) or None;
+    ``st`` is the per-position dict holding the trailing extreme between bars (key "ext").
+    Walks the same O->(H|L)->(L|H)->C path segment by segment: the trailing extreme moves to the best price of
+    each segment once the activation price has been reached; the stop then sits ``offset`` behind it and fills
+    when a segment moves down through it (long) / up through it (short); gaps fill at the open."""
+    pts = _path(o, h, l, c)
+    segs = [(o, o, True)] + [(pts[k - 1], pts[k], False) for k in range(1, len(pts)) if pts[k] != pts[k - 1]]
+    for p0, p1, opening in segs:
+        lvl_trail = None
+        if trail is not None:
+            best = max(p0, p1) if pos > 0 else min(p0, p1)
+            ext = st.get("ext")
+            if ext is None:
+                if (best >= trail[0]) if pos > 0 else (best <= trail[0]):
+                    ext = best
+            else:
+                ext = max(ext, best) if pos > 0 else min(ext, best)
+            if ext is not None:
+                st["ext"] = ext
+                lvl_trail = ext - pos * trail[1]
+        lo, hi = min(p0, p1), max(p0, p1)
+        up = p1 >= p0
+        cands = []
+        for kind, lvl in (("tp", tp), ("sl", sl), ("sl", lvl_trail)):
+            if lvl is None or lvl != lvl:
+                continue
+            favourable = kind == "tp"
+            beyond = (p0 >= lvl) if (pos > 0) == favourable else (p0 <= lvl)      # long limit / short stop: price above
+            if opening:
+                if beyond:
+                    cands.append((0.0, p0))
+            else:
+                moving_right_way = up if (pos > 0) == favourable else (not up)
+                if lo <= lvl <= hi and moving_right_way:
+                    cands.append((abs(lvl - p0), lvl))
+        if cands:
+            return min(cands, key=lambda x: x[0])[1]
+    return None
+
+
 def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequence[float],
              orders: Callable[[int, int], list], *,
              stop: Callable[[int, int, float, int], float | None] | None = None,
              target: Callable[[int, int, float, int], float | None] | None = None,
-             on_close: bool = False, slip: float = 0.0) -> list[tuple]:
+             on_close: bool = False, slip: float = 0.0,
+             trail: Callable[[int, int, float, int], tuple | None] | None = None, tick: float = 0.01) -> list[tuple]:
     """Trades as (direction, entry_bar, entry_price, exit_bar, exit_price).
+    ``trail(i, pos, entry_price, entry_bar) -> (points, offset)`` in TICKS (None = no trailing); ``tick`` = mintick.
     ``stop(i, pos, entry_price, entry_bar)`` / ``target(...)``: the bracket level working on
     bar i (None = none). ``on_close``: process_orders_on_close. ``slip``: price units added
     against the trader on market fills."""
     n = len(c)
     trades: list[tuple] = []
     pos, ep, eb = 0, math.nan, -1
+    tst: dict = {}
     queue: list = []
 
     def fill(order, i, px):
@@ -70,6 +114,7 @@ def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequ
             if pos == -d:
                 trades.append((pos, eb, ep, i, px - slip * pos))
             pos, ep, eb = d, px + slip * d, i
+            tst.clear()
         elif kind == "close" and pos == d:
             trades.append((pos, eb, ep, i, px - slip * pos))
             pos = 0
@@ -78,10 +123,13 @@ def simulate(o: Sequence[float], h: Sequence[float], l: Sequence[float], c: Sequ
         for od in queue:                       # orders from the previous close, at this open
             fill(od, i, o[i])
         queue = []
-        if pos != 0 and (stop or target):
+        if pos != 0 and (stop or target or trail):
             sl = stop(i, pos, ep, eb) if stop else None
             tp = target(i, pos, ep, eb) if target else None
-            hit = bracket_hit(o[i], h[i], l[i], c[i], pos, sl, tp)
+            tr = trail(i, pos, ep, eb) if trail else None
+            if tr is not None:
+                tr = (ep + pos * tr[0] * tick, tr[1] * tick)
+            hit = exit_hit(o[i], h[i], l[i], c[i], pos, sl, tp, tr, tst) if trail else bracket_hit(o[i], h[i], l[i], c[i], pos, sl, tp)
             if hit is not None:
                 trades.append((pos, eb, ep, i, hit))
                 pos = 0

@@ -264,3 +264,19 @@ def np_supertrend(h, l, c, factor, n):
             d[i] = 1 if c[i] < lo[i] else -1
         line[i] = lo[i] if d[i] == -1 else up[i]
     return line, d
+
+
+def np_vwap(df, src, start_minutes: int = 9 * 60 + 30, tz: str = "America/New_York"):
+    """Pine ta.vwap(src): volume-weighted mean of ``src``, reset at each session start
+    (default 09:30 New York, the stock session pinelib assumes)."""
+    import pandas as pd
+    local = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(tz)
+    day = (local - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
+    v = df["volume"].to_numpy()
+    out, pv, vv = _np.empty(len(v)), 0.0, 0.0
+    for i in range(len(v)):
+        if i == 0 or day[i] != day[i - 1]:
+            pv = vv = 0.0
+        pv, vv = pv + src[i] * v[i], vv + v[i]
+        out[i] = pv / vv
+    return out

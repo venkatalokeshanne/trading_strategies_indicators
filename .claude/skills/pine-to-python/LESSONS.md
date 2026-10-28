@@ -85,3 +85,21 @@ close; if the next open is higher, qty × open > equity and the broker refuses t
 emit the entry only when `o[i+1] <= c[i]` (see python/checks/V1frjvgM.py). v5 and older
 default to margin 0 — no refusal, but a 100x setting can wipe the account (NWIwEuKt): check the
 signal logic with a strategy_overrides qty instead.
+
+## P13 — A `var` assigned from a built-in series follows the current bar
+**What happened.** `longStop := low` became `self.long_stop = self.low`. `self.low` is a live
+series that reads the CURRENT bar, so the "stop" moved with every bar and a short was held 40 bars
+too long. Only the independent check (1 trade vs 5) exposed it (jJnqvv1t).
+**Rule.** A Pine `var`/state variable assigned from open/high/low/close/volume/time/hl2… stores a
+float: `self.x = float(self.low)`.
+**Check.** Lint ERROR on `self.<name> = self.<built-in series>`; independent check jJnqvv1t.
+
+## P14 — `time` is an int64 series: `float(self.time)` raised
+`PriceSeries.__float__` returned the raw int64, so `self.hour(self.time, "America/New_York")`
+crashed with TypeError (3Q98707C). Fixed in pinelib.core.
+**Check.** `test_time_series_converts_to_float_and_feeds_calendar_functions`.
+
+## P15 — Check bars must not outgrow the sizing
+`bars()` prices drift into the thousands; `percent_of_equity=10` on a 10 000 account then rounds
+to 0 shares and pinelib (correctly) takes no trade while the reference broker does. In a check use
+`SymbolInfo.make(..., qty_step=1e-9)` (fractional shares) and make sure it produces > 10 trades.

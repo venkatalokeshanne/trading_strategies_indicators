@@ -103,3 +103,9 @@ def test_inputs_override_and_record():
     r = run(T, _bars([1, 2]), symbol=SYM, timeframe="D", params={"Length": 7, "Source": "hl2"})
     assert seen[0] == (7, "hl2")
     assert r.inputs[0] == {"kind": "int", "title": "Length", "default": 14, "minval": 1}
+
+
+def test_time_series_converts_to_float_and_feeds_calendar_functions():
+    # `time` is an int64 array: float(self.time) and self.hour(self.time, tz) used to raise TypeError
+    out = _collect([1, 2], lambda s: (float(s.time), s.hour(s.time, "America/New_York")))
+    assert out[0] == (1704067200000.0, 19) and isinstance(out[0][0], float)

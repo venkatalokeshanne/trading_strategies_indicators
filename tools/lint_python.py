@@ -110,6 +110,13 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
                 if calls:
                     warns.append(f"line {ln}: {calls[0]} inside a conditional expression — only correct if the "
                                  f"Pine source has the call in the same conditional position [P5]")
+        # P13: a bare built-in series stored on self follows the CURRENT bar, not the bar it was stored on
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) \
+                and isinstance(node.value.value, ast.Name) and node.value.value.id == "self" \
+                and node.value.attr in ("open", "high", "low", "close", "volume", "time", "hl2", "hlc3", "ohlc4", "hlcc4") \
+                and any(isinstance(t, ast.Attribute) for t in node.targets):
+            errors.append(f"line {ln}: self.<var> = self.{node.value.attr} stores the live series, not its value — "
+                          f"use float(self.{node.value.attr}) for a Pine `var` assigned from a series [P13]")
         # P6: Python truthiness of nan is True; Pine treats na conditions as false
         if isinstance(node, (ast.If, ast.While)) and isinstance(node.test, ast.Name):
             pass

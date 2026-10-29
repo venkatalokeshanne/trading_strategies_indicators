@@ -693,7 +693,7 @@ def simulate_lots(o, h, l, c, orders, *, pyramiding: int, log: list | None = Non
 
 
 def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool = False, tick: float = 0.01,
-                      log: list | None = None) -> list[tuple]:
+                      qty_step: float | None = None, log: list | None = None) -> list[tuple]:
     """Quantity-aware reference broker for scripts that attach several exit orders (partial ``qty_percent`` exits, stop / limit / trailing legs) to their entries,
     written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat), "n": number of open lots (strategy.opentrades), "lots": [{id, d, q, ep, eb}] oldest first}:
@@ -705,6 +705,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
       ("cancel", id) | ("cancel_all",)          drop pending entries / exit orders with that id (queued market entries too) / every pending order, exit order and queued market order
     Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
     ties by creation order, so several exits at one price fill in the order they were issued; exits are live from the bar after they are issued (an exit issued with its entry is live from the fill bar).
+    ``qty_step``: the symbol's minimum quantity step - a partial close (``pct``) is rounded down to a multiple of it and a remainder under half a step is closed with it.
     Returns one row per closed piece: (direction, entry_bar, entry_price, exit_bar, exit_price, quantity), in closing order."""
     n = len(c)
     out: list[tuple] = log if log is not None else []
@@ -746,8 +747,12 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                     close_lot(x, x["q"], i, px)
             else:
                 left = sum(x["q"] for x in mine) * pct / 100.0
+                if qty_step:
+                    left = math.floor(left / qty_step + max(1e-9, left / qty_step * 1e-12)) * qty_step
                 for x in mine:
                     take = min(x["q"], left)
+                    if qty_step and x["q"] - take < qty_step * 0.5:
+                        take = x["q"]
                     if take > 1e-12:
                         close_lot(x, take, i, px)
                         left -= take

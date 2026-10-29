@@ -16,6 +16,7 @@ def rolling(x, n, fn):
 
 
 def one(df, params, p):
+    params = {**params, "Start": 946684800000}      # the default start (2018) is after the first years of the sample
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     v = df["volume"].to_numpy()
     n = len(c)

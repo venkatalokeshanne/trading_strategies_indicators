@@ -435,3 +435,15 @@ def simulate_pyr(o, h, l, c, orders, *, pyramiding: int = 1, stop=None, target=N
         else:
             queue = emitted
     return trades
+
+
+def np_cci(x, n):
+    """Pine ta.cci: (src - sma) / (0.015 * mean absolute deviation) over n bars."""
+    x = _np.asarray(x, float)
+    out = _np.full(len(x), _np.nan)
+    for i in range(n - 1, len(x)):
+        w = x[i - n + 1:i + 1]
+        mean = w.mean()
+        dev = _np.abs(w - mean).mean()
+        out[i] = (x[i] - mean) / (0.015 * dev) if dev != 0 else _np.nan
+    return out

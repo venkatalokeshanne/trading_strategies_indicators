@@ -79,8 +79,8 @@ class Strategy501(Script):
         in_range_h = self.H("in_range")
         in_range_1 = in_range_h[1]
         in_range_h.set(in_range)
-        new_range = in_range and not in_range_1
-        end_range = (not in_range) and bool(in_range_1)
+        new_range = in_range and not ((not na(in_range_1)) and bool(in_range_1))
+        end_range = (not in_range) and ((not na(in_range_1)) and bool(in_range_1))
         if new_day:
             self.range_high = NA
             self.range_low = NA

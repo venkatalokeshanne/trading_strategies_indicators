@@ -16,7 +16,7 @@ Not carried over: FVG boxes, kill-zone shading, signal shapes and the info table
 ────────────────────────────────────────────────────────────────────────
 """
 
-from pinelib import Script, pmath, ta
+from pinelib import Script, na, pmath, ta
 
 
 class Zeta9(Script):
@@ -79,8 +79,8 @@ class Zeta9(Script):
         bull_pinbar_1, bear_pinbar_1 = bp_h[1], sp_h[1]
         bp_h.set(bull_pinbar)
         sp_h.set(bear_pinbar)
-        ict_long_setup = bull_fvg or bull_ob or bool(bull_pinbar_1)
-        ict_short_setup = bear_fvg or bear_ob or bool(bear_pinbar_1)
+        ict_long_setup = bull_fvg or bull_ob or ((not na(bull_pinbar_1)) and bool(bull_pinbar_1))
+        ict_short_setup = bear_fvg or bear_ob or ((not na(bear_pinbar_1)) and bool(bear_pinbar_1))
         no_position = st.position_size == 0
         long_signal = in_killzone and bullish_trend and vwap_bull and rsi_ok_long and ict_long_setup and no_position
         short_signal = in_killzone and bearish_trend and vwap_bear and rsi_ok_short and ict_short_setup and no_position

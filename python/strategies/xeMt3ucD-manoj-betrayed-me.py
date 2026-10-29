@@ -53,8 +53,8 @@ class ManojBetrayedMe(Script):
         sl_h.set(smma_low)
         bs_h.set(buy_signal)
         ss_h.set(sell_signal)
-        buy_confirm = can_trade and bool(buy_signal_1) and close > smma_high and low > smma_high
-        sell_confirm = can_trade and bool(sell_signal_1) and close < smma_low and high < smma_low
+        buy_confirm = can_trade and (not na(buy_signal_1)) and bool(buy_signal_1) and close > smma_high and low > smma_high
+        sell_confirm = can_trade and (not na(sell_signal_1)) and bool(sell_signal_1) and close < smma_low and high < smma_low
         if is_session_close_bar:
             st.cancel("Buy")
             st.cancel("Sell")

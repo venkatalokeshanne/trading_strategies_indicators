@@ -63,7 +63,12 @@ def main() -> int:
                 except LookupError:
                     # still a lower timeframe than hourly (e.g. a 15-minute filter): use 5-minute bars
                     bars, tf, label = make_bars(n=6000, freq="5min", flat_run=False), "5", "synthetic 5"
-                    res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
+                    try:
+                        res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
+                    except LookupError:
+                        # an even lower request (e.g. a 3-minute entry timeframe): one-minute bars
+                        bars, tf, label = make_bars(n=6000, freq="1min", flat_run=False), "1", "synthetic 1"
+                        res = run(cls, bars, symbol=sym, timeframe=tf, data_provider=data.provider_for_scripts())
         except Exception as e:
             ok = False
             print(f"FAIL  {label}: {type(e).__name__}: {e}")

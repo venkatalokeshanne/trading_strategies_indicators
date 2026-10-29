@@ -702,7 +702,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                                                  at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
                                                  the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
       ("close", id[, pct]) | ("close_all",)     (ignored when nothing with that id is open at script time) market close of every lot with that entry id (``pct`` % of their open quantity, oldest lot first, when given) / of everything
-      ("cancel", id)                            drop a pending entry
+      ("cancel", id) | ("cancel_all",)          drop pending entries / exit orders with that id (queued market entries too) / every pending order, exit order and queued market order
     Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
     ties by creation order, so several exits at one price fill in the order they were issued; exits are live from the bar after they are issued (an exit issued with its entry is live from the fill bar).
     Returns one row per closed piece: (direction, entry_bar, entry_price, exit_bar, exit_price, quantity), in closing order."""
@@ -882,6 +882,12 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                                   "seq": seq[0], "filled": {}, "ext": {}}
             elif a[0] == "cancel":
                 pend = [p for p in pend if p["id"] != a[1]]
+                mq = [m for m in mq if not (m[0] == "entry" and m[1] == a[1])]
+                exits.pop(a[1], None)
+            elif a[0] == "cancel_all":
+                pend = []
+                mq = []
+                exits.clear()
             elif on_close:
                 fire(a, i, c[i])
             else:

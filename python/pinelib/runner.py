@@ -247,8 +247,10 @@ class Script:
 
     # ── time (Pine names; exchange timezone unless tz given)
     def _cal(self, t: Any, tz: str | None):
-        if t is None:
+        if t is None and tz is None:
             return self._ctx.cal_row(self._ctx.bar_index)
+        if t is None:
+            t = self.time
         ts = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(norm_tz(tz or self.syminfo.timezone))
         return ts
 

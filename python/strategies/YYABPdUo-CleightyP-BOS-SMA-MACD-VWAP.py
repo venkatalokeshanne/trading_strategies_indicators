@@ -2,7 +2,7 @@
 ── Converted from TradingView Pine Script ─────────────────────────────
 Original     : CleightyP BOS/SMA/MACD/VWAP
 Author       : CleightyP
-Source URL   : https://www.tradingview.com/script/YYABPdUo
+Source URL   : https://www.tradingview.com/script/YYABPdUo-CleightyP-BOS-SMA-MACD-VWAP
 Pine version : v5
 Licence      : not stated
 Type         : strategy

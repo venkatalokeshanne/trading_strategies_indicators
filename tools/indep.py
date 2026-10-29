@@ -698,7 +698,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
     written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat)}:
       ("entry", id, d, qty[, stop, limit])      market (stop and limit None), else a pending order kept until filled / replaced (same id) / cancelled; an opposite fill reverses, a same-direction fill beyond ``pyramiding`` is consumed
-      ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off[, profit_ticks, loss_ticks]])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100) of that lot's ORIGINAL quantity (never more than what is still open),
+      ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off[, profit_ticks, loss_ticks]])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100; or ("qty", q) for an absolute quantity) of that lot's ORIGINAL quantity (never more than what is still open),
                                                  at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
                                                  the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
       ("close", id) | ("close_all",)            market close of every lot with that entry id / of everything
@@ -762,7 +762,10 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
 
     def want(e, x):
         pct = 100.0 if e["pct"] is None else e["pct"]
-        w = x["init"] if pct >= 100.0 else x["init"] * pct / 100.0
+        if isinstance(pct, tuple):
+            w = pct[1]
+        else:
+            w = x["init"] if pct >= 100.0 else x["init"] * pct / 100.0
         return min(x["q"], max(0.0, w - e["filled"].get(x["seq"], 0.0)))
 
     def trail_update(e, x, p0, p1, opening):

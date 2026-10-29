@@ -60,7 +60,8 @@ class SymbolInfo:
         if q != q or q <= 0:
             return 0.0
         step = self.qty_step
-        return math.floor(q / step + 1e-9) * step
+        n = q / step
+        return math.floor(n + max(1e-9, abs(n) * 1e-12)) * step      # relative slack: 4.0 / 1e-9 must not floor to 3999999999
 
     @property
     def session_start_minutes(self) -> int:

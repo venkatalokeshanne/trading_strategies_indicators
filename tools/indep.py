@@ -690,3 +690,194 @@ def simulate_lots(o, h, l, c, orders, *, pyramiding: int, log: list | None = Non
             else:
                 queue.append(a)
     return trades
+
+
+def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool = False, tick: float = 0.01,
+                      log: list | None = None) -> list[tuple]:
+    """Quantity-aware reference broker for scripts that attach several exit orders (partial ``qty_percent`` exits, stop / limit / trailing legs) to their entries,
+    written from Pine's documented rules and sharing no code with pinelib.
+    ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat)}:
+      ("entry", id, d, qty[, stop, limit])      market (stop and limit None), else a pending order kept until filled / replaced (same id) / cancelled; an opposite fill reverses, a same-direction fill beyond ``pyramiding`` is consumed
+      ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100) of that lot's ORIGINAL quantity (never more than what is still open),
+                                                 at ``limit`` / ``stop`` (price levels) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
+                                                 the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
+      ("close", id) | ("close_all",)            market close of every lot with that entry id / of everything
+      ("cancel", id)                            drop a pending entry
+    Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
+    ties by creation order, so several exits at one price fill in the order they were issued; exits are live from the bar after they are issued (an exit issued with its entry is live from the fill bar).
+    Returns one row per closed piece: (direction, entry_bar, entry_price, exit_bar, exit_price, quantity), in closing order."""
+    n = len(c)
+    out: list[tuple] = log if log is not None else []
+    lots: list[dict] = []
+    exits: dict = {}
+    pend: list[dict] = []
+    mq: list = []
+    seq = [0]
+
+    def info():
+        q = sum(x["q"] * x["d"] for x in lots)
+        tot = sum(x["q"] for x in lots)
+        return {"pos": q, "avg": (sum(x["q"] * x["ep"] for x in lots) / tot) if tot else math.nan}
+
+    def close_lot(x, qty, i, px):
+        out.append((x["d"], x["eb"], x["ep"], i, px, qty))
+        x["q"] -= qty
+        if x["q"] <= 1e-12:
+            lots.remove(x)
+
+    def open_lot(eid, d, q, i, px):
+        if lots and lots[0]["d"] == -d:
+            for x in list(lots):
+                close_lot(x, x["q"], i, px)
+        elif lots and len(lots) >= max(1, pyramiding):
+            return
+        seq[0] += 1
+        lots.append({"id": eid, "d": d, "q": q, "init": q, "ep": px, "eb": i, "seq": seq[0]})
+
+    def fire(a, i, px):
+        if a[0] == "entry":
+            open_lot(a[1], a[2], a[3], i, px)
+        elif a[0] == "close":
+            for x in [x for x in lots if x["id"] == a[1]]:
+                close_lot(x, x["q"], i, px)
+        elif a[0] == "close_all":
+            for x in list(lots):
+                close_lot(x, x["q"], i, px)
+
+    def prune(extra=()):
+        """Exit orders whose entry has no open lot, pending order or (``extra``) just-queued entry are cancelled."""
+        alive = {x["id"] for x in lots} | {pd_["id"] for pd_ in pend} | set(extra)
+        for k in [k for k, e in exits.items() if (e["from"] and e["from"] not in alive) or (not e["from"] and not (lots or pend or extra))]:
+            del exits[k]
+
+    def hit(p0, p1, opening, lvl, rises):
+        if opening:
+            if (p0 >= lvl) if rises else (p0 <= lvl):
+                return (0.0, p0)
+            return None
+        lo, hi = min(p0, p1), max(p0, p1)
+        if lo <= lvl <= hi and ((p1 > p0) if rises else (p1 < p0)):
+            return (abs(lvl - p0), lvl)
+        return None
+
+    def want(e, x):
+        pct = 100.0 if e["pct"] is None else e["pct"]
+        w = x["init"] if pct >= 100.0 else x["init"] * pct / 100.0
+        return min(x["q"], max(0.0, w - e["filled"].get(x["seq"], 0.0)))
+
+    def trail_update(e, x, p0, p1, opening):
+        """Activation and best price of one trailing leg along the segment p0 -> p1; returns the current stop level or None."""
+        if e["tpts"] is None and e["tprice"] is None:
+            return None
+        d, key = x["d"], x["seq"]
+        act = e["tprice"] if e["tprice"] is not None else x["ep"] + d * e["tpts"] * tick
+        ext = e["ext"].get(key)
+        if opening:
+            best = p0
+            moving = True
+        else:
+            best = p1
+            moving = (p1 - p0) * d > 0
+        if ext is None:
+            if opening:
+                reached = (p0 - act) * d >= 0
+            else:
+                reached = moving and min(p0, p1) <= act <= max(p0, p1)
+            if not reached:
+                return None
+            ext = best if opening else p1
+        elif moving and (best - ext) * d > 0:
+            ext = best
+        e["ext"][key] = ext
+        return ext - d * e["toff"] * tick
+
+    for i in range(n):
+        for a in mq:
+            fire(a, i, o[i])
+        mq = []
+        prune()
+        pts = _path(o[i], h[i], l[i], c[i])
+        segs = [(pts[0], pts[0], True)] + [(pts[k - 1], pts[k], False) for k in range(1, 4) if pts[k] != pts[k - 1]]
+        for p0, p1, opening in segs:
+            while True:
+                cands = []
+                for od in pend:
+                    d = od["d"]
+                    lvl, kind = (od["stop"], "stop") if od["stop"] is not None else (od["limit"], "limit")
+                    r = hit(p0, p1, opening, lvl, (d > 0) == (kind == "stop"))
+                    if r:
+                        cands.append((r[0], od["seq"], "entry", od, r[1]))
+                for e in exits.values():
+                    for x in list(lots):
+                        if e["from"] not in ("", x["id"]) or want(e, x) <= 1e-12:
+                            continue
+                        d = x["d"]
+                        legs = []
+                        if e["stop"] is not None:
+                            legs.append((e["stop"], d < 0))
+                        if e["limit"] is not None:
+                            legs.append((e["limit"], d > 0))
+                        tl = trail_update(e, x, p0, p1, opening)
+                        if tl is not None:
+                            legs.append((tl, d < 0))
+                        for lvl, rises in legs:
+                            r = hit(p0, p1, opening, lvl, rises)
+                            if r:
+                                cands.append((r[0], e["seq"], "exit", (e, x), r[1]))
+                if not cands:
+                    break
+                _, _, kind, obj, px = min(cands, key=lambda z: (z[0], z[1]))
+                if kind == "entry":
+                    pend.remove(obj)
+                    open_lot(obj["id"], obj["d"], obj["q"], i, px)
+                else:
+                    e, x = obj
+                    q = want(e, x)
+                    e["filled"][x["seq"]] = e["filled"].get(x["seq"], 0.0) + q
+                    close_lot(x, q, i, px)
+                prune()
+                if not (opening and px == p0):
+                    opening = False
+                p0 = px
+        for a in orders(i, info()):
+            if a[0] == "entry":
+                stop = a[4] if len(a) > 4 else None
+                limit = a[5] if len(a) > 5 else None
+                if stop is None and limit is None:
+                    if on_close:
+                        fire(a, i, c[i])
+                    else:
+                        mq.append(a)
+                else:
+                    seq[0] += 1
+                    pend = [p for p in pend if p["id"] != a[1]]
+                    pend.append({"id": a[1], "d": a[2], "q": a[3], "stop": stop, "limit": limit, "seq": seq[0]})
+            elif a[0] == "exit":
+                _, xid, frm, pct, stop, limit = a[:6]
+                tpts, tprice, toff = (a[6:9] + (None, None, None))[:3] if len(a) > 6 else (None, None, None)
+                if xid in exits:
+                    e = exits[xid]
+                    e.update({"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff})
+                else:
+                    seq[0] += 1
+                    exits[xid] = {"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff,
+                                  "seq": seq[0], "filled": {}, "ext": {}}
+            elif a[0] == "cancel":
+                pend = [p for p in pend if p["id"] != a[1]]
+            elif on_close:
+                fire(a, i, c[i])
+            else:
+                mq.append(a)
+        prune({a[1] for a in mq if a[0] == "entry"} | ({"*"} if any(a[0] == "entry" for a in mq) else set()))
+    return out
+
+
+def compare_q(res, ref: list[tuple], tol: float = 1e-9) -> tuple[bool, str]:
+    """Like ``compare`` for 6-field reference rows (direction, entry_bar, entry_price, exit_bar, exit_price, quantity): the traded quantity is checked too."""
+    ours = [(t.direction, t.entry_bar, t.entry_price, t.exit_bar, t.exit_price, t.qty) for t in res.broker.closed]
+    if len(ours) != len(ref):
+        return False, f"trade count differs: pinelib {len(ours)} vs independent {len(ref)}; first diff {_first(ours, ref)}"
+    for a, b in zip(ours, ref):
+        if a[0] != b[0] or a[1] != b[1] or a[3] != b[3] or any(abs(a[k] - b[k]) > tol * max(1, abs(b[k])) for k in (2, 4, 5)):
+            return False, f"first differing trade: pinelib {a} vs independent {b}"
+    return True, f"{len(ours)} pieces identical"

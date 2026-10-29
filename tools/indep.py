@@ -696,7 +696,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                       log: list | None = None) -> list[tuple]:
     """Quantity-aware reference broker for scripts that attach several exit orders (partial ``qty_percent`` exits, stop / limit / trailing legs) to their entries,
     written from Pine's documented rules and sharing no code with pinelib.
-    ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat)}:
+    ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat), "n": number of open lots (strategy.opentrades), "lots": [{id, d, q, ep, eb}] oldest first}:
       ("entry", id, d, qty[, stop, limit])      market (stop and limit None), else a pending order kept until filled / replaced (same id) / cancelled; an opposite fill reverses, a same-direction fill beyond ``pyramiding`` is consumed
       ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off[, profit_ticks, loss_ticks]])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100; or ("qty", q) for an absolute quantity) of that lot's ORIGINAL quantity (never more than what is still open),
                                                  at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
@@ -717,7 +717,8 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
     def info():
         q = sum(x["q"] * x["d"] for x in lots)
         tot = sum(x["q"] for x in lots)
-        return {"pos": q, "avg": (sum(x["q"] * x["ep"] for x in lots) / tot) if tot else math.nan}
+        return {"pos": q, "avg": (sum(x["q"] * x["ep"] for x in lots) / tot) if tot else math.nan, "n": len(lots),
+                "lots": [{"id": x["id"], "d": x["d"], "q": x["q"], "ep": x["ep"], "eb": x["eb"]} for x in lots]}
 
     def close_lot(x, qty, i, px):
         out.append((x["d"], x["eb"], x["ep"], i, px, qty))

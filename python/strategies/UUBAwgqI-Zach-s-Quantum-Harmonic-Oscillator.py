@@ -16,7 +16,7 @@ Not carried over: the field colour (display only).
 ────────────────────────────────────────────────────────────────────────
 """
 
-from pinelib import Script, fixnan, pmath, ta
+from pinelib import Script, div, fixnan, pmath, ta
 
 
 class QuantumHarmonicOscillator(Script):
@@ -41,7 +41,7 @@ class QuantumHarmonicOscillator(Script):
         tf_close = fixnan(tf_close_raw)
         system_noise = ta.stdev(tf_close, self.length)
         sma = ta.sma(tf_close, self.length)
-        signed_displacement = (tf_close - sma) / (system_noise if system_noise > 0 else 1)
+        signed_displacement = div(tf_close - sma, system_noise if system_noise > 0 else 1)
         potential_energy = 0.5 * self.k_force * pmath.pow(signed_displacement, 2) * pmath.sign(signed_displacement)
         if potential_energy < -self.extreme and in_session:
             st.entry("U", st.long)

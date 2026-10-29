@@ -455,36 +455,44 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool 
     ``orders(i, pos)`` runs at bar i's close and returns actions in source order:
       ("entry", id, d, stop|None, limit|None)   market when both None, else a pending order kept until filled / replaced / cancelled
       ("exit", xid, from_id, stop|None, limit|None[, profit_pts|None, loss_pts|None])   attaches to the open trade with entry id ``from_id`` (or to its pending entry); replaces the exit with id xid
+      ("entry", id, d, stop, limit, qty)        optional quantity (default 1), used by partial closes
       ("close", id) | ("close_all",)            market, at the next open (ignored when nothing is open at script time)
+      ("close_part", id, qty)                   partial market close of qty units (one more closed-trade row; the exits keep working on the rest)
       ("cancel", id) | ("cancel_all",)
     Bar j: market orders fill at the open, then the pending orders are walked along the O->H->L->C (or O->L->H->C) path: whichever level is reached
     first fills (a level already passed at the open fills at the open), an entry's own exits are live straight after its fill, and an exit
     removes the exits of its trade. An opposite pending entry reverses; a same-direction one is ignored. ``on_close``: process_orders_on_close for the market orders. Returns (direction, entry_bar, entry_price, exit_bar, exit_price)."""
     n = len(c)
     trades: list[tuple] = log if log is not None else []
-    cur = {"d": 0, "id": None, "ep": math.nan, "eb": -1}
+    cur = {"d": 0, "id": None, "ep": math.nan, "eb": -1, "q": 1.0}
     pend: list[dict] = []
     exits: dict = {}
     mq: list = []
     seq = [0]
 
-    def close_pos(i, px):
+    def close_pos(i, px, part=None):
+        """Close the whole position, or ``part`` units of it (one more closed-trade row, the rest stays open)."""
         trades.append((cur["d"], cur["eb"], cur["ep"], i, px))
+        if part is not None and part < cur["q"] - 1e-12:
+            cur["q"] -= part
+            return
         for k in [k for k, e in exits.items() if e["from"] == cur["id"]]:
             del exits[k]
-        cur.update(d=0, id=None, ep=math.nan, eb=-1)
+        cur.update(d=0, id=None, ep=math.nan, eb=-1, q=1.0)
 
-    def open_pos(i, d, eid, px):
+    def open_pos(i, d, eid, px, q=1.0):
         if cur["d"] == d:
             return
         if cur["d"] == -d:
             close_pos(i, px)
-        cur.update(d=d, id=eid, ep=px, eb=i)
+        cur.update(d=d, id=eid, ep=px, eb=i, q=q)
 
     def fire_market(i, px):
         for od in mq:
             if od[0] == "entry":
-                open_pos(i, od[2], od[1], px)
+                open_pos(i, od[2], od[1], px, od[3])
+            elif od[0] == "close_part" and cur["d"] != 0 and cur["id"] == od[1]:
+                close_pos(i, px, od[2])
             elif od[0] == "close" and cur["d"] != 0 and cur["id"] == od[1]:
                 close_pos(i, px)
             elif od[0] == "close_all" and cur["d"] != 0:
@@ -541,7 +549,7 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool 
                     close_pos(i, px)
                 else:
                     pend.remove(od)
-                    open_pos(i, od["d"], od["id"], px)
+                    open_pos(i, od["d"], od["id"], px, od["q"])
                 if not (opening and px == p0):      # a fill inside the segment: carry on from the fill price (a gap fill at the open stays "opening")
                     opening = False
                 p0 = px
@@ -549,13 +557,14 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool 
         for a in emitted:
             seq[0] += 1
             if a[0] == "entry":
-                _, eid, d, stop, limit = a
+                eid, d, stop, limit = a[1:5]
+                q = a[5] if len(a) > 5 else 1.0          # optional quantity (only matters for partial closes)
                 pend[:] = [p for p in pend if p["id"] != eid]
                 mq[:] = [m for m in mq if not (m[0] == "entry" and m[1] == eid)]
                 if stop is None and limit is None:
-                    mq.append(("entry", eid, d))
+                    mq.append(("entry", eid, d, q))
                 else:
-                    pend.append(dict(id=eid, d=d, stop=stop, limit=limit, seq=seq[0]))
+                    pend.append(dict(id=eid, d=d, stop=stop, limit=limit, q=q, seq=seq[0]))
             elif a[0] == "exit":
                 xid, frm, stop, limit = a[1:5]
                 profit, loss = (a[5], a[6]) if len(a) > 5 else (None, None)      # optional "profit" / "loss" in price points from the entry price
@@ -566,6 +575,9 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool 
             elif a[0] == "close":
                 if cur["d"] != 0:
                     mq.append(("close", a[1]))
+            elif a[0] == "close_part":      # ("close_part", id, quantity): a partial market close
+                if cur["d"] != 0:
+                    mq.append(("close_part", a[1], a[2]))
             elif a[0] == "close_all":
                 if cur["d"] != 0:
                     mq.append(("close_all",))

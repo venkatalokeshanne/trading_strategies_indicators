@@ -454,7 +454,7 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
     (pyramiding 0/1), written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, pos)`` runs at bar i's close and returns actions in source order:
       ("entry", id, d, stop|None, limit|None)   market when both None, else a pending order kept until filled / replaced / cancelled
-      ("exit", xid, from_id, stop|None, limit|None)   attaches to the open trade with entry id ``from_id`` (or to its pending entry); replaces the exit with id xid
+      ("exit", xid, from_id, stop|None, limit|None[, profit_pts|None, loss_pts|None])   attaches to the open trade with entry id ``from_id`` (or to its pending entry); replaces the exit with id xid
       ("close", id) | ("close_all",)            market, at the next open (ignored when nothing is open at script time)
       ("cancel", id) | ("cancel_all",)
     Bar j: market orders fill at the open, then the pending orders are walked along the O->H->L->C (or O->L->H->C) path: whichever level is reached
@@ -522,7 +522,12 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
                     for xid, e in exits.items():
                         if e["from"] != cur["id"]:
                             continue
-                        for lvl, kind in ((e["stop"], "stop"), (e["limit"], "limit")):
+                        xs, xl = e["stop"], e["limit"]
+                        if xs is None and e.get("loss") is not None:        # relative levels: points from the trade's entry price
+                            xs = cur["ep"] - cur["d"] * e["loss"]
+                        if xl is None and e.get("profit") is not None:
+                            xl = cur["ep"] + cur["d"] * e["profit"]
+                        for lvl, kind in ((xs, "stop"), (xl, "limit")):
                             if lvl is None or lvl != lvl:
                                 continue
                             rises = (cur["d"] < 0) == (kind == "stop")      # long stop / short limit trigger on falling price
@@ -540,7 +545,7 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
                 if not (opening and px == p0):      # a fill inside the segment: carry on from the fill price (a gap fill at the open stays "opening")
                     opening = False
                 p0 = px
-        emitted = orders(i, cur["d"])
+        emitted = orders(i, cur["d"], dict(cur)) if orders.__code__.co_argcount >= 3 else orders(i, cur["d"])      # optional 3rd arg: the open trade {d, id, ep, eb}
         for a in emitted:
             seq[0] += 1
             if a[0] == "entry":
@@ -552,11 +557,12 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
                 else:
                     pend.append(dict(id=eid, d=d, stop=stop, limit=limit, seq=seq[0]))
             elif a[0] == "exit":
-                _, xid, frm, stop, limit = a
-                if stop is None and limit is None:
+                xid, frm, stop, limit = a[1:5]
+                profit, loss = (a[5], a[6]) if len(a) > 5 else (None, None)      # optional "profit" / "loss" in price points from the entry price
+                if stop is None and limit is None and profit is None and loss is None:
                     exits.pop(xid, None)
                 else:
-                    exits[xid] = {"from": frm, "stop": stop, "limit": limit, "seq": seq[0]}
+                    exits[xid] = {"from": frm, "stop": stop, "limit": limit, "profit": profit, "loss": loss, "seq": seq[0]}
             elif a[0] == "close":
                 if cur["d"] != 0:
                     mq.append(("close", a[1]))

@@ -250,7 +250,9 @@ class Broker:
                                 seq=self._next_seq()))
 
     def cancel(self, id: str) -> None:
-        self.pending = [o for o in self.pending if o.id != id]
+        # strategy.cancel() removes entry / order / exit orders by id; the market orders made by close() / close_all()
+        # are listed by TradingView as "Close entry(ies) order <id>", so they are not matched by the entry id.
+        self.pending = [o for o in self.pending if o.id != id or o.kind in ("close", "close_all")]
         self.exits = [o for o in self.exits if o.id != id]
 
     def cancel_all(self) -> None:

@@ -22,7 +22,7 @@ def check():
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     v = df["volume"].to_numpy()
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-    day = (ny - pd.Timedelta(minutes=9 * 60 + 30)).dt.date.to_numpy()
+    day = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=9 * 60 + 30)).dt.date.to_numpy()
     pv, vv, vw = 0.0, 0.0, np.empty(len(c))
     for i in range(len(c)):
         if i == 0 or day[i] != day[i - 1]:

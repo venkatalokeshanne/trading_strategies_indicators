@@ -16,7 +16,7 @@ def check():
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-    day = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    day = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     slot = (((ny.dt.hour * 60 + ny.dt.minute - 570) % 1440) // 60).to_numpy()
     key = np.array([f"{d}-{s}" for d, s in zip(day, slot)])
     starts = np.r_[True, key[1:] != key[:-1]]

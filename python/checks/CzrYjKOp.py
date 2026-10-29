@@ -17,7 +17,7 @@ def check():
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
     hr, mi = ny.dt.hour.to_numpy(), ny.dt.minute.to_numpy()
-    key = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    key = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     st = dict(hi=np.nan, lo=np.nan, found=False, count=0, stop=np.nan, tgt=np.nan)
     after = []                                            # (stop, target) at the end of each bar
 

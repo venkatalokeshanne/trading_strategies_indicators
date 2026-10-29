@@ -16,7 +16,7 @@ def check():
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-    iso = (ny - pd.Timedelta(minutes=570)).dt.isocalendar()
+    iso = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.isocalendar()
     wk = (iso["year"].astype(int) * 100 + iso["week"].astype(int)).to_numpy()
     last_of = np.r_[wk[1:] != wk[:-1], True]
     pid = np.cumsum(np.r_[True, wk[1:] != wk[:-1]]) - 1

@@ -17,7 +17,7 @@ def check():
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
     m = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
-    key = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    key = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     in_or = (m >= 570) & (m <= 585)
     after_or = m > 585                                   # time > or_end_time (today's 09:45), bars are on one calendar day
     vw, atr, e9 = np_vwap(df, c), np_atr(h, l, c, 14), np_ema(c, 9)

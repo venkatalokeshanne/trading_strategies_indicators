@@ -20,7 +20,7 @@ def check():
     m = (ny.dt.hour * 60 + ny.dt.minute).to_numpy()
     sess = (m >= 570) & (m < 720)
     in_range = (ny >= ny0).to_numpy() & (ny <= pd.Timestamp("2026-05-01 23:59", tz="America/New_York")).to_numpy()
-    key = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    key = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     e = np_ema(c, 21)
     root = np_sma(e, 21)
     pe, pl, ph = np.r_[np.nan, e[:-1]], np.r_[np.nan, l[:-1]], np.r_[np.nan, h[:-1]]

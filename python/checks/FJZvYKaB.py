@@ -21,7 +21,7 @@ def one(seed):
     ny = ut.dt.tz_convert("America/New_York")
     hh, mm = ut.dt.hour.to_numpy(), ut.dt.minute.to_numpy()
     wkd = (ny.dt.dayofweek < 5).to_numpy()
-    key = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    key = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     atr = np_atr(h, l, c, 14)
     vol_avg, atr_avg = np_sma(v, 20), np_sma(atr, 20)
     st = dict(oh=np.nan, ol=np.nan, ready=False, fired=False, sl=np.nan, tp=np.nan)

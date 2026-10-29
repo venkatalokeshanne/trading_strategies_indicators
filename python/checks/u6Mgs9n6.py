@@ -15,7 +15,7 @@ def check():
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-    key = (ny - pd.Timedelta(minutes=570)).dt.date.to_numpy()
+    key = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.date.to_numpy()
     dh = np.full(n, np.nan)                                # nan until the first day change (bar 0 has na change)
     for i in range(1, n):
         dh[i] = h[i] if key[i] != key[i - 1] else max(dh[i - 1], h[i]) if not np.isnan(dh[i - 1]) else np.nan

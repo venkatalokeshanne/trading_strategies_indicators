@@ -18,7 +18,7 @@ def check():
     o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
     n = len(c)
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("America/New_York")
-    sh = ny - pd.Timedelta(minutes=570)
+    sh = ny.dt.tz_localize(None) - pd.Timedelta(minutes=570)
     iso = sh.dt.isocalendar()
     wk = (iso["year"].astype(int) * 100 + iso["week"].astype(int)).to_numpy()
     new_wk = np.r_[True, wk[1:] != wk[:-1]]

@@ -32,7 +32,7 @@ def check():
     ist = t.dt.tz_convert("Asia/Kolkata")
     hr, mi = ist.dt.hour.to_numpy(), ist.dt.minute.to_numpy()
     dow = ((ist.dt.dayofweek.to_numpy() + 1) % 7) + 1                    # Pine numbering, Sunday = 1
-    iso = (t.dt.tz_convert("America/New_York") - pd.Timedelta(minutes=570)).dt.isocalendar()
+    iso = (t.dt.tz_convert("America/New_York").dt.tz_localize(None) - pd.Timedelta(minutes=570)).dt.isocalendar()
     wk = (iso["year"].astype(int) * 100 + iso["week"].astype(int)).to_numpy()
     t920 = (hr == 9) & (mi == 15)
     texit = (dow != 4) & (hr == 15) & (mi >= 15)

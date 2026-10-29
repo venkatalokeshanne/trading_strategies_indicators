@@ -171,7 +171,7 @@ class QuantTrendEngineLongOnly(Script):
 
         hard_stop_price = st.position_avg_price * (1 - self.hard_stop_perc / 100) if st.position_size > 0 else NA
         if st.position_size > 0:
-            self.high_since_entry = self.high if na(self.high_since_entry) else pmath.max(self.high_since_entry, self.high)
+            self.high_since_entry = float(self.high) if na(self.high_since_entry) else pmath.max(self.high_since_entry, self.high)
         else:
             self.high_since_entry = NA
         raw_trail = close - atr * self.trail_atr_mult if st.position_size > 0 else NA

@@ -82,6 +82,17 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
         errors.append(f"SOURCE['id'] must be {tv_id!r} (the file-name id)")
 
     # body checks --------------------------------------------------------------
+    SERIES_ATTRS = ("open", "high", "low", "close", "volume", "time", "hl2", "hlc3", "ohlc4", "hlcc4")
+    series_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            tg, v = node.targets[0], node.value
+            if isinstance(tg, ast.Name) and isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == "self" and v.attr in SERIES_ATTRS:
+                series_names.add(tg.id)
+            if isinstance(tg, ast.Tuple) and isinstance(v, ast.Tuple) and len(tg.elts) == len(v.elts):
+                for a, b in zip(tg.elts, v.elts):
+                    if isinstance(a, ast.Name) and isinstance(b, ast.Attribute) and isinstance(b.value, ast.Name) and b.value.id == "self" and b.attr in SERIES_ATTRS:
+                        series_names.add(a.id)
     for node in ast.walk(tree):
         ln = getattr(node, "lineno", "?")
         # P1: Python '/' raises on zero; Pine gives na
@@ -117,6 +128,20 @@ def lint(path: Path) -> tuple[list[str], list[str]]:
                 and any(isinstance(t, ast.Attribute) for t in node.targets):
             errors.append(f"line {ln}: self.<var> = self.{node.value.attr} stores the live series, not its value — "
                           f"use float(self.{node.value.attr}) for a Pine `var` assigned from a series [P13]")
+        # P13b: same through a local alias (close = self.close) or a conditional expression
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Attribute) for t in node.targets):
+            def _live(v):
+                if isinstance(v, ast.Name) and v.id in series_names:
+                    return v.id
+                if isinstance(v, ast.Attribute) and isinstance(v.value, ast.Name) and v.value.id == "self" and v.attr in SERIES_ATTRS:
+                    return "self." + v.attr
+                if isinstance(v, ast.IfExp):
+                    return _live(v.body) or _live(v.orelse)
+                return None
+            lv = _live(node.value)
+            if lv and not isinstance(node.value, ast.Attribute):
+                errors.append(f"line {ln}: self.<var> assigned from {lv} (possibly in a conditional expression) stores the live series, "
+                              f"not its value — wrap it in float() [P13]")
         # P6: Python truthiness of nan is True; Pine treats na conditions as false
         if isinstance(node, (ast.If, ast.While)) and isinstance(node.test, ast.Name):
             pass

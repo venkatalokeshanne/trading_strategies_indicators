@@ -656,7 +656,7 @@ def bbw(series: Any, length: Any, mult: float) -> float:
 def kc(series: Any, length: Any, mult: float, use_true_range: bool = True) -> tuple[float, float, float]:
     c = ctx()
     basis = ema(series, length)
-    rng = tr(True) if use_true_range else c.high_arr[c.bar_index] - c.low_arr[c.bar_index]
+    rng = tr() if use_true_range else c.high_arr[c.bar_index] - c.low_arr[c.bar_index]
     r = ema(rng, length)
     return basis, basis + r * mult, basis - r * mult
 

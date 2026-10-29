@@ -174,7 +174,7 @@ def hma(source: Any, length: Any) -> float:
     n = _n(length)
     half = wma(source, n // 2)
     full = wma(source, n)
-    return wma(2 * half - full, int(math.floor(math.sqrt(n))))
+    return wma(2 * half - full, int(math.floor(math.sqrt(n) + 0.5)))      # Hull's definition: round(sqrt(length)), ties up
 
 
 def alma(series: Any, length: Any, offset: float, sigma: float, floor: bool = False) -> float:

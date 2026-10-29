@@ -12,7 +12,7 @@ TV_ID = "ARp2fNeO"
 
 
 def hma(x, n):
-    return np_wma(2 * np_wma(x, n // 2) - np_wma(x, n), int(np.floor(np.sqrt(n))))
+    return np_wma(2 * np_wma(x, n // 2) - np_wma(x, n), int(np.floor(np.sqrt(n) + 0.5)))
 
 
 def one(df, cap):

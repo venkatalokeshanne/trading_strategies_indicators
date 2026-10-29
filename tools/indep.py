@@ -698,8 +698,8 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
     written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat)}:
       ("entry", id, d, qty[, stop, limit])      market (stop and limit None), else a pending order kept until filled / replaced (same id) / cancelled; an opposite fill reverses, a same-direction fill beyond ``pyramiding`` is consumed
-      ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100) of that lot's ORIGINAL quantity (never more than what is still open),
-                                                 at ``limit`` / ``stop`` (price levels) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
+      ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off[, profit_ticks, loss_ticks]])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100) of that lot's ORIGINAL quantity (never more than what is still open),
+                                                 at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
                                                  the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
       ("close", id) | ("close_all",)            market close of every lot with that entry id / of everything
       ("cancel", id)                            drop a pending entry
@@ -813,10 +813,12 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                             continue
                         d = x["d"]
                         legs = []
-                        if e["stop"] is not None:
-                            legs.append((e["stop"], d < 0))
-                        if e["limit"] is not None:
-                            legs.append((e["limit"], d > 0))
+                        sl = e["stop"] if e["stop"] is not None else (x["ep"] - d * e["loss"] * tick if e["loss"] is not None else None)
+                        tp = e["limit"] if e["limit"] is not None else (x["ep"] + d * e["profit"] * tick if e["profit"] is not None else None)
+                        if sl is not None:
+                            legs.append((sl, d < 0))
+                        if tp is not None:
+                            legs.append((tp, d > 0))
                         tl = trail_update(e, x, p0, p1, opening)
                         if tl is not None:
                             legs.append((tl, d < 0))
@@ -854,13 +856,13 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                     pend.append({"id": a[1], "d": a[2], "q": a[3], "stop": stop, "limit": limit, "seq": seq[0]})
             elif a[0] == "exit":
                 _, xid, frm, pct, stop, limit = a[:6]
-                tpts, tprice, toff = (a[6:9] + (None, None, None))[:3] if len(a) > 6 else (None, None, None)
+                tpts, tprice, toff, prof, loss = (tuple(a[6:11]) + (None,) * 5)[:5]
                 if xid in exits:
                     e = exits[xid]
-                    e.update({"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff})
+                    e.update({"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff, "profit": prof, "loss": loss})
                 else:
                     seq[0] += 1
-                    exits[xid] = {"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff,
+                    exits[xid] = {"from": frm, "pct": pct, "stop": stop, "limit": limit, "tpts": tpts, "tprice": tprice, "toff": toff, "profit": prof, "loss": loss,
                                   "seq": seq[0], "filled": {}, "ext": {}}
             elif a[0] == "cancel":
                 pend = [p for p in pend if p["id"] != a[1]]

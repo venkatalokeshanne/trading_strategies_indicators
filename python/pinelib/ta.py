@@ -713,7 +713,7 @@ def sar(start: float, inc: float, maximum: float) -> float:
             result = H[0]
         is_first_trend_bar = True
         acc = start
-    elif i > 1:
+    if i >= 1:
         result = result + acc * (max_min - result)
         if is_below:
             if result > L[i]:

@@ -516,7 +516,7 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
                     lvl, kind = (od["stop"], "stop") if od["stop"] is not None else (od["limit"], "limit")
                     rises = (d > 0) == (kind == "stop")
                     r = hit(p0, p1, opening, lvl, rises)
-                    if r and cur["d"] != d:
+                    if r:       # a same-direction entry that triggers is consumed without opening anything (pyramiding limit)
                         cands.append((r[0], od["seq"], "entry", od, r[1]))
                 if cur["d"] != 0:
                     for xid, e in exits.items():

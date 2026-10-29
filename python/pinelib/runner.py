@@ -237,6 +237,11 @@ class Script:
     def last_bar_index(self) -> int:
         return self._ctx.n_bars - 1
 
+    @property
+    def last_bar_time(self) -> int:
+        """``last_bar_time``: open time (ms) of the last bar of the loaded history."""
+        return int(self._ctx.time_arr[self._ctx.n_bars - 1])
+
     def H(self, name: str) -> Hist:
         """Script-level variable with history: ``self.H('x').set(v)``; ``self.H('x')[1]``."""
         h = self._ctx.named.get(name)

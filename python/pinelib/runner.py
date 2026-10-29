@@ -573,7 +573,7 @@ def _from_bars(cls, bars: pd.DataFrame, sym: SymbolInfo, timeframe: str) -> Cont
     local = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(sym.timezone)
     c.local = local
     start = sym.session_start_minutes
-    shifted = local - pd.Timedelta(minutes=start)
+    shifted = local.dt.tz_localize(None) - pd.Timedelta(minutes=start)      # wall-clock shift: an absolute shift lands on the wrong date on DST days
     c.trading_day = (shifted.dt.year * 1000 + shifted.dt.dayofyear).tolist()
     c.data_provider = None
     c.security_cache = {}
@@ -606,12 +606,12 @@ def _period_keys(self: Context, tf: str) -> list:
         per = secs // 60
         keys = [(td[i], mins[i] // per) for i in range(self.n_bars)]
     elif t.endswith("W"):
-        shifted = self.local - pd.Timedelta(minutes=self.sym.session_start_minutes)
+        shifted = self.local.dt.tz_localize(None) - pd.Timedelta(minutes=self.sym.session_start_minutes)
         iso = shifted.dt.isocalendar()
         mult = tf_seconds(tf) // (7 * 86400)
         keys = [(int(y), int(w) // mult) for y, w in zip(iso["year"], iso["week"])]
     elif t.endswith("M"):
-        shifted = self.local - pd.Timedelta(minutes=self.sym.session_start_minutes)
+        shifted = self.local.dt.tz_localize(None) - pd.Timedelta(minutes=self.sym.session_start_minutes)
         mult = max(1, tf_seconds(tf) // (30 * 86400))
         keys = [(int(y), (int(m) - 1) // mult) for y, m in zip(shifted.dt.year, shifted.dt.month)]
     else:

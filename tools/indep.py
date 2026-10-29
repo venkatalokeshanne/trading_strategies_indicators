@@ -320,7 +320,7 @@ def np_vwap(df, src, start_minutes: int = 9 * 60 + 30, tz: str = "America/New_Yo
     (default 09:30 New York, the stock session pinelib assumes)."""
     import pandas as pd
     local = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(tz)
-    day = (local - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
+    day = (local.dt.tz_localize(None) - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
     v = df["volume"].to_numpy()
     out, pv, vv = _np.empty(len(v)), 0.0, 0.0
     for i in range(len(v)):
@@ -365,7 +365,7 @@ def np_periods(df, minutes: int, start_minutes: int = 9 * 60 + 30, tz: str = "Am
     period's value on the earlier bars."""
     import pandas as pd
     ny = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(tz)
-    day = (ny - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
+    day = (ny.dt.tz_localize(None) - pd.Timedelta(minutes=start_minutes)).dt.date.to_numpy()
     slot = (((ny.dt.hour * 60 + ny.dt.minute - start_minutes) % 1440) // minutes).to_numpy()
     key = _np.array([f"{d}-{s}" for d, s in zip(day, slot)])
     pid = _np.cumsum(_np.r_[True, key[1:] != key[:-1]]) - 1

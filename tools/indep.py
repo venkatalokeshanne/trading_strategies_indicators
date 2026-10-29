@@ -701,7 +701,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
       ("exit", xid, from_id, pct, stop, limit[, trail_pts, trail_price, trail_off[, profit_ticks, loss_ticks]])   exit order for every open lot entered with ``from_id`` ("" = all lots): it closes ``pct`` % (None = 100; or ("qty", q) for an absolute quantity) of that lot's ORIGINAL quantity (never more than what is still open),
                                                  at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
                                                  the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
-      ("close", id) | ("close_all",)            market close of every lot with that entry id / of everything
+      ("close", id[, pct]) | ("close_all",)     (ignored when nothing with that id is open at script time) market close of every lot with that entry id (``pct`` % of their open quantity, oldest lot first, when given) / of everything
       ("cancel", id)                            drop a pending entry
     Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
     ties by creation order, so several exits at one price fill in the order they were issued; exits are live from the bar after they are issued (an exit issued with its entry is live from the fill bar).
@@ -738,8 +738,18 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
         if a[0] == "entry":
             open_lot(a[1], a[2], a[3], i, px)
         elif a[0] == "close":
-            for x in [x for x in lots if x["id"] == a[1]]:
-                close_lot(x, x["q"], i, px)
+            mine = [x for x in lots if x["id"] == a[1]]
+            pct = a[2] if len(a) > 2 else None
+            if pct is None or pct >= 100.0:
+                for x in mine:
+                    close_lot(x, x["q"], i, px)
+            else:
+                left = sum(x["q"] for x in mine) * pct / 100.0
+                for x in mine:
+                    take = min(x["q"], left)
+                    if take > 1e-12:
+                        close_lot(x, take, i, px)
+                        left -= take
         elif a[0] == "close_all":
             for x in list(lots):
                 close_lot(x, x["q"], i, px)
@@ -844,7 +854,10 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                 if not (opening and px == p0):
                     opening = False
                 p0 = px
+        open_ids = {x["id"] for x in lots}          # what the script sees: a close of an id that is not open at script time is ignored
         for a in orders(i, info()):
+            if (a[0] == "close" and a[1] not in open_ids) or (a[0] == "close_all" and not open_ids):
+                continue
             if a[0] == "entry":
                 stop = a[4] if len(a) > 4 else None
                 limit = a[5] if len(a) > 5 else None

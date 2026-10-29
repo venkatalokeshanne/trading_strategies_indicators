@@ -590,3 +590,63 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool 
         if on_close:        # process_orders_on_close: market orders fill at this bar's close (pending stop / limit orders still wait for the path)
             fire_market(i, c[i])
     return trades
+
+
+def simulate_dca(o, h, l, c, *, d: int, sig, win, base_size: float, limit_base: bool, ao_count: int, dev, size, exit_rule, ao_cond=None, log: list | None = None) -> list[tuple]:
+    """Reference broker for the lot-based DCA-bot template (orders processed at the bar close, one lot per order, ``d`` = +1 long / -1 short).
+    Written from Pine's documented rules and sharing no code with pinelib. Per bar: a pending LIMIT base order (limit = the signal close) fills at the open when the open is
+    beyond the limit, else when the bar's range reaches it (a market base order is a lot at the signal close); then the script: the base price is the first lot's fill price,
+    ``sig[i]`` (with ``win[i]``) while flat places (or replaces) the base order of ``base_size`` / close units, the next averaging order (``dev(k)`` percent beyond the base price against the
+    position, size ``size(k)`` quote units / close, extra condition ``ao_cond(i)``) is added at the close, and ``exit_rule(i, avg, S)`` (avg = lot-weighted average price before this bar's
+    averaging order; ``S`` a dict cleared whenever flat) closes every lot, including one added on the same bar, at the close. Trades are the individual lots, oldest first:
+    (direction, entry_bar, entry_price, exit_bar, exit_price)."""
+    n = len(c)
+    trades: list[tuple] = log if log is not None else []
+    lots: list[tuple] = []
+    pend = None
+    base, aof, prev_pos = math.nan, 0, 0.0
+    S: dict = {}
+    for i in range(n):
+        if pend is not None:
+            lim, q = pend
+            px = None
+            if d > 0:
+                px = o[i] if o[i] <= lim else (lim if l[i] <= lim else None)
+            else:
+                px = o[i] if o[i] >= lim else (lim if h[i] >= lim else None)
+            if px is not None:
+                lots.append((q, px, i))
+                pend = None
+        pos = sum(q for q, _, _ in lots)
+        inpos = pos != 0
+        if prev_pos == 0 and inpos and math.isnan(base):
+            base = sum(q * p for q, p, _ in lots) / pos
+            aof = 0
+        if (prev_pos != 0 and not inpos) or not inpos:
+            base, aof = math.nan, 0
+            S.clear()
+        market: list[float] = []
+        if win[i] and not inpos and sig[i]:
+            q = base_size / c[i]
+            if limit_base:
+                pend = (c[i], q)
+            else:
+                market.append(q)
+        if inpos and win[i] and aof < ao_count and not math.isnan(base):
+            k = aof + 1
+            trig = base * (1.0 - d * dev(k) / 100.0)
+            if d * (c[i] - trig) <= 0 and (ao_cond is None or ao_cond(i)):
+                market.append(size(k) / c[i])
+                aof = k
+        close_all = False
+        if inpos:
+            avg = sum(q * p for q, p, _ in lots) / pos
+            close_all = bool(exit_rule(i, avg, S))
+        for q in market:
+            lots.append((q, c[i], i))
+        if close_all:
+            for q, p, b in lots:
+                trades.append((d, b, p, i, c[i]))
+            lots = []
+        prev_pos = pos
+    return trades

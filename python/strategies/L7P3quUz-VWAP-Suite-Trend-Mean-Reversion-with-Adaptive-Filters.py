@@ -88,8 +88,8 @@ class VwapTrendMeanReversion(Script):
         self.cum_pv += tp_ * self.volume
         self.cum_vol += self.volume
         self.cum_pv2 += self.volume * pmath.pow(tp_, 2)
-        vwap = self.cum_pv / self.cum_vol if self.cum_vol != 0 else tp_
-        variance = (self.cum_pv2 / self.cum_vol) - pmath.pow(vwap, 2) if self.cum_vol != 0 else 0.0
+        vwap = div(self.cum_pv, self.cum_vol) if self.cum_vol != 0 else tp_
+        variance = div(self.cum_pv2, self.cum_vol) - pmath.pow(vwap, 2) if self.cum_vol != 0 else 0.0
         sd = pmath.sqrt(pmath.max(variance, 0.0))
         up1, lo1 = vwap + sd * self.b1, vwap - sd * self.b1
         up2, lo2 = vwap + sd * self.b2, vwap - sd * self.b2
@@ -157,9 +157,9 @@ class VwapTrendMeanReversion(Script):
             short_dist = atr * self.stop_atr if atr_stop else abs(up3 - close)
         risk_amt = st.equity * (self.risk_pct / 100)
         max_val = st.equity * (self.max_pos_pct / 100)
-        raw_l = risk_amt / long_dist if long_dist > 0 else 0
-        raw_s = risk_amt / short_dist if short_dist > 0 else 0
-        max_qty = max_val / close if close > 0 else 0
+        raw_l = div(risk_amt, long_dist) if long_dist > 0 else 0
+        raw_s = div(risk_amt, short_dist) if short_dist > 0 else 0
+        max_qty = div(max_val, close) if close > 0 else 0
         qty_l = pmath.min(raw_l, max_qty)
         qty_s = pmath.min(raw_s, max_qty)
         if self.tp_method == "VWAP Target":

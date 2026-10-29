@@ -650,3 +650,43 @@ def simulate_dca(o, h, l, c, *, d: int, sig, win, base_size: float, limit_base: 
             lots = []
         prev_pos = pos
     return trades
+
+
+def simulate_lots(o, h, l, c, orders, *, pyramiding: int, log: list | None = None) -> list[tuple]:
+    """Long-only multi-lot reference broker with market and pending buy-limit entries (one unit per fill), written from Pine's documented rules and sharing no code with pinelib.
+    ``orders(i, nlots)`` runs after bar i closes and returns, in source order: ("buy",) market entry, ("buy_limit", id, price) pending limit entry (an order with the same id is replaced; it stays
+    until filled, replaced or the end), ("close_all",) market close of every lot (pending orders are NOT cancelled). Bar j: the market queue fills at the open in creation order (an entry beyond the pyramiding limit is ignored),
+    then pending limits fill: those already reached at the open fill at the open, the others at their price when the bar's low reaches it, higher limits first; a fill beyond the pyramiding limit is consumed without opening a lot.
+    Trades: (1, entry_bar, entry_price, exit_bar, exit_price), the lots of one close_all oldest first."""
+    n = len(c)
+    trades: list[tuple] = log if log is not None else []
+    lots: list[tuple] = []
+    queue: list = []
+    pend: dict = {}
+    seq = 0
+    order_seq: dict = {}
+    for j in range(n):
+        for a in queue:
+            if a[0] == "buy":
+                if len(lots) < pyramiding:
+                    lots.append((o[j], j))
+            elif a[0] == "close_all":
+                for px, b in lots:
+                    trades.append((1, b, px, j, o[j]))
+                lots = []
+        queue = []
+        gap = sorted([k for k, lim in pend.items() if o[j] <= lim], key=lambda k: order_seq[k])
+        rest = sorted([k for k, lim in pend.items() if o[j] > lim and l[j] <= lim], key=lambda k: -pend[k])
+        for k in gap + rest:
+            px = o[j] if o[j] <= pend[k] else pend[k]
+            del pend[k]
+            if len(lots) < pyramiding:
+                lots.append((px, j))
+        for a in orders(j, len(lots)):
+            if a[0] == "buy_limit":
+                seq += 1
+                pend[a[1]] = a[2]
+                order_seq[a[1]] = seq
+            else:
+                queue.append(a)
+    return trades

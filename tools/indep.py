@@ -693,7 +693,7 @@ def simulate_lots(o, h, l, c, orders, *, pyramiding: int, log: list | None = Non
 
 
 def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool = False, tick: float = 0.01,
-                      qty_step: float | None = None, log: list | None = None) -> list[tuple]:
+                      qty_step: float | None = None, log: list | None = None, open_log: list | None = None) -> list[tuple]:
     """Quantity-aware reference broker for scripts that attach several exit orders (partial ``qty_percent`` exits, stop / limit / trailing legs) to their entries,
     written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, info)`` runs at bar i's close and returns actions in source order; ``info`` = {"pos": signed open quantity, "avg": quantity-weighted average entry price (nan when flat), "n": number of open lots (strategy.opentrades), "lots": [{id, d, q, ep, eb}] oldest first}:
@@ -707,6 +707,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
     Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
     ties by creation order, so several exits at one price fill in the order they were issued; exits are live from the bar after they are issued (an exit issued with its entry is live from the fill bar).
     ``qty_step``: the symbol's minimum quantity step - a partial close (``pct``) is rounded down to a multiple of it and a remainder under half a step is closed with it.
+    ``open_log``: if a list is given, the lots still open at the end are appended to it as (direction, entry_bar, entry_price, quantity).
     Returns one row per closed piece: (direction, entry_bar, entry_price, exit_bar, exit_price, quantity), in closing order."""
     n = len(c)
     out: list[tuple] = log if log is not None else []
@@ -913,6 +914,8 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                 fire(a, i, c[i])
             mq = []
         prune({a[1] for a in mq if a[0] == "entry"} | ({"*"} if any(a[0] == "entry" for a in mq) else set()))
+    if open_log is not None:
+        open_log.extend((x["d"], x["eb"], x["ep"], x["q"]) for x in lots)
     return out
 
 
@@ -925,3 +928,14 @@ def compare_q(res, ref: list[tuple], tol: float = 1e-9) -> tuple[bool, str]:
         if a[0] != b[0] or a[1] != b[1] or a[3] != b[3] or any(abs(a[k] - b[k]) > tol * max(1, abs(b[k])) for k in (2, 4, 5)):
             return False, f"first differing trade: pinelib {a} vs independent {b}"
     return True, f"{len(ours)} pieces identical"
+
+
+def compare_open(res, open_ref: list[tuple], tol: float = 1e-9) -> tuple[bool, str]:
+    """Compare the trades still open at the end of a run: rows (direction, entry_bar, entry_price, quantity) from simulate_brackets(open_log=...)."""
+    ours = [(t.direction, t.bar, t.price, t.qty) for t in res.broker.open]
+    if len(ours) != len(open_ref):
+        return False, f"open trades differ: pinelib {ours} vs independent {open_ref}"
+    for a, b in zip(ours, open_ref):
+        if a[0] != b[0] or a[1] != b[1] or any(abs(a[k] - b[k]) > tol * max(1, abs(b[k])) for k in (2, 3)):
+            return False, f"open trade differs: pinelib {a} vs independent {b}"
+    return True, f"{len(ours)} open trades identical"

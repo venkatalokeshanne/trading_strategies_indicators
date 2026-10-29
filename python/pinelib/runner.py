@@ -398,6 +398,9 @@ class StrategyFacade:
     def close_all(self, comment: str = "", **kw: Any) -> None:
         self._b.close_all(comment, **kw)
 
+    def default_entry_qty(self, fill_price: Any) -> float:
+        return self._b.default_entry_qty(float(fill_price))
+
     def cancel(self, id: str) -> None:
         self._b.cancel(id)
 

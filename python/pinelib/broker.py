@@ -181,6 +181,10 @@ class Broker:
             raise ValueError(f"unknown default_qty_type {c.default_qty_type!r}")
         return self.sym.round_qty(q)
 
+    def default_entry_qty(self, fill_price: float) -> float:
+        """``strategy.default_entry_qty(fill_price)``: the quantity an entry with no ``qty`` would trade at that price."""
+        return self.default_qty(fill_price)
+
     def entry(self, id: str, direction: int, qty: Any = NA, limit: Any = NA, stop: Any = NA,
               oca_name: str = "", oca_type: str = "none", comment: str = "", **_: Any) -> None:
         q = NA if _isna(qty) else float(qty)

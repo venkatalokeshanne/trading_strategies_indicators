@@ -447,3 +447,126 @@ def np_cci(x, n):
         dev = _np.abs(w - mean).mean()
         out[i] = (x[i] - mean) / (0.015 * dev) if dev != 0 else _np.nan
     return out
+
+
+def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
+    """Reference broker with a PENDING ORDER BOOK (stop / limit entries, exits by entry id, cancels) for one net position
+    (pyramiding 0/1), written from Pine's documented rules and sharing no code with pinelib.
+    ``orders(i, pos)`` runs at bar i's close and returns actions in source order:
+      ("entry", id, d, stop|None, limit|None)   market when both None, else a pending order kept until filled / replaced / cancelled
+      ("exit", xid, from_id, stop|None, limit|None)   attaches to the open trade with entry id ``from_id`` (or to its pending entry); replaces the exit with id xid
+      ("close", id) | ("close_all",)            market, at the next open (ignored when nothing is open at script time)
+      ("cancel", id) | ("cancel_all",)
+    Bar j: market orders fill at the open, then the pending orders are walked along the O->H->L->C (or O->L->H->C) path: whichever level is reached
+    first fills (a level already passed at the open fills at the open), an entry's own exits are live straight after its fill, and an exit
+    removes the exits of its trade. An opposite pending entry reverses; a same-direction one is ignored. Returns (direction, entry_bar, entry_price, exit_bar, exit_price)."""
+    n = len(c)
+    trades: list[tuple] = log if log is not None else []
+    cur = {"d": 0, "id": None, "ep": math.nan, "eb": -1}
+    pend: list[dict] = []
+    exits: dict = {}
+    mq: list = []
+    seq = [0]
+
+    def close_pos(i, px):
+        trades.append((cur["d"], cur["eb"], cur["ep"], i, px))
+        for k in [k for k, e in exits.items() if e["from"] == cur["id"]]:
+            del exits[k]
+        cur.update(d=0, id=None, ep=math.nan, eb=-1)
+
+    def open_pos(i, d, eid, px):
+        if cur["d"] == d:
+            return
+        if cur["d"] == -d:
+            close_pos(i, px)
+        cur.update(d=d, id=eid, ep=px, eb=i)
+
+    def fire_market(i, px):
+        for od in mq:
+            if od[0] == "entry":
+                open_pos(i, od[2], od[1], px)
+            elif od[0] == "close" and cur["d"] != 0 and cur["id"] == od[1]:
+                close_pos(i, px)
+            elif od[0] == "close_all" and cur["d"] != 0:
+                close_pos(i, px)
+        mq.clear()
+
+    def hit(p0, p1, opening, lvl, rises_to_fill):
+        """(distance, price) if the order level is reached on the segment p0->p1; rises_to_fill: filled when price is at/above the level."""
+        if opening:
+            if (p0 >= lvl) if rises_to_fill else (p0 <= lvl):
+                return (0.0, p0)
+            return None
+        lo, hi = min(p0, p1), max(p0, p1)
+        if lo <= lvl <= hi and ((p1 > p0) if rises_to_fill else (p1 < p0)):
+            return (abs(lvl - p0), lvl)
+        return None
+
+    for i in range(n):
+        fire_market(i, o[i])
+        pts = _path(o[i], h[i], l[i], c[i])
+        segs = [(pts[0], pts[0], True)] + [(pts[k - 1], pts[k], False) for k in range(1, 4) if pts[k] != pts[k - 1]]
+        for p0, p1, opening in segs:
+            while True:
+                cands = []
+                for od in pend:
+                    d = od["d"]
+                    if od["stop"] is not None and od["limit"] is not None:     # stop-limit: not supported by this reference
+                        raise NotImplementedError
+                    lvl, kind = (od["stop"], "stop") if od["stop"] is not None else (od["limit"], "limit")
+                    rises = (d > 0) == (kind == "stop")
+                    r = hit(p0, p1, opening, lvl, rises)
+                    if r and cur["d"] != d:
+                        cands.append((r[0], od["seq"], "entry", od, r[1]))
+                if cur["d"] != 0:
+                    for xid, e in exits.items():
+                        if e["from"] != cur["id"]:
+                            continue
+                        for lvl, kind in ((e["stop"], "stop"), (e["limit"], "limit")):
+                            if lvl is None or lvl != lvl:
+                                continue
+                            rises = (cur["d"] < 0) == (kind == "stop")      # long stop / short limit trigger on falling price
+                            r = hit(p0, p1, opening, lvl, rises)
+                            if r:
+                                cands.append((r[0], e["seq"], "exit", e, r[1]))
+                if not cands:
+                    break
+                _, _, kind, od, px = min(cands, key=lambda x: (x[0], x[1]))
+                if kind == "exit":
+                    close_pos(i, px)
+                else:
+                    pend.remove(od)
+                    open_pos(i, od["d"], od["id"], px)
+                if not (opening and px == p0):      # a fill inside the segment: carry on from the fill price (a gap fill at the open stays "opening")
+                    opening = False
+                p0 = px
+        emitted = orders(i, cur["d"])
+        for a in emitted:
+            seq[0] += 1
+            if a[0] == "entry":
+                _, eid, d, stop, limit = a
+                pend[:] = [p for p in pend if p["id"] != eid]
+                mq[:] = [m for m in mq if not (m[0] == "entry" and m[1] == eid)]
+                if stop is None and limit is None:
+                    mq.append(("entry", eid, d))
+                else:
+                    pend.append(dict(id=eid, d=d, stop=stop, limit=limit, seq=seq[0]))
+            elif a[0] == "exit":
+                _, xid, frm, stop, limit = a
+                if stop is None and limit is None:
+                    exits.pop(xid, None)
+                else:
+                    exits[xid] = {"from": frm, "stop": stop, "limit": limit, "seq": seq[0]}
+            elif a[0] == "close":
+                if cur["d"] != 0:
+                    mq.append(("close", a[1]))
+            elif a[0] == "close_all":
+                if cur["d"] != 0:
+                    mq.append(("close_all",))
+            elif a[0] == "cancel":
+                pend[:] = [p for p in pend if p["id"] != a[1]]
+                exits.pop(a[1], None)
+            elif a[0] == "cancel_all":
+                pend.clear()
+                exits.clear()
+    return trades

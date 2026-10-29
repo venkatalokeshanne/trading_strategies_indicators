@@ -501,6 +501,7 @@ def run(script_cls: type[Script], bars: pd.DataFrame, *, params: dict | None = N
                            script_cls.MAX_POLYLINES)
     script.open, script.high, script.low = ctx.open_s, ctx.high_s, ctx.low_s
     script.close, script.volume, script.time = ctx.close_s, ctx.volume_s, ctx.time_s
+    script.time_close = ctx.time_close_s
     script.hl2, script.hlc3, script.ohlc4, script.hlcc4 = ctx.hl2_s, ctx.hlc3_s, ctx.ohlc4_s, ctx.hlcc4_s
     script.na = NA
     broker = None
@@ -568,6 +569,10 @@ def _from_bars(cls, bars: pd.DataFrame, sym: SymbolInfo, timeframe: str) -> Cont
     c.close_s = PriceSeries(c.close_arr, "close")
     c.volume_s = PriceSeries(c.volume_arr, "volume")
     c.time_s = PriceSeries(c.time_arr, "time")
+    # bar close time: open + period for intraday bars, the next bar's open for daily and higher
+    ms = c.tf_secs * 1000
+    c.time_close_arr = [t + ms for t in c.time_arr] if c.tf_secs < 86400 else c.time_arr[1:] + [c.time_arr[-1] + ms] if c.time_arr else []
+    c.time_close_s = PriceSeries(c.time_close_arr, "time_close")
     H, L, C, O = c.high_arr, c.low_arr, c.close_arr, c.open_arr
     c.hl2_s = DerivedSeries(lambda i: (H[i] + L[i]) / 2, "hl2")
     c.hlc3_s = DerivedSeries(lambda i: (H[i] + L[i] + C[i]) / 3, "hlc3")

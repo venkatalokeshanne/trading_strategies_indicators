@@ -449,7 +449,7 @@ def np_cci(x, n):
     return out
 
 
-def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
+def simulate_ord(o, h, l, c, orders, *, log: list | None = None, on_close: bool = False) -> list[tuple]:
     """Reference broker with a PENDING ORDER BOOK (stop / limit entries, exits by entry id, cancels) for one net position
     (pyramiding 0/1), written from Pine's documented rules and sharing no code with pinelib.
     ``orders(i, pos)`` runs at bar i's close and returns actions in source order:
@@ -459,7 +459,7 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
       ("cancel", id) | ("cancel_all",)
     Bar j: market orders fill at the open, then the pending orders are walked along the O->H->L->C (or O->L->H->C) path: whichever level is reached
     first fills (a level already passed at the open fills at the open), an entry's own exits are live straight after its fill, and an exit
-    removes the exits of its trade. An opposite pending entry reverses; a same-direction one is ignored. Returns (direction, entry_bar, entry_price, exit_bar, exit_price)."""
+    removes the exits of its trade. An opposite pending entry reverses; a same-direction one is ignored. ``on_close``: process_orders_on_close for the market orders. Returns (direction, entry_bar, entry_price, exit_bar, exit_price)."""
     n = len(c)
     trades: list[tuple] = log if log is not None else []
     cur = {"d": 0, "id": None, "ep": math.nan, "eb": -1}
@@ -575,4 +575,6 @@ def simulate_ord(o, h, l, c, orders, *, log: list | None = None) -> list[tuple]:
             elif a[0] == "cancel_all":
                 pend.clear()
                 exits.clear()
+        if on_close:        # process_orders_on_close: market orders fill at this bar's close (pending stop / limit orders still wait for the path)
+            fire_market(i, c[i])
     return trades

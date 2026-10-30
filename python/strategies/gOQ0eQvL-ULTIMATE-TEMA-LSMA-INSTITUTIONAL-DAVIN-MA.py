@@ -324,10 +324,10 @@ class UltimateTemaLsma(Script):
         inst_size = self.inst_base_size
         if close >= dyn_buy_low and close <= dyn_buy_high:
             inst_action = "ACCUMULATE"
-            inst_size = self.inst_base_size * (1 + (dyn_buy_high - close) / dyn_range_width) if self.inst_size_scaling and dyn_range_width > 0 else self.inst_base_size
+            inst_size = self.inst_base_size * (1 + div(dyn_buy_high - close, dyn_range_width)) if self.inst_size_scaling and dyn_range_width > 0 else self.inst_base_size
         elif close >= dyn_sell_low and close <= dyn_sell_high:
             inst_action = "DISTRIBUTE"
-            inst_size = self.inst_base_size * (1 + (close - dyn_sell_low) / dyn_range_width) if self.inst_size_scaling and dyn_range_width > 0 else self.inst_base_size
+            inst_size = self.inst_base_size * (1 + div(close - dyn_sell_low, dyn_range_width)) if self.inst_size_scaling and dyn_range_width > 0 else self.inst_base_size
         elif close >= dyn_mid_low and close <= dyn_mid_high:
             inst_action = "PROVIDE_LIQUIDITY"
 
@@ -415,9 +415,9 @@ class UltimateTemaLsma(Script):
             position_size = 10.0
 
         if long_cond and pos == 0:
-            st.entry("Long", st.long, qty=st.equity / close * position_size / 100)
+            st.entry("Long", st.long, qty=div(st.equity, close) * position_size / 100)
         if short_cond and pos == 0:
-            st.entry("Short", st.short, qty=st.equity / close * position_size / 100)
+            st.entry("Short", st.short, qty=div(st.equity, close) * position_size / 100)
         if pos > 0:
             st.exit("Long Exit", "Long", stop=long_sl, limit=long_tp, trail_points=trail_offset, trail_offset=trail_offset)
         if pos < 0:

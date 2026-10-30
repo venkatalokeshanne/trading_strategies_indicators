@@ -281,6 +281,30 @@ class Script:
                           second=int(s), tz=norm_tz(tz))
         return int(round(ts.timestamp() * 1000))          # not .value: years beyond 2262 (timestamp(9999, ...)) overflow nanoseconds
 
+    def _regular_bounds(self) -> tuple[int, int]:
+        a, b = self.syminfo.session.split("-")[:2]
+        return int(a[:2]) * 60 + int(a[2:4]), int(b[:2]) * 60 + int(b[2:4])
+
+    def _is_regular(self, i: int) -> bool:
+        a, b = self._regular_bounds()
+        loc = self._ctx.local.iloc[i]
+        return a <= loc.hour * 60 + loc.minute < b
+
+    def session_isfirstbar_regular(self) -> bool:
+        """``session.isfirstbar_regular``: the first bar of the regular session of a trading day (every bar on daily and higher charts)."""
+        c, i = self._ctx, self._ctx.bar_index
+        if c.tf_secs >= 86400:
+            return True
+        return self._is_regular(i) and (i == 0 or not self._is_regular(i - 1) or c.trading_day[i] != c.trading_day[i - 1])
+
+    def session_islastbar_regular(self) -> bool:
+        """``session.islastbar_regular``: the bar whose end reaches the close of the regular session (every bar on daily and higher charts)."""
+        c, i = self._ctx, self._ctx.bar_index
+        if c.tf_secs >= 86400:
+            return True
+        loc = c.local.iloc[i]
+        return self._is_regular(i) and loc.hour * 60 + loc.minute + c.tf_secs // 60 >= self._regular_bounds()[1]
+
     def time_in_session(self, session: str, tz: str | None = None, t: Any = None) -> bool:
         """``not na(time(timeframe.period, session))`` — bar start inside the session."""
         return self._ctx.in_session(session, tz or self.syminfo.timezone, t)

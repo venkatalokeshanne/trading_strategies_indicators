@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
 Last tickets done: T01-T14, T16, T17. T15 (ML selector v2) deliberately SKIPPED: its trigger is 'T13/T14 show promise' and T14 says FRAGILE/no demonstrated edge.
-Next: more strategy supply (T06.2 from 9ZHBzpRZ; only 6 of 670 converted FULL strategies are in the store), cpi/jobs dates + earnings CSV, then rerun T13/T14. Do NOT trade on the current results.
+Next (T06.2 wave 2, IN PROGRESS): 12 new converted strategies (fFXP7nmK N3ItY18G lZ8kDfrb LB3VE9t8 mEHJ2lCm 2u7KKcCG sNFXyA3m iLXxAcTj bSGjA2Ie YP4axuGh 83hmaEOQ nBKnefqc) x 3 tf x 2 gates x 61 symbols = 4392 jobs. March-2024 smoke (10 symbols, data/smoke.duckdb): all 36 variants ran, trade on every symbol, all lose in March (3 over-trade: bSGjA2Ie LB3VE9t8 iLXxAcTj). Full-year run was interrupted by cloud restarts, ~1700 jobs left; resume with: python -m src.cli bulk run --start 2023-07-03 --end 2024-06-28 --strategies <12 ids> --yes (resumable). Then: features build + events build for new variants, rerun T13/T14, rewrite this file. Also cpi/jobs dates + earnings CSV. Do NOT trade on current results.
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.

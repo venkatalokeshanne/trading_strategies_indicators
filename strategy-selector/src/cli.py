@@ -15,6 +15,8 @@ reg_app = typer.Typer(no_args_is_help=True, help="Soft regimes")
 app.add_typer(reg_app, name="regimes")
 rank_app = typer.Typer(no_args_is_help=True, help="Stock ranker")
 app.add_typer(rank_app, name="rank")
+sel_app = typer.Typer(no_args_is_help=True, help="Strategy selector")
+app.add_typer(sel_app, name="select")
 bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
 app.add_typer(bulk_app, name="bulk")
 
@@ -195,6 +197,36 @@ def rank_eval(checkpoint: str = "open+10", k: int = 3, min_days: int = 60, symbo
     for name, feats in (("full model", None), ("in-play features only (no symbol history)", [f for f in ranker.FEATS if f != "trade_hist"])):
         res = ranker.evaluate(ranker.walk_forward(d, k, min_days, feats=feats))
         typer.echo(f"{name}: " + ", ".join(f"{a}={b}" for a, b in res.items()))
+
+
+@sel_app.command("picks")
+def sel_picks(checkpoint: str = "open+10", k: int = 3, days: int = 20, min_sample: int = 20, threshold: float = 0.0):
+    """Walk-forward picks (ranker top K -> variant or abstain) for the last N test days, with sample sizes and the realised PnL."""
+    import pandas as pd
+    from src.selector import ranker, variant
+    from src.store import db
+    cfg = config.load()
+    con = db.connect(cfg, read_only=True)
+    syms = pd.read_csv(cfg["paths"]["cache"].parent / "coverage.csv").query("learn")["symbol"].tolist()
+    feat = con.execute("SELECT * FROM features WHERE checkpoint = ?", [checkpoint]).df()
+    d = ranker.design(feat[feat["symbol"].isin(syms)], con.execute("SELECT * FROM events").df(), ranker.target(cfg, checkpoint))
+    rk = ranker.walk_forward(d, k, 60).tail(days)
+    d0, d1 = con.execute("SELECT min(d0), max(d1) FROM runs").fetchone()
+    dd, sy, vs, P, R = variant.load(cfg, checkpoint, syms, d0, d1)
+    rows = []
+    for r in rk.itertuples():
+        t = int(dd.get_loc(pd.Timestamp(r.day)))
+        for s in r.picks:
+            j = sy.index(s)
+            res = variant.select(P, R, vs, t, j, min_sample, threshold)
+            pnl = P[t, j, vs.index(res["pick"])] if res["pick"] else 0.0
+            rows.append(dict(day=str(r.day.date()), symbol=s, pick=res["pick"] or "ABSTAIN", score=round(res["score"], 2), n_sym=round(res["n_sym"]), n_reg=round(res["n_reg"]),
+                             cand=res["candidates"], pnl=round(pnl, 1), avg_all=round(P[t, j].mean(), 1)))
+    out = pd.DataFrame(rows)
+    (cfg["paths"]["runs"]).mkdir(exist_ok=True)
+    out.to_csv(cfg["paths"]["runs"] / "selector_picks.csv", index=False)
+    typer.echo(out.to_string(index=False))
+    typer.echo(f"days={out['day'].nunique()} picks={len(out)} abstain={(out['pick'] == 'ABSTAIN').sum()} realised pnl: selector {out['pnl'].sum():.0f} vs mean-of-all-variants {out['avg_all'].sum():.0f}")
 
 
 if __name__ == "__main__":

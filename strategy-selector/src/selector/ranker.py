@@ -70,7 +70,7 @@ def walk_forward(d: pd.DataFrame, k: int = 3, min_days: int = 60, refit_every: i
             model = _fit(h[feats].to_numpy(), h["yr"].to_numpy())
         s = (today[feats].to_numpy() - model[0]) @ model[1]
         top = lambda score: today.iloc[np.argsort(-score)[:k]]["y"].mean()
-        out.append(dict(day=day, model=top(s), base=top(today["base"].to_numpy()), hist=top(today["trade_hist"].to_numpy()), rand=today["y"].mean(),
+        out.append(dict(day=day, picks=today.iloc[np.argsort(-s)[:k]]["symbol"].tolist(), model=top(s), base=top(today["base"].to_numpy()), hist=top(today["trade_hist"].to_numpy()), rand=today["y"].mean(),
                         oracle=today.nlargest(k, "y")["y"].mean(), n=len(today)))
     return pd.DataFrame(out)
 

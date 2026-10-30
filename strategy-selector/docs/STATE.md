@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01-T08 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
-Next ticket: T09 (events). Full-universe 1m fetch (70 symbols x years) still NOT run; T06.2 (next wave of conversions) starts at 9ZHBzpRZ.
+Last tickets done: T01-T09 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
+Next ticket: T10 (regimes). Full-universe 1m fetch (70 symbols x years) still NOT run; T06.2 (next wave of conversions) starts at 9ZHBzpRZ.
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
@@ -28,5 +28,7 @@ T07 bulk runner (`src/selector/bulk.py`, `src/store/db.py`, `cli bulk run|top`):
  Acceptance (real Twelve Data, Jan-Mar 2024, 10 symbols AAPL MSFT NVDA TSLA AMD QQQ AMZN META IONQ SOUN, 6 strategies x 3 tf x 2 gates = 360 jobs): 72 s on 4 cores, 16903 trades, 12293 daily rows; rerun todo=0; `bulk top --day 2024-02-14` returns top/bottom variants. Dead/error marking (mark_degenerate) not exercised by this data (all 18 variants traded).
 T08 features (`src/features/day.py`, `cli features build` -> DuckDB `features`): per symbol-day-checkpoint FEATS = gap_pct/gap_atr (open print vs prior close), prior_ret/range_pct/range_atr/close_pos/rel_vol (prior day only, ATR14 daily Wilder shifted), and for open+N: range_pct/atr, ret/ret_atr, vol_rel (same N-min window vs 20 prior days), vwap_dist, orb (-1/0/1 vs the first-5-min range; 0 at +5) + mkt_gap_pct/mkt_ret/mkt_range_atr (SPY if cached else QQQ). premarket = the 09:30 open: only prior days + the opening print. NOT produced: pre-market volume/range (plan is RTH only), VIX (not fetched).
  Acceptance `tests/test_features.py`: scrambling every bar at/after the checkpoint (and all later days) leaves that day and earlier days exactly unchanged, 4 checkpoints; a deliberate leak (unshifted ATR) makes it fail. Real run: 12 cached symbols, 3636 rows.
+T09 events (`src/features/events.py`, `cli events refresh-fomc|build` -> DuckDB `events`): market-wide fomc (decision days parsed from federalreserve.gov into config/events.yaml, 2021-2027), opex (3rd Friday, Thursday if holiday), month_end (last session) + cpi/jobs from config/events.yaml; per-symbol earn_day / earn_tonight (after-close report that day) / earn_reaction (session that trades the reaction; time unknown -> both days). Known before the open of the flagged day.
+ LIMITS: cpi + jobs lists are EMPTY (bls.gov returns 403 to automated access; add the dates by hand - nothing is guessed). Twelve Data /earnings on the free plan only works for a few symbols (AAPL, QQQ of our 12); others get NaN, never 0 (add rows to config/earnings.csv: symbol,date,time). News: skipped (not cheap). Acceptance tests/test_events.py: FOMC 2024-01-31 and 03-20, AAPL after-close earnings 2024-02-01 -> tonight 02-01, reaction 02-02, plus the Fed-page parser.
 Known problems: full-universe fetch NOT run yet (70 symbols x years = many credits); do it before T07. Only AAPL/IONQ/SPCX/INFQ cached so far.
 Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

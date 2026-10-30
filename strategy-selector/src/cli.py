@@ -9,6 +9,8 @@ pine_app = typer.Typer(no_args_is_help=True, help="Pine strategy catalog")
 app.add_typer(pine_app, name="pine")
 feat_app = typer.Typer(no_args_is_help=True, help="Day features per checkpoint")
 app.add_typer(feat_app, name="features")
+ev_app = typer.Typer(no_args_is_help=True, help="Event flags")
+app.add_typer(ev_app, name="events")
 bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
 app.add_typer(bulk_app, name="bulk")
 
@@ -136,6 +138,32 @@ def feat_build(symbols: str = typer.Option("", help="comma list; default = every
     con.register("f_", f)
     con.execute("CREATE OR REPLACE TABLE features AS SELECT * FROM f_")
     typer.echo(f"features: {len(f)} rows, {f['symbol'].nunique()} symbols, {f['day'].nunique()} days, checkpoints {sorted(f['checkpoint'].unique())}")
+
+
+@ev_app.command("refresh-fomc")
+def ev_fomc():
+    """Download FOMC decision days from federalreserve.gov into config/events.yaml."""
+    from src.features import events
+    d = events.refresh_fomc()
+    typer.echo(f"fomc: {len(d)} decision days {d[0]}..{d[-1]}")
+
+
+@ev_app.command("build")
+def ev_build(start: str = typer.Option(...), end: str = typer.Option(...), symbols: str = typer.Option("", help="default = cached symbols")):
+    """Event flags per symbol-day -> DuckDB `events` (earnings NaN where no source has the symbol)."""
+    import pandas as pd
+    from src.data import calendar
+    from src.data.twelvedata import _dir
+    from src.features import events
+    from src.store import db
+    cfg = config.load()
+    syms = [x.strip().upper() for x in symbols.split(",") if x.strip()] or [s for s in cfg["universe"] if (_dir(cfg, s) / "coverage.json").exists()]
+    f = events.build(cfg, syms, pd.DatetimeIndex(calendar.sessions(start, end)["day"]))
+    con = db.connect(cfg)
+    con.register("f_", f)
+    con.execute("CREATE OR REPLACE TABLE events AS SELECT * FROM f_")
+    known = f.groupby("symbol")["earn_day"].apply(lambda x: x.notna().any())
+    typer.echo(f"events: {len(f)} rows; earnings known for {int(known.sum())}/{len(known)} symbols (rest NaN: add them to config/earnings.csv)")
 
 
 if __name__ == "__main__":

@@ -30,11 +30,11 @@ class Keys:
         self.cool[k] = time.time() + secs
 
 
-def _request(keys: Keys, params: dict, http=requests.get) -> dict:
+def _request(keys: Keys, params: dict, http=requests.get, url: str = URL) -> dict:
     for _ in range(20):
         k = keys.get()
         try:
-            j = http(URL, params={**params, "apikey": k}, timeout=60).json()
+            j = http(url, params={**params, "apikey": k}, timeout=60).json()
         except (requests.RequestException, ValueError):
             keys.back_off(k, 5)
             continue

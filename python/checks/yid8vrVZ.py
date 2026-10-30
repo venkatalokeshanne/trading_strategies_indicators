@@ -1,5 +1,9 @@
 """Independent check — XAUUSD Quant SMC, 10-minute short title (yid8vrVZ): the script is the same as qWRZMcV0 (only the short title differs); this runs the shared independent reference (qWRZMcV0.py) on 10-minute and 15-minute charts of this id."""
-from qWRZMcV0 import make, one
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from qWRZMcV0 import make, one  # noqa: E402
 
 
 def check():

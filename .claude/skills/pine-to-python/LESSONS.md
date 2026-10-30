@@ -103,3 +103,9 @@ crashed with TypeError (3Q98707C). Fixed in pinelib.core.
 `bars()` prices drift into the thousands; `percent_of_equity=10` on a 10 000 account then rounds
 to 0 shares and pinelib (correctly) takes no trade while the reference broker does. In a check use
 `SymbolInfo.make(..., qty_step=1e-9)` (fractional shares) and make sure it produces > 10 trades.
+
+## P16 — Explicit order quantities are not rounded; crypto periods anchor at 00:00 UTC
+`strategy.entry(qty=x)` / `strategy.order` pass an explicit quantity through unrounded in pinelib (only the default sizing is floored to the symbol's `qty_step`), so a reference that floors an explicit risk-sized quantity differs by up to one step. Keep it raw in the check (the default-sized cases keep using `qty_step=1e-9`). Higher-timeframe periods (`np_periods`) of a crypto symbol start at 00:00 UTC: call `np_periods(df, minutes, start_minutes=0, tz="UTC")`; the 09:30 New York default is for stocks.
+
+## P17 — A series expression stored on `self` is live (again)
+`self.vwap_num = self.vwap_num + self.hlc3 * self.volume` and `self.extreme = high if ... else ...` keep a lazy series object, not a number: the next bar sees the NEW bar's value. Wrap with `float()` whenever an expression of series (`self.high`, `self.hlc3 * self.volume`, ...) is assigned to a `var`-like attribute (found by the checks of PUg4DGVc, pJlHYjCK).

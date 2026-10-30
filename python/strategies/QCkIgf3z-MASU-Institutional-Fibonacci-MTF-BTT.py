@@ -16,7 +16,7 @@ Not carried over: plots, dashboard, S/R and TP/SL lines, the volume-profile poin
 ────────────────────────────────────────────────────────────────────────
 """
 
-from pinelib import NA, Script, na, pmath, ta
+from pinelib import NA, Script, div, na, pmath, ta
 
 
 class MasuFib(Script):
@@ -144,7 +144,7 @@ class MasuFib(Script):
             self.vol_sum = 0.0
         self.vwap_sum += volume * self.hlc3
         self.vol_sum += volume
-        self.vwap = self.vwap_sum / self.vol_sum if self.vol_sum > 0 else float(close)
+        self.vwap = div(self.vwap_sum, self.vol_sum) if self.vol_sum > 0 else float(close)
         vwap = float(self.vwap)
         buy_volume = volume if close > open_ else 0
         sell_volume = volume if close < open_ else 0
@@ -152,7 +152,7 @@ class MasuFib(Script):
         cvd_sma = ta.sma(cvd, self.cvd_length)
         cvd_bullish = cvd > cvd_sma and close < self.close[1] and cvd > cvd_1
         cvd_bearish = cvd < cvd_sma and close > self.close[1] and cvd < cvd_1
-        volume_ratio = buy_volume / pmath.max(sell_volume, 1)
+        volume_ratio = div(buy_volume, pmath.max(sell_volume, 1))
         strong_buying = volume_ratio > (1 + self.cvd_threshold)
         strong_selling = volume_ratio < (1 - self.cvd_threshold)
         price_above_vwap = close > vwap
@@ -183,8 +183,8 @@ class MasuFib(Script):
         f500 = swH - 0.500 * fib_diff if fib_ok else NA
         f618 = swH - 0.618 * fib_diff if fib_ok else NA
         cr = high - low
-        b_wick = (pmath.min(open_, close) - low) / cr if cr > 0 else 0.0
-        s_wick = (high - pmath.max(open_, close)) / cr if cr > 0 else 0.0
+        b_wick = div(pmath.min(open_, close) - low, cr) if cr > 0 else 0.0
+        s_wick = div(high - pmath.max(open_, close), cr) if cr > 0 else 0.0
         fz = self.fib_zone * atr
         sw_old = fib_ok and self.bar_index - self.fib_swHb >= 2 and self.bar_index - self.fib_swLb >= 2
         t_l382 = self.fib_use_382 and fib_upswing and not na(f382) and abs(low - f382) <= fz

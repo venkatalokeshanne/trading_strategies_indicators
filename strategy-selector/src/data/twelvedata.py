@@ -106,6 +106,8 @@ def _missing_ranges(covered: set[str], start: date, end: date) -> list[tuple[dat
 
 
 def _store(d, df: pd.DataFrame) -> None:
+    if df.empty:                       # symbol not listed yet in the range
+        return
     for ym, g in df.groupby(df["time"].dt.tz_convert(TZ).dt.strftime("%Y-%m")):
         f = d / f"{ym}.parquet"
         if f.exists():

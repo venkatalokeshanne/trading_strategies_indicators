@@ -290,6 +290,11 @@ class Script:
         loc = self._ctx.local.iloc[i]
         return a <= loc.hour * 60 + loc.minute < b
 
+    def session_ismarket(self) -> bool:
+        """``session.ismarket``: the bar lies in the regular session (always true on daily and higher charts)."""
+        c = self._ctx
+        return True if c.tf_secs >= 86400 else self._is_regular(c.bar_index)
+
     def session_isfirstbar_regular(self) -> bool:
         """``session.isfirstbar_regular``: the first bar of the regular session of a trading day (every bar on daily and higher charts)."""
         c, i = self._ctx, self._ctx.bar_index

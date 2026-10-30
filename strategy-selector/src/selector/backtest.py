@@ -26,7 +26,7 @@ def _stats(daily: pd.Series, alloc: float) -> dict:
 
 
 def run(cfg, d_from: str, d_to: str, checkpoint: str = "open+10", k: int = 3, neutral: bool = False, min_days: int = 60,
-        min_sample: int = 20, threshold: float = 0.0, out_dir=None) -> dict:
+        min_sample: int = 20, threshold: float = 0.0, out_dir=None, detail: bool = False) -> dict:
     con = db.connect(cfg, read_only=True)
     cov = pd.read_csv(cfg["paths"]["cache"].parent / "coverage.csv").query("learn")["symbol"].tolist()
     if neutral:
@@ -92,6 +92,8 @@ def run(cfg, d_from: str, d_to: str, checkpoint: str = "open+10", k: int = 3, ne
         pk.to_csv(out / "picks.csv", index=False)
         daily.cumsum().rename("equity").to_csv(out / "equity.csv")
         s["out"] = str(out)
+    if detail:                                          # for the robustness tests (not serialised)
+        s["_detail"] = dict(daily=daily, picks=pk, P=P, R=R, syms=sy, variants=vs, days=dd, test_idx=[int(dd.get_loc(x)) for x in daily.index])
     return s
 
 

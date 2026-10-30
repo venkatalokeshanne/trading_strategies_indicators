@@ -27,13 +27,19 @@ def setup_pinelib() -> None:
         sys.path.insert(0, p)
 
 
-def load() -> dict:
+def load(db: str | None = None, cost_mult: float = 1.0) -> dict:
     load_env()
     cfg = yaml.safe_load((ROOT / "config/default.yaml").read_text())
     wl = yaml.safe_load((ROOT / "config/watchlists.yaml").read_text())
     cfg["watchlists"] = wl
     cfg["universe"] = sorted({s for v in wl.values() for s in v})
     cfg["paths"] = {k: ROOT / v for k, v in cfg["paths"].items()}
+    if db:                                              # a second store (e.g. the x2-cost run) next to the main one
+        cfg["paths"]["db"] = ROOT / db
+    if cost_mult != 1.0:                                # stress: scale commission and slippage (part of the result cache key)
+        for c in cfg["costs"].values():
+            c["commission_per_share"] *= cost_mult
+            c["slippage_bps"] *= cost_mult
     return cfg
 
 

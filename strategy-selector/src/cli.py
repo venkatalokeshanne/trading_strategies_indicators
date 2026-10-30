@@ -110,11 +110,12 @@ def bulk_run(start: str = typer.Option(...), end: str = typer.Option(...),
              symbols: str = typer.Option("", help="comma list; default = every learn=true symbol of data/coverage.csv"),
              strategies: str = typer.Option("", help="ids, comma list; default = every converted FULL strategy"),
              gates: str = typer.Option("", help="comma list; default = config gates"),
-             workers: int = 0, max_minutes: float = 30.0, yes: bool = typer.Option(False, "--yes")):
+             workers: int = 0, max_minutes: float = 30.0, yes: bool = typer.Option(False, "--yes"),
+             db: str = typer.Option("", help="alternative store file (relative to the project)"), cost_mult: float = 1.0):
     """Run all variants x symbols x gates into data/store.duckdb (resumable; finished jobs are skipped)."""
     import pandas as pd
     from src.selector import bulk
-    cfg = config.load()
+    cfg = config.load(db or None, cost_mult)
     syms = [x.strip().upper() for x in symbols.split(",") if x.strip()]
     if not syms:
         cov = pd.read_csv(cfg["paths"]["cache"].parent / "coverage.csv")
@@ -235,6 +236,15 @@ def backtest_cmd(from_: str = typer.Option(..., "--from"), to: str = typer.Optio
     """Walk-forward backtest of rank -> pick variant -> trade; summary + runs/<id>/ files vs baselines."""
     from src.selector import backtest
     typer.echo(backtest.render(backtest.run(config.load(), from_, to, checkpoint, top_k, neutral)))
+
+
+@app.command("robustness")
+def robustness_cmd(from_: str = typer.Option(..., "--from"), to: str = typer.Option(..., "--to"), checkpoint: str = "open+10", top_k: int = 3):
+    """Costs x2, neutral universe, bootstrap, shuffled-day and threshold tests -> verdict (JSON in runs/robustness.json)."""
+    from src.selector import robust
+    cfg = config.load()
+    cfg["paths"]["runs"].mkdir(exist_ok=True)
+    typer.echo(robust.render(robust.run(cfg, from_, to, checkpoint, top_k, cfg["paths"]["runs"] / "robustness.json")))
 
 
 if __name__ == "__main__":

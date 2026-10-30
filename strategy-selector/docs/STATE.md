@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01-T07 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
-Next ticket: T08. Full-universe 1m fetch (70 symbols x years) still NOT run; T06.2 (next wave of conversions) starts at 9ZHBzpRZ.
+Last tickets done: T01-T08 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
+Next ticket: T09 (events). Full-universe 1m fetch (70 symbols x years) still NOT run; T06.2 (next wave of conversions) starts at 9ZHBzpRZ.
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
@@ -26,5 +26,7 @@ T06 wave 1 (TV repo, pine-to-python skill): 15 reviewed -> 10 converted FULL + i
  Catalog now: pending 1008, FULL 37, skipped 4, PARTIAL 2, NOT CONVERTIBLE 2.
 T07 bulk runner (`src/selector/bulk.py`, `src/store/db.py`, `cli bulk run|top`): variants = converted FULL strategy (progress.json) x tf x param set (optional config/variants.yaml id->{label:params}) x symbol x gate -> data/store.duckdb (runs = resume key = adapter cache_key incl. 1m data hash; trades; daily_pnl; variants). Prints jobs/todo/est minutes first, refuses > --max-minutes (30) without --yes. A job's rows commit in one transaction; 2 failed jobs of a variant stop it; variants with all jobs failed -> status error, with no trades anywhere -> dead (excluded from `bulk top`). Default symbols = learn=true in data/coverage.csv (none yet: 3 months < min_history_days) so pass --symbols.
  Acceptance (real Twelve Data, Jan-Mar 2024, 10 symbols AAPL MSFT NVDA TSLA AMD QQQ AMZN META IONQ SOUN, 6 strategies x 3 tf x 2 gates = 360 jobs): 72 s on 4 cores, 16903 trades, 12293 daily rows; rerun todo=0; `bulk top --day 2024-02-14` returns top/bottom variants. Dead/error marking (mark_degenerate) not exercised by this data (all 18 variants traded).
+T08 features (`src/features/day.py`, `cli features build` -> DuckDB `features`): per symbol-day-checkpoint FEATS = gap_pct/gap_atr (open print vs prior close), prior_ret/range_pct/range_atr/close_pos/rel_vol (prior day only, ATR14 daily Wilder shifted), and for open+N: range_pct/atr, ret/ret_atr, vol_rel (same N-min window vs 20 prior days), vwap_dist, orb (-1/0/1 vs the first-5-min range; 0 at +5) + mkt_gap_pct/mkt_ret/mkt_range_atr (SPY if cached else QQQ). premarket = the 09:30 open: only prior days + the opening print. NOT produced: pre-market volume/range (plan is RTH only), VIX (not fetched).
+ Acceptance `tests/test_features.py`: scrambling every bar at/after the checkpoint (and all later days) leaves that day and earlier days exactly unchanged, 4 checkpoints; a deliberate leak (unshifted ATR) makes it fail. Real run: 12 cached symbols, 3636 rows.
 Known problems: full-universe fetch NOT run yet (70 symbols x years = many credits); do it before T07. Only AAPL/IONQ/SPCX/INFQ cached so far.
 Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

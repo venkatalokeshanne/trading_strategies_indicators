@@ -7,6 +7,8 @@ data_app = typer.Typer(no_args_is_help=True, help="Market data")
 app.add_typer(data_app, name="data")
 pine_app = typer.Typer(no_args_is_help=True, help="Pine strategy catalog")
 app.add_typer(pine_app, name="pine")
+feat_app = typer.Typer(no_args_is_help=True, help="Day features per checkpoint")
+app.add_typer(feat_app, name="features")
 bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
 app.add_typer(bulk_app, name="bulk")
 
@@ -118,6 +120,22 @@ def bulk_top(day: str = typer.Option(...), n: int = 5, gate: str = ""):
     from src.selector import bulk
     top, bot = bulk.top_bottom(config.load(), day, n, gate or None)
     typer.echo("TOP\n" + top.to_string(index=False) + "\nBOTTOM\n" + bot.to_string(index=False))
+
+
+@feat_app.command("build")
+def feat_build(symbols: str = typer.Option("", help="comma list; default = every symbol with cached bars"),
+               checkpoints: str = typer.Option("", help="default = config checkpoints")):
+    """Compute features for every symbol-day-checkpoint into the DuckDB `features` table."""
+    from src.data.twelvedata import _dir
+    from src.features import day
+    from src.store import db
+    cfg = config.load()
+    syms = [x.strip().upper() for x in symbols.split(",") if x.strip()] or [s for s in cfg["universe"] if (_dir(cfg, s) / "coverage.json").exists()]
+    f = day.build(cfg, syms, [x.strip() for x in checkpoints.split(",") if x.strip()] or None)
+    con = db.connect(cfg)
+    con.register("f_", f)
+    con.execute("CREATE OR REPLACE TABLE features AS SELECT * FROM f_")
+    typer.echo(f"features: {len(f)} rows, {f['symbol'].nunique()} symbols, {f['day'].nunique()} days, checkpoints {sorted(f['checkpoint'].unique())}")
 
 
 if __name__ == "__main__":

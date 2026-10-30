@@ -13,6 +13,8 @@ ev_app = typer.Typer(no_args_is_help=True, help="Event flags")
 app.add_typer(ev_app, name="events")
 reg_app = typer.Typer(no_args_is_help=True, help="Soft regimes")
 app.add_typer(reg_app, name="regimes")
+rank_app = typer.Typer(no_args_is_help=True, help="Stock ranker")
+app.add_typer(rank_app, name="rank")
 bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
 app.add_typer(bulk_app, name="bulk")
 
@@ -173,6 +175,25 @@ def reg_report(top: int = 3, gate: str = ""):
     """Symbol-days per regime and the best variants' weighted mean daily PnL in each (needs `bulk run` data)."""
     from src.features import regimes
     typer.echo(regimes.report(config.load(), top, gate or None).to_string(index=False))
+
+
+@rank_app.command("eval")
+def rank_eval(checkpoint: str = "open+10", k: int = 3, min_days: int = 60, symbols: str = typer.Option("", help="default = learn=true symbols (>= min_history_days)")):
+    """Walk-forward: do the top-K ranked symbols earn more (best-variant PnL, gate = checkpoint) than the baseline / random?"""
+    import pandas as pd
+    from src.selector import ranker
+    from src.store import db
+    cfg = config.load()
+    con = db.connect(cfg, read_only=True)
+    feat = con.execute("SELECT * FROM features WHERE checkpoint = ?", [checkpoint]).df()
+    ev = con.execute("SELECT * FROM events").df()
+    syms = [x.strip().upper() for x in symbols.split(",") if x.strip()] or pd.read_csv(cfg["paths"]["cache"].parent / "coverage.csv").query("learn")["symbol"].tolist()
+    d = ranker.design(feat[feat["symbol"].isin(syms)], ev, ranker.target(cfg, checkpoint))
+    d = d[d["symbol"].isin(syms)]
+    typer.echo(f"symbols={d['symbol'].nunique()} days={d['day'].nunique()} k={k} checkpoint={checkpoint}")
+    for name, feats in (("full model", None), ("in-play features only (no symbol history)", [f for f in ranker.FEATS if f != "trade_hist"])):
+        res = ranker.evaluate(ranker.walk_forward(d, k, min_days, feats=feats))
+        typer.echo(f"{name}: " + ", ".join(f"{a}={b}" for a, b in res.items()))
 
 
 if __name__ == "__main__":

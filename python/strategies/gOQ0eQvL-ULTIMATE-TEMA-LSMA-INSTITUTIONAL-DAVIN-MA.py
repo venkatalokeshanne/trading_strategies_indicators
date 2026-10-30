@@ -13,7 +13,7 @@ Line-for-line translation (orders fill at the signal bar's close: process_orders
 While a position is open one exit order per side is re-issued every bar: ATR stop and target around the average price (the institutional multipliers apply when the CURRENT bar's signal source is institutional) and a trailing stop whose activation and offset are the ATR in ticks. A trade is closed after the maximum number of bars.
 Instrument detection (gold / bitcoin / ethereum) reads the full ticker id as the source does.
 Deviations from the original: none.
-Not carried over: plots, fills, signal shapes, the information table, and the CHoCH swing / liquidity-zone levels (they only feed plots).
+Not carried over: the Williams %R higher-timeframe request (its value is never used), plots, fills, signal shapes, the information table, and the CHoCH swing / liquidity-zone levels (they only feed plots).
 ────────────────────────────────────────────────────────────────────────
 """
 
@@ -176,7 +176,6 @@ class UltimateTemaLsma(Script):
         adx = ta.rma(dx, self.adx_length)
         wl = self.williams_length
         williams = -100 * div(ta.highest(high, wl) - close, ta.highest(high, wl) - ta.lowest(low, wl))
-        williams_htf = self.security(None, self.williams_htf_tf, lambda v: -100 * div(ta.highest(v.high, wl) - float(v.close), ta.highest(v.high, wl) - ta.lowest(v.low, wl)))
         cci = div(close - ta.sma(close, 14), 0.015 * ta.dev(close, 14))
         kama_rev = ta.ema(close, self.kama_length_rev)
         kama_rising = kama_rev > kama_1

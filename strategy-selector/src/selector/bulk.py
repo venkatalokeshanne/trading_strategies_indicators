@@ -92,7 +92,7 @@ def run(cfg, ids, symbols, gates, start, end, workers=None, max_minutes=30.0, ye
     for v in vs:
         con.execute("INSERT OR IGNORE INTO variants VALUES (?,?,?,?,'ok','')", [v["variant"], v["strategy"], v["tf"], json.dumps(v["params"])])
     dead: set = set()
-    probed: dict = {}
+    failed: dict = {}                              # variant -> symbols it failed on
     d0, d1 = pd.Timestamp(start).date(), pd.Timestamp(end).date()
     it = iter(todo)
     ran = 0
@@ -118,8 +118,8 @@ def run(cfg, ids, symbols, gates, start, end, workers=None, max_minutes=30.0, ye
                 db.save_job(con, key, v["variant"], s, g, d0, d1, status, t, secs, err)
                 ran += 1
                 if status == "error":
-                    probed[v["variant"]] = probed.get(v["variant"], 0) + 1
-                    if probed[v["variant"]] >= 2:       # two failures: the script is broken, stop spending compute on it
+                    failed.setdefault(v["variant"], set()).add(s)
+                    if len(failed[v["variant"]]) >= 3:  # fails on 3 different symbols: the script is broken, stop spending compute on it
                         dead.add(v["variant"])
             feed()
     mark_degenerate(con)

@@ -117,6 +117,8 @@ def run_day_trades(cfg, script_path, symbol: str, tf: int, gate: str, start: str
     lo = pd.Timestamp(start, tz=TZ) - pd.Timedelta(days=cfg["adapter"]["warmup_days"])
     hi = pd.Timestamp(end, tz=TZ) + pd.Timedelta(days=1)
     b1 = bars1m[(bars1m["time"] >= lo) & (bars1m["time"] < hi)]
+    if b1.empty:                                   # symbol has no bars in the window
+        return pd.DataFrame(columns=COLS)
     bars = resample(b1, tf)
     cls = make_day_script(script_path if isinstance(script_path, type) else load_script(script_path), bars, tf, gate, cfg["max_entries_per_day"])
     r = run(cls, bars, params=params, symbol=SymbolInfo(tickerid=f"NASDAQ:{symbol}", timezone=TZ),

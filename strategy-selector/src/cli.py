@@ -229,5 +229,13 @@ def sel_picks(checkpoint: str = "open+10", k: int = 3, days: int = 20, min_sampl
     typer.echo(f"days={out['day'].nunique()} picks={len(out)} abstain={(out['pick'] == 'ABSTAIN').sum()} realised pnl: selector {out['pnl'].sum():.0f} vs mean-of-all-variants {out['avg_all'].sum():.0f}")
 
 
+@app.command("backtest")
+def backtest_cmd(from_: str = typer.Option(..., "--from"), to: str = typer.Option(..., "--to"), checkpoint: str = "open+10", top_k: int = 3,
+                 neutral: bool = typer.Option(False, "--neutral", help="control: QQQ + mega-caps only")):
+    """Walk-forward backtest of rank -> pick variant -> trade; summary + runs/<id>/ files vs baselines."""
+    from src.selector import backtest
+    typer.echo(backtest.render(backtest.run(config.load(), from_, to, checkpoint, top_k, neutral)))
+
+
 if __name__ == "__main__":
     app()

@@ -103,3 +103,54 @@ def test_inputs_override_and_record():
     r = run(T, _bars([1, 2]), symbol=SYM, timeframe="D", params={"Length": 7, "Source": "hl2"})
     assert seen[0] == (7, "hl2")
     assert r.inputs[0] == {"kind": "int", "title": "Length", "default": 14, "minval": 1}
+
+
+def test_time_series_converts_to_float_and_feeds_calendar_functions():
+    # `time` is an int64 array: float(self.time) and self.hour(self.time, tz) used to raise TypeError
+    out = _collect([1, 2], lambda s: (float(s.time), s.hour(s.time, "America/New_York")))
+    assert out[0] == (1704067200000.0, 19) and isinstance(out[0][0], float)
+
+
+def test_session_with_several_ranges_matches_any_of_them():
+    # input.session("0930-1130,1330-1600") used to crash (split on '-' gave three parts)
+    t = pd.date_range("2024-03-04 09:30", periods=8, freq="1h", tz="America/New_York").tz_convert("UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append(self.time_in_session("0930-1130,1330-1600", "America/New_York"))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    assert out == [True, True, False, False, True, True, True, False]     # 09:30 10:30 | 11:30 12:30 | 13:30 14:30 15:30 | 16:30
+
+
+def test_utc_offset_time_zone_strings_are_accepted():
+    # "UTC+3", "GMT-5", "UTC+5:30" are valid Pine time zones; pandas only knows IANA names
+    t = pd.date_range("2024-03-04 12:00", periods=1, freq="1h", tz="UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append((self.hour(self.time, "UTC+3"), self.hour(self.time, "GMT-5"), self.minute(self.time, "UTC+5:30"),
+                        self.time_in_session("1500-1600", "UTC+3")))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    assert out == [(15, 7, 30, True)]
+
+
+def test_timestamp_beyond_year_2262_does_not_overflow():
+    # timestamp(9999, 1, 1, 23, 59) is a common "no end date" in Pine scripts; pandas nanoseconds overflow there
+    t = pd.date_range("2024-03-04 12:00", periods=1, freq="1h", tz="UTC").as_unit("ms").asi8
+    df = pd.DataFrame({"time": t, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    out = []
+
+    class T(Script):
+        def on_bar(self):
+            out.append((self.timestamp(9999, 1, 1, 23, 59), self.timestamp("UTC", 2024, 3, 4, 12, 0), self.timestamp(2024, 3, 4, 7, 0)))
+
+    run(T, df, symbol=SymbolInfo.make("NASDAQ:X", "stock"), timeframe="60")
+    far, now, local = out[0]
+    assert far > 253_000_000_000_000                                                        # year 9999, in milliseconds
+    assert now == int(t[0]) and local == int(t[0])                                          # 07:00 New York == 12:00 UTC (EST)

@@ -21,6 +21,18 @@ from .broker import LONG, SHORT, Broker, StrategyConfig
 from .core import NA, Context, DerivedSeries, Hist, PriceSeries, RT, callsite, fl, register_stop
 from .symbols import SymbolInfo
 
+def norm_tz(tz):
+    """Pine accepts "UTC+3", "GMT-5", "UTC+5:30" as well as IANA names; pandas needs a tzinfo for the former."""
+    import datetime as _dt
+    import re as _re
+    if isinstance(tz, str):
+        m = _re.fullmatch(r"(?:UTC|GMT)([+-])(\d{1,2})(?::?(\d{2}))?", tz.strip())
+        if m:
+            off = _dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0))
+            return _dt.timezone(off if m.group(1) == "+" else -off)
+    return tz
+
+
 # ─────────────────────────────────────────────────────────────── timeframes
 def tf_seconds(tf: str) -> int:
     """TradingView timeframe string → seconds ("1", "60", "240", "D", "3D", "W", "M", "1S")."""
@@ -225,6 +237,11 @@ class Script:
     def last_bar_index(self) -> int:
         return self._ctx.n_bars - 1
 
+    @property
+    def last_bar_time(self) -> int:
+        """``last_bar_time``: open time (ms) of the last bar of the loaded history."""
+        return int(self._ctx.time_arr[self._ctx.n_bars - 1])
+
     def H(self, name: str) -> Hist:
         """Script-level variable with history: ``self.H('x').set(v)``; ``self.H('x')[1]``."""
         h = self._ctx.named.get(name)
@@ -235,9 +252,11 @@ class Script:
 
     # ── time (Pine names; exchange timezone unless tz given)
     def _cal(self, t: Any, tz: str | None):
-        if t is None:
+        if t is None and tz is None:
             return self._ctx.cal_row(self._ctx.bar_index)
-        ts = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(tz or self.syminfo.timezone)
+        if t is None:
+            t = self.time
+        ts = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(norm_tz(tz or self.syminfo.timezone))
         return ts
 
     def year(self, t: Any = None, tz: str | None = None) -> int: return int(self._cal(t, tz).year)
@@ -259,8 +278,37 @@ class Script:
         y, mo, d, *rest = args
         h, mi, s = (list(rest) + [0, 0, 0])[:3]
         ts = pd.Timestamp(year=int(y), month=int(mo), day=int(d), hour=int(h), minute=int(mi),
-                          second=int(s), tz=tz)
-        return int(ts.tz_convert("UTC").value // 1_000_000)
+                          second=int(s), tz=norm_tz(tz))
+        return int(round(ts.timestamp() * 1000))          # not .value: years beyond 2262 (timestamp(9999, ...)) overflow nanoseconds
+
+    def _regular_bounds(self) -> tuple[int, int]:
+        a, b = self.syminfo.session.split("-")[:2]
+        return int(a[:2]) * 60 + int(a[2:4]), int(b[:2]) * 60 + int(b[2:4])
+
+    def _is_regular(self, i: int) -> bool:
+        a, b = self._regular_bounds()
+        loc = self._ctx.local.iloc[i]
+        return a <= loc.hour * 60 + loc.minute < b
+
+    def session_ismarket(self) -> bool:
+        """``session.ismarket``: the bar lies in the regular session (always true on daily and higher charts)."""
+        c = self._ctx
+        return True if c.tf_secs >= 86400 else self._is_regular(c.bar_index)
+
+    def session_isfirstbar_regular(self) -> bool:
+        """``session.isfirstbar_regular``: the first bar of the regular session of a trading day (every bar on daily and higher charts)."""
+        c, i = self._ctx, self._ctx.bar_index
+        if c.tf_secs >= 86400:
+            return True
+        return self._is_regular(i) and (i == 0 or not self._is_regular(i - 1) or c.trading_day[i] != c.trading_day[i - 1])
+
+    def session_islastbar_regular(self) -> bool:
+        """``session.islastbar_regular``: the bar whose end reaches the close of the regular session (every bar on daily and higher charts)."""
+        c, i = self._ctx, self._ctx.bar_index
+        if c.tf_secs >= 86400:
+            return True
+        loc = c.local.iloc[i]
+        return self._is_regular(i) and loc.hour * 60 + loc.minute + c.tf_secs // 60 >= self._regular_bounds()[1]
 
     def time_in_session(self, session: str, tz: str | None = None, t: Any = None) -> bool:
         """``not na(time(timeframe.period, session))`` — bar start inside the session."""
@@ -386,6 +434,9 @@ class StrategyFacade:
     def close_all(self, comment: str = "", **kw: Any) -> None:
         self._b.close_all(comment, **kw)
 
+    def default_entry_qty(self, fill_price: Any) -> float:
+        return self._b.default_entry_qty(float(fill_price))
+
     def cancel(self, id: str) -> None:
         self._b.cancel(id)
 
@@ -486,6 +537,7 @@ def run(script_cls: type[Script], bars: pd.DataFrame, *, params: dict | None = N
                            script_cls.MAX_POLYLINES)
     script.open, script.high, script.low = ctx.open_s, ctx.high_s, ctx.low_s
     script.close, script.volume, script.time = ctx.close_s, ctx.volume_s, ctx.time_s
+    script.time_close = ctx.time_close_s
     script.hl2, script.hlc3, script.ohlc4, script.hlcc4 = ctx.hl2_s, ctx.hlc3_s, ctx.ohlc4_s, ctx.hlcc4_s
     script.na = NA
     broker = None
@@ -553,6 +605,10 @@ def _from_bars(cls, bars: pd.DataFrame, sym: SymbolInfo, timeframe: str) -> Cont
     c.close_s = PriceSeries(c.close_arr, "close")
     c.volume_s = PriceSeries(c.volume_arr, "volume")
     c.time_s = PriceSeries(c.time_arr, "time")
+    # bar close time: open + period for intraday bars, the next bar's open for daily and higher
+    ms = c.tf_secs * 1000
+    c.time_close_arr = [t + ms for t in c.time_arr] if c.tf_secs < 86400 else c.time_arr[1:] + [c.time_arr[-1] + ms] if c.time_arr else []
+    c.time_close_s = PriceSeries(c.time_close_arr, "time_close")
     H, L, C, O = c.high_arr, c.low_arr, c.close_arr, c.open_arr
     c.hl2_s = DerivedSeries(lambda i: (H[i] + L[i]) / 2, "hl2")
     c.hlc3_s = DerivedSeries(lambda i: (H[i] + L[i] + C[i]) / 3, "hlc3")
@@ -561,7 +617,7 @@ def _from_bars(cls, bars: pd.DataFrame, sym: SymbolInfo, timeframe: str) -> Cont
     local = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert(sym.timezone)
     c.local = local
     start = sym.session_start_minutes
-    shifted = local - pd.Timedelta(minutes=start)
+    shifted = local.dt.tz_localize(None) - pd.Timedelta(minutes=start)      # wall-clock shift: an absolute shift lands on the wrong date on DST days
     c.trading_day = (shifted.dt.year * 1000 + shifted.dt.dayofyear).tolist()
     c.data_provider = None
     c.security_cache = {}
@@ -594,12 +650,12 @@ def _period_keys(self: Context, tf: str) -> list:
         per = secs // 60
         keys = [(td[i], mins[i] // per) for i in range(self.n_bars)]
     elif t.endswith("W"):
-        shifted = self.local - pd.Timedelta(minutes=self.sym.session_start_minutes)
+        shifted = self.local.dt.tz_localize(None) - pd.Timedelta(minutes=self.sym.session_start_minutes)
         iso = shifted.dt.isocalendar()
         mult = tf_seconds(tf) // (7 * 86400)
         keys = [(int(y), int(w) // mult) for y, w in zip(iso["year"], iso["week"])]
     elif t.endswith("M"):
-        shifted = self.local - pd.Timedelta(minutes=self.sym.session_start_minutes)
+        shifted = self.local.dt.tz_localize(None) - pd.Timedelta(minutes=self.sym.session_start_minutes)
         mult = max(1, tf_seconds(tf) // (30 * 86400))
         keys = [(int(y), (int(m) - 1) // mult) for y, m in zip(shifted.dt.year, shifted.dt.month)]
     else:
@@ -628,9 +684,9 @@ def _period_start_time(self: Context, tf: str) -> int:
 def _in_session(self: Context, session: str, tz: str, t: Any = None) -> bool:
     if t is None:
         loc = self.local.iloc[self.bar_index]
-        loc = loc.tz_convert(tz) if str(loc.tz) != tz else loc
+        loc = loc.tz_convert(norm_tz(tz)) if str(loc.tz) != tz else loc
     else:
-        loc = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(tz)
+        loc = pd.Timestamp(int(fl(t)), unit="ms", tz="UTC").tz_convert(norm_tz(tz))
     spec, _, days = session.partition(":")
     if days:
         pine_dow = (loc.dayofweek + 1) % 7 + 1
@@ -638,11 +694,14 @@ def _in_session(self: Context, session: str, tz: str, t: Any = None) -> bool:
             return False
     if spec in ("", "0000-0000", "24x7"):
         return True
-    a, b = spec.split("-")
     m = loc.hour * 60 + loc.minute
-    sa = int(a[:2]) * 60 + int(a[2:4])
-    sb = int(b[:2]) * 60 + int(b[2:4])
-    return (sa <= m < sb) if sa < sb else (m >= sa or m < sb)
+    for rng in spec.split(","):                       # "0930-1130,1330-1600": inside ANY of the ranges
+        a, b = rng.split("-")
+        sa = int(a[:2]) * 60 + int(a[2:4])
+        sb = int(b[:2]) * 60 + int(b[2:4])
+        if (sa <= m < sb) if sa < sb else (m >= sa or m < sb):
+            return True
+    return False
 
 
 Context.from_bars = classmethod(_from_bars)

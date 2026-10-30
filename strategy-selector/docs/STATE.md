@@ -1,6 +1,6 @@
 # STATE (rewrite each session, ≤40 lines)
-Last tickets done: T01-T06 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
-Next ticket: T07 (bulk runner + DuckDB). Needs the full-universe 1m fetch first. T06.2 (next wave) starts at 9ZHBzpRZ in data/catalog.json priority order.
+Last tickets done: T01-T07 (T06 = wave 1 of a repeatable ticket; all acceptance-tested)
+Next ticket: T08. Full-universe 1m fetch (70 symbols x years) still NOT run; T06.2 (next wave of conversions) starts at 9ZHBzpRZ.
 Decisions:
 - Project lives in `strategy-selector/` inside the helper repo; PINE_REPO_PATH=.. (repo root).
 - helper `python/pyproject.toml` is not pip-installable, so `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path.
@@ -24,5 +24,7 @@ T06 wave 1 (TV repo, pine-to-python skill): 15 reviewed -> 10 converted FULL + i
  Real-data adapter smoke: 10 strategies x AAPL,IONQ Mar 2024 on 5m: 20/20 ran, no crash. 3Q98707C trades 18:00-02:59 NY only -> inert on RTH data; jJnqvv1t ~0-1 trade/month; eWkFVSVF never trades on 10m bars (see catalog `note`).
  Found by the independent checks and fixed in the TV repo: (1) float(self.time) TypeError in pinelib, (2) var assigned from a series must be float()-frozen (new lint rule P13), (3) check harness sizing P15. Lessons P13-P15 added.
  Catalog now: pending 1008, FULL 37, skipped 4, PARTIAL 2, NOT CONVERTIBLE 2.
+T07 bulk runner (`src/selector/bulk.py`, `src/store/db.py`, `cli bulk run|top`): variants = converted FULL strategy (progress.json) x tf x param set (optional config/variants.yaml id->{label:params}) x symbol x gate -> data/store.duckdb (runs = resume key = adapter cache_key incl. 1m data hash; trades; daily_pnl; variants). Prints jobs/todo/est minutes first, refuses > --max-minutes (30) without --yes. A job's rows commit in one transaction; 2 failed jobs of a variant stop it; variants with all jobs failed -> status error, with no trades anywhere -> dead (excluded from `bulk top`). Default symbols = learn=true in data/coverage.csv (none yet: 3 months < min_history_days) so pass --symbols.
+ Acceptance (real Twelve Data, Jan-Mar 2024, 10 symbols AAPL MSFT NVDA TSLA AMD QQQ AMZN META IONQ SOUN, 6 strategies x 3 tf x 2 gates = 360 jobs): 72 s on 4 cores, 16903 trades, 12293 daily rows; rerun todo=0; `bulk top --day 2024-02-14` returns top/bottom variants. Dead/error marking (mark_degenerate) not exercised by this data (all 18 variants traded).
 Known problems: full-universe fetch NOT run yet (70 symbols x years = many credits); do it before T07. Only AAPL/IONQ/SPCX/INFQ cached so far.
 Open questions: pre-market source (T02 limitation); exact history depth + credit/min limit per key.

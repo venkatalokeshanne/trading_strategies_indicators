@@ -1,4 +1,4 @@
-"""Independent check — MNQ Prop Firm Execution System (qmvY3luY): 5-minute bars (24 h synthetic, price ~100) of a stock-style symbol with a point value of 50 (so the +150 / -300 daily thresholds are reachable), market orders at the next open, commission / slippage off.
+"""Independent check — MNQ Prop Firm Execution System (qmvY3luY): 5-minute bars (24 h synthetic, price ~100) of a stock-style symbol with a point value of 500 (so the +150 / -300 daily thresholds are reachable), market orders at the next open, commission / slippage off.
 3-bar pivots keep the last swing high / low; a sweep (low under the swing low and close back above it, or the mirror) with the 200 EMA side, the 13:00-16:00 New York session and the daily risk engine (3 counted signals, equity change since the day's first bar > -300; the day changes at 09:30 New York) triggers an entry of 1 contract (2 above +150 today) with a half-size 1 : 1 target and a runner with a 1.8 : 1 target and the swing stop. The counter ticks on every signal, also for entries ignored by pyramiding 0.
 Uses the quantity-aware bracket reference (indep.simulate_brackets), the equity (initial capital + closed P&L x point value + open P&L) mirrored for the daily engine. Variants: 5-minute and 15-minute bars."""
 import numpy as np
@@ -8,7 +8,7 @@ from indep import bars, compare_q, np_ema, np_periods, run_conversion, simulate_
 from pinelib import SymbolInfo
 
 TV_ID = "qmvY3luY"
-PV = 50.0
+PV = 500.0
 
 
 def pivots(x, left, right, high):

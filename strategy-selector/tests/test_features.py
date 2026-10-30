@@ -45,3 +45,18 @@ def test_no_lookahead(cp):
     pd.testing.assert_frame_equal(f0.loc[:d0], f1.loc[:d0], check_exact=True)
     assert not f0.loc[d0].isna().all()
     assert not f0.loc[d0 + pd.Timedelta(days=3):].equals(f1.loc[d0 + pd.Timedelta(days=3):])   # the scramble really changed later days
+
+
+def test_regime_scores_use_only_prior_days():
+    from src.features import regimes
+    b = _bars()
+    s0 = regimes._scores(b)
+    d0 = s0.index[len(s0) // 2]
+    et = b["time"].dt.tz_convert(TZ)
+    hit = et.dt.normalize().dt.tz_localize(None) >= d0                     # every bar of day d0 and later
+    x = b.copy()
+    for c in ("open", "high", "low", "close"):
+        x[c] = np.where(hit, x[c] * 1.37, x[c])
+    s1 = regimes._scores(x)
+    pd.testing.assert_frame_equal(s0.loc[:d0], s1.loc[:d0], check_exact=True)
+    assert not s0.loc[d0:].equals(s1.loc[d0:])

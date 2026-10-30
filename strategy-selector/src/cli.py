@@ -11,6 +11,8 @@ feat_app = typer.Typer(no_args_is_help=True, help="Day features per checkpoint")
 app.add_typer(feat_app, name="features")
 ev_app = typer.Typer(no_args_is_help=True, help="Event flags")
 app.add_typer(ev_app, name="events")
+reg_app = typer.Typer(no_args_is_help=True, help="Soft regimes")
+app.add_typer(reg_app, name="regimes")
 bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
 app.add_typer(bulk_app, name="bulk")
 
@@ -164,6 +166,13 @@ def ev_build(start: str = typer.Option(...), end: str = typer.Option(...), symbo
     con.execute("CREATE OR REPLACE TABLE events AS SELECT * FROM f_")
     known = f.groupby("symbol")["earn_day"].apply(lambda x: x.notna().any())
     typer.echo(f"events: {len(f)} rows; earnings known for {int(known.sum())}/{len(known)} symbols (rest NaN: add them to config/earnings.csv)")
+
+
+@reg_app.command("report")
+def reg_report(top: int = 3, gate: str = ""):
+    """Symbol-days per regime and the best variants' weighted mean daily PnL in each (needs `bulk run` data)."""
+    from src.features import regimes
+    typer.echo(regimes.report(config.load(), top, gate or None).to_string(index=False))
 
 
 if __name__ == "__main__":

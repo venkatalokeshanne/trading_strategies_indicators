@@ -234,8 +234,9 @@ def sel_picks(checkpoint: str = "open+10", k: int = 3, days: int = 20, min_sampl
 def backtest_cmd(from_: str = typer.Option(..., "--from"), to: str = typer.Option(..., "--to"), checkpoint: str = "open+10", top_k: int = 3,
                  neutral: bool = typer.Option(False, "--neutral", help="control: QQQ + mega-caps only")):
     """Walk-forward backtest of rank -> pick variant -> trade; summary + runs/<id>/ files vs baselines."""
+    from src import service
     from src.selector import backtest
-    typer.echo(backtest.render(backtest.run(config.load(), from_, to, checkpoint, top_k, neutral)))
+    typer.echo(backtest.render(service.run_backtest(from_, to, checkpoint, top_k, neutral)))
 
 
 @app.command("robustness")
@@ -245,6 +246,13 @@ def robustness_cmd(from_: str = typer.Option(..., "--from"), to: str = typer.Opt
     cfg = config.load()
     cfg["paths"]["runs"].mkdir(exist_ok=True)
     typer.echo(robust.render(robust.run(cfg, from_, to, checkpoint, top_k, cfg["paths"]["runs"] / "robustness.json")))
+
+
+@app.command("report")
+def report_cmd(run_id: str = typer.Argument("latest"), vs: str = typer.Option("", help="second run id to compare with")):
+    """One-page report of a backtest run: results, strategy / regime contribution, library health."""
+    from src.selector import report
+    typer.echo(report.render(config.load(), run_id, vs or None))   # rendering only; the data comes from service.get_run
 
 
 if __name__ == "__main__":

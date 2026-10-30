@@ -131,13 +131,17 @@ def run_day_trades(cfg, script_path, symbol: str, tf: int, gate: str, start: str
     return t[(t["day"] >= pd.Timestamp(start).date()) & (t["day"] <= pd.Timestamp(end).date())].reset_index(drop=True)[COLS]
 
 
-def cache_key(cfg, script_path, symbol, tf, gate, start, end, params, bars1m) -> str:
+def data_hash(bars1m) -> str:
+    return str(int(pd.util.hash_pandas_object(bars1m[["time", "close", "volume"]], index=False).sum()))
+
+
+def cache_key(cfg, script_path, symbol, tf, gate, start, end, params, bars1m, dh: str | None = None) -> str:
     h = hashlib.sha1()
     h.update(Path(script_path).read_bytes())
     h.update(json.dumps([params, symbol, tf, gate, start, end, cfg["costs"], cfg["adapter"],
                          cfg["max_entries_per_day"], cfg["tiers"].get(config.tier(cfg, symbol))], sort_keys=True,
                         default=str).encode())
-    h.update(str(int(pd.util.hash_pandas_object(bars1m[["time", "close", "volume"]], index=False).sum())).encode())
+    h.update((dh or data_hash(bars1m)).encode())
     return h.hexdigest()[:20]
 
 

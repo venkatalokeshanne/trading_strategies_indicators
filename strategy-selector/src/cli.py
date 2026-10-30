@@ -7,6 +7,8 @@ data_app = typer.Typer(no_args_is_help=True, help="Market data")
 app.add_typer(data_app, name="data")
 pine_app = typer.Typer(no_args_is_help=True, help="Pine strategy catalog")
 app.add_typer(pine_app, name="pine")
+bulk_app = typer.Typer(no_args_is_help=True, help="Bulk runner + DuckDB store")
+app.add_typer(bulk_app, name="bulk")
 
 
 @app.command()
@@ -90,6 +92,32 @@ def triage(top: int = 30):
     typer.echo(f"strategies={len(df)}  status: {df['status'].value_counts().to_dict()}")
     typer.echo("pending by convertibility: " + str(pend["convertibility"].value_counts().to_dict()) + f"  dups={int((pend['dup_of'] != '').sum())}")
     typer.echo(pend[pend["priority"] > 0].head(top)[["title", "convertibility", "priority"]].to_string(max_colwidth=60))
+
+
+@bulk_app.command("run")
+def bulk_run(start: str = typer.Option(...), end: str = typer.Option(...),
+             symbols: str = typer.Option("", help="comma list; default = every learn=true symbol of data/coverage.csv"),
+             strategies: str = typer.Option("", help="ids, comma list; default = every converted FULL strategy"),
+             gates: str = typer.Option("", help="comma list; default = config gates"),
+             workers: int = 0, max_minutes: float = 30.0, yes: bool = typer.Option(False, "--yes")):
+    """Run all variants x symbols x gates into data/store.duckdb (resumable; finished jobs are skipped)."""
+    import pandas as pd
+    from src.selector import bulk
+    cfg = config.load()
+    syms = [x.strip().upper() for x in symbols.split(",") if x.strip()]
+    if not syms:
+        cov = pd.read_csv(cfg["paths"]["cache"].parent / "coverage.csv")
+        syms = cov[cov["learn"]]["symbol"].tolist()
+    bulk.run(cfg, [x.strip() for x in strategies.split(",") if x.strip()] or None, syms,
+             [x.strip() for x in gates.split(",") if x.strip()] or cfg["gates"], start, end, workers or None, max_minutes, yes, typer.echo)
+
+
+@bulk_app.command("top")
+def bulk_top(day: str = typer.Option(...), n: int = 5, gate: str = ""):
+    """Best and worst variants on one day."""
+    from src.selector import bulk
+    top, bot = bulk.top_bottom(config.load(), day, n, gate or None)
+    typer.echo("TOP\n" + top.to_string(index=False) + "\nBOTTOM\n" + bot.to_string(index=False))
 
 
 if __name__ == "__main__":

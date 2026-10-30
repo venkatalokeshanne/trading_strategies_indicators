@@ -52,7 +52,8 @@ def check(universe: bool = typer.Option(False, "--universe"),
     for sym in syms:
         t, s = quality.check_symbol(cfg, sym)
         rows.append(s)
-        days.append(t[t["bad"]])
+        if len(t):                       # symbols with no bars in the range have no day table
+            days.append(t[t["bad"]])
     cov = pd.DataFrame(rows)
     out = cfg["paths"]["cache"].parent
     pd.concat(days).to_csv(out / "bad_days.csv", index=False)

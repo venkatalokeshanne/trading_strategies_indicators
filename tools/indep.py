@@ -702,6 +702,7 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
                                                  at ``limit`` / ``stop`` (price levels; ``profit`` / ``loss`` ticks from the lot's entry price are used only when the price level is absent) or by a trailing stop (activated at ``trail_price`` or ``trail_pts`` ticks of profit, then following the best price by ``trail_off`` ticks);
                                                  the legs of one exit order are alternatives (once its quantity is filled the order is done); re-issuing the same xid only updates its levels; exits whose entry is gone are dropped
       ("close_qty", id, qty)                    market close of that quantity of the id's lots (a later close of the same id in the same bar replaces an earlier one, like a same-id entry)
+      ("order", id, d, qty)                     strategy.order: market, nets into the position (opposite side closes the oldest lots first and any excess opens a new one), pyramiding does not apply
       ("close", id[, pct]) | ("close_all",)     (ignored when nothing with that id is open at script time) market close of every lot with that entry id (``pct`` % of their open quantity, oldest lot first, when given) / of everything
       ("cancel", id) | ("cancel_all",)          drop pending entries / exit orders with that id (queued market entries too) / every pending order, exit order and queued market order
     Bar j: market orders fill at the open (or at the signal close with ``on_close``); then the OHLC path (O->H->L->C when the high is nearer the open, else O->L->H->C) is walked: the level reached first fills (a level already passed at the open fills at the open),
@@ -772,6 +773,18 @@ def simulate_brackets(o, h, l, c, orders, *, pyramiding: int = 1, on_close: bool
         elif a[0] == "close_all":
             for x in list(lots):
                 close_lot(x, x["q"], i, px)
+        elif a[0] == "order":                      # strategy.order: net the quantity into the position (opposite side reduces oldest-first, any excess reverses), no pyramiding limit
+            d, left = a[2], a[3]
+            if lots and lots[0]["d"] == -d:
+                for x in list(lots):
+                    take = min(x["q"], left)
+                    close_lot(x, take, i, px)
+                    left -= take
+                    if left <= 1e-12:
+                        break
+            if left > 1e-12:
+                seq[0] += 1
+                lots.append({"id": a[1], "d": d, "q": left, "init": left, "ep": px, "eb": i, "seq": seq[0]})
 
     def prune(extra=()):
         """Exit orders whose entry has no open lot, pending order or (``extra``) just-queued entry are cancelled."""

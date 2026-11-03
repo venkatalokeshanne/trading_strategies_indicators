@@ -18,7 +18,7 @@ def load(cfg, gate: str, symbols, d0, d1):
     from src.store import db
     con = db.connect(cfg, read_only=True)
     runs = con.execute("SELECT DISTINCT r.variant, r.symbol FROM runs r JOIN variants v USING (variant) WHERE r.gate = ? AND r.status='ok' AND v.status='ok'", [gate]).df()
-    pnl = con.execute("SELECT variant, symbol, date AS day, pnl FROM daily_pnl WHERE gate = ?", [gate]).df()
+    pnl = con.execute("SELECT d.variant, d.symbol, d.date AS day, d.pnl FROM daily_pnl d JOIN variants v USING (variant) WHERE d.gate = ? AND v.status='ok'", [gate]).df()
     days = pd.DatetimeIndex(calendar.sessions(d0, d1)["day"])
     variants = sorted(runs["variant"].unique())
     syms = sorted(set(symbols) & set(runs["symbol"]))

@@ -129,6 +129,8 @@ def run_day_trades(cfg, script_path, symbol: str, tf: int, gate: str, start: str
                            pnl=x.profit, commission=x.commission) for x in r.broker.closed])
     if t.empty:
         return pd.DataFrame(columns=COLS)
+    f = cfg["adapter"]["notional"] / (t["qty"] * t["entry_price"])     # scripts that size themselves (% of equity) ignore default qty: rescale to fixed $ per entry
+    t[["qty", "pnl", "commission"]] = t[["qty", "pnl", "commission"]].mul(f, axis=0)
     t.insert(0, "day", t["entry_time"].dt.date)
     return t[(t["day"] >= pd.Timestamp(start).date()) & (t["day"] <= pd.Timestamp(end).date())].reset_index(drop=True)[COLS]
 

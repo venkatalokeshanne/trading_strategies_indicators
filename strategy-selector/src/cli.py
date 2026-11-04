@@ -256,7 +256,7 @@ def report_cmd(run_id: str = typer.Argument("latest"), vs: str = typer.Option(""
 
 
 @app.command("picks")
-def picks_cmd(date: str = typer.Option("", help="session date YYYY-MM-DD; default = today (New York)"), k: int = 2,
+def picks_cmd(date: str = typer.Option("", help="session date YYYY-MM-DD; default = today (New York)"), k: int = 6,
               fetch: bool = typer.Option(False, "--fetch", help="download missing bars first (run after 09:40 ET)"),
               score: bool = typer.Option(False, "--score", help="past dates only: show what the picks made in the store")):
     """Which stocks and strategies to run today (trained only on earlier days)."""

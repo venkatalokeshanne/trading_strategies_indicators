@@ -135,7 +135,7 @@ def mark_degenerate(con) -> None:
                    FROM (SELECT variant, count(*) FILTER (WHERE status='ok') ok, sum(n_trades) n FROM runs GROUP BY variant) r
                    WHERE variants.variant = r.variant AND (r.ok = 0 OR r.n = 0)""")
     con.execute("""UPDATE variants SET status='ok', reason='' FROM (SELECT variant, sum(n_trades) n FROM runs GROUP BY variant) r
-                   WHERE variants.variant = r.variant AND variants.status NOT IN ('ok','lookahead') AND r.n > 0""")
+                   WHERE variants.variant = r.variant AND variants.status NOT IN ('ok','lookahead','samebar') AND r.n > 0""")
 
 
 def top_bottom(cfg, day: str, n: int = 5, gate: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:

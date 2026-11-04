@@ -29,18 +29,23 @@ def member(R: pd.DataFrame) -> pd.DataFrame:
 
 
 def train_map(L: pd.DataFrame, M: pd.DataFrame, asof) -> dict[str, list[str]]:
-    """regime -> best TOPN variants by mean pnl per symbol-day of that regime, from rows strictly before asof."""
+    """regime -> TOPN variants with the best mean/std of pnl per symbol-day of that regime (consistency, not just average), rows strictly before asof."""
     a = pd.Timestamp(asof)
     L, M = L[L["date"] < a], M[M["date"] < a]
     n = M.groupby("regime").size()
-    s = L.merge(M, on=["symbol", "date"]).groupby(["regime", "variant"])["pnl"].sum().reset_index()
-    s["avg"] = s["pnl"] / s["regime"].map(n)
-    s = s[s["regime"].map(n) >= MIN_N].sort_values("avg", ascending=False)
+    j = L.merge(M, on=["symbol", "date"]).assign(q=lambda x: x["pnl"] ** 2)
+    s = j.groupby(["regime", "variant"])[["pnl", "q"]].sum().reset_index()
+    nn = s["regime"].map(n)
+    s["avg"] = s["pnl"] / nn
+    s["score"] = s["avg"] / np.sqrt((s["q"] / nn - s["avg"] ** 2).clip(lower=1e-9))
+    s = s[nn >= MIN_N].sort_values("score", ascending=False)
+    s = s.assign(sid=s["variant"].str.split("|").str[0]).drop_duplicates(["regime", "sid"])   # best timeframe of each strategy: three different strategies, not one script at 5/10/15m
     return s.groupby("regime").head(TOPN).groupby("regime")["variant"].apply(list).to_dict()
 
 
 def vote(sets: dict, regimes: list[str]) -> list[str]:
-    return pd.Series([v for r in regimes for v in sets.get(r, [])]).value_counts().head(TOPN).index.tolist()
+    c = pd.Series([v for r in regimes for v in sets.get(r, [])]).value_counts()
+    return c[~c.index.str.split("|").str[0].duplicated()].head(TOPN).index.tolist()
 
 
 def _x(f: pd.DataFrame) -> pd.DataFrame:

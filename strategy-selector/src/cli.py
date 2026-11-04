@@ -255,5 +255,28 @@ def report_cmd(run_id: str = typer.Argument("latest"), vs: str = typer.Option(""
     typer.echo(report.render(config.load(), run_id, vs or None))   # rendering only; the data comes from service.get_run
 
 
+@app.command("picks")
+def picks_cmd(date: str = typer.Option("", help="session date YYYY-MM-DD; default = today (New York)"), k: int = 2,
+              fetch: bool = typer.Option(False, "--fetch", help="download missing bars first (run after 09:40 ET)"),
+              score: bool = typer.Option(False, "--score", help="past dates only: show what the picks made in the store")):
+    """Which stocks and strategies to run today (trained only on earlier days)."""
+    import pandas as pd
+    from src.selector import live
+    cfg = config.load()
+    day = date or pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d")
+    if fetch:
+        live.fetch_today(cfg, live.learn_symbols(cfg), day)
+    r = live.picks(cfg, day, k)
+    typer.echo(f"PICKS {r['date']} at {r['checkpoint']} (trained on {r['trained_days']} earlier days; flat by 15:55 ET; hard stop {r['stop_pct']:.0%} from entry)")
+    for p in r["picks"]:
+        typer.echo(f"{p['symbol']}  rank score {p['score']}  conditions: {', '.join(p['regimes'])}")
+        for s in p["strategies"]:
+            typer.echo(f"   run: {s}")
+    typer.echo("Split your size equally across the strategies of each stock. Backtest-derived: not a promise; known biases in docs/STATE.md.")
+    if score:
+        x = live.realised(cfg, r)
+        typer.echo("realised in store (check only): " + ("n/a" if x is None else f"{x:+.0f} at $10k per stock"))
+
+
 if __name__ == "__main__":
     app()

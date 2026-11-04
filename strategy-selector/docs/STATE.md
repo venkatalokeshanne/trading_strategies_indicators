@@ -1,6 +1,7 @@
 # STATE (rewrite each session, ≤40 lines)
 Done: T01-T14, T16, T17 (T15 ML selector skipped: no demonstrated edge). T06.2 bulk run done for the TOP 250 Atlas-ranked strategies (not all 631). T14 NOT rerun on the new window.
 VERDICT: UNPROVEN / FRAGILE. Do NOT trade on this. Numbers below are after two bug fixes found this session and are still optimistic.
+DAILY USE: `python -m src.cli picks --fetch` (after 09:40 ET; `--date D --score` to replay a past day). src/selector/live.py: market conditions -> top-3 strategies per regime (mean $ per symbol-day, trained on days < today); stocks ranked by open+10 range/volume/gap ridge; k=2 stocks; hard stop 1%. Walk-forward Jan-Oct 2026: strategy set +$297k on all stocks, 2 picked stocks ~+$36k (random 2: +$19k). Strategy edge >> stock-picking edge; one strategy (6XPbhz9C) dominates every regime. Output runs/live/<date>.json. Refresh store monthly (bulk rerun changes data hash -> full recompute).
 Next: (1) finish pass 2 (x2 costs store) then `features build` into it and rerun T14; (2) audit the top variants for lookahead; (3) Atlas prior for T12; (4) conversion backlog.
 Setup/decisions:
 - Project in `strategy-selector/`; PINE_REPO_PATH=..; `src/config.setup_pinelib()` adds `$PINE_REPO_PATH/python` to sys.path. Data = Twelve Data 1m RTH (no pre-market on this plan), cache `data/cache/<SYM>/<YYYY-MM>.parquet`.

@@ -223,7 +223,9 @@ AUXILIARY: list[SymbolRef] = [
     SymbolRef("AMEX:SPY", "stock", "yahoo", "SPY", "SPDR S&P 500 ETF"),
     SymbolRef("NASDAQ:QQQ", "stock", "yahoo", "QQQ", "Invesco QQQ Trust"),
     SymbolRef("AMEX:IWM", "stock", "yahoo", "IWM", "iShares Russell 2000 ETF"),
+    SymbolRef("AMEX:XLK", "stock", "yahoo", "XLK", "Technology Select Sector SPDR Fund"),
     SymbolRef("BINANCE:BTCUSDT", "crypto", "binance", "BTCUSDT", "Bitcoin / TetherUS"),
+    SymbolRef("BITSTAMP:BTCUSD", "crypto", "yahoo", "BTC-USD", "Bitcoin / USD"),
 ]
 
 

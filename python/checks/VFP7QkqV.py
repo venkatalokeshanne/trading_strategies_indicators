@@ -1,0 +1,72 @@
+"""Independent check — CNPS 03 SMA Dual Slope (VFP7QkqV): 15-minute bars, New York time. MACD(12,26,9) crosses open a long / short (reversing), filtered by the SMA200 slope (>= previous long, < previous short, na -> false); only
+while minutes-of-day (bar start) lie in [09:00, 14:30). Leaving the window closes any position at the next open. Once a position was open at a script run, stop = avg -/+ 10 and limit = avg +/- 30 work from the next bar.
+Variants: default (no trend filter), trend filter + no window, and no take-profit / no take-profit / long only."""
+import numpy as np
+import pandas as pd
+
+from indep import bars, compare, np_cross_over, np_cross_under, np_ema, np_sma, run_conversion, simulate
+from pinelib import SymbolInfo
+
+TV_ID = "VFP7QkqV"
+
+
+def one(df, params, use_tf, use_tp, direction, use_time=True):
+    o, h, l, c = (df[k].to_numpy() for k in ("open", "high", "low", "close"))
+    n = len(c)
+    f, sl_ = np_sma(c, 34), np_sma(c, 89)
+    pf, ps = np.r_[np.nan, f[:-1]], np.r_[np.nan, sl_[:-1]]
+    with np.errstate(invalid="ignore"):
+        gc = (f >= pf) & (sl_ >= ps)
+        dc = (f < pf) & (sl_ < ps)
+    sma = np_sma(c, 200)
+    prev = np.r_[np.nan, sma[:-1]]
+    with np.errstate(invalid="ignore"):
+        bull, bear = sma >= prev, sma < prev
+    loc = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Asia/Ho_Chi_Minh")
+    mins = (loc.dt.hour * 60 + loc.dt.minute).to_numpy()
+    ins = (mins >= 540) & (mins < 870) if use_time else np.ones(n, bool)
+    pb, pr = np.r_[False, bull[:-1]], np.r_[False, bear[:-1]]
+    fbear = bear & pb & (np.arange(n) > 0) if use_tf else np.zeros(n, bool)
+    fbull = bull & pr & (np.arange(n) > 0) if use_tf else np.zeros(n, bool)
+    pins = np.r_[False, ins[:-1]]
+    ended = ~ins & pins & (np.arange(n) > 0) if use_time else np.zeros(n, bool)
+    poscl = np.zeros(n)
+
+    def orders(i, pos):
+        poscl[i] = pos
+        out = []
+        if ended[i] and pos != 0:
+            out.append(("close", pos))
+        if fbear[i] and pos > 0:
+            out.append(("close", 1))
+        if fbull[i] and pos < 0:
+            out.append(("close", -1))
+        if gc[i] and (bull[i] if use_tf else True) and ins[i] and direction in ("Long", "Both"):
+            out.append(("entry", 1))
+        if dc[i] and (bear[i] if use_tf else True) and ins[i] and direction in ("Short", "Both"):
+            out.append(("entry", -1))
+        return out
+
+    def level(i, pos, ep, eb, sgn):
+        if eb >= i:
+            return None
+        return ep + sgn * pos * 10.0 if sgn < 0 else (ep + pos * 20.0 if use_tp else None)
+
+    stop = lambda i, pos, ep, eb: level(i, pos, ep, eb, -1)
+    tgt = lambda i, pos, ep, eb: level(i, pos, ep, eb, 1)
+    with np.errstate(invalid="ignore"):
+        ref = simulate(o, h, l, c, orders, stop=stop, target=tgt)
+    sym = SymbolInfo.make("DNSE:VN301!", "stock", qty_step=1e-9, timezone="Asia/Ho_Chi_Minh", session="0900-1445")
+    ok, d = compare(run_conversion(TV_ID, df, symbol=sym, tf="15", params=params, strategy_overrides={"margin_long": 0, "margin_short": 0, "slippage": 0, "commission_value": 0}), ref)
+    return ok and len(ref) > 10, f"{d} (got {len(ref)})"
+
+
+def check():
+    df = bars(30000, seed=411, freq="15min")
+    msgs, allok = [], True
+    for params, tf, tp, dr, ut in (({}, False, True, "Both", True), ({"Use Time Filter?": False, "Use SMA Trend Filter?": True}, True, True, "Both", False),
+                               ({"Use Take Profit?": False, "Trade Direction": "Long"}, False, False, "Long", True)):
+        ok, m = one(df, params, tf, tp, dr, ut)
+        allok &= ok
+        msgs.append(m)
+    return allok, " | ".join(msgs)

@@ -186,7 +186,7 @@ class Hist(State):
         return p[-n] if n <= len(p) else NA
 
     # numeric behaviour ------------------------------------------------------
-    def __float__(self) -> float: return self.cur
+    def __float__(self) -> float: return float(self.cur)     # `time` is int64: __float__ must return a real float
     def __bool__(self) -> bool: return truthy(self.cur)
     def __repr__(self) -> str: return f"Hist({self.cur})"
     def __neg__(self): return -self.cur
@@ -235,7 +235,7 @@ class PriceSeries:
         i = RT.ctx.bar_index - int(n)
         return self.arr[i] if 0 <= i else NA
 
-    def __float__(self) -> float: return self.cur
+    def __float__(self) -> float: return float(self.cur)     # `time` is int64: __float__ must return a real float
     def __bool__(self) -> bool: return truthy(self.cur)
     def __repr__(self) -> str: return f"{self.name}({self.cur})"
     def __neg__(self): return -self.cur

@@ -1,0 +1,326 @@
+//@version=6
+indicator("Hendo's Consolidator Helper", overlay=true, max_boxes_count=300, max_lines_count=300)
+
+// ═══════════════════════════════════════════════════════════
+//  HENDO'S CONSOLIDATOR HELPER
+//
+//  This does NOT generate signals. It runs the checks you
+//  already decided on and reports which ones pass.
+//
+//  Checks it CAN do:     session, location, HTF trend, candle
+//                        shape, volume, momentum, RSI, clock
+//  Checks it CANNOT do:  are you fit to trade, is this level
+//                        meaningful, where is your invalidation,
+//                        what size are you using
+//
+//  Run on the 1m chart. BTCUSD.
+// ═══════════════════════════════════════════════════════════
+
+// ───────────── Inputs ─────────────
+gZ = "Zones"
+zoneTF     = input.timeframe("15", "Detect gaps on", group=gZ)
+minGapPct  = input.float(0.03, "Min gap size (% of price)", minval=0.0, step=0.01, group=gZ)
+zoneBuffer = input.float(0.05, "Count as 'at zone' within (%)", minval=0.0, step=0.01, group=gZ, tooltip="Price this close to a zone edge counts as being at it.")
+maxZones   = input.int(6, "Max zones kept", minval=1, maxval=20, group=gZ)
+hideFilled = input.bool(true, "Remove filled zones from chart", group=gZ, tooltip="On = filled gaps disappear. Off = they turn grey so you can see history.")
+
+gT = "Higher timeframe"
+htf    = input.timeframe("60", "Trend timeframe", group=gT)
+emaLen = input.int(50, "Trend EMA length", minval=5, group=gT)
+
+gV = "Volume"
+volLen  = input.int(20, "Volume MA length", minval=2, group=gV)
+volMult = input.float(1.5, "Must exceed MA by", minval=1.0, step=0.1, group=gV)
+
+gM = "Momentum"
+regLen = input.int(14, "Regression length", minval=3, group=gM)
+
+gR = "RSI veto"
+rsiLen = input.int(14, "RSI length", minval=2, group=gR)
+rsiOB  = input.int(70, "Overbought", minval=50, maxval=95, group=gR)
+rsiOS  = input.int(30, "Oversold", minval=5, maxval=50, group=gR)
+rsiTF  = input.timeframe("", "RSI timeframe", group=gR, tooltip="Blank = same as chart (1m). Set to 15 for the smoother 15m reading. Blank matches a standard RSI pane.")
+
+gC = "Clock"
+earlyMin = input.int(8, "Window opens with N min left", minval=3, maxval=14, group=gC)
+lateMin  = input.int(2, "Window closes with N min left", minval=1, maxval=6, group=gC)
+
+gS = "Session (UTC)"
+useSession = input.bool(true, "Require good session", group=gS)
+goodSess   = input.session("1300-2100", "Preferred window", group=gS, tooltip="1300-2100 UTC = 8am-4pm Central (US session).")
+
+gP = "Panel"
+panelPos = input.string("Top Right", "Position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=gP)
+
+gK = "Kalshi target"
+manualTarget = input.float(0.0, "Target price (0 = use 15m open)", minval=0.0, step=1.0, group=gK, tooltip="Type the exact target Kalshi shows for the contract. Leave at 0 to use the 15m candle open.")
+showTargetLine = input.bool(true, "Draw target line", group=gK)
+
+gRG = "Consolidation range"
+useRange   = input.bool(true, "Detect range + sweeps", group=gRG)
+rangeLen   = input.int(30, "Lookback bars for range", minval=10, maxval=120, group=gRG, tooltip="How many bars define the current trading box.")
+maxRangePct = input.float(0.35, "Max range width (%)", minval=0.05, step=0.05, group=gRG, tooltip="If the high-low span is wider than this, price is trending, not ranging.")
+sweepTol   = input.float(0.02, "Wick must clear edge by (%)", minval=0.0, step=0.01, group=gRG)
+
+// ───────────── 1. SESSION ─────────────
+bool inGoodSession = not na(time(timeframe.period, goodSess, "UTC"))
+bool sessPass = not useSession or inGoodSession
+string sessTxt = inGoodSession ? "US / overlap" : "off-peak"
+
+// ───────────── 2. LOCATION (fair value gaps) ─────────────
+volMA = ta.sma(volume, volLen)
+
+[gh0, gl0, gh2, gl2, gt] = request.security(syminfo.tickerid, zoneTF, [high, low, high[2], low[2], time], lookahead=barmerge.lookahead_off)
+bool newHtfBar = ta.change(gt) != 0
+
+type Zone
+    box   b
+    float top
+    float bot
+    bool  bull
+    bool  dead
+
+var array<Zone> zones = array.new<Zone>()
+
+bool bullGap = gh2 < gl0
+bool bearGap = gl2 > gh0
+float zTop = bullGap ? gl0 : gh0
+float zBot = bullGap ? gh2 : gl2
+float zSize = math.abs(zTop - zBot)
+bool sizeOK = close > 0 and (zSize / close * 100.0) >= minGapPct
+
+if newHtfBar and (bullGap or bearGap) and sizeOK
+    float t = math.max(zTop, zBot)
+    float b = math.min(zTop, zBot)
+    color fill = bullGap ? color.new(#26a69a, 84) : color.new(#ef5350, 84)
+    color edge = bullGap ? color.new(#26a69a, 45) : color.new(#ef5350, 45)
+    box nb = box.new(bar_index, t, bar_index + 1, b, border_color=edge, border_width=1, bgcolor=fill, extend=extend.right)
+    array.push(zones, Zone.new(nb, t, b, bullGap, false))
+    while array.size(zones) > maxZones
+        Zone old = array.shift(zones)
+        box.delete(old.b)
+
+float nearTop = na
+float nearBot = na
+bool  nearBull = false
+bool  haveZone = false
+float nearDist = na
+
+if array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        if not z.dead
+            // Only kill a zone when a candle CLOSES fully through it.
+            // A wick poking in is a test, not a fill.
+            bool filled = z.bull ? (close < z.bot) : (close > z.top)
+            if filled
+                z.dead := true
+                if hideFilled
+                    box.delete(z.b)
+                else
+                    box.set_bgcolor(z.b, color.new(color.gray, 92))
+                    box.set_border_color(z.b, color.new(color.gray, 70))
+        if not z.dead
+            float d = close > z.top ? close - z.top : close < z.bot ? z.bot - close : 0.0
+            if not haveZone or d < nearDist
+                haveZone := true
+                nearDist := d
+                nearTop  := z.top
+                nearBot  := z.bot
+                nearBull := z.bull
+
+float bufferPts = close * zoneBuffer / 100.0
+bool locPass = haveZone and nearDist <= bufferPts
+string locTxt = not haveZone ? "no zone" : locPass ? (nearBull ? "at bull zone" : "at bear zone") : str.tostring(nearDist, "#.#") + " away"
+
+// ───────────── 3. HIGHER TIMEFRAME TREND ─────────────
+float htfEma = request.security(syminfo.tickerid, htf, ta.ema(close, emaLen), lookahead=barmerge.lookahead_off)
+bool trendUp = close > htfEma
+string trendTxt = trendUp ? "UP - longs only" : "DOWN - shorts only"
+
+// ───────────── 4. CANDLE SHAPE (closed 1m candle) ─────────────
+float body    = math.abs(close[1] - open[1])
+float rng     = high[1] - low[1]
+float upWick  = high[1] - math.max(close[1], open[1])
+float dnWick  = math.min(close[1], open[1]) - low[1]
+bool  bodyOK  = rng > 0 and body / rng > 0.55
+
+float tolPts = close * 0.0002
+
+bool hammer   = rng > 0 and dnWick / rng > 0.5 and body / rng < 0.4
+bool star     = rng > 0 and upWick / rng > 0.5 and body / rng < 0.4
+bool bullEng  = close[1] > open[1] and close[2] < open[2] and close[1] >= open[2] and open[1] <= close[2]
+bool bearEng  = close[1] < open[1] and close[2] > open[2] and close[1] <= open[2] and open[1] >= close[2]
+bool maruUp   = rng > 0 and body / rng > 0.9 and close[1] > open[1]
+bool maruDn   = rng > 0 and body / rng > 0.9 and close[1] < open[1]
+bool strongUp = bodyOK and close[1] > open[1]
+bool strongDn = bodyOK and close[1] < open[1]
+bool doji     = rng > 0 and body / rng < 0.15
+bool spinTop  = rng > 0 and body / rng < 0.35 and upWick / rng > 0.25 and dnWick / rng > 0.25
+bool tweezBot = math.abs(low[1] - low[2]) <= tolPts and close[1] > open[1] and close[2] < open[2]
+bool tweezTop = math.abs(high[1] - high[2]) <= tolPts and close[1] < open[1] and close[2] > open[2]
+bool insideBar = high[1] < high[2] and low[1] > low[2]
+bool threeUp  = close[1] > open[1] and close[2] > open[2] and close[3] > open[3] and close[1] > close[2] and close[2] > close[3]
+bool threeDn  = close[1] < open[1] and close[2] < open[2] and close[3] < open[3] and close[1] < close[2] and close[2] < close[3]
+
+bool bullPattern = hammer or bullEng or maruUp or strongUp or tweezBot or threeUp
+bool bearPattern = star or bearEng or maruDn or strongDn or tweezTop or threeDn
+bool shapePass = bullPattern or bearPattern
+
+string shapeTxt = threeUp ? "three green - strong" : threeDn ? "three red - strong" : tweezBot ? "tweezer bottom" : tweezTop ? "tweezer top" : bullEng ? "bull engulfing" : bearEng ? "bear engulfing" : hammer ? "hammer" : star ? "shooting star" : maruUp ? "marubozu up" : maruDn ? "marubozu down" : strongUp ? "strong green" : strongDn ? "strong red" : doji ? "doji - no read" : spinTop ? "spinning top - chop" : insideBar ? "inside bar - coiling" : "nothing clear"
+
+string shapeTag = threeUp ? "3up" : threeDn ? "3dn" : tweezBot ? "TWZ" : tweezTop ? "TWZ" : bullEng ? "ENG" : bearEng ? "ENG" : hammer ? "HAM" : star ? "STAR" : maruUp ? "MAR" : maruDn ? "MAR" : ""
+
+// ───────────── 5. VOLUME ─────────────
+float volRatio = volMA > 0 ? volume[1] / volMA[1] : 0.0
+bool volPass = volRatio >= volMult
+string volTxt = str.tostring(volRatio, "#.##") + "x MA"
+
+// ───────────── 6. MOMENTUM ─────────────
+float reg     = ta.linreg(close, regLen, 0)
+float regPrev = ta.linreg(close, regLen, 1)
+float slope   = reg - regPrev
+bool momUp    = slope > 0
+bool momAccel = math.abs(slope) > math.abs(regPrev - ta.linreg(close, regLen, 2))
+string momTxt = (momUp ? "rising" : "falling") + (momAccel ? " - building" : " - fading")
+
+// ───────────── 7. RSI VETO ─────────────
+float rsiRaw = ta.rsi(close, rsiLen)
+float rsi = rsiTF == "" ? rsiRaw : request.security(syminfo.tickerid, rsiTF, rsiRaw, lookahead=barmerge.lookahead_off)
+bool rsiBlocksLong  = rsi >= rsiOB
+bool rsiBlocksShort = rsi <= rsiOS
+bool rsiPass = not (trendUp and rsiBlocksLong) and not (not trendUp and rsiBlocksShort)
+string rsiTxt = str.tostring(rsi, "#.#") + (rsiBlocksLong ? " - overbought" : rsiBlocksShort ? " - oversold" : " - clear")
+
+// ───────────── 8. CLOCK ─────────────
+int MS15 = 15 * 60 * 1000
+int bStart = timenow - (timenow % MS15)
+int msLeft = bStart + MS15 - timenow
+float minLeft = msLeft / 60000.0
+bool clockPass = minLeft <= earlyMin and minLeft >= lateMin
+string clockTxt = str.tostring(math.floor(minLeft)) + "m " + str.tostring(math.floor((msLeft % 60000) / 1000)) + "s - " + (minLeft > earlyMin ? "early" : minLeft >= lateMin ? "WINDOW" : "too late")
+
+// ───────────── 9. LEAN + TARGET ─────────────
+float open15 = request.security(syminfo.tickerid, "15", open, lookahead=barmerge.lookahead_off)
+float lean = close - open15
+string leanWord = lean > 0 ? "GREEN +" : lean < 0 ? "RED " : "FLAT "
+string leanTxt = na(open15) ? "-" : leanWord + str.tostring(lean, "#.##")
+
+float target = manualTarget > 0 ? manualTarget : open15
+float toBeat = close - target
+string beatSide = toBeat > 0 ? "ABOVE by " : toBeat < 0 ? "BELOW by " : "AT "
+string beatTxt = na(target) ? "-" : str.tostring(target, "#.##") + "  " + beatSide + str.tostring(math.abs(toBeat), "#.##")
+color beatCol = toBeat > 0 ? color.new(#26a69a, 0) : toBeat < 0 ? color.new(#ef5350, 0) : color.gray
+
+// ───────────── 10. CONSOLIDATION RANGE + SWEEPS ─────────────
+float rHigh = ta.highest(high, rangeLen)
+float rLow  = ta.lowest(low, rangeLen)
+float rWidthPct = close > 0 ? (rHigh - rLow) / close * 100.0 : 999.0
+bool  isRanging = useRange and rWidthPct <= maxRangePct
+
+float tolR = close * sweepTol / 100.0
+
+// Sweep = the last CLOSED candle wicked past an edge but closed back inside.
+bool sweepTop = isRanging and high[1] > rHigh[2] + tolR and close[1] < rHigh[2]
+bool sweepBot = isRanging and low[1]  < rLow[2]  - tolR and close[1] > rLow[2]
+bool anySweep = sweepTop or sweepBot
+
+string rangeTxt = not useRange ? "off" : not isRanging ? "trending (" + str.tostring(rWidthPct, "#.##") + "%)" : "range " + str.tostring(rLow, "#.##") + " - " + str.tostring(rHigh, "#.##")
+string sweepTxt = sweepTop ? "SWEEP HIGH - short" : sweepBot ? "SWEEP LOW - long" : isRanging ? "inside range" : "-"
+color  sweepCol = sweepTop ? color.new(#ef5350, 0) : sweepBot ? color.new(#26a69a, 0) : color.gray
+
+// draw the box - anchored to a fixed left edge so it does not slide
+var box   rBox      = na
+var int   rAnchor   = na
+var float rBoxHigh  = na
+var float rBoxLow   = na
+
+if isRanging
+    // Only re-anchor when the range boundaries actually change meaningfully.
+    bool needsNew = na(rBox) or na(rBoxHigh) or math.abs(rHigh - rBoxHigh) > tolR or math.abs(rLow - rBoxLow) > tolR
+    if needsNew
+        if not na(rBox)
+            box.delete(rBox)
+        rAnchor  := bar_index - rangeLen
+        rBoxHigh := rHigh
+        rBoxLow  := rLow
+        rBox := box.new(rAnchor, rBoxHigh, bar_index, rBoxLow, border_color=color.new(#5b6ea8, 30), border_width=1, bgcolor=color.new(#5b6ea8, 92), extend=extend.right)
+
+if not isRanging and not na(rBox)
+    box.delete(rBox)
+    rBox     := na
+    rBoxHigh := na
+    rBoxLow  := na
+
+// ───────────── Tally ─────────────
+// A sweep at a range edge counts as valid location, same as being at a gap zone.
+bool locOrSweep = locPass or anySweep
+int passed = (sessPass ? 1 : 0) + (locOrSweep ? 1 : 0) + (shapePass ? 1 : 0) + (volPass ? 1 : 0) + (rsiPass ? 1 : 0) + (clockPass ? 1 : 0)
+bool allCore = sessPass and locOrSweep and shapePass and volPass and rsiPass and clockPass
+
+// ───────────── Panel ─────────────
+pos = panelPos == "Top Right" ? position.top_right : panelPos == "Top Left" ? position.top_left : panelPos == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+var table t = table.new(pos, 3, 15, border_width=1, border_color=color.new(color.gray, 70), frame_width=1, frame_color=color.new(color.gray, 50))
+
+f_row(int r, string label, bool ok, string detail) =>
+    color bg = color.new(#1b202b, 0)
+    table.cell(t, 0, r, ok ? "PASS" : "----", text_color=ok ? color.new(#26a69a, 0) : color.new(#ef5350, 0), text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, r, label, text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, r, detail, text_color=color.new(#d5d9e0, 0), text_size=size.small, bgcolor=bg)
+
+if barstate.islast
+    color hdr = color.new(#2b303c, 0)
+    color bg  = color.new(#1b202b, 0)
+
+    table.cell(t, 0, 0, "", bgcolor=hdr)
+    table.cell(t, 1, 0, "HENDO'S HELPER", text_color=color.white, bgcolor=hdr)
+    table.cell(t, 2, 0, str.tostring(passed) + "/6 core", text_color=allCore ? color.new(#26a69a, 0) : color.new(#e0a458, 0), bgcolor=hdr)
+
+    f_row(1, "Session",    sessPass,  sessTxt)
+    f_row(2, "Location",   locOrSweep, anySweep ? "range edge sweep" : locTxt)
+    f_row(3, "HTF trend",  true,      trendTxt)
+    f_row(4, "Shape",      shapePass, shapeTxt)
+    f_row(5, "Volume",     volPass,   volTxt)
+    f_row(6, "Momentum",   true,      momTxt)
+    f_row(7, "RSI veto",   rsiPass,   rsiTxt)
+    f_row(8, "Clock",      clockPass, clockTxt)
+
+    table.cell(t, 0, 9, "", text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 9, "Range", text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, 9, rangeTxt, text_color=isRanging ? color.new(#5b6ea8, 0) : color.gray, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 10, anySweep ? "PASS" : "----", text_color=anySweep ? color.new(#26a69a, 0) : color.new(#ef5350, 0), text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 10, "Sweep", text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, 10, sweepTxt, text_color=sweepCol, text_size=size.small, bgcolor=bg)
+
+    table.cell(t, 0, 11, "", text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 1, 11, "15m lean", text_color=color.gray, text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, 11, leanTxt, text_color=lean > 0 ? color.new(#26a69a, 0) : lean < 0 ? color.new(#ef5350, 0) : color.gray, text_size=size.small, bgcolor=bg)
+
+    color tbg = color.new(#242a36, 0)
+    table.cell(t, 0, 12, "", bgcolor=tbg)
+    table.cell(t, 1, 12, "PRICE TO BEAT", text_color=color.new(#e0a458, 0), text_size=size.small, bgcolor=tbg)
+    table.cell(t, 2, 12, beatTxt, text_color=beatCol, text_size=size.small, bgcolor=tbg)
+
+    color vbg = allCore ? color.new(#26a69a, 78) : color.new(#1b202b, 0)
+    table.cell(t, 0, 13, "", bgcolor=vbg)
+    table.cell(t, 1, 13, allCore ? "6/6 CORE PASS" : "NOT ALIGNED", text_color=allCore ? color.new(#26a69a, 0) : color.gray, text_size=size.small, bgcolor=vbg)
+    table.cell(t, 2, 13, allCore ? "still your call" : "wait", text_color=color.gray, text_size=size.small, bgcolor=vbg)
+
+    table.cell(t, 0, 14, "", bgcolor=bg)
+    table.cell(t, 1, 14, "Not checked", text_color=color.new(#e0a458, 0), text_size=size.small, bgcolor=bg)
+    table.cell(t, 2, 14, "fitness / invalidation / size", text_color=color.new(#e0a458, 0), text_size=size.small, bgcolor=bg)
+
+// ───────────── Plots ─────────────
+plot(htfEma, "HTF trend EMA", color=color.new(color.blue, 40), linewidth=2)
+plot(showTargetLine ? target : na, "Price to beat", color=color.new(#e0a458, 0), linewidth=2, style=plot.style_linebr)
+
+// ───────────── Alerts ─────────────
+plotshape(sweepTop, title="Sweep high", style=shape.triangledown, location=location.abovebar, color=color.new(#ef5350, 0), size=size.tiny, offset=-1)
+plotshape(sweepBot, title="Sweep low",  style=shape.triangleup,   location=location.belowbar, color=color.new(#26a69a, 0), size=size.tiny, offset=-1)
+
+alertcondition(allCore and not allCore[1], "All core checks passed", "BTC: all six core checks aligned - review the setup")
+alertcondition(locPass and not locPass[1], "Price reached a zone", "BTC: price has reached a fair value gap zone")
+alertcondition(sweepTop, "Range high swept", "BTC: wick above range high closed back inside - failed breakout")
+alertcondition(sweepBot, "Range low swept", "BTC: wick below range low closed back inside - failed breakdown")

@@ -1,0 +1,271 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("Confluence Engine Strategy [JOAT]", shorttitle="CES [JOAT]",
+         overlay=true,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=5,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=2,
+         max_bars_back=500)
+// ─── INPUTS ──────────────────────────────────────────────────────────
+var GRP_E  = "Entry Engine"
+var GRP_F  = "Filters"
+var GRP_R  = "Risk Management"
+var GRP_X  = "Exit Logic"
+var GRP_V  = "Visual"
+
+i_lrLen     = input.int   (9,    "LR Length",               group=GRP_E, minval=3)
+i_sigLen    = input.int   (5,    "LR Signal Length",         group=GRP_E, minval=2)
+i_fastEMA   = input.int   (20,   "Fast EMA",                 group=GRP_E, minval=5)
+i_slowEMA   = input.int   (50,   "Slow EMA",                 group=GRP_E, minval=10)
+i_atrLen    = input.int   (14,   "ATR Length",               group=GRP_E, minval=3)
+i_regLen    = input.int   (50,   "Regime ATR Length",        group=GRP_E, minval=20)
+i_confScore = input.int   (50,   "Min Confluence Score",     group=GRP_E, minval=0, maxval=100)
+i_longs     = input.bool  (true, "Trade Long",               group=GRP_E)
+i_shorts    = input.bool  (true, "Trade Short",              group=GRP_E)
+
+i_volFilt   = input.bool  (true, "Require Volume Spike",    group=GRP_F)
+i_volLen    = input.int   (20,   "Volume SMA Length",        group=GRP_F, minval=5)
+i_volMult   = input.float (1.0,  "Volume Multiplier",        group=GRP_F, minval=0.5, step=0.1)
+i_rsiLen    = input.int   (14,   "RSI Length",               group=GRP_F, minval=2)
+i_rsiBullMax= input.int   (72,   "RSI Max for Longs",        group=GRP_F, minval=50, maxval=99)
+i_rsiBearMin= input.int   (28,   "RSI Min for Shorts",       group=GRP_F, minval=1,  maxval=50)
+i_cooldown  = input.int   (3,    "Cooldown Bars After Exit", group=GRP_F, minval=0)
+i_regFilter = input.bool  (true, "Regime Filter (no ranging)", group=GRP_F)
+i_regThresh = input.float (0.85, "Trending Regime Threshold", group=GRP_F, minval=0.5, maxval=1.5, step=0.05)
+
+i_riskPct   = input.float (5.0,  "Risk Per Trade (%)",       group=GRP_R, minval=0.5, maxval=25, step=0.5)
+i_slMult    = input.float (1.5,  "SL  (ATR x)",              group=GRP_R, minval=0.5, step=0.25)
+i_tpMult    = input.float (2.5,  "TP  (ATR x)",              group=GRP_R, minval=0.5, step=0.25)
+i_timeout   = input.int   (20,   "Timeout Exit (bars)",      group=GRP_X, minval=3)
+i_htfTF     = input.string("60", "HTF Bias Timeframe",       group=GRP_X)
+
+i_showSig   = input.bool  (true, "Show Signal Labels",       group=GRP_V)
+i_showLvls  = input.bool  (true, "Show TP/SL Levels",        group=GRP_V)
+
+// ─── PALETTE ─────────────────────────────────────────────────────────
+C_BULL  = color.rgb(0, 245, 212)
+C_BEAR  = color.rgb(255, 68, 102)
+C_GOLD  = color.rgb(255, 215, 0)
+C_SLATE = color.rgb(96, 112, 128)
+_isDark = color.r(chart.bg_color) < 128
+C_PANEL = _isDark ? color.new(color.black, 80) : color.new(color.white, 75)
+C_TXT   = _isDark ? color.white : color.black
+
+// ─── HELPERS ─────────────────────────────────────────────────────────
+safeDiv(float n, float d) =>
+    d != 0.0 and not na(d) ? n / d : 0.0
+
+// ─── CORE CALCULATIONS ───────────────────────────────────────────────
+lr_open  = ta.linreg(open,  i_lrLen, 0)
+lr_close = ta.linreg(close, i_lrLen, 0)
+sigLine  = ta.sma(lr_close, i_sigLen)
+
+fastEMA  = ta.ema(close, i_fastEMA)
+slowEMA  = ta.ema(close, i_slowEMA)
+trendUp  = fastEMA > slowEMA
+trendDn  = fastEMA < slowEMA
+
+atr14    = ta.atr(i_atrLen)
+atrSlow  = ta.atr(i_regLen)
+atrRatio = safeDiv(atr14, math.max(atrSlow, syminfo.mintick))
+isTrending   = atrRatio > i_regThresh or not i_regFilter
+isCompressed = atrRatio < i_regThresh * 0.75
+
+rsiVal   = ta.rsi(close, i_rsiLen)
+volSma   = ta.sma(volume, i_volLen)
+volOk    = not i_volFilt or volume > volSma * i_volMult
+
+// HTF trend bias (non-repainting)
+htfClose = request.security(syminfo.tickerid, i_htfTF, close[1], lookahead=barmerge.lookahead_off)
+htfEmaF  = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_fastEMA), lookahead=barmerge.lookahead_off)
+htfEmaS  = request.security(syminfo.tickerid, i_htfTF, ta.ema(close, i_slowEMA), lookahead=barmerge.lookahead_off)
+htfBull  = htfEmaF > htfEmaS
+htfBear  = htfEmaF < htfEmaS
+
+WARMUP  = math.max(i_slowEMA * 2, i_regLen * 2)
+isReady = bar_index >= WARMUP
+
+// ─── CONFLUENCE SCORE ────────────────────────────────────────────────
+f_scoreL() =>
+    // Score for a LONG setup (0-100)
+    trendS = trendUp   ? 25 : 0
+    htfS   = htfBull   ? 20 : 0
+    volS   = volume > volSma * 1.2 ? 20 : volume > volSma ? 10 : 0
+    rsiS   = rsiVal < 50 ? math.min((55.0 - rsiVal) * 0.5, 20.0) : 0.0
+    regS   = isTrending ? 15 : 0
+    int(math.min(trendS + htfS + int(volS) + int(rsiS) + regS, 100))
+
+f_scoreS() =>
+    // Score for a SHORT setup (0-100)
+    trendS = trendDn   ? 25 : 0
+    htfS   = htfBear   ? 20 : 0
+    volS   = volume > volSma * 1.2 ? 20 : volume > volSma ? 10 : 0
+    rsiS   = rsiVal > 50 ? math.min((rsiVal - 45.0) * 0.5, 20.0) : 0.0
+    regS   = isTrending ? 15 : 0
+    int(math.min(trendS + htfS + int(volS) + int(rsiS) + regS, 100))
+
+// ─── SIGNAL GENERATION ───────────────────────────────────────────────
+lrCross  = ta.crossover (lr_close, sigLine)
+lrUnder  = ta.crossunder(lr_close, sigLine)
+
+longScore  = lrCross ? f_scoreL() : 0
+shortScore = lrUnder ? f_scoreS() : 0
+
+bullSig = lrCross and trendUp and htfBull and volOk and rsiVal < i_rsiBullMax and
+          isTrending and longScore >= i_confScore and i_longs and isReady and barstate.isconfirmed
+
+bearSig = lrUnder and trendDn and htfBear and volOk and rsiVal > i_rsiBearMin and
+          isTrending and shortScore >= i_confScore and i_shorts and isReady and barstate.isconfirmed
+
+// ─── COOLDOWN ────────────────────────────────────────────────────────
+var int lastExitBar = na
+cooldownOk = na(lastExitBar) or (bar_index - lastExitBar >= i_cooldown)
+
+// ─── POSITION STATE ──────────────────────────────────────────────────
+var float entryAtr    = na
+var float entryTP     = na
+var float entrySL     = na
+var int   entryBar    = na
+var bool  inLong      = false
+var bool  inShort     = false
+
+// Detect position open
+if strategy.position_size > 0 and strategy.position_size[1] == 0
+    inLong    := true
+    inShort   := false
+    entryAtr  := atr14
+    entryBar  := bar_index
+
+if strategy.position_size < 0 and strategy.position_size[1] == 0
+    inShort   := true
+    inLong    := false
+    entryAtr  := atr14
+    entryBar  := bar_index
+
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    inLong    := false
+    inShort   := false
+    lastExitBar := bar_index
+
+// Calculate TP/SL
+if inLong and not na(entryAtr)
+    entryTP := strategy.position_avg_price + entryAtr * i_tpMult
+    entrySL := strategy.position_avg_price - entryAtr * i_slMult
+
+if inShort and not na(entryAtr)
+    entryTP := strategy.position_avg_price - entryAtr * i_tpMult
+    entrySL := strategy.position_avg_price + entryAtr * i_slMult
+
+// ─── ENTRIES ─────────────────────────────────────────────────────────
+if bullSig and cooldownOk and strategy.position_size == 0
+    strategy.entry("Long", strategy.long,
+         comment="CES L " + str.tostring(longScore))
+
+if bearSig and cooldownOk and strategy.position_size == 0
+    strategy.entry("Short", strategy.short,
+         comment="CES S " + str.tostring(shortScore))
+
+// ─── EXITS ───────────────────────────────────────────────────────────
+if inLong and not na(entryTP) and not na(entrySL)
+    strategy.exit("TP/SL Long", "Long", limit=entryTP, stop=entrySL)
+
+if inShort and not na(entryTP) and not na(entrySL)
+    strategy.exit("TP/SL Short", "Short", limit=entryTP, stop=entrySL)
+
+// Timeout exit
+if inLong and not na(entryBar) and bar_index - entryBar >= i_timeout
+    strategy.close("Long", comment="Timeout")
+
+if inShort and not na(entryBar) and bar_index - entryBar >= i_timeout
+    strategy.close("Short", comment="Timeout")
+
+// Trend flip exit
+if inLong and trendDn and barstate.isconfirmed
+    strategy.close("Long", comment="Trend Flip")
+
+if inShort and trendUp and barstate.isconfirmed
+    strategy.close("Short", comment="Trend Flip")
+
+// ─── SIGNAL VISUALS ──────────────────────────────────────────────────
+if i_showSig and bullSig
+    label.new(bar_index, low, "LONG " + str.tostring(longScore),
+         color=color.new(C_BULL, 55), textcolor=color.white,
+         style=label.style_label_up, size=size.small)
+
+if i_showSig and bearSig
+    label.new(bar_index, high, "SHORT " + str.tostring(shortScore),
+         color=color.new(C_BEAR, 55), textcolor=color.white,
+         style=label.style_label_down, size=size.small)
+
+// TP/SL level lines
+var line tpLine = na
+var line slLine = na
+
+if inLong or inShort
+    if not na(tpLine)
+        line.delete(tpLine)
+    if not na(slLine)
+        line.delete(slLine)
+    if i_showLvls and not na(entryTP) and not na(entrySL)
+        tpLine := line.new(nz(entryBar, bar_index), entryTP, bar_index + 10, entryTP,
+                   color=color.new(C_BULL, 25), width=1, style=line.style_dotted)
+        slLine := line.new(nz(entryBar, bar_index), entrySL, bar_index + 10, entrySL,
+                   color=color.new(C_BEAR, 25), width=1, style=line.style_dashed)
+
+// ─── EQUITY CURVE PLOT ───────────────────────────────────────────────
+plot(fastEMA, "Fast EMA", color=color.new(trendUp ? C_BULL : C_BEAR, 60), linewidth=1)
+plot(slowEMA, "Slow EMA", color=color.new(trendUp ? C_BULL : C_BEAR, 40), linewidth=2)
+
+// Regime background
+regimeBg = isCompressed ? color.new(C_GOLD, 95) : na
+bgcolor(regimeBg, title="Compression Regime")
+
+// ─── DASHBOARD ───────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 10,
+     bgcolor=C_PANEL, border_width=1, border_color=color.new(color.gray, 55))
+
+if barstate.islast
+    pnlPct     = safeDiv(strategy.netprofit, strategy.initial_capital) * 100.0
+    winRate    = strategy.wintrades + strategy.losstrades > 0 ?
+                  safeDiv(float(strategy.wintrades), float(strategy.wintrades + strategy.losstrades)) * 100.0 : 0.0
+    posStr     = inLong ? "LONG" : inShort ? "SHORT" : "FLAT"
+    posClr     = inLong ? C_BULL : inShort ? C_BEAR : C_SLATE
+    regStr     = isCompressed ? "COMPRESS" : isTrending ? "TRENDING" : "NEUTRAL"
+    regClr     = isCompressed ? C_GOLD : isTrending ? C_BULL : C_SLATE
+    scoreL     = f_scoreL()
+    scoreS     = f_scoreS()
+    htfStr     = htfBull ? "BULL" : htfBear ? "BEAR" : "NEUTRAL"
+    htfClr     = htfBull ? C_BULL : htfBear ? C_BEAR : C_SLATE
+
+    table.cell(dash, 0, 0, "CES [JOAT]",
+         bgcolor=color.new(C_GOLD, 35), text_color=color.black, text_size=size.small)
+    table.cell(dash, 1, 0, "JackOfAllTrades",
+         bgcolor=color.new(C_GOLD, 35), text_color=color.black, text_size=size.small)
+    table.cell(dash, 0, 1, "Net P&L",  text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 1, (pnlPct >= 0 ? "+" : "") + str.tostring(math.round(pnlPct, 1)) + "%",
+         text_color=pnlPct >= 0 ? C_BULL : C_BEAR, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 2, "Win Rate", text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 2, str.tostring(math.round(winRate, 1)) + "%",
+         text_color=winRate >= 50 ? C_BULL : C_BEAR, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 3, "Trades",   text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 3, str.tostring(strategy.closedtrades),
+         text_color=C_GOLD, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 4, "Position", text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 4, posStr,     text_color=posClr, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 5, "Regime",   text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 5, regStr,     text_color=regClr, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 6, "HTF Bias", text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 6, htfStr,     text_color=htfClr, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 7, "L Score",  text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 7, str.tostring(scoreL),
+         text_color=scoreL >= i_confScore ? C_BULL : C_SLATE, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 8, "S Score",  text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 8, str.tostring(scoreS),
+         text_color=scoreS >= i_confScore ? C_BEAR : C_SLATE, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 0, 9, "ATR Ratio",text_color=C_TXT, text_size=size.small, bgcolor=C_PANEL)
+    table.cell(dash, 1, 9, str.tostring(math.round(atrRatio, 3)),
+         text_color=isTrending ? C_BULL : C_SLATE, text_size=size.small, bgcolor=C_PANEL)

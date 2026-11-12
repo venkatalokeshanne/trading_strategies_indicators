@@ -1,0 +1,276 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © realanthonyc https://www.tradingview.com/u/realanthonyc
+
+//@version=6
+// -------------------------------------------------------------------------------
+//  TradingFlow: Efficiency & Absorption Index
+// -------------------------------------------------------------------------------
+indicator("TradingFlow: Efficiency & Absorption Index (EAI) v2.2.3", "TF: EAI", overlay=false, precision=1, max_bars_back=500)
+
+// -------------------------------------
+// Inputs
+// -------------------------------------
+
+grpCore = "Efficiency Model"
+atrLength = input.int(14, "ATR Length", minval=2, maxval=200, group=grpCore)
+volumeLength = input.int(30, "Relative Volume Length", minval=10, maxval=200, group=grpCore)
+smoothLength = input.int(5, "Efficiency Smoothing", minval=1, maxval=100, group=grpCore)
+signalLength = input.int(5, "Signal Line Length", minval=1, maxval=100, group=grpCore)
+bandLength = input.int(80, "Adaptive Band Length", minval=20, maxval=300, group=grpCore)
+bandMultiplier = input.float(1.5, "Band Standard Deviations", minval=0.5, maxval=3.0, step=0.1, group=grpCore)
+
+grpAbs = "Potential Absorption"
+volumeThreshold = input.float(1.6, "Minimum Relative Volume", minval=1.0, maxval=5.0, step=0.1, group=grpAbs)
+progressThreshold = input.float(0.25, "Maximum Net Progress (ATR)", minval=0.05, maxval=1.0, step=0.05, group=grpAbs,
+     tooltip="Maximum absolute close-to-close progress, measured in ATR units.")
+minimumRange = input.float(0.45, "Minimum Bar Range (ATR)", minval=0.1, maxval=2.0, step=0.05, group=grpAbs,
+     tooltip="Rejects tiny micro-bars that have low progress simply because nothing traded.")
+contextLength = input.int(30, "Auction Location Length", minval=10, maxval=100, group=grpAbs)
+approachLength = input.int(5, "Prior Approach Length", minval=2, maxval=20, group=grpAbs,
+     tooltip="Measures whether price approached the potential absorption bar from above or below.")
+minimumApproach = input.float(0.50, "Minimum Prior Approach (ATR)", minval=0.0, maxval=3.0, step=0.05, group=grpAbs,
+     tooltip="Requires a meaningful directional approach before an event can be assigned a bullish or bearish absorption direction.")
+edgeThreshold = input.float(0.65, "Required Range-Edge Location", minval=0.50, maxval=0.90, step=0.05, group=grpAbs)
+rejectionThreshold = input.float(0.15, "Minimum Rejection Bias", minval=0.0, maxval=0.8, step=0.05, group=grpAbs)
+cooldownBars = input.int(3, "Signal Cooldown", minval=0, maxval=20, group=grpAbs)
+
+grpVisual = "Visuals"
+showSignals = input.bool(true, "Show Potential Absorption Markers", group=grpVisual)
+showBackground = input.bool(true, "Shade Potential Absorption Bars", group=grpVisual)
+showLimitedProgress = input.bool(true, "Shade High-Participation, Limited-Progress Events", group=grpVisual)
+showDashboard = input.bool(false, "Show Dashboard", group=grpVisual)
+
+// -------------------------------------
+// Palette and Helpers
+// -------------------------------------
+
+clamp(float value, float lower, float upper) =>
+    math.max(lower, math.min(upper, value))
+
+color bullAbsorptionColor = color.rgb(76, 175, 80)
+color bearAbsorptionColor = color.rgb(244, 67, 54)
+color bullAbsorptionDeep = color.rgb(39, 144, 42)
+color bearAbsorptionDeep = color.rgb(201, 48, 37)
+color positiveStrong = color.rgb(38, 198, 218)
+color positiveWeak = color.rgb(128, 222, 234)
+color negativeStrong = color.rgb(236, 64, 121)
+color negativeWeak = color.rgb(244, 143, 177)
+color signalColor = color.rgb(255, 152, 0)
+color upperBandColor = color.rgb(38, 166, 154)
+color lowerBandColor = color.rgb(239, 83, 80)
+color neutralColor = color.rgb(137, 148, 163)
+color limitedProgressEventColor = color.rgb(183, 191, 202)
+color warningColor = color.rgb(184, 146, 74)
+color tableHeaderColor = color.rgb(218, 239, 237)
+color tableLabelColor = color.rgb(235, 241, 244)
+color tableValueColor = color.rgb(250, 252, 252)
+color tableTextColor = color.rgb(38, 50, 56)
+color tableMutedTextColor = color.rgb(75, 91, 99)
+color tableBorderColor = color.rgb(91, 132, 128)
+color tableBullColor = color.rgb(225, 243, 227)
+color tableBearColor = color.rgb(252, 229, 232)
+color tablePositiveColor = color.rgb(222, 244, 246)
+color tableNegativeColor = color.rgb(250, 229, 235)
+color tableWarningColor = color.rgb(246, 238, 218)
+color tableBullTextColor = color.rgb(35, 115, 56)
+color tableBearTextColor = color.rgb(165, 47, 54)
+color tablePositiveTextColor = color.rgb(25, 120, 129)
+color tableNegativeTextColor = color.rgb(173, 48, 92)
+color tableWarningTextColor = color.rgb(126, 94, 34)
+
+// -------------------------------------
+// Observable Components
+// -------------------------------------
+
+barRange = high - low
+atrValue = ta.atr(atrLength)
+atrBaseline = atrValue[1]
+tickFloor = syminfo.mintick > 0.0 ? syminfo.mintick : 1e-10
+atrSafe = not na(atrBaseline) ? math.max(atrBaseline, tickFloor) : na
+
+// CLV: close position inside this bar. This is not volume delta.
+clv = barRange > 0.0 ? clamp((2.0 * close - high - low) / barRange, -1.0, 1.0) : 0.0
+upperWick = barRange > 0.0 ? high - math.max(open, close) : 0.0
+lowerWick = barRange > 0.0 ? math.min(open, close) - low : 0.0
+wickBias = barRange > 0.0 ? (lowerWick - upperWick) / barRange : 0.0
+rejectionBias = clamp(0.65 * wickBias + 0.35 * clv, -1.0, 1.0)
+
+// Net result is actual close-to-close progress, not candle body/range.
+netProgress = not na(atrSafe) ? (close - close[1]) / atrSafe : na
+progressMagnitude = not na(netProgress) ? math.abs(netProgress) : na
+rangeInAtr = not na(atrSafe) ? barRange / atrSafe : na
+
+// Median normalization is robust to isolated volume spikes. Participation is
+// clamped so one exceptional print cannot dominate the oscillator indefinitely.
+volumeBaseline = ta.median(volume[1], volumeLength)
+hasVolume = not na(volume) and volume > 0.0 and not na(volumeBaseline) and volumeBaseline > 0.0
+relativeVolumeRaw = hasVolume ? volume / volumeBaseline : na
+relativeVolume = hasVolume ? clamp(relativeVolumeRaw, 0.25, 4.0) : na
+
+// Directional price progress obtained per sqrt(relative participation).
+// Positive/negative retain direction; larger absolute values mean price moved
+// more efficiently for the amount of participation observed.
+rawEfficiency = hasVolume and not na(netProgress) ? netProgress / math.sqrt(relativeVolume) : na
+efficiency = ta.ema(rawEfficiency, smoothLength)
+signalLine = ta.ema(efficiency, signalLength)
+
+// Compare the current reading with a completed prior distribution so an
+// exceptional current bar cannot raise the boundary used to assess itself.
+efficiencyMean = ta.sma(efficiency[1], bandLength)
+efficiencyDeviation = ta.stdev(efficiency[1], bandLength)
+upperBand = efficiencyMean + bandMultiplier * efficiencyDeviation
+lowerBand = efficiencyMean - bandMultiplier * efficiencyDeviation
+
+// -------------------------------------
+// Context-aware Potential Absorption
+// -------------------------------------
+
+// Compare the current auction with the range that existed BEFORE this bar.
+// Using low/high instead of close preserves genuine sweep-and-reject events
+// that probe a range edge and then close back toward the middle.
+priorContextHigh = ta.highest(high[1], contextLength)
+priorContextLow = ta.lowest(low[1], contextLength)
+contextSpan = priorContextHigh - priorContextLow
+lowTestPosition = contextSpan > 0.0 ? clamp((low - priorContextLow) / contextSpan, 0.0, 1.0) : 0.5
+highTestPosition = contextSpan > 0.0 ? clamp((high - priorContextLow) / contextSpan, 0.0, 1.0) : 0.5
+
+priorApproach = not na(atrSafe) ? (close[1] - close[approachLength + 1]) / atrSafe : 0.0
+
+hasHighEffort = hasVolume and relativeVolumeRaw >= volumeThreshold
+hasLowResult = not na(progressMagnitude) and progressMagnitude <= progressThreshold
+hasMeaningfulAuction = not na(rangeInAtr) and rangeInAtr >= minimumRange
+highParticipationLimitedProgress = hasHighEffort and hasLowResult and hasMeaningfulAuction
+
+// Potential bullish absorption: a meaningful sell approach tested the prior range's lower
+// edge, but lower prices were rejected. Bearish is the symmetrical upper test.
+bullEdgeTest = lowTestPosition <= 1.0 - edgeThreshold
+bearEdgeTest = highTestPosition >= edgeThreshold
+bullContext = priorApproach < -minimumApproach and bullEdgeTest and rejectionBias > rejectionThreshold
+bearContext = priorApproach > minimumApproach and bearEdgeTest and rejectionBias < -rejectionThreshold
+
+// Potential absorption states wait for the close, so realtime markers do not flicker and
+// disappear as volume, close, and wick geometry change intrabar.
+closedBar = barstate.isconfirmed
+bullState = closedBar and highParticipationLimitedProgress and bullContext
+bearState = closedBar and highParticipationLimitedProgress and bearContext
+limitedProgressState = closedBar and highParticipationLimitedProgress and not bullContext and not bearContext
+
+// Cooldown is measured from the last displayed marker, not every qualifying
+// state. Suppressed events therefore cannot keep extending the cooldown.
+var int lastBullMarkerBar = na
+var int lastBearMarkerBar = na
+var int lastLimitedProgressEventBar = na
+
+bullSignal = bullState and (na(lastBullMarkerBar) or bar_index - lastBullMarkerBar > cooldownBars)
+bearSignal = bearState and (na(lastBearMarkerBar) or bar_index - lastBearMarkerBar > cooldownBars)
+limitedProgressSignal = limitedProgressState and (na(lastLimitedProgressEventBar) or bar_index - lastLimitedProgressEventBar > cooldownBars)
+
+if bullSignal
+    lastBullMarkerBar := bar_index
+if bearSignal
+    lastBearMarkerBar := bar_index
+if limitedProgressSignal
+    lastLimitedProgressEventBar := bar_index
+
+// -------------------------------------
+// Visuals
+// -------------------------------------
+
+color efficiencyColor = neutralColor
+if bullState
+    efficiencyColor := bullAbsorptionColor
+else if bearState
+    efficiencyColor := bearAbsorptionColor
+else if efficiency > 0.0
+    efficiencyColor := efficiency >= efficiency[1] ? positiveStrong : positiveWeak
+else if efficiency < 0.0
+    efficiencyColor := efficiency <= efficiency[1] ? negativeStrong : negativeWeak
+
+plot(efficiency, "Directional Price Efficiency", color=efficiencyColor, style=plot.style_columns)
+plot(signalLine, "Efficiency Signal", color=color.new(signalColor, 25), linewidth=2)
+plot(efficiencyMean, "Efficiency Mean", color=neutralColor, linewidth=1, display=display.data_window)
+upperBandPlot = plot(upperBand, "Upper Adaptive Band", color=upperBandColor, linewidth=1)
+lowerBandPlot = plot(lowerBand, "Lower Adaptive Band", color=lowerBandColor, linewidth=1)
+hline(0.0, "Zero", color=neutralColor, display=display.none)
+
+// This event is direction-neutral, so shade only that bar's adaptive range.
+// It describes high participation with limited net price progress, not a forecast.
+limitedProgressFillColor = showLimitedProgress and limitedProgressSignal ? color.new(limitedProgressEventColor, 60) : na
+fill(upperBandPlot, lowerBandPlot, color=limitedProgressFillColor, title="High-Participation, Limited-Progress Event")
+
+plotshape(showSignals and bullSignal, "Potential Bullish Absorption", shape.triangleup, location.bottom, bullAbsorptionDeep, size=size.tiny, display=display.pane)
+plotshape(showSignals and bearSignal, "Potential Bearish Absorption", shape.triangledown, location.top, bearAbsorptionDeep, size=size.tiny, display=display.pane)
+
+bgColor = bullState ? color.rgb(232, 245, 233) : bearState ? color.rgb(255, 235, 238) : na
+bgcolor(showBackground ? bgColor : na)
+
+// Diagnostics available without changing the pane scale.
+plot(relativeVolumeRaw, "Diagnostic: Relative Volume", display=display.data_window)
+plot(progressMagnitude, "Diagnostic: Net Progress (ATR)", display=display.data_window)
+plot(rejectionBias, "Diagnostic: Rejection Bias", display=display.data_window)
+plot(priorApproach, "Diagnostic: Prior Approach (ATR)", display=display.data_window)
+plot(lowTestPosition, "Diagnostic: Low Test Position", display=display.data_window)
+plot(highTestPosition, "Diagnostic: High Test Position", display=display.data_window)
+
+// -------------------------------------
+// Dashboard
+// -------------------------------------
+
+string stateText = "NORMAL AUCTION"
+string actionText = "OBSERVE"
+color stateBackgroundColor = tableValueColor
+color stateTextColor = tableMutedTextColor
+
+if not hasVolume
+    stateText := "NO USABLE VOLUME"
+    actionText := "UNAVAILABLE"
+else if bullState
+    stateText := "POTENTIAL BULLISH ABSORPTION"
+    actionText := "WAIT FOR PRICE CONFIRMATION"
+    stateBackgroundColor := tableBullColor
+    stateTextColor := tableBullTextColor
+else if bearState
+    stateText := "POTENTIAL BEARISH ABSORPTION"
+    actionText := "WAIT FOR PRICE CONFIRMATION"
+    stateBackgroundColor := tableBearColor
+    stateTextColor := tableBearTextColor
+else if limitedProgressState
+    stateText := "HIGH PARTICIPATION / LIMITED PROGRESS"
+    actionText := "WAIT FOR PRICE RESPONSE"
+    stateBackgroundColor := tableWarningColor
+    stateTextColor := tableWarningTextColor
+else if not na(efficiency) and not na(upperBand) and efficiency > upperBand
+    stateText := "EFFICIENT UP EXPANSION"
+    actionText := "CONTEXT ONLY"
+    stateBackgroundColor := tablePositiveColor
+    stateTextColor := tablePositiveTextColor
+else if not na(efficiency) and not na(lowerBand) and efficiency < lowerBand
+    stateText := "EFFICIENT DOWN EXPANSION"
+    actionText := "CONTEXT ONLY"
+    stateBackgroundColor := tableNegativeColor
+    stateTextColor := tableNegativeTextColor
+
+progressText = na(netProgress) ? "—" : (netProgress > 0.0 ? "+" : "") + str.tostring(netProgress, "#.00") + " ATR"
+locationText = bullEdgeTest and bearEdgeTest ? "BOTH EDGE ZONES" : bullEdgeTest ? "LOW EDGE ZONE" : bearEdgeTest ? "HIGH EDGE ZONE" : "MID RANGE"
+
+var table dashboard = table.new(position.top_right, 2, 6,
+     bgcolor=tableValueColor,
+     frame_color=tableBorderColor, frame_width=1,
+     border_color=tableBorderColor, border_width=1)
+
+if barstate.islast
+    if showDashboard
+        table.cell(dashboard, 0, 0, "EAI", text_color=tableTextColor, bgcolor=tableHeaderColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 0, "CURRENT", text_color=tableTextColor, bgcolor=tableHeaderColor, text_size=size.tiny)
+        table.cell(dashboard, 0, 1, "STATE", text_color=tableMutedTextColor, bgcolor=tableLabelColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 1, stateText, text_color=stateTextColor, bgcolor=stateBackgroundColor, text_size=size.tiny)
+        table.cell(dashboard, 0, 2, "ACTION", text_color=tableMutedTextColor, bgcolor=tableLabelColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 2, actionText, text_color=tableTextColor, bgcolor=tableValueColor, text_size=size.tiny)
+        table.cell(dashboard, 0, 3, "REL VOLUME", text_color=tableMutedTextColor, bgcolor=tableLabelColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 3, hasVolume ? str.tostring(relativeVolumeRaw, "#.00") + "x" : "—", text_color=hasHighEffort ? tableWarningTextColor : tableTextColor, bgcolor=hasHighEffort ? tableWarningColor : tableValueColor, text_size=size.tiny)
+        table.cell(dashboard, 0, 4, "NET PROGRESS", text_color=tableMutedTextColor, bgcolor=tableLabelColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 4, progressText, text_color=hasLowResult ? tableWarningTextColor : netProgress > 0.0 ? tablePositiveTextColor : netProgress < 0.0 ? tableNegativeTextColor : tableTextColor, bgcolor=hasLowResult ? tableWarningColor : tableValueColor, text_size=size.tiny)
+        table.cell(dashboard, 0, 5, "LOCATION", text_color=tableMutedTextColor, bgcolor=tableLabelColor, text_size=size.tiny)
+        table.cell(dashboard, 1, 5, locationText, text_color=tableTextColor, bgcolor=tableValueColor, text_size=size.tiny)
+    else
+        table.clear(dashboard, 0, 0, 1, 5)

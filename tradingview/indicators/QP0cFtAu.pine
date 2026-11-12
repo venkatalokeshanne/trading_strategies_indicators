@@ -1,0 +1,263 @@
+//@version=6
+indicator("Sistema Apolo - Order Blocks & Zonas Institucionales [ORO]", shorttitle="Apolo OB/FVG", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// SISTEMA APOLO — ORDER BLOCKS / FVG / PRESENCIA INSTITUCIONAL
+// Estilo visual: cajas grises con borde negro y texto de rango de precio
+// (formato tipo "ZONA DE BUY" / "OB M15"), enfocado en XAUUSD.
+// ============================================================================
+
+// ============================ INPUTS ============================
+grpStruct = "Estructura de Mercado"
+swingLen     = input.int(10, "Longitud de Swing (Pivot)", minval=2, group=grpStruct, tooltip="En XAUUSD M15/H1 recomendable 8-14")
+maxLookback  = input.int(40, "Máx. barras búsqueda de OB", minval=5, maxval=100, group=grpStruct)
+
+grpStyle = "Apariencia"
+styleMode      = input.string("Institucional (gris/negro)", "Estilo visual", options=["Institucional (gris/negro)", "Clásico (colores)"], group=grpStyle)
+showZoneText   = input.bool(true, "Mostrar texto ZONA DE BUY / ZONA DE SELL", group=grpStyle)
+showPriceRange = input.bool(true, "Mostrar rango de precio dentro de la caja", group=grpStyle)
+showTFTag      = input.bool(true, "Mostrar etiqueta 'OB + Timeframe'", group=grpStyle)
+buyZoneText    = input.string("ZONA DE BUY", "Texto zona alcista", group=grpStyle)
+sellZoneText   = input.string("ZONA DE SELL", "Texto zona bajista", group=grpStyle)
+textSize       = input.string("small", "Tamaño de texto", options=["tiny","small","normal"], group=grpStyle)
+f_textSize() => textSize == "tiny" ? size.tiny : textSize == "normal" ? size.normal : size.small
+
+grpOB = "Order Blocks"
+showOB            = input.bool(true, "Mostrar Order Blocks", group=grpOB)
+maxObBull         = input.int(6, "Máx OB Alcistas visibles", minval=1, maxval=20, group=grpOB)
+maxObBear         = input.int(6, "Máx OB Bajistas visibles", minval=1, maxval=20, group=grpOB)
+extendBars        = input.int(60, "Extender cajas (barras)", minval=5, group=grpOB)
+useBodyOnly       = input.bool(false, "Usar solo cuerpo de vela (sin mecha)", group=grpOB)
+obBullColor       = input.color(color.new(color.gray, 78), "Color relleno OB (estilo Clásico Alcista)", group=grpOB)
+obBearColor       = input.color(color.new(color.gray, 78), "Color relleno OB (estilo Clásico Bajista)", group=grpOB)
+obBorderColor     = input.color(color.black, "Color de borde OB (estilo Institucional)", group=grpOB)
+obMitigatedColor  = input.color(color.new(color.gray, 92), "Color OB Mitigado", group=grpOB)
+
+grpFVG = "Fair Value Gaps / Zonas de Regresión (imanes de precio)"
+showFVG       = input.bool(true, "Mostrar FVG", group=grpFVG)
+fvgMinAtrMult = input.float(0.15, "Tamaño mínimo FVG (x ATR)", minval=0, step=0.05, group=grpFVG)
+fvgBullColor  = input.color(color.new(#3DDCC0, 68), "Color FVG Alcista (menta/teal)", group=grpFVG)
+fvgBearColor  = input.color(color.new(#FF6B9D, 78), "Color FVG Bajista (rosa)", group=grpFVG)
+
+grpInst = "Presencia Institucional"
+volLen        = input.int(20, "Periodo SMA de Volumen", minval=5, group=grpInst)
+volMultiplier = input.float(1.5, "Múltiplo de Volumen Institucional", minval=1.0, step=0.1, group=grpInst)
+instColor     = input.color(color.new(color.yellow, 55), "Color Borde Institucional", group=grpInst)
+
+grpSig = "Señales"
+showSignals   = input.bool(true, "Mostrar señales Compra/Venta", group=grpSig)
+requireReject = input.bool(true, "Requerir vela de rechazo para validar señal", group=grpSig)
+
+// ============================ SERIES BASE ============================
+atr    = ta.atr(14)
+volAvg = ta.sma(volume, volLen)
+isInstBar(off) => volume[off] > volAvg[off] * volMultiplier
+isInstitutionalStyle = styleMode == "Institucional (gris/negro)"
+
+f_fmt(price) => str.tostring(price, format.mintick)
+
+f_obText(top, bot, isBull) =>
+    string t = ""
+    if showZoneText
+        t := isBull ? buyZoneText : sellZoneText
+    if showPriceRange
+        t := t == "" ? f_fmt(top) + "-" + f_fmt(bot) : t + "\n" + f_fmt(top) + "-" + f_fmt(bot)
+    if showTFTag
+        t := t == "" ? "OB " + timeframe.period : t + "\n" + "OB " + timeframe.period
+    t
+
+// ============================ SWINGS / BOS ============================
+swHigh = ta.pivothigh(high, swingLen, swingLen)
+swLow  = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastSwingHigh    = na
+var int   lastSwingHighBar = na
+var float lastSwingLow     = na
+var int   lastSwingLowBar  = na
+var float usedSwingHigh    = na
+var float usedSwingLow     = na
+
+if not na(swHigh)
+    lastSwingHigh := swHigh
+    lastSwingHighBar := bar_index - swingLen
+if not na(swLow)
+    lastSwingLow := swLow
+    lastSwingLowBar := bar_index - swingLen
+
+bosUp   = not na(lastSwingHigh) and ta.crossover(close, lastSwingHigh) and lastSwingHigh != usedSwingHigh
+bosDown = not na(lastSwingLow)  and ta.crossunder(close, lastSwingLow) and lastSwingLow != usedSwingLow
+
+// ============================ ARRAYS OB ============================
+var array<box>  bullBoxes = array.new<box>()
+var array<bool> bullMitig = array.new<bool>()
+var array<bool> bullInst  = array.new<bool>()
+
+var array<box>  bearBoxes = array.new<box>()
+var array<bool> bearMitig = array.new<bool>()
+var array<bool> bearInst  = array.new<bool>()
+
+f_findBearishCandle(maxLB) =>
+    int foundOff = na
+    for i = 1 to maxLB
+        if close[i] < open[i]
+            foundOff := i
+            break
+    foundOff
+
+f_findBullishCandle(maxLB) =>
+    int foundOff = na
+    for i = 1 to maxLB
+        if close[i] > open[i]
+            foundOff := i
+            break
+    foundOff
+
+// --- OB Alcista tras ruptura de estructura (BOS) al alza ---
+if bosUp and showOB
+    off = f_findBearishCandle(maxLookback)
+    if not na(off)
+        top   = useBodyOnly ? math.max(open[off], close[off]) : high[off]
+        bot   = useBodyOnly ? math.min(open[off], close[off]) : low[off]
+        obBar = bar_index - off
+        inst  = isInstBar(off)
+        fillC   = isInstitutionalStyle ? color.new(color.gray, 78) : obBullColor
+        borderC = isInstitutionalStyle ? (inst ? instColor : obBorderColor) : (inst ? instColor : color.new(obBullColor, 30))
+        b = box.new(left=obBar, top=top, bottom=bot, right=bar_index + extendBars,
+             border_color = borderC, bgcolor = fillC, border_width = inst ? 2 : 1,
+             text = f_obText(top, bot, true), text_color = color.black, text_size = f_textSize(),
+             text_halign = text.align_center, text_valign = text.align_center)
+        array.push(bullBoxes, b)
+        array.push(bullMitig, false)
+        array.push(bullInst, inst)
+        usedSwingHigh := lastSwingHigh
+        if array.size(bullBoxes) > maxObBull
+            box.delete(array.shift(bullBoxes))
+            array.shift(bullMitig)
+            array.shift(bullInst)
+
+// --- OB Bajista tras ruptura de estructura (BOS) a la baja ---
+if bosDown and showOB
+    off = f_findBullishCandle(maxLookback)
+    if not na(off)
+        top   = useBodyOnly ? math.max(open[off], close[off]) : high[off]
+        bot   = useBodyOnly ? math.min(open[off], close[off]) : low[off]
+        obBar = bar_index - off
+        inst  = isInstBar(off)
+        fillC   = isInstitutionalStyle ? color.new(color.gray, 78) : obBearColor
+        borderC = isInstitutionalStyle ? (inst ? instColor : obBorderColor) : (inst ? instColor : color.new(obBearColor, 30))
+        b = box.new(left=obBar, top=top, bottom=bot, right=bar_index + extendBars,
+             border_color = borderC, bgcolor = fillC, border_width = inst ? 2 : 1,
+             text = f_obText(top, bot, false), text_color = color.black, text_size = f_textSize(),
+             text_halign = text.align_center, text_valign = text.align_center)
+        array.push(bearBoxes, b)
+        array.push(bearMitig, false)
+        array.push(bearInst, inst)
+        usedSwingLow := lastSwingLow
+        if array.size(bearBoxes) > maxObBear
+            box.delete(array.shift(bearBoxes))
+            array.shift(bearMitig)
+            array.shift(bearInst)
+
+// ============================ MITIGACIÓN + SEÑALES ============================
+bullSignal = false
+bearSignal = false
+
+if array.size(bullBoxes) > 0
+    for i = array.size(bullBoxes) - 1 to 0
+        b = array.get(bullBoxes, i)
+        mitigated = array.get(bullMitig, i)
+        top = box.get_top(b)
+        bot = box.get_bottom(b)
+        if not mitigated
+            box.set_right(b, bar_index)
+            touched     = low <= top and low >= bot
+            invalidated = close < bot
+            if invalidated
+                box.delete(b)
+                array.remove(bullBoxes, i)
+                array.remove(bullMitig, i)
+                array.remove(bullInst, i)
+                continue
+            if touched
+                reject = requireReject ? close > open : true
+                if reject and showSignals
+                    bullSignal := true
+                array.set(bullMitig, i, true)
+                box.set_bgcolor(b, obMitigatedColor)
+                box.set_border_color(b, obMitigatedColor)
+
+if array.size(bearBoxes) > 0
+    for i = array.size(bearBoxes) - 1 to 0
+        b = array.get(bearBoxes, i)
+        mitigated = array.get(bearMitig, i)
+        top = box.get_top(b)
+        bot = box.get_bottom(b)
+        if not mitigated
+            box.set_right(b, bar_index)
+            touched     = high >= bot and high <= top
+            invalidated = close > top
+            if invalidated
+                box.delete(b)
+                array.remove(bearBoxes, i)
+                array.remove(bearMitig, i)
+                array.remove(bearInst, i)
+                continue
+            if touched
+                reject = requireReject ? close < open : true
+                if reject and showSignals
+                    bearSignal := true
+                array.set(bearMitig, i, true)
+                box.set_bgcolor(b, obMitigatedColor)
+                box.set_border_color(b, obMitigatedColor)
+
+// ============================ FVG — ZONAS DE REGRESIÓN ============================
+var array<box>  fvgBoxes  = array.new<box>()
+var array<bool> fvgIsBull = array.new<bool>()
+
+bullFVG = low > high[2] and (low - high[2]) > atr * fvgMinAtrMult
+bearFVG = high < low[2] and (low[2] - high) > atr * fvgMinAtrMult
+
+if showFVG and bullFVG
+    txt = showPriceRange ? f_fmt(low) + "-" + f_fmt(high[2]) : ""
+    fb = box.new(left=bar_index-1, top=low, bottom=high[2], right=bar_index+extendBars,
+         border_color=color.new(fvgBullColor,40), bgcolor=fvgBullColor, border_style=line.style_dashed,
+         text=txt, text_color=color.black, text_size=f_textSize())
+    array.push(fvgBoxes, fb)
+    array.push(fvgIsBull, true)
+
+if showFVG and bearFVG
+    txt = showPriceRange ? f_fmt(low[2]) + "-" + f_fmt(high) : ""
+    fb = box.new(left=bar_index-1, top=low[2], bottom=high, right=bar_index+extendBars,
+         border_color=color.new(fvgBearColor,40), bgcolor=fvgBearColor, border_style=line.style_dashed,
+         text=txt, text_color=color.black, text_size=f_textSize())
+    array.push(fvgBoxes, fb)
+    array.push(fvgIsBull, false)
+
+if array.size(fvgBoxes) > 0
+    for i = array.size(fvgBoxes) - 1 to 0
+        fb = array.get(fvgBoxes, i)
+        top = box.get_top(fb)
+        bot = box.get_bottom(fb)
+        isBull = array.get(fvgIsBull, i)
+        filled = isBull ? close < bot : close > top
+        if filled
+            box.delete(fb)
+            array.remove(fvgBoxes, i)
+            array.remove(fvgIsBull, i)
+        else
+            box.set_right(fb, bar_index)
+    if array.size(fvgBoxes) > 30
+        box.delete(array.shift(fvgBoxes))
+        array.shift(fvgIsBull)
+
+// ============================ SEÑALES VISUALES + ALERTAS ============================
+if bullSignal
+    label.new(bar_index, low - atr*0.5, showZoneText ? buyZoneText : "COMPRA", style=label.style_label_up,
+         color=color.new(color.black,15), textcolor=color.white, size=f_textSize())
+
+if bearSignal
+    label.new(bar_index, high + atr*0.5, showZoneText ? sellZoneText : "VENTA", style=label.style_label_down,
+         color=color.new(color.black,15), textcolor=color.white, size=f_textSize())
+
+alertcondition(bullSignal, title="Compra - Order Block", message="Sistema Apolo ORO: posible entrada en COMPRA (OB alcista mitigado)")
+alertcondition(bearSignal, title="Venta - Order Block", message="Sistema Apolo ORO: posible entrada en VENTA (OB bajista mitigado)")

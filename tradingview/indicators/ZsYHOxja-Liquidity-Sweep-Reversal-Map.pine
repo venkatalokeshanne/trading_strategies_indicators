@@ -1,0 +1,302 @@
+//@version=6
+indicator("Liquidity Sweep & Reversal Map", "LSRM", overlay = true, max_labels_count = 300, max_lines_count = 60)
+
+//------------------------------------------------------------------------------
+// PRESET INPUTS
+//------------------------------------------------------------------------------
+preset = input.string("NIFTY", "Instrument Preset", options = ["NIFTY", "BANKNIFTY", "CUSTOM"])
+
+sweepBuffer = input.float(1.0,  "Sweep Buffer (points)", minval = 0)
+minBodyPerc = input.float(50.0, "Min Body % for Reversal Candle", minval = 0, maxval = 100)
+
+useVolFilter = input.bool(true, "Use Volume Spike Filter")
+volLen       = input.int(20, "Volume Lookback", minval = 1)
+volMult      = input.float(1.5, "Volume Spike Multiplier", minval = 1.0)
+
+showTodayHighLow = input.bool(true, "Show Today's High/Low + Labels")
+showPrevHighLow  = input.bool(true, "Show Previous Day High/Low + Labels")
+showLabels       = input.bool(true, "Show BS/SS Labels")
+showZones        = input.bool(true, "Show Sweep Zones")
+showLevelLines   = input.bool(true, "Show All Level Lines + Labels")
+
+//------------------------------------------------------------------------------
+// APPLY PRESETS (override at start)
+//------------------------------------------------------------------------------
+if barstate.isfirst
+    if preset == "NIFTY"
+        sweepBuffer := 1.0
+        minBodyPerc := 60.0
+        volLen      := 20
+        volMult     := 1.5
+
+    if preset == "BANKNIFTY"
+        sweepBuffer := 3.0
+        minBodyPerc := 50.0
+        volLen      := 15
+        volMult     := 1.8
+
+//------------------------------------------------------------------------------
+// DAILY + PREVIOUS DAY LEVELS
+//------------------------------------------------------------------------------
+var float dayHigh     = na
+var float dayLow      = na
+var float prevDayHigh = na
+var float prevDayLow  = na
+
+newDay = ta.change(time("D")) != 0
+
+if newDay
+    prevDayHigh := dayHigh
+    prevDayLow  := dayLow
+    dayHigh := high
+    dayLow  := low
+else
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow)  ? low  : math.min(dayLow,  low)
+
+//------------------------------------------------------------------------------
+// VOLUME FILTER
+//------------------------------------------------------------------------------
+avgVol = ta.sma(volume, volLen)
+volSpike = useVolFilter ? (volume > avgVol * volMult) : true
+
+//------------------------------------------------------------------------------
+// STRONG REVERSAL CANDLES
+//------------------------------------------------------------------------------
+f_strongBull(level) =>
+    rng = high - low
+    body = math.abs(close - open)
+    bp = rng > 0 ? body / rng * 100 : 0
+    close > open and close > level and bp >= minBodyPerc
+
+f_strongBear(level) =>
+    rng = high - low
+    body = math.abs(close - open)
+    bp = rng > 0 ? body / rng * 100 : 0
+    close < open and close < level and bp >= minBodyPerc
+
+//------------------------------------------------------------------------------
+// SWEEP DETECTION (previous candle sweeps, current confirms)
+//------------------------------------------------------------------------------
+f_processLowSweep(level, enabled, code) =>
+    bool out = false
+    string tag = ""
+    float price = na
+    float wick = na
+    if enabled and not na(level)
+        sweepCond = low[1] < level - sweepBuffer and close[1] >= level
+        if sweepCond and f_strongBull(level) and volSpike
+            out := true
+            tag := code
+            price := level
+            wick := low[1]
+    [out, tag, price, wick]
+
+f_processHighSweep(level, enabled, code) =>
+    bool out = false
+    string tag = ""
+    float price = na
+    float wick = na
+    if enabled and not na(level)
+        sweepCond = high[1] > level + sweepBuffer and close[1] <= level
+        if sweepCond and f_strongBear(level) and volSpike
+            out := true
+            tag := code
+            price := level
+            wick := high[1]
+    [out, tag, price, wick]
+
+//------------------------------------------------------------------------------
+// FINAL SIGNALS (RESET EVERY BAR)
+//------------------------------------------------------------------------------
+bool   buySignal  = false
+bool   sellSignal = false
+
+string sigLevel = ""
+float  sigPrice = na
+float  wickLow  = na
+float  wickHigh = na
+
+// Priority TL â†’ TH â†’ PDL â†’ PDH
+[b1,n1,p1,l1] = f_processLowSweep(dayLow, showTodayHighLow, "TL")
+if b1 and not(buySignal or sellSignal)
+    buySignal := true
+    sigLevel := n1
+    sigPrice := p1
+    wickLow  := l1
+
+[s1,n2,p2,h1] = f_processHighSweep(dayHigh, showTodayHighLow, "TH")
+if s1 and not(buySignal or sellSignal)
+    sellSignal := true
+    sigLevel := n2
+    sigPrice := p2
+    wickHigh := h1
+
+[b2,n3,p3,l2] = f_processLowSweep(prevDayLow, showPrevHighLow, "PDL")
+if b2 and not(buySignal or sellSignal)
+    buySignal := true
+    sigLevel := n3
+    sigPrice := p3
+    wickLow  := l2
+
+[s2,n4,p4,h2] = f_processHighSweep(prevDayHigh, showPrevHighLow, "PDH")
+if s2 and not(buySignal or sellSignal)
+    sellSignal := true
+    sigLevel := n4
+    sigPrice := p4
+    wickHigh := h2
+
+//------------------------------------------------------------------------------
+// SAFE LABEL CREATOR (Pine v6 compliant)
+//------------------------------------------------------------------------------
+f_makeLabel(existing, x, y, txt) =>
+    if na(existing)
+        label.new(
+            x, y, txt,
+            style = label.style_label_center,
+            textcolor = color.white,
+            color = color.new(color.black, 40),
+            size = size.small
+        )
+    else
+        label.set_x(existing, x)
+        label.set_y(existing, y)
+        label.set_text(existing, txt)
+        existing
+
+//------------------------------------------------------------------------------
+// LEVEL LINES + LABELS (SYNC-SAFE VERSION)
+//------------------------------------------------------------------------------
+var line  lTH  = na
+var line  lTL  = na
+var line  lPDH = na
+var line  lPDL = na
+
+var label labTH  = na
+var label labTL  = na
+var label labPDH = na
+var label labPDL = na
+
+f_updLine(ln, y) =>
+    if not na(ln)
+        line.set_xy1(ln, bar_index - 50, y)
+        line.set_xy2(ln, bar_index, y)
+        line.set_extend(ln, extend.right)
+
+if showLevelLines
+    //------------------------- TH
+    if showTodayHighLow and not na(dayHigh)
+        if na(lTH)
+            lTH := line.new(bar_index, dayHigh, bar_index+1, dayHigh,
+                extend=extend.right, color=color.rgb(255,180,80), width=4, style=line.style_dotted)
+        f_updLine(lTH, dayHigh)
+        labTH := f_makeLabel(labTH, bar_index, dayHigh, "TH")
+    else
+        if not na(lTH)
+            line.delete(lTH)
+            lTH := na
+        if not na(labTH)
+            label.delete(labTH)
+            labTH := na
+
+    //------------------------- TL
+    if showTodayHighLow and not na(dayLow)
+        if na(lTL)
+            lTL := line.new(bar_index, dayLow, bar_index+1, dayLow,
+                extend=extend.right, color=color.rgb(80,150,255), width=4, style=line.style_dotted)
+        f_updLine(lTL, dayLow)
+        labTL := f_makeLabel(labTL, bar_index, dayLow, "TL")
+    else
+        if not na(lTL)
+            line.delete(lTL)
+            lTL := na
+        if not na(labTL)
+            label.delete(labTL)
+            labTL := na
+
+    //------------------------- PDH
+    if showPrevHighLow and not na(prevDayHigh)
+        if na(lPDH)
+            lPDH := line.new(bar_index, prevDayHigh, bar_index+1, prevDayHigh,
+                extend=extend.right, color=color.rgb(255,210,60), width=4, style=line.style_solid)
+        f_updLine(lPDH, prevDayHigh)
+        labPDH := f_makeLabel(labPDH, bar_index, prevDayHigh, "PDH")
+    else
+        if not na(lPDH)
+            line.delete(lPDH)
+            lPDH := na
+        if not na(labPDH)
+            label.delete(labPDH)
+            labPDH := na
+
+    //------------------------- PDL
+    if showPrevHighLow and not na(prevDayLow)
+        if na(lPDL)
+            lPDL := line.new(bar_index, prevDayLow, bar_index+1, prevDayLow,
+                extend=extend.right, color=color.rgb(60,220,255), width=4, style=line.style_solid)
+        f_updLine(lPDL, prevDayLow)
+        labPDL := f_makeLabel(labPDL, bar_index, prevDayLow, "PDL")
+    else
+        if not na(lPDL)
+            line.delete(lPDL)
+            lPDL := na
+        if not na(labPDL)
+            label.delete(labPDL)
+            labPDL := na
+
+//------------------------------------------------------------------------------
+// BS / SS LABELS (ONLY ON TRUE SWEEP)
+//------------------------------------------------------------------------------
+if showLabels and barstate.isconfirmed
+    if buySignal
+        label.new(
+            bar_index, low, "BS",
+            style=label.style_label_up,
+            color=color.new(color.rgb(0,180,110), 0),
+            textcolor=color.white,
+            size=size.tiny
+        )
+
+    if sellSignal
+        label.new(
+            bar_index, high, "SS",
+            style=label.style_label_down,
+            color=color.new(color.rgb(210,40,40), 0),
+            textcolor=color.white,
+            size=size.tiny
+        )
+
+//------------------------------------------------------------------------------
+// SWEEP ZONES
+//------------------------------------------------------------------------------
+var box lastZone = na
+
+if showZones and barstate.isconfirmed
+    if not na(lastZone)
+        box.delete(lastZone)
+
+    if buySignal and not na(wickLow)
+        lastZone := box.new(
+            bar_index-1, sigPrice,
+            bar_index,   wickLow,
+            bgcolor=color.new(color.rgb(0,200,120), 82),
+            border_color=color.rgb(0,180,110),
+            border_width=1)
+
+    if sellSignal and not na(wickHigh)
+        lastZone := box.new(
+            bar_index-1, wickHigh,
+            bar_index,   sigPrice,
+            bgcolor=color.new(color.rgb(230,80,80), 82),
+            border_color=color.rgb(210,40,40),
+            border_width=1)
+
+if not showZones and not na(lastZone)
+    box.delete(lastZone)
+    lastZone := na
+
+//------------------------------------------------------------------------------
+// ALERTS
+//------------------------------------------------------------------------------
+alertcondition(buySignal and barstate.isconfirmed,  "Buy Sweep Reversal",  "Buy sweep reversal confirmed.")
+alertcondition(sellSignal and barstate.isconfirmed, "Sell Sweep Reversal", "Sell sweep reversal confirmed.")

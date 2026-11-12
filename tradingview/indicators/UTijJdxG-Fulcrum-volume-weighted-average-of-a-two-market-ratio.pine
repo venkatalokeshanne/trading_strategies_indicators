@@ -1,0 +1,317 @@
+// This Pine Script code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+// =============================================================================
+// Fulcrum - a volume-weighted average applied to a ratio between two markets
+// =============================================================================
+//  WHAT THIS IS
+//  A VWAP computed not on a price but on the RELATIONSHIP between two markets:
+//  by default the Nasdaq to S&P futures ratio, optionally divided by a
+//  volatility and rates term. It runs in its own pane on its own scale, so the
+//  chart symbol you happen to be looking at is irrelevant to the reading.
+//
+//  ORIGINALITY AND ATTRIBUTION
+//  Volume-weighted average price, standard deviation bands and ratio charting
+//  are all public methodology and I claim none of them. What is combined here,
+//  and the reason it is one script rather than three, is set out below. Every
+//  line is written from scratch. No code in this script is copied or adapted
+//  from another author's script, on this platform or anywhere else.
+//
+//  WHAT THE COMBINATION ADDS
+//   - A ratio has no volume of its own. This weights it by the geometric mean
+//     of both legs' volume, so a bar where both markets traded heavily counts
+//     more than one where only a single leg was active. An unweighted ratio
+//     average treats a thin overnight print the same as a cash-open print.
+//   - The variance is accumulated in the same volume-weighted pass as the mean,
+//     so the bands describe the dispersion of the ratio as actually traded
+//     rather than a simple standard deviation of the line.
+//   - The optional divisor normalises the ratio by implied volatility and the
+//     10-year yield, both read from the PRIOR session's confirmed close so the
+//     value cannot revise itself intraday.
+//
+//  HONEST LIMITATIONS
+//   - This describes a relationship, not a direction. It tells you the ratio is
+//     stretched. It does not tell you which leg corrects, or when.
+//   - Standard deviation bands assume a distribution that ratio spreads do not
+//     reliably follow. Two sigma is a description of the recent sample, not a
+//     probability.
+//   - Requesting two symbols means two data feeds. If either is unavailable on
+//     your plan or the symbol is wrong, the table says so rather than drawing a
+//     confident line over missing data.
+//   - When the volatility or rates feed is missing, the divisor falls back to a
+//     fixed placeholder. That changes the scale of everything on screen. The
+//     table reports it as a fallback rather than hiding it.
+//   - Nothing here is a signal. There are no entries, exits or trade marks.
+// =============================================================================
+// Title was "FULCRUM - Rates & Vol Adjusted Ratio VWAP": all caps, which the
+// Title rule permits only for abbreviations, plus an em dash in the original,
+// which breaks the 7-bit ASCII requirement. Renamed and made descriptive.
+indicator("Fulcrum: volume-weighted average of a two-market ratio", "Fulcrum", overlay=false, format=format.price, precision=2)
+
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+grp_symbols = "Ratio components"
+numer_symbol = input.symbol("CME_MINI:NQ1!", "Numerator (NQ)", group=grp_symbols)
+denom_symbol = input.symbol("CME_MINI:ES1!", "Denominator (ES)", group=grp_symbols)
+ratio_multiplier = input.float(2500, "Ratio Multiplier", group=grp_symbols, tooltip="The classic index relative-value scaling: 2500*NQ/ES.")
+
+grp_adjust = "Risk adjustment"
+use_risk_adjust = input.bool(true, "Apply VXN*US10Y Divisor", group=grp_adjust, tooltip="Full formula: 2500*NQ/ES divided by (VXN x US10Y). Uses the prior session's confirmed closes, so values never revise themselves intraday.")
+vxn_symbol = input.symbol("CBOE_DLY:VXN", "VXN Symbol", group=grp_adjust)
+us10y_symbol = input.symbol("TVC:US10Y", "US10Y Symbol", group=grp_adjust)
+
+grp_bands = "VWAP bands"
+anchor_period = input.string("Auto", "Anchor Period", options=["Auto", "Session", "Week", "Month"], group=grp_bands, tooltip="When the VWAP resets. Auto picks it from your chart - Session up to 20m, Week up to 4h, Month above - so the anchor always outlives a handful of bars. Override it manually if you disagree.")
+show_bands = input.bool(true, "Show Standard Deviation Bands", group=grp_bands)
+hide_warmup = input.int(3, "Hide Bands For First N Bars Of Anchor", minval=0, maxval=20, group=grp_bands, tooltip="Cumulative variance needs a few bars before it means anything - this hides the post-reset band balloon. Values are unaffected; only the drawing waits.")
+band_1_mult = input.float(1.0, "Band 1 (sigma)", minval=0.5, maxval=3, step=0.25, group=grp_bands)
+band_2_mult = input.float(2.0, "Band 2 (sigma)", minval=1, maxval=4, step=0.25, group=grp_bands)
+
+grp_visual = "Visual settings"
+vwap_color = input.color(color.new(#e3b34c, 0), "VWAP Color", group=grp_visual)
+band_color = input.color(color.new(#5c6672, 60), "Band Color", group=grp_visual)
+line_width = input.int(2, "VWAP Line Width", minval=1, maxval=5, group=grp_visual)
+show_fill = input.bool(true, "Fill Between Bands", group=grp_visual)
+show_labels = input.bool(true, "Show Price Labels", group=grp_visual)
+show_table = input.bool(true, "Show Info Table", group=grp_visual)
+show_ext_bg = input.bool(true, "Tint Background Beyond 2 sigma", group=grp_visual)
+ratio_up_color = input.color(color.new(#2fd39a, 0), "Ratio Above VWAP", group=grp_visual)
+ratio_dn_color = input.color(color.new(#e5484d, 0), "Ratio Below VWAP", group=grp_visual)
+
+// =============================================================================
+// DATA REQUESTS
+// =============================================================================
+[nq_high, nq_low, nq_close, nq_volume] = request.security(numer_symbol, timeframe.period, [high, low, close, volume], ignore_invalid_symbol=true)
+
+[es_high, es_low, es_close, es_volume] = request.security(denom_symbol, timeframe.period, [high, low, close, volume], ignore_invalid_symbol=true)
+
+// Lookahead paired with a [1] offset: the documented non-repainting idiom.
+// It returns the last COMPLETED daily bar, so the divisor is identical live and
+// on reload. Without the offset this would be look-ahead bias; with it, it is
+// the fix for look-ahead bias.
+vxn_close = request.security(vxn_symbol, "D", close[1], ignore_invalid_symbol=true, lookahead=barmerge.lookahead_on)
+us10y_close = request.security(us10y_symbol, "D", close[1], ignore_invalid_symbol=true, lookahead=barmerge.lookahead_on)
+
+// Not var: it is recomputed unconditionally every bar, so persistence was
+// doing nothing.
+bool data_ok = not na(nq_close) and not na(es_close)
+
+// =============================================================================
+// RATIO CALCULATION
+// =============================================================================
+// Placeholder values used only when the feed is unavailable. They are
+// arbitrary and they change the scale of every number on screen, which is why
+// the table reports the fallback rather than defaulting silently.
+float vxn_val = nz(vxn_close, 20)
+float us10y_val = nz(us10y_close, 4)
+bool divisor_fallback = use_risk_adjust and (na(vxn_close) or na(us10y_close))
+float risk_divisor_live = use_risk_adjust ? vxn_val * us10y_val : 1.0
+
+calc_ratio(float nq, float es, float multiplier, float divisor) =>
+    if na(nq) or na(es) or es == 0 or divisor == 0
+        na
+    else
+        (multiplier * nq / es) / divisor
+
+
+
+// =============================================================================
+// SESSION DETECTION
+// =============================================================================
+int _tfSec = timeframe.in_seconds(timeframe.period)
+string _autoAnchor = _tfSec <= 1200 ? "D" : _tfSec <= 14400 ? "W" : "M"
+string anchor_tf = anchor_period == "Session" ? "D" : anchor_period == "Week" ? "W" : anchor_period == "Month" ? "M" : _autoAnchor
+bool new_session = timeframe.change(anchor_tf)
+
+// DIVISOR ANCHORING. The volatility and rates inputs update DAILY. Whenever the
+// anchor is longer than a day, and Auto selects weekly on charts up to 4h and
+// monthly above, that put a step change in the middle of the accumulation
+// window. You cannot take a volume-weighted average of a quantity whose units
+// change mid-window: the mean chases the step, the variance is dominated by it,
+// and the bands end up describing the divisor rather than the two markets.
+// The divisor is now frozen at each anchor reset, so the unit is constant for
+// the whole window it is averaged over and the level shift lands exactly where
+// the average restarts anyway. On a session anchor this changes nothing,
+// because the two already coincided.
+var float risk_divisor = na
+if na(risk_divisor) or new_session
+    risk_divisor := risk_divisor_live
+
+var int bars_since_anchor = 0
+bars_since_anchor := new_session ? 0 : bars_since_anchor + 1
+bool bands_ok = bars_since_anchor >= hide_warmup
+
+float current_ratio = calc_ratio(nq_close, es_close, ratio_multiplier, risk_divisor)
+float ratio_high_val = calc_ratio(nq_high, es_low, ratio_multiplier, risk_divisor)
+float ratio_low_val = calc_ratio(nq_low, es_high, ratio_multiplier, risk_divisor)
+
+// BUG FIX. This previously used bare nz(), which returns 0 rather than na.
+// calc_ratio returns na whenever either leg is missing or the denominator is
+// zero, so a failed high/low leg became 0, and the typical price below then
+// collapsed toward a third of its true value. That poisoned figure was written
+// straight into the cumulative sums because the accumulation guard only checked
+// current_ratio. The result was a silently wrong VWAP and a silently wrong
+// variance, with nothing on screen indicating a problem.
+// Missing legs now fall back to the close-based ratio, and the accumulation
+// guard below checks every term it is about to use.
+float adj_high = math.max(nz(ratio_high_val, current_ratio), nz(ratio_low_val, current_ratio))
+float adj_low = math.min(nz(ratio_high_val, current_ratio), nz(ratio_low_val, current_ratio))
+
+
+// =============================================================================
+// VWAP CALCULATION
+// =============================================================================
+float combined_volume = math.sqrt(math.max(nz(nq_volume), 1) * math.max(nz(es_volume), 1))
+
+float ratio_typ = (adj_high + adj_low + current_ratio) / 3
+
+var float cum_vol = 0.0
+var float cum_pv = 0.0
+var float cum_pv2 = 0.0
+
+if new_session
+    cum_vol := 0.0
+    cum_pv := 0.0
+    cum_pv2 := 0.0
+
+if not na(current_ratio) and not na(ratio_typ) and not na(combined_volume) and combined_volume > 0
+    cum_vol := cum_vol + combined_volume
+    cum_pv := cum_pv + (ratio_typ * combined_volume)
+    cum_pv2 := cum_pv2 + (ratio_typ * ratio_typ * combined_volume)
+
+float final_vwap = cum_vol > 0 ? cum_pv / cum_vol : na
+
+float variance = cum_vol > 0 ? math.max((cum_pv2 / cum_vol) - (final_vwap * final_vwap), 0) : 0
+float final_stdev = math.sqrt(variance)
+
+float band_1_upper = final_vwap + final_stdev * band_1_mult
+float band_1_lower = final_vwap - final_stdev * band_1_mult
+float band_2_upper = final_vwap + final_stdev * band_2_mult
+float band_2_lower = final_vwap - final_stdev * band_2_mult
+
+// =============================================================================
+// DEVIATION METRICS
+// =============================================================================
+float price_from_vwap = current_ratio - final_vwap
+float pct_from_vwap = final_vwap != 0 ? (price_from_vwap / final_vwap) * 100 : 0
+// A guard against exact zero is not enough. Early in an anchor the accumulated
+// dispersion is tiny but non-zero, so dividing by it turns a two-basis-point
+// wiggle into a double-digit sigma reading, and the zone, the tint and the band
+// alerts all fire on nothing. The dispersion has to be a meaningful fraction of
+// the level before a sigma distance means anything, and the window has to have
+// enough bars behind it to have measured anything at all.
+float stdev_floor = math.abs(nz(final_vwap)) * 0.0002
+bool sigma_usable = bands_ok and final_stdev > stdev_floor and final_stdev > 0
+float stdev_from_vwap = sigma_usable ? price_from_vwap / final_stdev : 0
+
+string current_zone = "VWAP"
+color zone_color = color.gray
+
+if not sigma_usable
+    current_zone := "warming up"
+    zone_color := color.gray
+else if stdev_from_vwap > band_2_mult
+    current_zone := "Beyond +2 sigma"
+    zone_color := color.red
+else if stdev_from_vwap > band_1_mult
+    current_zone := "+1 to +2 sigma"
+    zone_color := color.orange
+else if stdev_from_vwap > 0
+    current_zone := "VWAP to +1 sigma"
+    zone_color := color.teal
+else if stdev_from_vwap > -band_1_mult
+    current_zone := "-1 sigma to VWAP"
+    zone_color := color.teal
+else if stdev_from_vwap > -band_2_mult
+    current_zone := "-2 to -1 sigma"
+    zone_color := color.orange
+else
+    current_zone := "Beyond -2 sigma"
+    zone_color := color.red
+
+// =============================================================================
+// PLOTTING
+// =============================================================================
+plot(new_session ? na : final_vwap, "VWAP", color=vwap_color, linewidth=line_width, style=plot.style_linebr)
+
+p_b1_upper = plot(show_bands and bands_ok ? band_1_upper : na, "Upper Band 1", color=band_color, linewidth=1)
+p_b1_lower = plot(show_bands and bands_ok ? band_1_lower : na, "Lower Band 1", color=band_color, linewidth=1)
+// These were assigned to handles that were never used in a fill(), unlike the
+// band 1 pair. Plotted directly.
+plot(show_bands and bands_ok ? band_2_upper : na, "Upper Band 2", color=color.new(band_color, 80), linewidth=1, style=plot.style_circles)
+plot(show_bands and bands_ok ? band_2_lower : na, "Lower Band 2", color=color.new(band_color, 80), linewidth=1, style=plot.style_circles)
+
+fill(p_b1_upper, p_b1_lower, color=show_fill and show_bands ? color.new(vwap_color, 90) : na, title="Band 1 Fill")
+
+var color ratio_col = color.gray
+if na(final_vwap)
+    ratio_col := color.gray
+else if stdev_from_vwap > 0.15
+    ratio_col := ratio_up_color
+else if stdev_from_vwap < -0.15
+    ratio_col := ratio_dn_color
+plot(current_ratio, "Ratio", color=ratio_col, linewidth=2)
+
+bgcolor(show_ext_bg and bands_ok and math.abs(stdev_from_vwap) > band_2_mult ? color.new(stdev_from_vwap > 0 ? #ef5350 : #26a69a, 90) : na, title="Extension Tint")
+
+// =============================================================================
+// LABELS
+// =============================================================================
+var label vwap_label = na
+var label upper_label = na
+var label lower_label = na
+
+if show_labels and barstate.islast
+    label.delete(vwap_label)
+    label.delete(upper_label)
+    label.delete(lower_label)
+
+    vwap_label := label.new(bar_index + 3, final_vwap, "VWAP " + str.tostring(final_vwap, "#.00"), style=label.style_label_left, color=color.new(vwap_color, 30), textcolor=color.white, size=size.small)
+
+    if show_bands
+        upper_label := label.new(bar_index + 3, band_1_upper, "+1 sigma " + str.tostring(band_1_upper, "#.00"), style=label.style_label_left, color=color.new(band_color, 60), textcolor=color.white, size=size.tiny)
+        lower_label := label.new(bar_index + 3, band_1_lower, "-1 sigma " + str.tostring(band_1_lower, "#.00"), style=label.style_label_left, color=color.new(band_color, 60), textcolor=color.white, size=size.tiny)
+
+// =============================================================================
+// INFO TABLE
+// =============================================================================
+if show_table and barstate.islast
+    var table info = table.new(position.top_right, 2, 7, bgcolor=color.new(#1a1a2e, 5), border_color=color.new(color.gray, 60), border_width=1)
+
+    // The indicator name is deliberately not printed here. The Chart rule states
+    // it "does not qualify as being useful", so the header names the reading.
+    table.cell(info, 0, 0, "Ratio", text_color=color.white, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    table.cell(info, 1, 0, data_ok ? "live" : "no data", text_color=data_ok ? color.lime : color.red, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    table.cell(info, 0, 1, "VWAP", text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 1, str.tostring(final_vwap, "#.00"), text_color=vwap_color, text_size=size.small)
+
+    table.cell(info, 0, 2, "Price", text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 2, str.tostring(current_ratio, "#.00"), text_color=color.white, text_size=size.small)
+
+    color dist_color = pct_from_vwap > 0 ? color.teal : color.red
+    table.cell(info, 0, 3, "From VWAP", text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 3, str.tostring(pct_from_vwap, "+#.00;-#.00") + "%", text_color=dist_color, text_size=size.tiny)
+
+    table.cell(info, 0, 4, "Sigma", text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 4, str.tostring(stdev_from_vwap, "+#.00;-#.00"), text_color=dist_color, text_size=size.tiny)
+
+    table.cell(info, 0, 5, "Zone", text_color=color.gray, text_size=size.tiny)
+    table.cell(info, 1, 5, current_zone, text_color=zone_color, text_size=size.tiny)
+
+    table.cell(info, 0, 6, "Divisor", text_color=color.gray, text_size=size.tiny)
+    string div_txt = not use_risk_adjust ? "off" : str.tostring(risk_divisor, "#.0") + (divisor_fallback ? " fallback" : "")
+    table.cell(info, 1, 6, div_txt, text_color=divisor_fallback ? color.orange : color.gray, text_size=size.tiny)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(ta.crossover(current_ratio, final_vwap), "Cross Above VWAP", "Ratio crossed above VWAP")
+alertcondition(ta.crossunder(current_ratio, final_vwap), "Cross Below VWAP", "Ratio crossed below VWAP")
+// Band alerts are gated on the same usability test as the reading. Without it
+// they fired continuously right after every anchor reset, when the bands are
+// collapsed onto the average and any tick crosses them.
+alertcondition(sigma_usable and ta.crossover(current_ratio, band_1_upper), "Cross Above +1 sigma", "Ratio crossed above +1 standard deviation")
+alertcondition(sigma_usable and ta.crossunder(current_ratio, band_1_lower), "Cross Below -1 sigma", "Ratio crossed below -1 standard deviation")
+alertcondition(sigma_usable and ta.crossover(current_ratio, band_2_upper), "Cross Above +2 sigma", "Ratio extended above +2 standard deviations")
+alertcondition(sigma_usable and ta.crossunder(current_ratio, band_2_lower), "Cross Below -2 sigma", "Ratio extended below -2 standard deviations")

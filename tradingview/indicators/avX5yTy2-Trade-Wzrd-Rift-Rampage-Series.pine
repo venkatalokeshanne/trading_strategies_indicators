@@ -1,0 +1,1014 @@
+// © trade-wzrd
+// =============================================================================
+// Trade Wzrd - Rift [Rampage Series]
+// Volume-profile hunting engine. A live profile - anchored to the clock or to
+// confirmed swing structure - is rebuilt every bar from the intrabar feed and
+// rendered as one clean instrument in the chart margin: delta-graded rows,
+// Point of Control, Value Area, Point of Void (the weakest node inside value)
+// and zero-volume gaps. On price, only what you act on: level rails, typed
+// signal chips with deep-dive tooltips, node retest lines that fade into
+// dotted history once filled, resting-liquidity rails at swing extremes, and
+// a trade box that carries every signal - entry, stop, target - then freezes
+// exactly where the market fills it. Stops and targets can be framed by
+// volatility or by the profile nodes themselves. Signal models: value-edge
+// sweep and reclaim, POC rejection, POV void break - gated by CVD divergence,
+// bar delta, wick, momentum, trend and session filters. Built-in automation:
+// entries, opposite-signal closes and TP/SL-hit closes all emit webhook-ready
+// order strings using comma syntax.
+// Educational shell. Not a signal service. Works on any symbol with volume.
+// =============================================================================
+
+//@version=6
+indicator("Trade Wzrd - Rift [Rampage Series]", shorttitle = "Trade Wzrd - Rift [Rampage Series]", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500,
+     max_polylines_count = 100, precision = 6, explicit_plot_zorder = true, calc_bars_count = 5000)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+
+// --------------------------- TRADEWZRD AUTOMATION ----------------------------
+g_tw = "Trade Wzrd Automation"
+tw_about     = input.bool(false, "What Is Trade Wzrd?", group = g_tw, tooltip = "Trade Wzrd is the automation layer built into every Rampage Series script.\n\nIt turns each signal into a plain-text order string:\n- Entry with stop and target\n- Opposite-signal close\n- TP/SL-hit close\n\nThe same syntax drives automation across 7+ platforms, including MT4, MT5, cTrader, TradeLocker, DxTrade, Tradovate and NinjaTrader.\n\nSupports percent-risk or fixed-volume sizing, magic numbers, and order comments.\n\nNo lock-in: the strings are plain text, so you can wire them to whatever endpoint you already use.")
+tw_enabled   = input.bool(true, "Enable Automation", group = g_tw, tooltip = "Signals fire alert() strings. Create ONE alert on 'Any alert() function call' and point it at your webhook endpoint.")
+tw_symbol    = input.string("", "Symbol Override (Blank = Chart)", group = g_tw)
+tw_vol_type  = input.string("RISK", "Volume Mode", ["RISK", "VOL"], group = g_tw, inline = "twv")
+tw_vol_val   = input.float(1.0, "Risk % or Volume", minval = 0.0, step = 0.1, group = g_tw, inline = "twv")
+tw_opp_close = input.bool(true, "Close On Opposite Signal", group = g_tw, inline = "twc", tooltip = "Entry strings prepend a CLOSE for the opposite side before the new order.")
+tw_exit_close = input.bool(true, "Close On TP / SL Hit", group = g_tw, inline = "twc", tooltip = "When the open trade's stop or target is hit, a CLOSE alert fires for that side. Mirrors the on-chart trade box.")
+tw_magic     = input.string("", "Magic Number", group = g_tw, inline = "twm")
+tw_comment   = input.string("Rift", "Comment", group = g_tw, inline = "twm")
+
+
+// ------------------------------ PROFILE ENGINE ------------------------------
+g_pf = "Profile Engine"
+i_anchor   = input.string("Period", "Profile Anchor", ["Period", "Swing"], group = g_pf, inline = "an1", tooltip = "Period: one profile per timeframe period (day, week...). Swing: a new profile starts at every confirmed pivot reversal - profiles follow market structure instead of the clock.")
+i_swingLen = input.int(10, "Swing Pivot Len", minval = 2, maxval = 50, group = g_pf, inline = "an1", tooltip = "Pivot strength used when the anchor is Swing. Higher = bigger swings, longer profiles.")
+i_period  = input.timeframe("D", "Profile Period", group = g_pf, tooltip = "Each period builds one profile: POC, Value Area, Point of Void and delta heat reset here.")
+i_ltf     = input.timeframe("1", "Intrabar Feed", options = ["1S", "1", "5", "15"], group = g_pf, tooltip = "Lower timeframe used to estimate buy/sell volume per price row. Must be lower than the chart. 1-minute is the safe default.")
+i_ticks   = input.float(0, "Ticks Per Row (0 = Auto)", minval = 0, group = g_pf, inline = "rw1")
+i_atrRows = input.float(8.0, "Auto: ATR / N", minval = 2, maxval = 50, step = 0.5, group = g_pf, inline = "rw1", tooltip = "Auto row height = ATR(14) divided by N. Bigger N = thinner rows.")
+i_vaPct   = input.float(70.0, "Value Area %", minval = 50, maxval = 95, step = 1, group = g_pf, inline = "va1")
+i_hist    = input.int(5, "Past Profiles Kept", minval = 0, maxval = 15, group = g_pf, inline = "va1", tooltip = "POC / VAH / VAL of finished profiles stay on chart as levels until crossed.")
+
+// --------------------------------- SIGNALS ----------------------------------
+g_sg = "Signals"
+i_sigMode  = input.string("All", "Signal Model", ["All", "Sweep & Reclaim", "POC Bounce", "POV Void"], group = g_sg, tooltip = "Sweep & Reclaim: price pierces the Value Area edge and closes back inside with delta support. POC Bounce: rejection of the developing Point of Control. POV Void: price drives through the Point of Void - the lowest-volume node inside value - where resistance is thinnest.")
+i_div      = input.bool(true,  "Require CVD Divergence", group = g_sg, inline = "dv1", tooltip = "Price prints a new extreme but cumulative delta does not confirm it.")
+i_divLen   = input.int(30, "Divergence Lookback", minval = 5, group = g_sg, inline = "dv1")
+i_deltaConf = input.bool(true, "Require Bar Delta Confirm", group = g_sg, tooltip = "Signal bar's own delta must agree with the direction.")
+i_dirMode  = input.string("Both", "Direction", ["Both", "Longs Only", "Shorts Only"], group = g_sg, inline = "dr1")
+i_sigCool  = input.int(8, "Signal Cooldown (Bars)", minval = 0, maxval = 300, group = g_sg, tooltip = "Same-direction signals cannot re-fire at the same node (within 1 ATR) inside this window. A genuinely new node fires immediately.")
+
+// --------------------------------- FILTERS -----------------------------------
+g_fl = "Filters"
+i_f_mom   = input.bool(false, "ATR Momentum Guard", group = g_fl, inline = "fl1", tooltip = "Blocks signals on overextended bars: bar range must not exceed ATR x the multiplier.")
+i_momMult = input.float(2.0, "Max Range (ATR x)", minval = 0.5, maxval = 10, step = 0.25, group = g_fl, inline = "fl1")
+i_f_wick  = input.bool(false, "Rejection Wick", group = g_fl, inline = "fl2", tooltip = "Sweep and POC Bounce signals need a real rejection wick (share of bar range). Not applied to POV Void drives.")
+i_wickPct = input.float(30.0, "Wick % of Range", minval = 5, maxval = 90, group = g_fl, inline = "fl2")
+i_f_ema   = input.bool(false, "EMA Trend Filter", group = g_fl, inline = "fl3", tooltip = "Longs only above the EMA, shorts only below it.")
+i_emaLen  = input.int(200, "EMA Len", minval = 5, group = g_fl, inline = "fl3")
+i_f_sess  = input.bool(false, "Session Window", group = g_fl, inline = "fl4", tooltip = "Signals only inside this exchange-timezone session window.")
+i_sess    = input.session("0800-1700", "Window", group = g_fl, inline = "fl4")
+
+// ----------------------------------- RISK ------------------------------------
+g_rk = "Risk"
+i_slMode = input.string("ATR Beyond Sweep", "Stop Mode", ["ATR Beyond Sweep", "Beyond Origin Node"], group = g_rk, inline = "rk0", tooltip = "ATR Beyond Sweep: stop sits the ATR multiple past the sweep extreme. Beyond Origin Node: stop sits a small buffer past the node the signal was born from (VAL, POC or POV) - structure invalidation instead of volatility distance.")
+i_tpMode = input.string("R Multiple", "Target Mode", ["R Multiple", "Next Node"], group = g_rk, inline = "rk0", tooltip = "R Multiple: target = entry plus risk times the R ratio. Next Node: target = the nearest opposing profile node (POC, POV or VA edge) - the trade aims at real structure.")
+i_slAtrM = input.float(1.5, "Stop: ATR Mult Beyond Sweep", minval = 0.1, step = 0.1, group = g_rk, inline = "rk1")
+i_slAtrL = input.int(14, "ATR Len", minval = 2, group = g_rk, inline = "rk1")
+i_rr     = input.float(2.0, "Target: Reward : Risk", minval = 0.2, step = 0.1, group = g_rk, inline = "rk2")
+i_nodeBuf = input.float(0.25, "Node Buffer (ATR x)", minval = 0.0, maxval = 3, step = 0.05, group = g_rk, inline = "rk2", tooltip = "Structure modes only: how far past the origin node the stop sits.")
+
+// --------------------------------- LIQUIDITY ---------------------------------
+g_lq = "Liquidity"
+i_v_liq   = input.bool(true, "Liquidity Rails", group = g_lq, inline = "lq1", tooltip = "Swing highs and lows hold resting stops. Rails extend right until the pool is raided, then die on the raid bar.")
+i_liqLen  = input.int(5, "Pool Pivot Len", minval = 2, maxval = 50, group = g_lq, inline = "lq1")
+i_liqMax  = input.int(6, "Max Rails Per Side", minval = 1, maxval = 20, group = g_lq, inline = "lq2")
+i_liqZone = input.bool(true, "Swept Zones", group = g_lq, inline = "lq2", tooltip = "When a pool is raided and price closes back inside, the raided range stays painted as a faint zone.")
+
+// --------------------------------- VISUALS -----------------------------------
+g_vx = "Visuals"
+i_v_profile = input.bool(true,  "Margin Profile", group = g_vx, inline = "vx1", tooltip = "The live profile rendered as one histogram in the right margin: delta-graded rows, gold POC, orange POV, orange-edged volume gaps.")
+i_bins      = input.int(30, "Profile Rows", minval = 10, maxval = 60, group = g_vx, inline = "vx1")
+i_profOff   = input.int(8, "Margin Offset", minval = 2, maxval = 100, group = g_vx, inline = "vx2", tooltip = "Bars between the last candle and the profile.")
+i_profW     = input.int(40, "Max Width (Bars)", minval = 5, maxval = 200, group = g_vx, inline = "vx2", tooltip = "Width of the biggest row. All other rows scale against it.")
+i_profText  = input.bool(true, "Volume Text", group = g_vx, inline = "vx3", tooltip = "Prints traded volume inside above-average rows.")
+i_v_outline = input.bool(true, "Profile Outline", group = g_vx, inline = "vx3b", tooltip = "Draws a single smooth outline around the margin profile silhouette.")
+i_v_stat    = input.bool(true, "Profile Stats", group = g_vx, inline = "vx3b", tooltip = "Small delta-% label on the profile. Hover for total, buy and sell volume, delta, POC and POV.")
+i_v_zig     = input.bool(true, "Swing ZigZag", group = g_vx, inline = "vx3c", tooltip = "Swing anchor only: dotted connectors between confirmed swing points.")
+i_v_glow    = input.bool(true,  "Neon POC + POV Rails", group = g_vx, inline = "vx3")
+i_v_va      = input.bool(true,  "Value Area Zone", group = g_vx, inline = "vx4")
+i_v_npoc    = input.bool(true,  "Past Levels", group = g_vx, inline = "vx4")
+i_v_rtest   = input.bool(true,  "Node Retest Lines", group = g_vx, inline = "vx5", tooltip = "Every signal draws the node it was born from as a level. Lines die on breach or expiry.")
+i_rtBars    = input.int(50, "Retest Life (Bars)", minval = 5, maxval = 300, group = g_vx, inline = "vx5")
+i_rtCool    = input.int(40, "Retest Cooldown", minval = 0, maxval = 300, group = g_vx, inline = "vx6", tooltip = "Minimum bars between two retest lines on the same side at a similar price.")
+i_v_rtHist  = input.bool(true, "Keep Filled Lines", group = g_vx, inline = "vx6b", tooltip = "Breached or expired retest lines stay on chart as darker dotted history instead of vanishing.")
+i_v_whale   = input.bool(true,  "Whale Bars", group = g_vx, inline = "vx6")
+i_whalePct  = input.float(60.0, "Whale Delta %", minval = 30, maxval = 95, group = g_vx, inline = "vx7")
+i_v_candles = input.bool(true,  "Delta-Tinted Candles", group = g_vx, inline = "vx7")
+i_v_labels  = input.bool(true,  "Signal Labels", group = g_vx, inline = "vx8", tooltip = "Typed signal chips with a deep-dive tooltip: node, ATR distance, wick, delta, CVD, trend.")
+i_v_bg      = input.bool(false, "Delta Regime Background", group = g_vx, inline = "vx8")
+i_v_trade   = input.bool(true,  "Trade Box (Entry/SL/TP)", group = g_vx, inline = "vx8b", tooltip = "Every signal draws its position: entry line with price tag, dashed stop, solid target, shaded risk and reward zones. The box follows price and freezes exactly where the stop or target is hit.")
+i_colBull   = input.color(#00e1ff, "Bull", group = g_vx, inline = "vx9")
+i_colBear   = input.color(#ff3d71, "Bear", group = g_vx, inline = "vx9")
+i_colPoc    = input.color(#ffd740, "POC", group = g_vx, inline = "vx0")
+i_colVa     = input.color(#7c4dff, "Value Area", group = g_vx, inline = "vx0")
+i_colVoid   = input.color(#ff9100, "Void / POV", group = g_vx, inline = "vx9")
+
+// -------------------------------- DASHBOARD ----------------------------------
+g_db = "Dashboard"
+i_dbShow = input.bool(true, "Show Dashboard", group = g_db, inline = "db1")
+i_dbLoc  = input.string("Bottom Right", "Location", ["Top Right", "Middle Right", "Bottom Right", "Top Left", "Middle Left", "Bottom Left"], group = g_db, inline = "db1")
+i_dbSize = input.string("Tiny", "Size", ["Tiny", "Small", "Normal", "Large"], group = g_db, inline = "db2")
+
+// =============================================================================
+// PROFILE ENGINE — intrabar volume distributed across price rows
+// =============================================================================
+
+type Profile
+    float   base     = na   // price of row 0
+    float   rowSize  = na
+    int     startBar = na
+    float[] buy
+    float[] sell
+    float[] tot
+
+f_newProfile(float rs, int bi, float refPrice) =>
+    b = math.floor(refPrice / rs) * rs
+    Profile.new(b, rs, bi, array.new<float>(), array.new<float>(), array.new<float>())
+
+// index of the row containing price px (may be out of range — caller grows)
+f_rowIdx(Profile p, float px) =>
+    int(math.floor((px - p.base) / p.rowSize))
+
+// grow the row arrays until [i0, i1] is addressable
+f_grow(Profile p, int i0, int i1) =>
+    int a = i0
+    int b = i1
+    while b > p.tot.size() - 1 and p.tot.size() < 400
+        p.buy.push(0.0)
+        p.sell.push(0.0)
+        p.tot.push(0.0)
+    while a < 0 and p.tot.size() < 400
+        p.buy.unshift(0.0)
+        p.sell.unshift(0.0)
+        p.tot.unshift(0.0)
+        p.base -= p.rowSize
+        a += 1
+        b += 1
+    [a, b]
+
+// Point of Control + Value Area (two-sided expansion from POC)
+// + Point of Void: the lowest-volume node inside the value area, excluding POC.
+// Returns [poc, vah, val, pocIdx, vaBottomIdx, vaTopIdx, pov, povIdx]
+f_pocVa(Profile p, float vaPct) =>
+    sz    = p.tot.size()
+    float poc = na
+    float vah = na
+    float val = na
+    float pov = na
+    int   pocIdx = 0
+    int   povIdx = -1
+    int   bt = 0
+    int   tp = 0
+    if sz > 0 and p.tot.sum() > 0
+        mx     = p.tot.max()
+        pocIdx := p.tot.indexof(mx)
+        poc    := p.base + pocIdx * p.rowSize + p.rowSize / 2
+        target = p.tot.sum() * vaPct / 100.0
+        acc    = mx
+        bt := pocIdx
+        tp := pocIdx
+        while acc < target and (bt > 0 or tp < sz - 1)
+            up = tp < sz - 1 ? p.tot.get(tp + 1) : -1.0
+            dn = bt > 0      ? p.tot.get(bt - 1) : -1.0
+            if up >= dn
+                tp  += 1
+                acc += math.max(up, 0.0)
+            else
+                bt  -= 1
+                acc += math.max(dn, 0.0)
+        vah := p.base + (tp + 1) * p.rowSize
+        val := p.base + bt * p.rowSize
+        // POV: weakest node inside value — where price meets the least resistance
+        float minV = na
+        for x = bt to tp
+            vx = p.tot.get(x)
+            if x != pocIdx and (na(minV) or vx < minV)
+                minV   := vx
+                povIdx := x
+        if povIdx >= 0
+            pov := p.base + povIdx * p.rowSize + p.rowSize / 2
+    [poc, vah, val, pocIdx, bt, tp, pov, povIdx]
+
+// --- intrabar feed: signed volume per lower-timeframe bar ---
+atr14 = ta.atr(14)
+[ltfVol, ltfDir, ltfHi, ltfLo] = request.security_lower_tf(syminfo.tickerid, i_ltf, [volume, math.sign(close - close[1]), high, low])
+
+// --- profile lifecycle: clock periods or confirmed swing reversals ---
+pivH = ta.pivothigh(high, i_swingLen, i_swingLen)
+pivL = ta.pivotlow(low, i_swingLen, i_swingLen)
+var int swingDir = 0
+swingReset = false
+if i_anchor == "Swing"
+    if not na(pivL) and swingDir != 1
+        swingDir   := 1
+        swingReset := true
+    if not na(pivH) and swingDir != -1
+        swingDir   := -1
+        swingReset := true
+newPeriod = i_anchor == "Swing" ? swingReset : timeframe.change(i_period)
+
+// history of finished profiles (levels stay on chart until crossed)
+var float[] hPoc   = array.new<float>()
+var float[] hVah   = array.new<float>()
+var float[] hVal   = array.new<float>()
+var int[]   hStart = array.new<int>()
+var int[]   hEnd   = array.new<int>()
+
+var Profile prof = na
+if newPeriod and not na(prof) and prof.tot.size() > 0 and prof.tot.sum() > 0 and i_hist > 0
+    [pPoc, pVah, pVal, pIdx, pBt, pTp, pPov, pPovIdx] = f_pocVa(prof, i_vaPct)
+    hPoc.push(pPoc)
+    hVah.push(pVah)
+    hVal.push(pVal)
+    hStart.push(prof.startBar)
+    hEnd.push(bar_index - 1)
+    if hPoc.size() > i_hist
+        hPoc.shift()
+        hVah.shift()
+        hVal.shift()
+        hStart.shift()
+        hEnd.shift()
+
+if newPeriod or na(prof)
+    rs = i_ticks > 0 ? i_ticks * syminfo.mintick : atr14 / i_atrRows
+    rs := math.max(rs, syminfo.mintick)
+    sb = i_anchor == "Swing" ? math.max(bar_index - i_swingLen, 0) : bar_index
+    prof := f_newProfile(rs, sb, open)
+
+// --- swing zigzag: dotted connectors between confirmed swing points ---
+var line[] zigLn = array.new<line>()
+var int   zigBar  = na
+var float zigPx   = na
+if i_anchor == "Swing" and swingReset
+    zBar = bar_index - i_swingLen
+    zPx  = nz(pivL, pivH)
+    if i_v_zig and not na(zigBar) and not na(zPx)
+        zigLn.push(line.new(zigBar, zigPx, zBar, zPx, color = color.new(zPx > zigPx ? i_colBull : i_colBear, 15), style = line.style_dotted))
+        if zigLn.size() > 12
+            line.delete(zigLn.shift())
+    zigBar := zBar
+    zigPx  := zPx
+
+// --- distribute intrabar volume across rows, accumulate bar delta + CVD ---
+var float cvd = 0.0
+if newPeriod
+    cvd := 0.0
+barDelta = 0.0
+barBuy   = 0.0
+barSell  = 0.0
+
+if ltfVol.size() > 0
+    for i = 0 to ltfVol.size() - 1
+        v  = nz(ltfVol.get(i))
+        d  = nz(ltfDir.get(i))
+        hi = ltfHi.get(i)
+        lo = ltfLo.get(i)
+        sv = v * d
+        barDelta += sv
+        if d > 0
+            barBuy += v
+        if d < 0
+            barSell += v
+        if d == 0
+            barBuy  += v / 2
+            barSell += v / 2
+        if v > 0 and not na(hi) and not na(lo)
+            r0 = f_rowIdx(prof, lo)
+            r1 = f_rowIdx(prof, hi)
+            [g0, g1] = f_grow(prof, r0, r1)
+            g0 := math.max(g0, 0)
+            g1 := math.min(g1, prof.tot.size() - 1)
+            if g0 <= g1
+                cnt = g1 - g0 + 1
+                per = v / cnt
+                for x = g0 to g1
+                    prof.tot.set(x, prof.tot.get(x) + per)
+                    if d > 0
+                        prof.buy.set(x, prof.buy.get(x) + per)
+                    if d < 0
+                        prof.sell.set(x, prof.sell.get(x) + per)
+                    if d == 0
+                        prof.buy .set(x, prof.buy .get(x) + per / 2)
+                        prof.sell.set(x, prof.sell.get(x) + per / 2)
+
+cvd += barDelta
+barDeltaPct = volume > 0 ? barDelta / volume * 100 : 0.0
+
+// --- developing levels: POC, Value Area, Point of Void (live, every bar) ---
+[dPoc, dVah, dVal, dPocIdx, dBt, dTp, dPov, dPovIdx] = f_pocVa(prof, i_vaPct)
+profRows = prof.tot.size()
+profMax  = profRows > 0 ? prof.tot.max() : 0.0
+
+// --- compact volume formatter (labels, tooltips, dashboard) ---
+f_volFmt(float v) =>
+    av = math.abs(v)
+    av >= 1e6 ? str.tostring(v / 1e6, "#.##") + "M" : av >= 1e3 ? str.tostring(v / 1e3, "#.#") + "K" : str.tostring(v, "#")
+// =============================================================================
+// SIGNAL ENGINE — sweep & reclaim, POC bounce, POV void break + filter stack
+// =============================================================================
+
+atrSL = ta.atr(i_slAtrL)
+
+// --- divergence gates: price prints the extreme, cumulative delta refuses ---
+divLongOK  = not i_div or (low  < ta.lowest(low[1], i_divLen)  and cvd > ta.lowest(cvd[1], i_divLen))
+divShortOK = not i_div or (high > ta.highest(high[1], i_divLen) and cvd < ta.highest(cvd[1], i_divLen))
+
+// --- bar delta confirmation ---
+dLongOK  = not i_deltaConf or barDelta > 0
+dShortOK = not i_deltaConf or barDelta < 0
+
+// --- sweep & reclaim on the developing Value Area edges ---
+sweepL = not na(dVal) and low  < dVal and close > dVal and close > open
+sweepS = not na(dVah) and high > dVah and close < dVah and close < open
+
+// --- developing POC rejection ---
+bounceL = not na(dPoc) and low  <= dPoc and close > dPoc and close > open and low > dVal
+bounceS = not na(dPoc) and high >= dPoc and close < dPoc and close < open and high < dVah
+
+// --- POV void break: price drives through the thinnest node inside value ---
+voidL = not na(dPov) and close > dPov and close[1] <= dPov and close > open
+voidS = not na(dPov) and close < dPov and close[1] >= dPov and close < open
+
+// --- filter stack ---
+barRng  = high - low
+momOK   = not i_f_mom or barRng <= atrSL * i_momMult
+wickL   = barRng > 0 ? (math.min(open, close) - low)  / barRng * 100 : 0.0
+wickS   = barRng > 0 ? (high - math.max(open, close)) / barRng * 100 : 0.0
+wickOKL = not i_f_wick or wickL >= i_wickPct
+wickOKS = not i_f_wick or wickS >= i_wickPct
+emaV    = ta.ema(close, i_emaLen)
+emaOKL  = not i_f_ema or close > emaV
+emaOKS  = not i_f_ema or close < emaV
+sessOK  = not i_f_sess or not na(time(timeframe.period, i_sess))
+filtersOn = (i_f_mom ? 1 : 0) + (i_f_wick ? 1 : 0) + (i_f_ema ? 1 : 0) + (i_f_sess ? 1 : 0)
+
+// --- model wiring (wick gate applies to rejection models, not void drives) ---
+modeSwp = i_sigMode == "All" or i_sigMode == "Sweep & Reclaim"
+modeBnc = i_sigMode == "All" or i_sigMode == "POC Bounce"
+modeVd  = i_sigMode == "All" or i_sigMode == "POV Void"
+
+rawL = (modeSwp and sweepL  and wickOKL) or (modeBnc and bounceL and wickOKL) or (modeVd and voidL)
+rawS = (modeSwp and sweepS  and wickOKS) or (modeBnc and bounceS and wickOKS) or (modeVd and voidS)
+
+longOK  = i_dirMode != "Shorts Only"
+shortOK = i_dirMode != "Longs Only"
+
+// --- which node birthed the signal (labels, retest lines, tooltips) ---
+float  nodePxL  = na
+string nodeNmL  = ""
+string nodeTagL = ""
+if modeSwp and sweepL
+    nodePxL  := dVal
+    nodeNmL  := "VAL SWEEP"
+    nodeTagL := "SWEEP"
+if modeBnc and bounceL
+    nodePxL  := dPoc
+    nodeNmL  := "POC BOUNCE"
+    nodeTagL := "POC"
+if modeVd and voidL
+    nodePxL  := dPov
+    nodeNmL  := "POV BREAK"
+    nodeTagL := "VOID"
+float  nodePxS  = na
+string nodeNmS  = ""
+string nodeTagS = ""
+if modeSwp and sweepS
+    nodePxS  := dVah
+    nodeNmS  := "VAH SWEEP"
+    nodeTagS := "SWEEP"
+if modeBnc and bounceS
+    nodePxS  := dPoc
+    nodeNmS  := "POC BOUNCE"
+    nodeTagS := "POC"
+if modeVd and voidS
+    nodePxS  := dPov
+    nodeNmS  := "POV BREAK"
+    nodeTagS := "VOID"
+
+// --- whale absorption bars: extreme one-sided delta on heavy volume ---
+volAvg    = ta.sma(volume, 20)
+whaleBuy  = barDeltaPct >= i_whalePct  and volume > volAvg * 1.5
+whaleSell = barDeltaPct <= -i_whalePct and volume > volAvg * 1.5
+
+// --- node-episode dedup: no repeat signals grinding at the same level ---
+var int   lastLBar  = na
+var float lastLNode = na
+var int   lastSBar  = na
+var float lastSNode = na
+dupL = not na(lastLBar) and bar_index - lastLBar < i_sigCool and not na(nodePxL) and not na(lastLNode) and math.abs(nodePxL - lastLNode) < atrSL
+dupS = not na(lastSBar) and bar_index - lastSBar < i_sigCool and not na(nodePxS) and not na(lastSNode) and math.abs(nodePxS - lastSNode) < atrSL
+
+longSignal  = rawL and divLongOK  and dLongOK  and momOK and emaOKL and sessOK and longOK  and not dupL and not newPeriod
+shortSignal = rawS and divShortOK and dShortOK and momOK and emaOKS and sessOK and shortOK and not dupS and not newPeriod
+
+// --- risk framing: volatility distance or real structure (origin node / next node) ---
+slLong  = math.round_to_mintick(i_slMode == "Beyond Origin Node" and not na(nodePxL) ? math.min(low, nodePxL)  - atrSL * i_nodeBuf : low  - atrSL * i_slAtrM)
+slShort = math.round_to_mintick(i_slMode == "Beyond Origin Node" and not na(nodePxS) ? math.max(high, nodePxS) + atrSL * i_nodeBuf : high + atrSL * i_slAtrM)
+// nearest opposing node above / below entry (POC, POV, VA edges)
+float tpNodeL = na
+if not na(dPoc) and dPoc > close
+    tpNodeL := dPoc
+if not na(dVah) and dVah > close and (na(tpNodeL) or dVah < tpNodeL)
+    tpNodeL := dVah
+if dPovIdx >= 0 and not na(dPov) and dPov > close and (na(tpNodeL) or dPov < tpNodeL)
+    tpNodeL := dPov
+float tpNodeS = na
+if not na(dPoc) and dPoc < close
+    tpNodeS := dPoc
+if not na(dVal) and dVal < close and (na(tpNodeS) or dVal > tpNodeS)
+    tpNodeS := dVal
+if dPovIdx >= 0 and not na(dPov) and dPov < close and (na(tpNodeS) or dPov > tpNodeS)
+    tpNodeS := dPov
+tpLong  = math.round_to_mintick(i_tpMode == "Next Node" and not na(tpNodeL) and tpNodeL - close > atrSL * 0.3 ? tpNodeL : close + (close - slLong) * i_rr)
+tpShort = math.round_to_mintick(i_tpMode == "Next Node" and not na(tpNodeS) and close - tpNodeS > atrSL * 0.3 ? tpNodeS : close - (slShort - close) * i_rr)
+
+// --- last-signal memory (dashboard) ---
+var int lastSigDir = 0
+var int lastSigBar = na
+if longSignal
+    lastSigDir := 1
+    lastSigBar := bar_index
+    lastLBar   := bar_index
+    lastLNode  := nodePxL
+if shortSignal
+    lastSigDir := -1
+    lastSigBar := bar_index
+    lastSBar   := bar_index
+    lastSNode  := nodePxS
+
+// --- POC touch counter: each separate visit of price into the node ---
+var int pocTouches = 0
+if newPeriod
+    pocTouches := 0
+onPoc  = not na(dPoc)    and low <= dPoc    and high >= dPoc
+onPoc1 = not na(dPoc[1]) and low[1] <= dPoc[1] and high[1] >= dPoc[1]
+if onPoc and not onPoc1
+    pocTouches += 1
+
+
+// =============================================================================
+// TRADEWZRD AUTOMATION — webhook-ready order strings
+// =============================================================================
+twSym = tw_symbol != "" ? tw_symbol : syminfo.ticker
+f_fmt(float p) => str.tostring(p, format.mintick)
+f_tail() => (tw_magic != "" ? ", MAGIC=" + tw_magic : "") + (tw_comment != "" ? ", COMMENT=" + tw_comment : "")
+
+if longSignal and tw_enabled
+    msg = (tw_opp_close ? "CLOSE," + twSym + ",SIDE=SELL" + f_tail() + ";" : "") + "BUY," + twSym + ", " + tw_vol_type + "=" + str.tostring(tw_vol_val) + ", SL=" + f_fmt(slLong) + ", TP=" + f_fmt(tpLong) + ", TPSLTYPE=PRICE" + f_tail()
+    alert(msg, alert.freq_once_per_bar_close)
+
+if shortSignal and tw_enabled
+    msg = (tw_opp_close ? "CLOSE," + twSym + ",SIDE=BUY" + f_tail() + ";" : "") + "SELL," + twSym + ", " + tw_vol_type + "=" + str.tostring(tw_vol_val) + ", SL=" + f_fmt(slShort) + ", TP=" + f_fmt(tpShort) + ", TPSLTYPE=PRICE" + f_tail()
+    alert(msg, alert.freq_once_per_bar_close)
+
+// =============================================================================
+// MARGIN PROFILE — the whole engine rendered as one instrument, right of price
+// =============================================================================
+var box[] mpBox = array.new<box>()
+if barstate.islast
+    if mpBox.size() > 0
+        for b in mpBox
+            box.delete(b)
+        mpBox.clear()
+    if i_v_profile and profRows > 1 and profMax > 0
+        span = profRows * prof.rowSize
+        binH = span / i_bins
+        bv = array.new<float>(i_bins, 0.0)
+        bd = array.new<float>(i_bins, 0.0)
+        for x = 0 to profRows - 1
+            j  = math.min(int(x * i_bins / profRows), i_bins - 1)
+            tv = prof.tot.get(x)
+            bv.set(j, bv.get(j) + tv)
+            bd.set(j, bd.get(j) + prof.buy.get(x) - prof.sell.get(x))
+        bMax = bv.max()
+        bAvg = bv.avg()
+        // traded span in bin space (void gaps only count inside it)
+        firstB = -1
+        lastB  = -1
+        for j = 0 to i_bins - 1
+            if bv.get(j) > 0
+                if firstB < 0
+                    firstB := j
+                lastB := j
+        x0 = bar_index + i_profOff
+        for j = 0 to i_bins - 1
+            v = bv.get(j)
+            inSpan = firstB >= 0 and j >= firstB and j <= lastB
+            isVoid = inSpan and v < bMax * 0.05
+            if v > 0 or isVoid
+                y0 = prof.base + j * binH
+                y1 = y0 + binH
+                r0 = int(j * profRows / i_bins)
+                r1 = math.min(int((j + 1) * profRows / i_bins) - 1, profRows - 1)
+                isPoc = dPocIdx >= r0 and dPocIdx <= r1 and profMax > 0
+                isPov = dPovIdx >= r0 and dPovIdx <= r1 and dPovIdx >= 0
+                inVA  = not na(dVal) and r1 >= dBt and r0 <= dTp
+                w    = v > 0 ? math.max(int(v / bMax * i_profW), 1) : 2
+                dpc  = v > 0 ? bd.get(j) / v : 0.0
+                tr   = int(88 - v / bMax * 55)
+                cc   = dpc > 0.05 ? color.new(i_colBull, tr) : dpc < -0.05 ? color.new(i_colBear, tr) : color.new(color.gray, math.min(tr + 8, 92))
+                bc   = color.new(cc, 100)
+                if inVA and not isVoid
+                    cc := color.new(cc, math.max(tr - 12, 18))
+                if isVoid
+                    cc := color.new(i_colVoid, 95)
+                    bc := color.new(i_colVoid, 45)
+                if isPov
+                    cc := color.new(i_colVoid, math.max(tr - 20, 10))
+                if isPoc
+                    cc := color.new(i_colPoc, math.max(tr - 30, 5))
+                txt = i_profText and v > bAvg ? str.tostring(v, format.volume) : ""
+                tc  = isPoc or isPov or tr < 50 ? color.new(#10131a, 0) : color.new(chart.fg_color, 15)
+                mpBox.push(box.new(x0, y1, x0 + w, y0, border_color = bc, bgcolor = cc, text = txt, text_color = tc, text_halign = text.align_left, text_size = size.tiny))
+
+// --- silhouette outline: one smooth polyline around the whole profile ---
+var polyline mpPoly = na
+// --- stats label: net delta % on the profile, depth on hover ---
+var label mpStat = na
+if barstate.islast
+    polyline.delete(mpPoly)
+    label.delete(mpStat)
+    mpPoly := na
+    mpStat := na
+    if i_v_profile and profRows > 1 and profMax > 0
+        span = profRows * prof.rowSize
+        binH = span / i_bins
+        x0   = bar_index + i_profOff
+        if i_v_outline
+            ov = array.new<float>(i_bins, 0.0)
+            for x = 0 to profRows - 1
+                j = math.min(int(x * i_bins / profRows), i_bins - 1)
+                ov.set(j, ov.get(j) + prof.tot.get(x))
+            oMax = ov.max()
+            pts = array.new<chart.point>()
+            pts.push(chart.point.from_index(x0, prof.base))
+            for j = 0 to i_bins - 1
+                bvol = ov.get(j)
+                w = bvol > 0 and oMax > 0 ? math.max(int(bvol / oMax * i_profW), 1) : 1
+                y0 = prof.base + j * binH
+                pts.push(chart.point.from_index(x0 + w, y0))
+                pts.push(chart.point.from_index(x0 + w, y0 + binH))
+            pts.push(chart.point.from_index(x0, prof.base + span))
+            mpPoly := polyline.new(pts, false, true, line_color = color.new(prof.buy.sum() >= prof.sell.sum() ? i_colBull : i_colBear, 25), line_width = 2)
+        if i_v_stat
+            totV  = prof.tot.sum()
+            buyV  = prof.buy.sum()
+            sellV = prof.sell.sum()
+            dPct  = totV > 0 ? (buyV - sellV) / totV * 100 : 0.0
+            statTip = "Total Volume: " + str.tostring(totV, format.volume) + "\nBuy Volume: " + str.tostring(buyV, format.volume) + "\nSell Volume: " + str.tostring(sellV, format.volume) + "\nDelta: " + str.tostring(dPct, "#.#") + "%\nPOC: " + (na(dPoc) ? "-" : f_fmt(dPoc)) + "\nPOV: " + (na(dPov) ? "-" : f_fmt(dPov)) + "\nValue Area: " + str.tostring(i_vaPct, "#") + "%"
+            mpStat := label.new(x0, prof.base + span + binH, (dPct >= 0 ? "+" : "") + str.tostring(dPct, "#.#") + "%", color = color.new(chart.fg_color, 100), textcolor = dPct >= 0 ? i_colBull : i_colBear, style = label.style_label_down, size = size.small, tooltip = statTip)
+
+// =============================================================================
+// LEVEL RAILS — thin lines on price: neon POC, dotted POV, value area zone
+// =============================================================================
+var line pocGlowA = na
+var line pocGlowB = na
+var line pocCore  = na
+var line povLn    = na
+if newPeriod and not na(pocCore)
+    line.delete(pocGlowA)
+    line.delete(pocGlowB)
+    line.delete(pocCore)
+    pocGlowA := na
+    pocGlowB := na
+    pocCore  := na
+if newPeriod and not na(povLn)
+    line.delete(povLn)
+    povLn := na
+
+if i_v_glow and not na(dPoc)
+    if newPeriod or na(pocCore)
+        pocGlowA := line.new(prof.startBar, dPoc, bar_index + 1, dPoc, color = color.new(i_colPoc, 90), width = 6)
+        pocGlowB := line.new(prof.startBar, dPoc, bar_index + 1, dPoc, color = color.new(i_colPoc, 70), width = 3)
+        pocCore  := line.new(prof.startBar, dPoc, bar_index + 1, dPoc, color = color.new(i_colPoc, 0),  width = 1)
+    else
+        line.set_xy1(pocGlowA, prof.startBar, dPoc)
+        line.set_xy2(pocGlowA, bar_index + 1, dPoc)
+        line.set_xy1(pocGlowB, prof.startBar, dPoc)
+        line.set_xy2(pocGlowB, bar_index + 1, dPoc)
+        line.set_xy1(pocCore, prof.startBar, dPoc)
+        line.set_xy2(pocCore, bar_index + 1, dPoc)
+
+if i_v_glow and not na(dPov)
+    if newPeriod or na(povLn)
+        povLn := line.new(prof.startBar, dPov, bar_index + 1, dPov, color = color.new(i_colVoid, 25), style = line.style_dotted)
+    else
+        line.set_xy1(povLn, prof.startBar, dPov)
+        line.set_xy2(povLn, bar_index + 1, dPov)
+
+// --- value area zone: VAH/VAL rails + translucent fill ---
+var line     vahLn = na
+var line     valLn = na
+var linefill vaFill = na
+if newPeriod and not na(vahLn)
+    line.delete(vahLn)
+    line.delete(valLn)
+    linefill.delete(vaFill)
+    vahLn  := na
+    valLn  := na
+    vaFill := na
+
+if i_v_va and not na(dVah) and not na(dVal)
+    if newPeriod or na(vahLn)
+        vahLn  := line.new(prof.startBar, dVah, bar_index + 1, dVah, color = color.new(i_colVa, 20), style = line.style_dashed)
+        valLn  := line.new(prof.startBar, dVal, bar_index + 1, dVal, color = color.new(i_colVa, 20), style = line.style_dashed)
+        vaFill := linefill.new(vahLn, valLn, color.new(i_colVa, 90))
+    else
+        line.set_xy1(vahLn, prof.startBar, dVah)
+        line.set_xy2(vahLn, bar_index + 1, dVah)
+        line.set_xy1(valLn, prof.startBar, dVal)
+        line.set_xy2(valLn, bar_index + 1, dVal)
+
+// --- right-edge level tags ---
+var label tagPoc = na
+var label tagVah = na
+var label tagVal = na
+var label tagPov = na
+if i_v_glow and not na(dPoc)
+    if na(tagPoc)
+        tagPoc := label.new(bar_index + 2, dPoc, "", color = color.new(i_colPoc, 100), textcolor = i_colPoc, style = label.style_label_left, size = size.tiny)
+        tagVah := label.new(bar_index + 2, dVah, "", color = color.new(i_colVa, 100), textcolor = color.new(i_colVa, 0), style = label.style_label_left, size = size.tiny)
+        tagVal := label.new(bar_index + 2, dVal, "", color = color.new(i_colVa, 100), textcolor = color.new(i_colVa, 0), style = label.style_label_left, size = size.tiny)
+        tagPov := label.new(bar_index + 2, dPov, "", color = color.new(i_colVoid, 100), textcolor = color.new(i_colVoid, 0), style = label.style_label_left, size = size.tiny)
+    label.set_xy(tagPoc, bar_index + 2, dPoc)
+    label.set_text(tagPoc, "POC " + f_fmt(dPoc))
+    label.set_xy(tagVah, bar_index + 2, dVah)
+    label.set_text(tagVah, "VAH " + f_fmt(dVah))
+    label.set_xy(tagVal, bar_index + 2, dVal)
+    label.set_text(tagVal, "VAL " + f_fmt(dVal))
+    if not na(dPov)
+        label.set_xy(tagPov, bar_index + 2, dPov)
+        label.set_text(tagPov, "POV " + f_fmt(dPov))
+
+// --- past profiles: POC / VAH / VAL extend right until price crosses them ---
+var line[] hPocLn = array.new<line>()
+var line[] hVahLn = array.new<line>()
+var line[] hValLn = array.new<line>()
+var bool[] hDead  = array.new_bool()
+
+if i_v_npoc and hPoc.size() > hPocLn.size()
+    for i = hPocLn.size() to hPoc.size() - 1
+        hPocLn.push(line.new(hStart.get(i), hPoc.get(i), bar_index + 1, hPoc.get(i), color = color.new(i_colPoc, 35), style = line.style_dotted))
+        hVahLn.push(line.new(hStart.get(i), hVah.get(i), bar_index + 1, hVah.get(i), color = color.new(i_colVa, 60), style = line.style_dotted))
+        hValLn.push(line.new(hStart.get(i), hVal.get(i), bar_index + 1, hVal.get(i), color = color.new(i_colVa, 60), style = line.style_dotted))
+        hDead.push(false)
+
+while hPocLn.size() > hPoc.size()
+    l1 = hPocLn.shift()
+    l2 = hVahLn.shift()
+    l3 = hValLn.shift()
+    hDead.shift()
+    if not na(l1)
+        line.delete(l1)
+    if not na(l2)
+        line.delete(l2)
+    if not na(l3)
+        line.delete(l3)
+
+if i_v_npoc and hPocLn.size() > 0
+    for i = 0 to hPocLn.size() - 1
+        if not hDead.get(i)
+            lv  = hPoc.get(i)
+            lvh = hVah.get(i)
+            lvl = hVal.get(i)
+            crossed = (close > lv) != (close[1] > lv) or (close > lvh) != (close[1] > lvh) or (close > lvl) != (close[1] > lvl)
+            if crossed
+                hDead.set(i, true)
+                line.set_color(hPocLn.get(i), color.new(i_colPoc, 88))
+                line.set_color(hVahLn.get(i), color.new(i_colVa, 92))
+                line.set_color(hValLn.get(i), color.new(i_colVa, 92))
+            else
+                line.set_x2(hPocLn.get(i), bar_index + 1)
+                line.set_x2(hVahLn.get(i), bar_index + 1)
+                line.set_x2(hValLn.get(i), bar_index + 1)
+
+// --- whale absorption markers (glow diamond) ---
+if i_v_whale and whaleBuy
+    label.new(bar_index, low, " ", color = color.new(i_colBull, 75), style = label.style_circle, size = size.large)
+    label.new(bar_index, low, "W", color = color.new(i_colBull, 100), textcolor = i_colBull, style = label.style_label_up, size = size.small)
+if i_v_whale and whaleSell
+    label.new(bar_index, high, " ", color = color.new(i_colBear, 75), style = label.style_circle, size = size.large)
+    label.new(bar_index, high, "W", color = color.new(i_colBear, 100), textcolor = i_colBear, style = label.style_label_down, size = size.small)
+
+// =============================================================================
+// LIQUIDITY POOLS — resting stops at swing extremes, alive until raided
+// =============================================================================
+var line[]  lqHiLn = array.new<line>()
+var float[] lqHiPx = array.new<float>()
+var line[]  lqLoLn = array.new<line>()
+var float[] lqLoPx = array.new<float>()
+var box[]   lqZn   = array.new<box>()
+
+liqPh = ta.pivothigh(high, i_liqLen, i_liqLen)
+liqPl = ta.pivotlow(low,  i_liqLen, i_liqLen)
+
+if i_v_liq and not na(liqPh)
+    if lqHiLn.size() >= i_liqMax
+        line.delete(lqHiLn.shift())
+        lqHiPx.shift()
+    lqHiLn.push(line.new(bar_index - i_liqLen, liqPh, bar_index, liqPh, color = color.new(i_colBear, 55), style = line.style_dotted, width = 1, extend = extend.right))
+    lqHiPx.push(liqPh)
+
+if i_v_liq and not na(liqPl)
+    if lqLoLn.size() >= i_liqMax
+        line.delete(lqLoLn.shift())
+        lqLoPx.shift()
+    lqLoLn.push(line.new(bar_index - i_liqLen, liqPl, bar_index, liqPl, color = color.new(i_colBull, 55), style = line.style_dotted, width = 1, extend = extend.right))
+    lqLoPx.push(liqPl)
+
+// --- raids: a wick through the pool kills the rail on the raid bar ---
+if lqHiLn.size() > 0
+    for j = lqHiLn.size() - 1 to 0
+        px = lqHiPx.get(j)
+        if high > px
+            line.set_extend(lqHiLn.get(j), extend.none)
+            line.set_x2(lqHiLn.get(j), bar_index)
+            line.set_color(lqHiLn.get(j), color.new(i_colBear, 82))
+            if close < px and i_liqZone
+                lqZn.push(box.new(bar_index, high, bar_index + 20, px, border_color = na, bgcolor = color.new(i_colBear, 88)))
+                if lqZn.size() > 10
+                    box.delete(lqZn.shift())
+            lqHiLn.remove(j)
+            lqHiPx.remove(j)
+
+if lqLoLn.size() > 0
+    for j = lqLoLn.size() - 1 to 0
+        px = lqLoPx.get(j)
+        if low < px
+            line.set_extend(lqLoLn.get(j), extend.none)
+            line.set_x2(lqLoLn.get(j), bar_index)
+            line.set_color(lqLoLn.get(j), color.new(i_colBull, 82))
+            if close > px and i_liqZone
+                lqZn.push(box.new(bar_index, px, bar_index + 20, low, border_color = na, bgcolor = color.new(i_colBull, 88)))
+                if lqZn.size() > 10
+                    box.delete(lqZn.shift())
+            lqLoLn.remove(j)
+            lqLoPx.remove(j)
+
+
+// --- node retest lines: the level a signal was born from, alive until breach ---
+var line[]  rtLn   = array.new<line>()
+var float[] rtPx   = array.new<float>()
+var int[]   rtDir  = array.new<int>()
+var int[]   rtBar  = array.new<int>()
+var line[]  rtHist = array.new<line>()
+
+f_rtCooldown(float px, int d) =>
+    bool cool = false
+    if rtBar.size() > 0
+        for j = 0 to rtBar.size() - 1
+            if rtDir.get(j) == d and bar_index - rtBar.get(j) < i_rtCool and math.abs(rtPx.get(j) - px) < atrSL
+                cool := true
+    cool
+
+if rtLn.size() > 0
+    for j = rtLn.size() - 1 to 0
+        lv       = rtPx.get(j)
+        d        = rtDir.get(j)
+        expired  = bar_index - rtBar.get(j) > i_rtBars
+        breached = d == 1 ? close < lv : close > lv
+        if expired or breached
+            if i_v_rtHist
+                ln = rtLn.get(j)
+                line.set_x2(ln, bar_index)
+                line.set_style(ln, line.style_dotted)
+                line.set_color(ln, color.new(d == 1 ? i_colBull : i_colBear, 72))
+                rtHist.push(ln)
+                if rtHist.size() > 20
+                    line.delete(rtHist.shift())
+            else
+                line.delete(rtLn.get(j))
+            rtLn.remove(j)
+            rtPx.remove(j)
+            rtDir.remove(j)
+            rtBar.remove(j)
+
+// --- typed signal chips + retest line birth ---
+atrLbl = ta.atr(10)
+
+tipL = "NODE  " + nodeNmL + " @ " + (na(nodePxL) ? "-" : f_fmt(nodePxL))
+tipL += "\nATR DIST  " + (na(nodePxL) ? "-" : str.tostring(math.abs(close - nodePxL) / atrSL, "#.##"))
+tipL += "\nWICK  " + str.tostring(wickL, "#") + "%"
+tipL += "\nBAR DELTA  " + str.tostring(barDeltaPct, "#.#") + "%"
+tipL += "\nCVD  " + (cvd >= 0 ? "+" : "") + f_volFmt(cvd)
+tipL += "\nTREND  " + (close > emaV ? "BULL" : "BEAR") + " (EMA " + str.tostring(i_emaLen) + ")"
+tipS = "NODE  " + nodeNmS + " @ " + (na(nodePxS) ? "-" : f_fmt(nodePxS))
+tipS += "\nATR DIST  " + (na(nodePxS) ? "-" : str.tostring(math.abs(close - nodePxS) / atrSL, "#.##"))
+tipS += "\nWICK  " + str.tostring(wickS, "#") + "%"
+tipS += "\nBAR DELTA  " + str.tostring(barDeltaPct, "#.#") + "%"
+tipS += "\nCVD  " + (cvd >= 0 ? "+" : "") + f_volFmt(cvd)
+tipS += "\nTREND  " + (close > emaV ? "BULL" : "BEAR") + " (EMA " + str.tostring(i_emaLen) + ")"
+
+if i_v_labels and longSignal
+    label.new(bar_index, low - atrLbl, "BUY · " + nodeTagL, color = color.new(i_colBull, 15), textcolor = #ffffff, style = label.style_label_up, size = size.small, tooltip = tipL)
+
+if i_v_labels and shortSignal
+    label.new(bar_index, high + atrLbl, "SELL · " + nodeTagS, color = color.new(i_colBear, 15), textcolor = #ffffff, style = label.style_label_down, size = size.small, tooltip = tipS)
+
+if i_v_rtest and longSignal and not na(nodePxL) and not f_rtCooldown(nodePxL, 1)
+    if rtLn.size() >= 12
+        line.delete(rtLn.shift())
+        rtPx.shift()
+        rtDir.shift()
+        rtBar.shift()
+    rtLn.push(line.new(bar_index, nodePxL, bar_index + i_rtBars, nodePxL, color = color.new(i_colBull, 30), width = 1))
+    rtPx.push(nodePxL)
+    rtDir.push(1)
+    rtBar.push(bar_index)
+
+if i_v_rtest and shortSignal and not na(nodePxS) and not f_rtCooldown(nodePxS, -1)
+    if rtLn.size() >= 12
+        line.delete(rtLn.shift())
+        rtPx.shift()
+        rtDir.shift()
+        rtBar.shift()
+    rtLn.push(line.new(bar_index, nodePxS, bar_index + i_rtBars, nodePxS, color = color.new(i_colBear, 30), width = 1))
+    rtPx.push(nodePxS)
+    rtDir.push(-1)
+    rtBar.push(bar_index)
+
+// =============================================================================
+// TRADE BOX — entry, stop and target carried as one position; dies where filled
+// =============================================================================
+var int      tbDir    = 0
+var int      tbBar    = na
+var float    tbEPx    = na
+var float    tbSlPx   = na
+var float    tbTpPx   = na
+var line     tbEntry  = na
+var line     tbSL     = na
+var line     tbTP     = na
+var label    tbLbE    = na
+var label    tbLbS    = na
+var label    tbLbT    = na
+var linefill tbRisk   = na
+var linefill tbReward = na
+
+if longSignal or shortSignal
+    line.delete(tbEntry)
+    line.delete(tbSL)
+    line.delete(tbTP)
+    label.delete(tbLbE)
+    label.delete(tbLbS)
+    label.delete(tbLbT)
+    linefill.delete(tbRisk)
+    linefill.delete(tbReward)
+    tbEntry  := na
+    tbSL     := na
+    tbTP     := na
+    tbLbE    := na
+    tbLbS    := na
+    tbLbT    := na
+    tbRisk   := na
+    tbReward := na
+    tbDir  := longSignal ? 1 : -1
+    tbBar  := bar_index
+    tbEPx  := close
+    tbSlPx := longSignal ? slLong : slShort
+    tbTpPx := longSignal ? tpLong : tpShort
+    if i_v_trade
+        ec = tbDir == 1 ? i_colBull : i_colBear
+        tbEntry  := line.new(bar_index, tbEPx, bar_index + 1, tbEPx, color = ec, width = 2)
+        tbSL     := line.new(bar_index, tbSlPx, bar_index + 1, tbSlPx, color = color.new(i_colBear, 40), style = line.style_dashed, width = 1)
+        tbTP     := line.new(bar_index, tbTpPx, bar_index + 1, tbTpPx, color = color.new(i_colBull, 40), width = 1)
+        tbLbE    := label.new(bar_index, tbEPx, (tbDir == 1 ? "BUY " : "SELL ") + f_fmt(tbEPx), style = label.style_label_left, color = ec, textcolor = #161616, size = size.small)
+        tbLbS    := label.new(bar_index, tbSlPx, "SL " + f_fmt(tbSlPx), style = label.style_label_left, color = color.new(i_colBear, 40), textcolor = #ffffff, size = size.small)
+        tbLbT    := label.new(bar_index, tbTpPx, "TP " + f_fmt(tbTpPx), style = label.style_label_left, color = color.new(i_colBull, 40), textcolor = #161616, size = size.small)
+        tbRisk   := linefill.new(tbEntry, tbSL, color.new(i_colBear, 84))
+        tbReward := linefill.new(tbEntry, tbTP, color.new(i_colBull, 84))
+
+// --- toggled off mid-trade: wipe the drawings, keep the state machine alive ---
+if not i_v_trade and not na(tbEntry)
+    line.delete(tbEntry)
+    line.delete(tbSL)
+    line.delete(tbTP)
+    label.delete(tbLbE)
+    label.delete(tbLbS)
+    label.delete(tbLbT)
+    linefill.delete(tbRisk)
+    linefill.delete(tbReward)
+    tbEntry  := na
+    tbSL     := na
+    tbTP     := na
+    tbLbE    := na
+    tbLbS    := na
+    tbLbT    := na
+    tbRisk   := na
+    tbReward := na
+
+// --- live: the box follows price, then freezes exactly where stop or target is hit ---
+if tbDir != 0
+    if not na(tbEntry)
+        line.set_x2(tbEntry, bar_index + 1)
+        line.set_x2(tbSL, bar_index + 1)
+        line.set_x2(tbTP, bar_index + 1)
+        label.set_x(tbLbE, bar_index)
+        label.set_x(tbLbS, bar_index)
+        label.set_x(tbLbT, bar_index)
+    hitSl = tbDir == 1 ? low  <= tbSlPx : high >= tbSlPx
+    hitTp = tbDir == 1 ? high >= tbTpPx : low  <= tbTpPx
+    if hitSl and hitTp
+        hitTp := false  // both tagged in one bar: call it honestly, stop first
+    if bar_index > tbBar and (hitSl or hitTp)
+        if not na(tbEntry)
+            line.set_x2(tbEntry, bar_index)
+            line.set_x2(tbSL, bar_index)
+            line.set_x2(tbTP, bar_index)
+            label.new(bar_index, hitTp ? tbTpPx : tbSlPx, hitTp ? "TP HIT" : "SL HIT", style = label.style_label_left, color = color.new(hitTp ? i_colBull : i_colBear, 15), textcolor = hitTp ? #161616 : #ffffff, size = size.tiny)
+        if tw_enabled and tw_exit_close
+            alert("CLOSE," + twSym + ",SIDE=" + (tbDir == 1 ? "BUY" : "SELL") + f_tail(), alert.freq_once_per_bar_close)
+        tbDir := 0
+
+
+// --- delta-tinted candles ---
+dClamp  = math.max(math.min(barDeltaPct, 80), -80)
+candleB = color.from_gradient(dClamp, 0, 80, color.new(i_colBull, 78), color.new(i_colBull, 18))
+candleS = color.from_gradient(-dClamp, 0, 80, color.new(i_colBear, 78), color.new(i_colBear, 18))
+barcolor(i_v_candles ? (barDeltaPct > 12 ? candleB : barDeltaPct < -12 ? candleS : na) : na, title = "Delta Candles")
+
+// --- optional delta regime background ---
+cvdUp = ta.rising(cvd, 10)
+bgcolor(i_v_bg ? (cvdUp ? color.new(i_colBull, 94) : color.new(i_colBear, 94)) : na, title = "Delta Regime")
+
+// =============================================================================
+// DASHBOARD — instrument panel: dark chrome, dividers, right-aligned values
+// =============================================================================
+color DB_DATA  = #DBDBDB
+color DB_HEAD  = #808080
+color DB_BG    = #161616
+color DB_BORD  = #2E2E2E
+
+dbPos  = i_dbLoc == "Top Right" ? position.top_right : i_dbLoc == "Middle Right" ? position.middle_right : i_dbLoc == "Bottom Right" ? position.bottom_right : i_dbLoc == "Top Left" ? position.top_left : i_dbLoc == "Middle Left" ? position.middle_left : position.bottom_left
+dbSize = i_dbSize == "Tiny" ? size.tiny : i_dbSize == "Small" ? size.small : i_dbSize == "Normal" ? size.normal : size.large
+
+var table db = i_dbShow ? table.new(dbPos, 2, 19, bgcolor = DB_BG, border_width = 0, frame_color = DB_BORD, frame_width = 1, force_overlay = true) : na
+
+f_dbCell(int col, int row, string txt, color fg, string align) =>
+    table.cell(db, col, row, txt, text_color = fg, text_size = dbSize, text_halign = align, bgcolor = color(na))
+
+f_dbDiv(int row) =>
+    table.merge_cells(db, 0, row, 1, row)
+    table.cell(db, 0, row, "━━━━━━━━━━━━━━", text_color = DB_BORD, text_size = dbSize, text_halign = text.align_center, bgcolor = color(na))
+
+if barstate.islast and i_dbShow
+    bullTx = color.new(#089981, 0)
+    bearTx = color.new(#f23645, 0)
+    table.merge_cells(db, 0, 0, 1, 0)
+    f_dbCell(0, 0, "R I F T", DB_DATA, text.align_center)
+    f_dbDiv(1)
+    f_dbCell(0, 2, "PROFILE", DB_HEAD, text.align_left)
+    f_dbCell(1, 2, i_anchor == "Swing" ? "SWING " + str.tostring(i_swingLen) : i_period, DB_DATA, text.align_right)
+    f_dbCell(0, 3, "AUTOMATION", DB_HEAD, text.align_left)
+    f_dbCell(1, 3, tw_enabled ? "ARMED" : "OFF", tw_enabled ? bullTx : bearTx, text.align_right)
+    f_dbDiv(4)
+    f_dbCell(0, 5, "POC", DB_HEAD, text.align_left)
+    f_dbCell(1, 5, na(dPoc) ? "-" : f_fmt(dPoc), i_colPoc, text.align_right)
+    f_dbCell(0, 6, "VAH", DB_HEAD, text.align_left)
+    f_dbCell(1, 6, na(dVah) ? "-" : f_fmt(dVah), color.new(i_colVa, 0), text.align_right)
+    f_dbCell(0, 7, "VAL", DB_HEAD, text.align_left)
+    f_dbCell(1, 7, na(dVal) ? "-" : f_fmt(dVal), color.new(i_colVa, 0), text.align_right)
+    f_dbCell(0, 8, "POV", DB_HEAD, text.align_left)
+    f_dbCell(1, 8, na(dPov) ? "-" : f_fmt(dPov), i_colVoid, text.align_right)
+    f_dbDiv(9)
+    f_dbCell(0, 10, "SESSION CVD", DB_HEAD, text.align_left)
+    f_dbCell(1, 10, (cvd >= 0 ? "+" : "") + f_volFmt(cvd), cvd >= 0 ? bullTx : bearTx, text.align_right)
+    f_dbCell(0, 11, "BAR DELTA", DB_HEAD, text.align_left)
+    f_dbCell(1, 11, (barDeltaPct >= 0 ? "+" : "") + str.tostring(barDeltaPct, "#.#") + "%", barDeltaPct > 12 ? bullTx : barDeltaPct < -12 ? bearTx : DB_DATA, text.align_right)
+    f_dbCell(0, 12, "REGIME", DB_HEAD, text.align_left)
+    f_dbCell(1, 12, cvdUp ? "ACCUMULATION" : "DISTRIBUTION", cvdUp ? bullTx : bearTx, text.align_right)
+    f_dbCell(0, 13, "WHALE", DB_HEAD, text.align_left)
+    f_dbCell(1, 13, whaleBuy ? "BUYING" : whaleSell ? "SELLING" : "-", whaleBuy ? bullTx : whaleSell ? bearTx : DB_DATA, text.align_right)
+    f_dbDiv(14)
+    f_dbCell(0, 15, "SIGNAL", DB_HEAD, text.align_left)
+    f_dbCell(1, 15, lastSigDir == 0 ? "-" : (lastSigDir == 1 ? "LONG" : "SHORT") + " · " + str.tostring(bar_index - nz(lastSigBar, bar_index)) + " bars", lastSigDir == 1 ? bullTx : lastSigDir == -1 ? bearTx : DB_DATA, text.align_right)
+    f_dbCell(0, 16, "POC TOUCHES", DB_HEAD, text.align_left)
+    f_dbCell(1, 16, str.tostring(pocTouches), DB_DATA, text.align_right)
+    f_dbCell(0, 17, "FILTERS", DB_HEAD, text.align_left)
+    f_dbCell(1, 17, str.tostring(filtersOn) + "/4 ON", filtersOn > 0 ? bullTx : DB_DATA, text.align_right)
+    f_dbCell(0, 18, "SYMBOL", DB_HEAD, text.align_left)
+    f_dbCell(1, 18, twSym, DB_DATA, text.align_right)
+
+// =============================================================================
+// API PLOTS (hidden) + ALERT CONDITIONS
+// =============================================================================
+plot(dPoc, "API POC", display = display.none)
+plot(dVah, "API VAH", display = display.none)
+plot(dVal, "API VAL", display = display.none)
+plot(dPov, "API POV", display = display.none)
+plot(longSignal ? 1 : shortSignal ? -1 : 0, "API Signal", display = display.none)
+
+alertcondition(longSignal,  title = "Rift Long Signal",  message = "Rift LONG on {{ticker}} @ {{close}}")
+alertcondition(shortSignal, title = "Rift Short Signal", message = "Rift SHORT on {{ticker}} @ {{close}}")

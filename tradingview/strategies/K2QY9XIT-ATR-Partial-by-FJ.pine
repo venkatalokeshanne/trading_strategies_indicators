@@ -1,0 +1,372 @@
+//@version=5
+strategy("ATR % long",
+     overlay=false,                    // <<< teď v samostatném panelu pod cenou
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=50)
+
+// === INPUTS ===
+leverage         = input.int(100, title="Leverage")
+first_entry_usdt = input.float(1000.0, title="First Entry Size $")
+ema_high_frame   = input.timeframe("15", title="Higher EMA Timeframe")
+
+// pro dashboard / grafy marginu
+account_equity_usd = input.float(10000.0, "Account equity $ (for margin %)", minval=1)
+show_margin_table  = input.bool(true,  "Show margin / PnL dashboard (table)")
+show_margin_plots  = input.bool(true,  "Show margin / PnL plots")
+
+ema_fast   = ta.ema(close, 50)
+ema_medium = ta.ema(close, 100)
+ema_slow   = ta.ema(close, 200)
+
+ema_fast_higher   = request.security(syminfo.tickerid, ema_high_frame, ta.ema(close, 50))
+ema_medium_higher = request.security(syminfo.tickerid, ema_high_frame, ta.ema(close, 100))
+ema_slow_higher   = request.security(syminfo.tickerid, ema_high_frame, ta.ema(close, 200))
+
+// Jemná granularita 0.1–50 %
+min_add_diff_pct = input.float(5.0, title="Min ADD trigger %", minval=0.1, maxval=50.0, step=0.1) / 100.0
+
+// Multiplikátor triggeru pro další scale-in kroky
+add_trigger_mult_input = input.float(1.5, title="Add trigger multiplier (per extra scale-in)", minval=1.0, maxval=10.0, step=0.1)
+
+max_kept_labels  = input.int(300, "Max kept labels", minval=20)
+usd_prefix       = "$"
+
+// Scale multiplier 10× až 200× (kolik % aktuální pozice dokupujeme podle diffu)
+scale_mult_input = input.int(100, title="Scale multiplier (x)", minval=10, maxval=200, step=10)
+scale_mult       = scale_mult_input * 1.0
+
+// --- LABEL OFFSETS ---
+entry_atr_off = 10.0
+exit_atr_off  = 10.0
+
+// --- ATR / Supertrend inputs ---
+atrPeriod = input.int(10, "ATR period")
+atrMult   = input.float(10.0, "ATR multiplier (Supertrend)")
+
+// === SIGNALS (Supertrend) ===
+[supertrend, direction] = ta.supertrend(atrMult, atrPeriod)
+atr = ta.atr(atrPeriod)
+wantLong  = ta.crossover(close, supertrend)
+wantShort = ta.crossunder(close, supertrend)  // jen vizuálně
+
+// === TP LADDER NASTAVENÍ ===
+tp_step_pct_input       = input.float(1.0,  "TP step % (profit)",  minval=0.1, maxval=10.0,  step=0.1)
+tp_close_step_pct_input = input.float(10.0, "TP close % per step", minval=1.0,  maxval=100.0, step=1.0)
+tp_add_back_pct_input   = input.float(10.0, "Add-back % of remaining pos after TP", minval=0.0, maxval=100.0, step=0.1)
+tp_add_back_frac        = tp_add_back_pct_input / 100.0
+
+// === STATE ===
+var float long_avg_price       = na
+var float avg_snap             = na     // snapshot průměru (pro TP referenci)
+var float size_snap            = na     // snapshot velikosti pozice (pro TP množství)
+var int   entry_count          = 0
+var label[] allLabels          = array.new<label>()
+var float prev_pos_sz          = 0.0
+var float prev_avg_px          = na
+var float pending_add_diff_pct = na   // pro entry label (scale-in)
+var float last_avg_for_exit    = na   // avg, přes který se zavíralo (pro výstupní label)
+var int   closed_steps         = 0    // kolik TP kroků už proběhlo v rámci jednoho trade
+var float pending_add_qty      = 0.0  // add-back, který se provede na DALŠÍM baru
+var bool  add_back_executed_this_bar = false  // jestli se na tomto baru prováděl add-back
+var int   add_step_count       = 0    // kolik SCALE-IN kroků (ne add-back) už proběhlo v rámci trade
+
+// dashboard tabulka v rohu
+var table margin_dash = table.new(position.top_right, 2, 4, border_width = 1)
+
+// --- reset flagu na každém novém baru ---
+if barstate.isnew
+    add_back_executed_this_bar := false
+
+// --- Avg price (live) ---
+if strategy.position_size > 0
+    long_avg_price := strategy.position_avg_price
+else
+    long_avg_price := na
+
+prev_avg_px := long_avg_price
+
+// --- ADD-BACK ENTRY NA DALŠÍM BARU ---
+if barstate.isnew and pending_add_qty > 0 and strategy.position_size > 0
+    strategy.entry("Long", strategy.long, qty=pending_add_qty)
+    add_back_executed_this_bar := true
+    pending_add_qty := 0.0
+
+// ---- PŘÍKUPY: x % pod avg -> přidat x × scale_mult % aktuální pozice ----
+if wantLong and (ema_fast_higher < ema_medium_higher and ema_medium_higher < ema_slow_higher)
+    float qty = na
+    if strategy.position_size == 0
+        // první vstup
+        qty := first_entry_usdt / close
+        pending_add_diff_pct := na
+    else if strategy.position_size > 0 and not na(long_avg_price)
+        // další scale-in vstupy (DCA)
+        diff_down = (long_avg_price - close) / long_avg_price
+
+        // požadovaný propad podle kroku: 1., 2., 3. ...
+        float required_diff = min_add_diff_pct * math.pow(add_trigger_mult_input, add_step_count)
+
+        if diff_down > required_diff
+            add_frac = diff_down * scale_mult
+            qty := math.abs(strategy.position_size) * add_frac
+            pending_add_diff_pct := diff_down * 100.0
+    if not na(qty) and qty > 0
+        strategy.entry("Long", strategy.long, qty=qty)
+
+// === LABELY / SNAPSHOT při NAVÝŠENÍ POZICE ===
+pos_sz = strategy.position_size
+if pos_sz > prev_pos_sz and pos_sz > 0
+    bool is_new_position = prev_pos_sz == 0
+    bool is_scale_in     = prev_pos_sz > 0 and not add_back_executed_this_bar
+    bool is_add_back     = add_back_executed_this_bar
+
+    entry_count += 1
+
+    added_qty   = pos_sz - prev_pos_sz
+    added_usd   = math.abs(added_qty * close)
+    used_margin_usd     = added_usd / leverage
+    total_pos_value_usd = math.abs(pos_sz * close)
+    total_margin_usd    = total_pos_value_usd / leverage
+
+    // procento do labelu = pro scale-in diff, pro add-back bude 0
+    float show_diff_pct = na(pending_add_diff_pct) ? 0.0 : pending_add_diff_pct
+
+    // === ENTRY LABELY – horní + spodní (marže zvýrazněná) ===
+    // Horní label – číslo vstupu + přidaný USD a použitá marže
+    y_in = low - atr * entry_atr_off
+
+    txt_in_top = "#" + str.tostring(entry_count) + " " + str.tostring(show_diff_pct, "#.##") + "%" +
+                 "\n" + usd_prefix + str.tostring(added_usd, "#,###.##") +
+                 " (" + usd_prefix + str.tostring(used_margin_usd, "#,###.##") + ")"
+
+    lb_in_top = label.new(bar_index, y_in, txt_in_top,
+                          xloc=xloc.bar_index, yloc=yloc.price,
+                          style=label.style_label_up,
+                          textcolor=color.white,
+                          color=color.new(#218f25, 0),
+                          size=size.small)
+    array.push(allLabels, lb_in_top)
+
+    // Spodní label – zvýrazněná celková marže
+    txt_in_margin = usd_prefix + str.tostring(total_margin_usd, "#,###.##")
+
+    // posuneme víc dolů, aby se tolik nepřekrýval
+    y_in_margin = y_in - atr * 3.0
+
+    lb_in_margin = label.new(bar_index, y_in_margin, txt_in_margin,
+                             xloc=xloc.bar_index, yloc=yloc.price,
+                             style=label.style_label_up,
+                             textcolor=color.black,
+                             color=color.new(color.yellow, 0),
+                             size=size.normal)
+    array.push(allLabels, lb_in_margin)
+
+    // === Správa kroků a snapshotů ===
+
+        // nový trade – reset kroků TP i scale-in
+    if is_new_position
+        closed_steps   := 0
+        add_step_count := 0
+
+    // čistý scale-in (NE add-back) – zvyšujeme čítač scale-in kroků
+    if is_scale_in
+        add_step_count += 1
+
+    // Každý skutečný nový vstup (první entry nebo další scale-in)
+    // resetuje TP počítadlo, aby se znovu jelo od TP1.
+    if not is_add_back
+        closed_steps := 0
+        avg_snap     := strategy.position_avg_price
+        size_snap    := pos_sz
+
+    pending_add_diff_pct := na
+
+// ---- PARTIAL TAKE PROFIT – každé X % zisku zavřít Y % referenční pozice ----
+float ref_avg = na(avg_snap) ? strategy.position_avg_price : avg_snap
+if strategy.position_size > 0 and not na(ref_avg) and ref_avg != 0
+    profit_pct = (close - ref_avg) / ref_avg * 100.0
+
+    // max počet TP kroků podle tp_close_step_pct_input (např. 10 % → max 10 kroků)
+    int max_steps = math.max(1, int(math.floor(100.0 / tp_close_step_pct_input)))
+
+    if profit_pct >= tp_step_pct_input
+        int target_steps = math.min(int(math.floor(profit_pct / tp_step_pct_input)), max_steps)
+
+        if target_steps > closed_steps
+            int steps_to_close = target_steps - closed_steps
+
+            bool is_last_batch = target_steps == max_steps
+
+            float qty_final = 0.0
+
+            if is_last_batch
+                // poslední batch – zavřít ZBYTEK celé pozice
+                qty_final := strategy.position_size
+            else
+                // standardní batch – podle ref_size (size_snap – add-back se nepočítá)
+                float step_frac           = tp_close_step_pct_input / 100.0
+                float total_frac_to_close = step_frac * steps_to_close
+                float ref_size            = na(size_snap) or size_snap <= 0 ? strategy.position_size : size_snap
+                float qty_ref             = ref_size * total_frac_to_close
+                qty_final := math.min(qty_ref, strategy.position_size)
+
+            if qty_final > 0
+                // uložíme avg pro výstupní label
+                last_avg_for_exit := ref_avg
+
+                // pozice PŘED TP (aktuální bar)
+                float pos_before_tp = strategy.position_size
+
+                // samotný TP
+                strategy.close("Long", qty=qty_final)
+                closed_steps := target_steps
+
+                // naplánujeme ADD-BACK na DALŠÍ bar, pokud není poslední batch
+                if tp_add_back_frac > 0 and not is_last_batch
+                    float pos_after_tp_est = math.max(pos_before_tp - qty_final, 0.0)
+                    pending_add_qty := pos_after_tp_est * tp_add_back_frac
+
+// === LABEL VÝSTUPU – posun NAHORU od high ===
+if pos_sz < prev_pos_sz
+    closed_qty = prev_pos_sz - pos_sz
+    closed_usd = math.abs(closed_qty * close)
+    total_pos_value_usd = math.abs(pos_sz * close)
+    total_margin_usd    = total_pos_value_usd / leverage
+
+    // Z jakého avg vycházet (preferuj uložený z TP, jinak "live" z předchozího kroku)
+    float basis_avg = na(last_avg_for_exit) ? prev_avg_px : last_avg_for_exit
+
+    // % změna mezi avg a close
+    float diff_pct = na(basis_avg) or basis_avg == 0.0 ? na : (close - basis_avg) / basis_avg * 100.0
+
+    // Profit z uzavřené části
+    float profit_usd = na(basis_avg) ? na : closed_qty * (close - basis_avg)
+
+    y_out = high + atr * exit_atr_off
+
+    txt_out = str.tostring(diff_pct, "#.##") + "% " +
+              usd_prefix + str.tostring(profit_usd, "#,###.##") +
+              "\n" + usd_prefix + str.tostring(total_margin_usd, "#,###.##")
+
+    lb_out = label.new(bar_index, y_out, txt_out,
+                       xloc=xloc.bar_index, yloc=yloc.price,
+                       style=label.style_label_down,
+                       textcolor=color.white,
+                       color=color.new(#a12222, 0),
+                       size=size.small)
+    array.push(allLabels, lb_out)
+
+    last_avg_for_exit := na
+
+// limit labelů
+if array.size(allLabels) > max_kept_labels
+    label.delete(array.shift(allLabels))
+
+// reset při plném zavření
+if strategy.position_size == 0 and prev_pos_sz > 0
+    entry_count       := 0
+    avg_snap          := na
+    size_snap         := na
+    last_avg_for_exit := na
+    closed_steps      := 0
+    pending_add_qty   := 0.0
+    add_step_count    := 0
+
+prev_pos_sz := pos_sz
+
+// === MARGIN & PnL METRIKY ===
+float cur_pos_sz   = strategy.position_size
+float cur_avg_px   = strategy.position_avg_price
+float cur_notional = math.abs(cur_pos_sz * close)
+float cur_margin   = cur_notional / leverage
+
+float u_pnl_usd = (na(cur_avg_px) or cur_pos_sz == 0) ? 0.0 : (close - cur_avg_px) * cur_pos_sz
+float u_pnl_pct = (na(cur_avg_px) or cur_pos_sz == 0 or cur_avg_px == 0.0) ? 0.0 : (close - cur_avg_px) / cur_avg_px * 100.0
+
+float margin_pct_of_equity = account_equity_usd > 0 ? cur_margin / account_equity_usd * 100.0 : na
+
+// === DASHBOARD TABLE (v rohu panelu) ===
+if show_margin_table and barstate.islast
+    // hlavičky – černé pozadí, aby to „svítilo“ nad grafem
+    table.cell(margin_dash, 0, 0, "METRIC",
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 0))
+    table.cell(margin_dash, 1, 0, "VALUE",
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 0))
+
+    // Notional
+    table.cell(margin_dash, 0, 1, "Notional",
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 10))
+    table.cell(margin_dash, 1, 1,
+         usd_prefix + str.tostring(cur_notional, "#,###.##"),
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 10))
+
+    // Used Margin
+    table.cell(margin_dash, 0, 2, "Margin used",
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 10))
+
+    color margin_bg =
+         margin_pct_of_equity >= 50 ? color.new(color.red,   20) :
+         margin_pct_of_equity >= 30 ? color.new(color.orange,20) :
+         margin_pct_of_equity >= 10 ? color.new(color.green, 20) :
+                                      color.new(color.gray,  60)
+
+    table.cell(
+         margin_dash, 1, 2,
+         usd_prefix + str.tostring(cur_margin, "#,###.##") +
+         " (" + str.tostring(margin_pct_of_equity, "#.##") + "%)",
+         text_color = color.white,
+         bgcolor    = margin_bg)
+
+    // Unrealized PnL
+    table.cell(margin_dash, 0, 3, "Unrealized PnL",
+         text_color = color.white,
+         bgcolor    = color.new(color.black, 10))
+
+    color pnl_bg =
+         u_pnl_usd > 0 ? color.new(color.green, 20) :
+         u_pnl_usd < 0 ? color.new(color.red,   20) :
+                         color.new(color.gray,  60)
+
+    table.cell(
+         margin_dash, 1, 3,
+         usd_prefix + str.tostring(u_pnl_usd, "#,###.##") +
+         " (" + str.tostring(u_pnl_pct, "#.##") + "%)",
+         text_color = color.white,
+         bgcolor    = pnl_bg)
+
+// === PLOTS: margin & PnL v tomhle panelu ===
+plot(
+     show_margin_plots ? cur_margin : na,
+     title = "Used Margin $",
+     color = color.new(color.orange, 0),
+     linewidth = 2)
+
+plot(
+     show_margin_plots ? u_pnl_usd : na,
+     title = "Unrealized PnL $",
+     color = color.new(color.blue, 0),
+     linewidth = 2)
+
+// === VIZUALIZACE AVG PRICŮ A SIGNÁLŮ (taky v tomhle panelu) ===
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na,
+     title="Long Avg Price (live)", color=color.new(color.blue, 0),
+     linewidth=2, style=plot.style_linebr)
+
+plot(not na(avg_snap) ? avg_snap : na,
+     title="Avg Snapshot (pro TP)", color=color.new(color.teal, 0),
+     linewidth=2, style=plot.style_linebr)
+
+plotchar(wantLong, title="LongSignal", char="▲", location=location.belowbar,
+         color=color.new(#31a135, 0), size=size.tiny)
+plotchar(wantShort, title="ShortSignal", char="▼", location=location.abovebar,
+         color=color.new(#af1616, 0), size=size.tiny)
+plot(supertrend, "Supertrend", color=color.new(color.orange, 0))
+
+// podbarvení trendu – jen estetika panelu
+bgcolor(ema_fast_higher < ema_medium_higher and ema_medium_higher < ema_slow_higher ? color.new(color.green, 90) : na)
+bgcolor(ema_fast_higher > ema_medium_higher and ema_medium_higher > ema_slow_higher ? color.new(color.red,   90) : na)

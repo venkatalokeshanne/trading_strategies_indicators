@@ -1,0 +1,153 @@
+
+//@version=6
+strategy(
+     title              = "DRO Momentum Surge",
+     shorttitle         = "DRO Surge",
+     overlay            = true,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 5,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.2,
+     slippage           = 10,
+     calc_on_every_tick = false)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+var string G_VOL   = "Volume Surge"
+var string G_TREND = "Trend Filter"
+var string G_EXIT  = "Exit Logic"
+
+i_vol_len   = input.int(10,    "Volume MA Length",        group=G_VOL,   minval=5)
+i_vol_mult  = input.float(2.0, "Volume Surge Multiplier", group=G_VOL,   minval=1.2, step=0.1)
+i_blowoff   = input.float(3.5, "Blow-off Vol Multiplier", group=G_VOL,   minval=2.0, step=0.1)
+i_wick_pct  = input.float(0.35,"Blow-off Wick Ratio",     group=G_VOL,   minval=0.1, step=0.05)
+i_ema_len   = input.int(20,    "Trend EMA",               group=G_TREND, minval=5)
+i_rsi_len   = input.int(14,    "RSI Length",              group=G_TREND, minval=5)
+i_rsi_max   = input.int(80,    "Max RSI at Entry",        group=G_TREND, minval=50, maxval=90)
+i_close_pct = input.float(0.6, "Min Close % of Range",    group=G_TREND, minval=0.3, maxval=1.0, step=0.05,
+     tooltip="Bar must close in top X% of its range — filters out weak/wick candles")
+i_atr_len   = input.int(10,    "ATR Length",              group=G_EXIT,  minval=3)
+i_atr_sl    = input.float(2.5, "ATR Hard Stop Mult",      group=G_EXIT,  minval=1.5, step=0.1)
+i_atr_tr    = input.float(3.0, "ATR Trail Stop Mult",     group=G_EXIT,  minval=2.0, step=0.1)
+i_min_gain  = input.float(15.0,"Min Gain % for Trail",    group=G_EXIT,  minval=5.0, step=1.0)
+
+// ─── CALCULATIONS ─────────────────────────────────────────────────────────────
+vol_ma       = ta.sma(volume, i_vol_len)
+ema_trend    = ta.ema(close, i_ema_len)
+rsi_val      = ta.rsi(close, i_rsi_len)
+atr_val      = ta.atr(i_atr_len)
+
+vol_ratio    = volume / vol_ma
+vol_surge    = vol_ratio >= i_vol_mult
+
+// Bullish close quality: close must be in top X% of bar's range
+candle_range = high - low
+close_pos    = candle_range > 0 ? (close - low) / candle_range : 0.5
+bullish_bar  = close > open and close_pos >= i_close_pct
+
+// Blow-off detection: extreme volume + big upper wick = distribution/reversal
+upper_wick   = high - math.max(open, close)
+blowoff_top  = vol_ratio >= i_blowoff and
+     candle_range > 0 and
+     (upper_wick / candle_range) >= i_wick_pct
+
+// ─── ENTRY CONDITION ──────────────────────────────────────────────────────────
+// Volume ignition (daily): surge + strong bullish close + above EMA + RSI ok + no blow-off
+long_signal = vol_surge and
+     bullish_bar and
+     rsi_val < i_rsi_max and
+     close > ema_trend and
+     not blowoff_top and
+     strategy.position_size == 0
+
+// ─── POSITION TRACKING ────────────────────────────────────────────────────────
+var float entry_px     = na
+var float hard_stop    = na
+var float trail_high   = na
+var float trail_stop   = na
+var bool  trail_active = false
+
+if long_signal
+    entry_px     := close
+    hard_stop    := close - i_atr_sl * atr_val
+    trail_high   := close
+    trail_stop   := hard_stop
+    trail_active := false
+    strategy.entry("Long", strategy.long)
+
+if strategy.position_size > 0
+    trail_high   := math.max(trail_high, close)
+    float gain_pct = (trail_high - entry_px) / entry_px * 100
+    if gain_pct >= i_min_gain
+        trail_active := true
+    trail_stop   := trail_active ? trail_high - i_atr_tr * atr_val : hard_stop
+    strategy.exit("Exit", "Long", stop=math.max(hard_stop, trail_stop))
+
+// Blow-off exit — close immediately on distribution candle
+if strategy.position_size > 0 and blowoff_top
+    strategy.close("Long", comment="Blow-off exit")
+    entry_px     := na
+    hard_stop    := na
+    trail_high   := na
+    trail_stop   := na
+    trail_active := false
+
+// ─── PLOTS ────────────────────────────────────────────────────────────────────
+plot(ema_trend, "Trend EMA (20d)", color.new(color.orange, 10), 2)
+
+plot(strategy.position_size > 0 ? hard_stop  : na, "Hard Stop",  color.new(color.red,    0), 1, plot.style_linebr)
+plot(strategy.position_size > 0 ? trail_stop : na, "Trail Stop", color.new(color.orange, 0), 2, plot.style_linebr)
+
+plotshape(long_signal,
+     title    = "Momentum Surge Entry",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = color.new(color.lime, 0),
+     size     = size.normal,
+     text     = "SURGE")
+
+plotshape(blowoff_top,
+     title    = "Blow-off Warning",
+     style    = shape.xcross,
+     location = location.abovebar,
+     color    = color.new(color.red, 0),
+     size     = size.normal,
+     text     = "BLOWOFF")
+
+bgcolor(vol_surge and bullish_bar and not blowoff_top ? color.new(color.green, 92) : na, title="Surge BG")
+bgcolor(blowoff_top ? color.new(color.red, 80) : na, title="Blow-off BG")
+
+// ─── STATUS TABLE ─────────────────────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 8,
+     bgcolor      = color.new(color.black, 72),
+     border_width = 1,
+     border_color = color.new(color.gray, 60))
+
+if barstate.islastconfirmedhistory or barstate.isrealtime
+    vol_disp   = str.tostring(math.round(vol_ratio, 2)) + "x"
+    vol_col    = vol_ratio >= i_blowoff ? color.red : vol_ratio >= i_vol_mult ? color.green : color.gray
+    rsi_str    = str.tostring(math.round(rsi_val, 1))
+    rsi_col    = rsi_val > i_rsi_max ? color.red : rsi_val > 70 ? color.orange : color.new(color.green, 0)
+    trend_str  = close > ema_trend ? "ABOVE ▲" : "BELOW ▼"
+    trend_col  = close > ema_trend ? color.green : color.red
+    in_trade   = strategy.position_size > 0
+    stop_str   = in_trade ? "$" + str.tostring(math.round(math.max(hard_stop, trail_stop), 3)) : "—"
+    trail_str  = trail_active ? "Active ✓" : "Pending"
+    trail_col2 = trail_active ? color.green : color.gray
+    close_str  = str.tostring(math.round(close_pos * 100, 0)) + "%"
+
+    table.cell(t, 0, 0, "DRO Surge",   bgcolor=color.new(color.blue, 40),  text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, "Status",       bgcolor=color.new(color.blue, 40),  text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 1, "Vol Ratio",    text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 1, vol_disp,       text_color=vol_col,     text_size=size.small)
+    table.cell(t, 0, 2, "RSI",          text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 2, rsi_str,        text_color=rsi_col,     text_size=size.small)
+    table.cell(t, 0, 3, "vs 20 EMA",    text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 3, trend_str,      text_color=trend_col,   text_size=size.small)
+    table.cell(t, 0, 4, "Close Pos",    text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 4, close_str,      text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 5, "ATR(10d)",     text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 5, "$" + str.tostring(math.round(atr_val, 3)), text_color=color.white, text_size=size.small)
+    table.cell(t, 0, 6, "Active Stop",  text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 6, stop_str,       text_color=color.yellow, text_size=size.small)
+    table.cell(t, 0, 7, "Trail",        text_color=color.gray,  text_size=size.small)
+    table.cell(t, 1, 7, trail_str,      text_color=trail_col2,  text_size=size.small)

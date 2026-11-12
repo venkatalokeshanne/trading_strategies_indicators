@@ -1,0 +1,339 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("Crownmark Allocation Engine [JOAT]", shorttitle="Crownmark Engine [JOAT]", overlay=true, max_bars_back=5000, max_lines_count=120, max_labels_count=30, max_boxes_count=30, pyramiding=0, initial_capital=100000, calc_on_every_tick=false, process_orders_on_close=true, commission_type=strategy.commission.percent, commission_value=0.01, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+//------------------------------------------------------------------------------
+// Crownmark Allocation Engine
+// Portfolio-style execution framework that integrates regime scoring, adaptive
+// trend corridor bias, auction acceptance filters, pressure confirmation,
+// divergence-aware suppression, and ATR-based risk management.
+//------------------------------------------------------------------------------
+
+string grpRegime = "Regime Engine"
+string grpTrend = "Trend Corridor"
+string grpAuction = "Auction Context"
+string grpPressure = "Pressure Filter"
+string grpDivergence = "Divergence Guard"
+string grpRisk = "Risk Management"
+string grpVisual = "Visual System"
+string grpDash = "Dashboard"
+
+src = input.source(close, "Source", group=grpRegime)
+regimeFastLen = input.int(21, "Regime Fast Length", minval=2, maxval=150, group=grpRegime)
+regimeSlowLen = input.int(55, "Regime Slow Length", minval=5, maxval=300, group=grpRegime)
+regimeAdxLen = input.int(14, "ADX Length", minval=2, maxval=100, group=grpRegime)
+regimeVolLen = input.int(21, "Volatility Length", minval=5, maxval=150, group=grpRegime)
+regimeEfficiencyLen = input.int(20, "Efficiency Length", minval=5, maxval=100, group=grpRegime)
+bullRegimeThreshold = input.float(18.0, "Bull Regime Threshold", minval=5.0, maxval=60.0, step=0.5, group=grpRegime)
+bearRegimeThreshold = input.float(-18.0, "Bear Regime Threshold", minval=-60.0, maxval=-5.0, step=0.5, group=grpRegime)
+
+baselineLength = input.int(34, "Baseline Length", minval=5, maxval=200, group=grpTrend)
+fastKama = input.int(4, "KAMA Fast", minval=1, maxval=20, group=grpTrend)
+slowKama = input.int(26, "KAMA Slow", minval=5, maxval=100, group=grpTrend)
+widthLength = input.int(34, "Width Length", minval=5, maxval=200, group=grpTrend)
+widthMultiplier = input.float(1.8, "Width Multiplier", minval=0.2, maxval=6.0, step=0.1, group=grpTrend)
+pullbackTolerance = input.float(0.35, "Pullback Tolerance ATR", minval=0.05, maxval=2.0, step=0.05, group=grpTrend)
+
+auctionLength = input.int(80, "Auction Lookback", minval=20, maxval=300, group=grpAuction)
+auctionDeviation = input.float(1.00, "Value Area Width", minval=0.2, maxval=3.0, step=0.05, group=grpAuction)
+requireAuctionAcceptance = input.bool(true, "Require Auction Acceptance", group=grpAuction)
+requireVwapAlignment = input.bool(true, "Require VWAP Alignment", group=grpAuction)
+
+pressureVolumeLen = input.int(34, "Pressure Volume Length", minval=5, maxval=200, group=grpPressure)
+pressureSmooth = input.int(8, "Pressure Smoothing", minval=1, maxval=50, group=grpPressure)
+pressureThreshold = input.float(12.0, "Pressure Threshold", minval=2.0, maxval=50.0, step=0.5, group=grpPressure)
+requireExpansion = input.bool(true, "Require Volatility Expansion", group=grpPressure)
+
+divLeft = input.int(5, "Pivot Left Bars", minval=1, maxval=20, group=grpDivergence)
+divRight = input.int(5, "Pivot Right Bars", minval=1, maxval=20, group=grpDivergence)
+divSuppressWindow = input.int(18, "Suppression Window", minval=3, maxval=60, group=grpDivergence)
+useDivergenceGuard = input.bool(true, "Use Divergence Guard", group=grpDivergence)
+
+atrLength = input.int(14, "ATR Length", minval=2, maxval=100, group=grpRisk)
+stopAtrMultiple = input.float(1.8, "Stop ATR Multiple", minval=0.5, maxval=6.0, step=0.1, group=grpRisk)
+targetAtrMultiple = input.float(3.2, "Target ATR Multiple", minval=0.5, maxval=10.0, step=0.1, group=grpRisk)
+trailAtrMultiple = input.float(1.1, "Trail ATR Multiple", minval=0.2, maxval=5.0, step=0.1, group=grpRisk)
+maxBarsInTrade = input.int(40, "Maximum Bars In Trade", minval=5, maxval=200, group=grpRisk)
+flatOnOppositeSignal = input.bool(true, "Flatten On Opposite Signal", group=grpRisk)
+
+themeMode = input.string("Foundry Night", "Theme", options=["Foundry Night", "Slate Current", "Fjord Ember"], group=grpVisual)
+showCorridor = input.bool(true, "Show Trend Corridor", group=grpVisual)
+showAuctionZone = input.bool(true, "Show Auction Zone", group=grpVisual)
+showVwap = input.bool(true, "Show Rolling VWAP", group=grpVisual)
+showBarTint = input.bool(true, "Tint Bars By State", group=grpVisual)
+showExecutionLabels = input.bool(false, "Show Execution Labels", group=grpVisual)
+
+showDashboard = input.bool(true, "Show Dashboard", group=grpDash)
+dashboardPosition = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=grpDash)
+dashboardSize = input.string("Medium", "Size", options=["Small", "Medium", "Large"], group=grpDash)
+
+var color bullCore = color.new(#44c69b, 0)
+var color bearCore = color.new(#d37066, 0)
+var color neutralCore = color.new(#98a5b4, 0)
+var color accentCore = color.new(#d0ae75, 0)
+var color panelBg = color.new(#0f141d, 0)
+var color panelBgSoft = color.new(#171f29, 0)
+var color panelBorder = color.new(#2a3645, 0)
+var color textMain = color.new(#e7edf5, 0)
+var color textDim = color.new(#92a1b3, 0)
+
+if barstate.isfirst
+    if themeMode == "Foundry Night"
+        bullCore := color.new(#46c59c, 0)
+        bearCore := color.new(#d57268, 0)
+        accentCore := color.new(#d1ac74, 0)
+    else if themeMode == "Slate Current"
+        bullCore := color.new(#4ab7af, 0)
+        bearCore := color.new(#ca7782, 0)
+        accentCore := color.new(#90b2d0, 0)
+        panelBg := color.new(#10161f, 0)
+        panelBgSoft := color.new(#17212d, 0)
+        panelBorder := color.new(#314051, 0)
+    else
+        bullCore := color.new(#67c28d, 0)
+        bearCore := color.new(#df7f63, 0)
+        accentCore := color.new(#d8bc77, 0)
+        panelBg := color.new(#141218, 0)
+        panelBgSoft := color.new(#1d1821, 0)
+        panelBorder := color.new(#392f39, 0)
+
+f_safe_div(float num, float den, float fallback) =>
+    math.abs(den) > 1e-10 ? num / den : fallback
+
+f_clamp(float value, float lo, float hi) =>
+    math.max(lo, math.min(hi, value))
+
+f_zscore(float seriesValue, int len) =>
+    meanValue = ta.sma(seriesValue, len)
+    deviation = ta.stdev(seriesValue, len)
+    deviation > 0 ? (seriesValue - meanValue) / deviation : 0.0
+
+f_tanh(float value) =>
+    expValue = math.exp(2.0 * value)
+    (expValue - 1.0) / (expValue + 1.0)
+
+f_sum_series(float seriesValue, int len) =>
+    float total = 0.0
+    for i = 0 to len - 1
+        total += nz(seriesValue[i], 0.0)
+    total
+
+f_scale_signed(float seriesValue, int len) =>
+    lowValue = ta.lowest(seriesValue, len)
+    highValue = ta.highest(seriesValue, len)
+    span = highValue - lowValue
+    span > 0 ? ((seriesValue - lowValue) / span) * 2.0 - 1.0 : 0.0
+
+f_efficiency(float seriesValue, int len) =>
+    float movement = 0.0
+    for i = 0 to len - 1
+        movement += math.abs(seriesValue[i] - seriesValue[i + 1])
+    netMove = math.abs(seriesValue - seriesValue[len])
+    f_safe_div(netMove, movement, 0.0)
+
+f_kama(float seriesValue, int len, int fastLen, int slowLen) =>
+    fastSC = 2.0 / (fastLen + 1.0)
+    slowSC = 2.0 / (slowLen + 1.0)
+    direction = math.abs(seriesValue - seriesValue[len])
+    volatility = 0.0
+    for i = 0 to len - 1
+        volatility += math.abs(seriesValue[i] - seriesValue[i + 1])
+    efficiencyRatio = volatility > 0 ? direction / volatility : 0.0
+    smoothing = math.pow(efficiencyRatio * (fastSC - slowSC) + slowSC, 2.0)
+    var float kamaValue = na
+    kamaValue := na(kamaValue[1]) ? seriesValue : kamaValue[1] + smoothing * (seriesValue - kamaValue[1])
+    kamaValue
+
+f_table_pos(string pos) =>
+    pos == "Top Left" ? position.top_left : pos == "Bottom Right" ? position.bottom_right : pos == "Bottom Left" ? position.bottom_left : position.top_right
+
+f_table_size(string sizeText) =>
+    sizeText == "Small" ? size.small : sizeText == "Large" ? size.large : size.normal
+
+f_regime_text(float regimeScore, float bullTrigger, float bearTrigger) =>
+    regimeScore > bullTrigger ? "Directional Bull" :
+     regimeScore < bearTrigger ? "Directional Bear" :
+     math.abs(regimeScore) < 8 ? "Balanced" : "Transitional"
+
+fastEma = ta.ema(src, regimeFastLen)
+slowEma = ta.ema(src, regimeSlowLen)
+atrValue = ta.atr(atrLength)
+[_, _, adxValue] = ta.dmi(regimeAdxLen, regimeAdxLen)
+efficiency = f_efficiency(src, regimeEfficiencyLen)
+volExpansion = ta.stdev(close, regimeVolLen) / math.max(ta.sma(close, regimeVolLen), syminfo.mintick)
+trendSlope = ta.linreg(fastEma - slowEma, regimeFastLen, 0) - ta.linreg(fastEma - slowEma, regimeFastLen, 1)
+trendScore = f_scale_signed(fastEma - slowEma, regimeSlowLen) * 35.0
+slopeScore = f_clamp(f_zscore(trendSlope, regimeVolLen), -2.0, 2.0) * 10.0
+strengthScore = f_clamp((adxValue - 20.0) / 25.0, -1.0, 1.0) * 25.0 * math.sign(fastEma - slowEma)
+efficiencyScore = f_clamp(efficiency * 2.0 - 1.0, -1.0, 1.0) * 20.0 * math.sign(fastEma - slowEma)
+volScore = f_clamp(f_zscore(volExpansion, regimeVolLen), -2.0, 2.0) * 5.0 * math.sign(fastEma - slowEma)
+regimeScore = trendScore + slopeScore + strengthScore + efficiencyScore + volScore
+regimeText = f_regime_text(regimeScore, bullRegimeThreshold, bearRegimeThreshold)
+
+baseline = f_kama(src, baselineLength, fastKama, slowKama)
+hybridWidth = (ta.atr(widthLength) * 0.65 + ta.stdev(src, widthLength) * 0.35) * widthMultiplier
+upperCorridor = baseline + hybridWidth
+lowerCorridor = baseline - hybridWidth
+innerUpper = baseline + hybridWidth * 0.5
+innerLower = baseline - hybridWidth * 0.5
+bullTrend = close > baseline and baseline > baseline[1]
+bearTrend = close < baseline and baseline < baseline[1]
+pullbackLong = low <= innerUpper and close > baseline - atrValue * pullbackTolerance
+pullbackShort = high >= innerLower and close < baseline + atrValue * pullbackTolerance
+
+rollingVolume = f_sum_series(volume, auctionLength)
+rollingVwap = rollingVolume > 0 ? f_sum_series(hlc3 * volume, auctionLength) / rollingVolume : ta.sma(hlc3, auctionLength)
+auctionSigma = ta.stdev(hlc3, auctionLength) * auctionDeviation
+auctionHigh = rollingVwap + auctionSigma
+auctionLow = rollingVwap - auctionSigma
+auctionLongOk = not requireAuctionAcceptance or (close >= auctionLow and close <= auctionHigh)
+auctionShortOk = not requireAuctionAcceptance or (close >= auctionLow and close <= auctionHigh)
+vwapLongOk = not requireVwapAlignment or close >= rollingVwap
+vwapShortOk = not requireVwapAlignment or close <= rollingVwap
+
+trueRange = math.max(high - low, syminfo.mintick)
+body = close - open
+closeLocation = ((close - low) - (high - close)) / trueRange
+relativeVolume = f_safe_div(volume, ta.sma(volume, pressureVolumeLen), 1.0)
+effortComponent = f_clamp(body / trueRange, -1.0, 1.0)
+resultComponent = f_tanh(f_safe_div(body, atrValue, 0.0) * 4.0)
+locationComponent = f_clamp(closeLocation, -1.0, 1.0)
+pressureRaw = (effortComponent * 0.40 + resultComponent * 0.35 + locationComponent * 0.25) * relativeVolume * 100.0
+pressureComposite = ta.ema(pressureRaw, pressureSmooth)
+pressureSignal = ta.ema(pressureComposite, math.max(2, int(pressureSmooth * 1.5)))
+rangeZ = f_zscore(trueRange, regimeVolLen)
+pressureLongOk = pressureComposite > pressureThreshold and pressureComposite > pressureSignal and (not requireExpansion or rangeZ > -0.10)
+pressureShortOk = pressureComposite < -pressureThreshold and pressureComposite < pressureSignal and (not requireExpansion or rangeZ > -0.10)
+
+rsiComponent = ta.rsi(close, 14)
+rocComponent = ta.roc(close, 8)
+oscillator = ta.ema((rsiComponent - 50.0) * 1.2 + rocComponent, 3)
+var float priorPriceHigh = na
+var float priorOscHigh = na
+var float priorPriceLow = na
+var float priorOscLow = na
+bool bearDivEvent = false
+bool bullDivEvent = false
+pricePivotHigh = ta.pivothigh(high, divLeft, divRight)
+pricePivotLow = ta.pivotlow(low, divLeft, divRight)
+oscPivotHigh = ta.pivothigh(oscillator, divLeft, divRight)
+oscPivotLow = ta.pivotlow(oscillator, divLeft, divRight)
+
+if not na(pricePivotHigh) and not na(oscPivotHigh)
+    currentPriceHigh = high[divRight]
+    currentOscHigh = oscillator[divRight]
+    bearDivEvent := not na(priorPriceHigh) and currentPriceHigh > priorPriceHigh and currentOscHigh < priorOscHigh
+    priorPriceHigh := currentPriceHigh
+    priorOscHigh := currentOscHigh
+
+if not na(pricePivotLow) and not na(oscPivotLow)
+    currentPriceLow = low[divRight]
+    currentOscLow = oscillator[divRight]
+    bullDivEvent := not na(priorPriceLow) and currentPriceLow < priorPriceLow and currentOscLow > priorOscLow
+    priorPriceLow := currentPriceLow
+    priorOscLow := currentOscLow
+
+recentBearDiv = ta.barssince(bearDivEvent and barstate.isconfirmed) < divSuppressWindow
+recentBullDiv = ta.barssince(bullDivEvent and barstate.isconfirmed) < divSuppressWindow
+divergenceLongOk = not useDivergenceGuard or not recentBearDiv
+divergenceShortOk = not useDivergenceGuard or not recentBullDiv
+
+regimeLongOk = regimeScore > bullRegimeThreshold
+regimeShortOk = regimeScore < bearRegimeThreshold
+trendLongOk = bullTrend and pullbackLong and close <= upperCorridor
+trendShortOk = bearTrend and pullbackShort and close >= lowerCorridor
+longSignal = barstate.isconfirmed and regimeLongOk and trendLongOk and auctionLongOk and vwapLongOk and pressureLongOk and divergenceLongOk
+shortSignal = barstate.isconfirmed and regimeShortOk and trendShortOk and auctionShortOk and vwapShortOk and pressureShortOk and divergenceShortOk
+
+if longSignal and strategy.position_size <= 0
+    strategy.entry("Long Crownmark", strategy.long, comment="Regime Long")
+
+if shortSignal and strategy.position_size >= 0
+    strategy.entry("Short Crownmark", strategy.short, comment="Regime Short")
+
+var int entryBarIndex = na
+if strategy.position_size != 0 and strategy.position_size[1] == 0
+    entryBarIndex := bar_index
+if strategy.position_size == 0
+    entryBarIndex := na
+
+barsInTrade = strategy.position_size != 0 and not na(entryBarIndex) ? bar_index - entryBarIndex : 0
+longProtectStop = strategy.position_size > 0 ? math.max(strategy.position_avg_price - atrValue * stopAtrMultiple, lowerCorridor - atrValue * 0.25) : na
+shortProtectStop = strategy.position_size < 0 ? math.min(strategy.position_avg_price + atrValue * stopAtrMultiple, upperCorridor + atrValue * 0.25) : na
+longTrail = strategy.position_size > 0 ? baseline - atrValue * trailAtrMultiple : na
+shortTrail = strategy.position_size < 0 ? baseline + atrValue * trailAtrMultiple : na
+longStop = strategy.position_size > 0 ? math.max(longProtectStop, longTrail) : na
+shortStop = strategy.position_size < 0 ? math.min(shortProtectStop, shortTrail) : na
+longTarget = strategy.position_size > 0 ? strategy.position_avg_price + atrValue * targetAtrMultiple : na
+shortTarget = strategy.position_size < 0 ? strategy.position_avg_price - atrValue * targetAtrMultiple : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Crownmark Exit", "Long Crownmark", stop=longStop, limit=longTarget, comment="Managed Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Crownmark Exit", "Short Crownmark", stop=shortStop, limit=shortTarget, comment="Managed Exit")
+
+longFailState = strategy.position_size > 0 and (regimeScore < 0 or pressureComposite < 0 or close < baseline or barsInTrade >= maxBarsInTrade or recentBearDiv)
+shortFailState = strategy.position_size < 0 and (regimeScore > 0 or pressureComposite > 0 or close > baseline or barsInTrade >= maxBarsInTrade or recentBullDiv)
+
+if flatOnOppositeSignal and shortSignal and strategy.position_size > 0
+    strategy.close("Long Crownmark", comment="Opposite Signal")
+else if longFailState
+    strategy.close("Long Crownmark", comment="Context Exit")
+
+if flatOnOppositeSignal and longSignal and strategy.position_size < 0
+    strategy.close("Short Crownmark", comment="Opposite Signal")
+else if shortFailState
+    strategy.close("Short Crownmark", comment="Context Exit")
+
+corridorColor = bullTrend ? bullCore : bearTrend ? bearCore : neutralCore
+auctionColor = close >= rollingVwap ? color.new(bullCore, 75) : color.new(bearCore, 75)
+barStateColor = strategy.position_size > 0 ? bullCore : strategy.position_size < 0 ? bearCore : corridorColor
+
+plotBasis = plot(showCorridor ? baseline : na, title="Baseline", color=corridorColor, linewidth=2)
+plotUpper = plot(showCorridor ? upperCorridor : na, title="Upper Corridor", color=color.new(corridorColor, 18), linewidth=1)
+plotLower = plot(showCorridor ? lowerCorridor : na, title="Lower Corridor", color=color.new(corridorColor, 18), linewidth=1)
+plotInnerUpper = plot(showCorridor ? innerUpper : na, title="Inner Upper", color=color.new(corridorColor, 55), linewidth=1)
+plotInnerLower = plot(showCorridor ? innerLower : na, title="Inner Lower", color=color.new(corridorColor, 55), linewidth=1)
+plotAuctionHigh = plot(showAuctionZone ? auctionHigh : na, title="Auction High", color=color.new(accentCore, 30), linewidth=1)
+plotAuctionLow = plot(showAuctionZone ? auctionLow : na, title="Auction Low", color=color.new(accentCore, 30), linewidth=1)
+plotVwapLine = plot(showVwap ? rollingVwap : na, title="Rolling VWAP", color=accentCore, linewidth=2)
+fill(plotUpper, plotLower, color=color.new(corridorColor, 90), title="Corridor Fill")
+fill(plotInnerUpper, plotInnerLower, color=color.new(corridorColor, 94), title="Inner Corridor Fill")
+fill(plotAuctionHigh, plotAuctionLow, color=color.new(auctionColor, 84), title="Auction Fill")
+barcolor(showBarTint ? color.new(barStateColor, 40) : na)
+bgcolor(math.abs(regimeScore) > math.abs(bullRegimeThreshold) ? color.new(corridorColor, 95) : na)
+plotshape(showExecutionLabels and longSignal, title="Long Rotation", style=shape.labelup, location=location.belowbar, size=size.tiny, color=color.new(bullCore, 0), textcolor=color.white, text="L")
+plotshape(showExecutionLabels and shortSignal, title="Short Rotation", style=shape.labeldown, location=location.abovebar, size=size.tiny, color=color.new(bearCore, 0), textcolor=color.white, text="S")
+
+biasText = bullTrend ? "Bull Corridor" : bearTrend ? "Bear Corridor" : "Neutral Corridor"
+pressureText = pressureComposite > pressureThreshold ? "Positive Tape" : pressureComposite < -pressureThreshold ? "Negative Tape" : "Balanced Tape"
+divergenceText = recentBearDiv ? "Bear Divergence" : recentBullDiv ? "Bull Divergence" : "Clear"
+exposureText = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+
+var table dashboard = table.new(position.top_right, 2, 6, frame_color=panelBorder, frame_width=1, bgcolor=panelBg)
+
+if showDashboard and barstate.islast
+    dashSize = size.normal
+    table.cell(dashboard, 0, 0, "Execution Summary", text_color=textMain, text_size=dashSize, bgcolor=panelBgSoft)
+    table.cell(dashboard, 1, 0, timeframe.period, text_color=textMain, text_size=dashSize, bgcolor=panelBgSoft)
+    table.cell(dashboard, 0, 1, "Regime", text_color=textDim, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 1, 1, regimeText, text_color=regimeScore >= 0 ? bullCore : bearCore, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 0, 2, "Corridor", text_color=textDim, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 1, 2, biasText, text_color=corridorColor, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 0, 3, "Auction", text_color=textDim, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 1, 3, close >= rollingVwap ? "Above Fair Value" : "Below Fair Value", text_color=close >= rollingVwap ? bullCore : bearCore, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 0, 4, "Pressure", text_color=textDim, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 1, 4, pressureText, text_color=pressureComposite >= 0 ? bullCore : bearCore, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 0, 5, "Exposure", text_color=textDim, text_size=dashSize, bgcolor=panelBg)
+    table.cell(dashboard, 1, 5, exposureText, text_color=strategy.position_size == 0 ? neutralCore : strategy.position_size > 0 ? bullCore : bearCore, text_size=dashSize, bgcolor=panelBg)
+else if not showDashboard and barstate.islast
+    table.clear(dashboard, 0, 0, 1, 5)
+
+alertcondition(longSignal, title="Crownmark Long Setup", message="Crownmark Allocation Engine [JOAT] confirmed long setup.")
+alertcondition(shortSignal, title="Crownmark Short Setup", message="Crownmark Allocation Engine [JOAT] confirmed short setup.")
+alertcondition(barstate.isconfirmed and recentBearDiv, title="Crownmark Bear Divergence Guard", message="Crownmark Allocation Engine [JOAT] has an active bear divergence guard.")
+alertcondition(barstate.isconfirmed and recentBullDiv, title="Crownmark Bull Divergence Guard", message="Crownmark Allocation Engine [JOAT] has an active bull divergence guard.")
+alertcondition(barstate.isconfirmed and ta.crossover(pressureComposite, pressureSignal), title="Crownmark Positive Pressure Rotation", message="Crownmark Allocation Engine [JOAT] pressure rotated positive.")
+alertcondition(barstate.isconfirmed and ta.crossunder(pressureComposite, pressureSignal), title="Crownmark Negative Pressure Rotation", message="Crownmark Allocation Engine [JOAT] pressure rotated negative.")

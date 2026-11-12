@@ -1,0 +1,201 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════════════════════════ //
+//# * ══════════════════════════════════════════════════════════════════════════════════════════════
+//# *
+//# * Study       : Positioning Flow Index
+//# * Author      : © dgtrd
+//# *
+//# * Revision History
+//# *  Release    : Aug 10, 2026
+//# *
+//# * ══════════════════════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════════════════════════ //
+
+indicator("Positioning Flow Index by DGT", 'PFI ☼☾', format = format.volume, max_labels_count = 500)
+
+display = display.all - display.status_line
+
+pfiGR = 'Positioning Flow Index'
+oiFS   = input.bool(true, "Positioning Flow Index", inline = 'PFI', group = pfiGR, tooltip = "Enable to visualize the Positioning Flow Index (PFI), a bounded -100 to +100 measure of positioning flow derived from Open Interest change and price change.")
+clUP   = input.color(#00897B, '', inline = 'PFI', group = pfiGR)
+clDW   = input.color(#FF5252, '', inline = 'PFI', group = pfiGR)
+pfiLen = input.int(34, '  Lookback', minval = 5, inline = 'void', group = pfiGR, display = display, tooltip = "Number of bars used to normalize OI change and price return into Z-scores.\n\nSmoothing applied to the final Positioning Flow Index line.")
+smth   = input.int(3, 'Smoothing', minval = 1, inline = 'void', group = pfiGR, display = display)
+flowModel = input.string("C: Price-dir x OI-mag x Price-conf", "  Flow Model", options = ["A: OI x sign(Price)", "B: OI x Price", "C: Price-dir x OI-mag x Price-conf"], group = pfiGR, display = display, tooltip = "A: Flow strength comes from OI magnitude; price determines only the direction. This can produce a strong reading even when price movement is small.\n\nB: Flow strength is the direct product of OI and Price Z-scores. This captures both dimensions, but unusually large Price Z-scores can dominate the result.\n\nC: Price determines directional pressure, OI determines participation magnitude, and the absolute Price Z-score contribution is capped at 1.0 to prevent extreme price moves from dominating. OI direction is interpreted separately by Flow State, so PFI and Flow State answer related but distinct questions. Compare the three models on a live chart to determine which best fits your use case.")
+
+stateMinZ = input.float(0.50, "  Minimum State Z-Score", minval = 0, display = display, group = pfiGR, tooltip = "Both OI and Price Z-scores must reach this threshold for a bar to receive a directional Flow State. Below the threshold, the bar is classified as Neutral. Lower values increase sensitivity; higher values produce fewer, more selective states.")
+
+prGR = "Price Sentiment"
+prSS  = input.bool(true, "Price Sentiment", inline = 'prs', group = prGR, tooltip = "Enable to display Price Sentiment, normalized independently and clamped to the same -100 to +100 scale as the Positioning Flow Index for direct comparison.\n\nAdjust the smoothing factor for the Price Sentiment line.")
+prSSC = input.color(color.new(#9598a1, 0), "", inline = 'prs', group = prGR)
+smthP = input.int(3, 'Smoothing', minval = 1, inline = 'prs', group = prGR, display = display)
+
+dashGR = "Flow Dashboard"
+showDash = input.bool(true, "Show Flow Dashboard", group = dashGR, tooltip = "Enable to display the current Flow State, its strength, and the underlying PFI, Price Z-score, and OI Z-score readings.")
+
+overlayGR = "Main Chart Overlays"
+signalMode   = input.string("Early + Confirmed", "Flow State Markers", options = ["Off", "Confirmed Only", "Early + Confirmed"], group = overlayGR, tooltip = "Off: no on-chart markers. Confirmed Only: prints an LB/SB/SC/LU label only at candle close (barstate.isconfirmed) -- once printed it never repaints. Early + Confirmed: also shows a lighter, provisional 'LB?'-style Early Flow Warning while the candle is still forming; unlike the Confirmed marker, this warning can change or disappear before the candle closes since it reflects live, still-forming data.")
+markerMinStrength = input.float(0.50, "  Minimum Signal Strength for Markers", minval = 0, maxval = 1, step = 0.05, display = display, group = overlayGR, tooltip = "Controls the minimum Signal Strength required for a state-transition marker. This is deliberately separate from Minimum State Z-Score: a valid Flow State can exist at roughly 25% Signal Strength with the default stateMinZ = 0.50, but the default 50% marker threshold prevents weaker transitions from cluttering the chart. The dashboard always shows the actual current state; this setting only gates the on-chart marker.")
+ribbonMode   = input.string("State Ribbon", "Flow State Ribbon", options = ["Off", "State Ribbon"], display = display, group = overlayGR, tooltip = "Off: rely on the LB/SB/SC/LU transition markers and dashboard instead. State Ribbon: displays a thin, continuous colored band around the price candles. Hue shows the current Flow State, while color intensity reflects Signal Strength. Neutral renders as a visible gray segment rather than a gap in the timeline.")
+
+f_tanh(_x) =>
+    x = math.max(math.min(_x, 20.0), -20.0)
+    e2x = math.exp(2 * x)
+    (e2x - 1) / (e2x + 1)
+
+f_safeRange(_range) =>
+    math.max(_range, syminfo.mintick)
+
+f_meter(_pct) =>
+    filled = int(math.max(0, math.min(10, math.round(_pct / 10))))
+    bar = ""
+    for i = 0 to 9
+        bar += i < filled ? "█" : "░"
+    bar
+
+sym = str.endswith(syminfo.ticker, "USDT") or str.endswith(syminfo.ticker, "USDC") ? syminfo.ticker + ".P_OI" : str.endswith(syminfo.ticker, ".P") ? syminfo.ticker + "_OI" : syminfo.ticker + "T.P_OI"
+oiC = request.security(sym, timeframe.period, close, ignore_invalid_symbol = true)
+hasOI = not na(oiC)
+
+if barstate.islast
+    var table oiT = table.new(position.middle_center, 1, 1)
+    if na(oiC)
+        table.cell(oiT, 0, 0, 'No Open Interest data found for the ' + syminfo.ticker + ' symbol.', text_size = size.normal, text_color = #ff9800, text_halign = text.align_left)
+    if syminfo.type != 'crypto'
+        table.cell(oiT, 0, 0, 'Only Cryptocurrencies', text_size = size.normal, text_color = color.white, text_halign = text.align_left)
+
+oiDelta = hasOI and oiC[1] > 0 and oiC > 0 ? math.log(oiC / oiC[1]) : na
+oiMean  = ta.sma(oiDelta, pfiLen)
+oiStd   = ta.stdev(oiDelta, pfiLen)
+oiZ     = hasOI ? (oiStd > 0 ? (oiDelta - oiMean) / oiStd : 0.0) : na
+
+prDelta = math.log(close / close[1])
+prMean  = ta.sma(prDelta, pfiLen)
+prStd   = ta.stdev(prDelta, pfiLen)
+prZ     = prStd > 0 ? (prDelta - prMean) / prStd : 0.0
+
+flow = switch flowModel
+    "A: OI x sign(Price)"              => oiZ * math.sign(prZ)
+    "B: OI x Price"                    => oiZ * prZ
+    "C: Price-dir x OI-mag x Price-conf" => math.sign(prZ) * math.abs(oiZ) * math.min(math.abs(prZ), 1.0)
+    => oiZ * math.sign(prZ)
+
+pfi = ta.ema(100 * f_tanh(flow), smth)
+
+oiActive = hasOI and not na(oiZ) and math.abs(oiZ) >= stateMinZ
+prActive = math.abs(prZ) >= stateMinZ
+active   = oiActive and prActive
+
+state = not hasOI ? "OI DATA UNAVAILABLE" :
+         not active ? "NEUTRAL" :
+         prZ > 0 and oiZ > 0 ? "LONG BUILDUP" :
+         prZ < 0 and oiZ > 0 ? "SHORT BUILDUP" :
+         prZ > 0 and oiZ < 0 ? "SHORT COVERING" :
+         prZ < 0 and oiZ < 0 ? "LONG UNWINDING" : "NEUTRAL"
+
+participation = hasOI ? math.min(math.abs(oiZ), 2.0) / 2.0 : na
+confirmation  = math.min(math.abs(prZ), 2.0) / 2.0
+sigStrength = hasOI ? math.sqrt(participation * confirmation) : na
+strengthPct = hasOI ? sigStrength * 100 : na
+
+strengthLabel = not hasOI ? "" :
+             sigStrength >= 0.75 ? "STRONG " :
+             sigStrength >= 0.35 ? "" :
+             "WEAK "
+dispState = not hasOI ? state : state == "NEUTRAL" ? state : strengthLabel + state
+
+stateColor = state == "LONG BUILDUP"   ? clUP :
+             state == "SHORT BUILDUP"  ? clDW :
+             state == "SHORT COVERING" ? color.new(color.yellow, 0) :
+             state == "LONG UNWINDING" ? color.new(color.orange, 0) :
+             state == "OI DATA UNAVAILABLE" ? #ff9800 : color.gray
+
+plot(oiFS ? pfi : na, 'Positioning Flow Index', pfi >= 0 ? (pfi[1] > pfi ? color.new(clUP, 50) : clUP) : (pfi[1] > pfi ? clDW : color.new(clDW, 50)), style = plot.style_columns, display = display)
+hline(0, "Zero Line", color = color.new(color.gray, 60))
+
+stateAbbrev = state == "LONG BUILDUP"   ? "LB" :
+              state == "SHORT BUILDUP"  ? "SB" :
+              state == "SHORT COVERING" ? "SC" :
+              state == "LONG UNWINDING" ? "LU" : ""
+
+isBearishFlavor = state == "SHORT BUILDUP" or state == "LONG UNWINDING"
+
+confirmedStateChanged = barstate.isconfirmed and hasOI and state != state[1] and state != "NEUTRAL" and sigStrength >= markerMinStrength
+earlyStateChanged     = not barstate.isconfirmed and hasOI and state != state[1] and state != "NEUTRAL" and sigStrength >= markerMinStrength
+
+stateTitle = state == "LONG BUILDUP"   ? "Long Buildup" :
+             state == "SHORT BUILDUP"  ? "Short Buildup" :
+             state == "SHORT COVERING" ? "Short Covering" :
+             state == "LONG UNWINDING" ? "Long Unwinding" : state
+
+if (signalMode == "Confirmed Only" or signalMode == "Early + Confirmed") and confirmedStateChanged
+    label.new(bar_index, isBearishFlavor ? high : low, text = stateAbbrev,
+      style = isBearishFlavor ? label.style_label_down : label.style_label_up,
+      color = stateColor, textcolor = color.white, size = size.tiny, force_overlay = true,
+      tooltip = dispState + "\nPFI " + str.tostring(pfi, '#.#') + " | Price " + str.tostring(prZ, '#.##') + "σ | OI " + str.tostring(oiZ, '#.##') + "σ | Strength " + str.tostring(strengthPct, '#') + "%")
+      //tooltip = "Confirmed " + dispState + "\nPFI " + str.tostring(pfi, '#.#') + " | Price " + str.tostring(prZ, '#.##') + "σ | OI " + str.tostring(oiZ, '#.##') + "σ | Strength " + str.tostring(strengthPct, '#') + "%")
+
+var label earlyLbl = na
+if signalMode == "Early + Confirmed" and not barstate.isconfirmed
+    if earlyStateChanged
+        earlyTooltip = "Early Flow Warning -- current Price/OI conditions indicate a potential " + stateTitle + ", but the candle has not closed. This may change or disappear before confirmation.\nPFI " + str.tostring(pfi, '#.#') + " | Price " + str.tostring(prZ, '#.##') + "σ | OI " + str.tostring(oiZ, '#.##') + "σ | Strength " + str.tostring(strengthPct, '#') + "%"
+        if na(earlyLbl)
+            earlyLbl := label.new(bar_index, isBearishFlavor ? high : low, text = "●\n" + stateAbbrev,
+              style = isBearishFlavor ? label.style_label_down : label.style_label_up,
+              color = color.new(stateColor, 60), textcolor = color.new(color.white, 20), size = size.tiny, force_overlay = true,
+              tooltip = earlyTooltip)
+        else
+            label.set_xy(earlyLbl, bar_index, isBearishFlavor ? high : low)
+            label.set_text(earlyLbl, "●\n" + stateAbbrev)
+            label.set_style(earlyLbl, isBearishFlavor ? label.style_label_down : label.style_label_up)
+            label.set_color(earlyLbl, color.new(stateColor, 60))
+            label.set_tooltip(earlyLbl, earlyTooltip)
+    else if not na(earlyLbl)
+        label.delete(earlyLbl)
+        earlyLbl := na
+
+if barstate.isconfirmed and not na(earlyLbl)
+    label.delete(earlyLbl)
+    earlyLbl := na
+
+stripTransp = state == "NEUTRAL" ? 75 :
+              hasOI ? int(math.max(35, 80 - sigStrength * 45)) : 85
+stripColor  = state == "LONG BUILDUP"   ? color.new(clUP, stripTransp) :
+              state == "SHORT BUILDUP"  ? color.new(clDW, stripTransp) :
+              state == "SHORT COVERING" ? color.new(color.yellow, stripTransp) :
+              state == "LONG UNWINDING" ? color.new(color.orange, stripTransp) :
+              color.new(color.gray, stripTransp)
+
+stripOffset = ta.atr(14) * 0.40
+stripLow    = low - stripOffset
+stripHigh   = stripLow + stripOffset * 0.45
+stripP1 = plot(ribbonMode == "State Ribbon" ? stripLow : na, title = "Flow State Ribbon (base)", color = color(na), display = display.none, editable = false, force_overlay = true)
+stripP2 = plot(ribbonMode == "State Ribbon" ? stripHigh : na, title = "Flow State Ribbon (top)", color = color(na), display = display.none, editable = false, force_overlay = true)
+fill(stripP1, stripP2, color = ribbonMode == "State Ribbon" ? stripColor : na, title = "Flow State Ribbon")
+
+prF  = ta.ema(high + low - 2 * ta.ema(close, 13), smthP)
+pHST = ta.highest(prF, 89)
+pLST = ta.lowest(prF, 89)
+prSentimentRaw = 100 * (prF - math.avg(pHST, pLST)) / f_safeRange((pHST - pLST) / 2)
+prSentiment    = math.max(-100.0, math.min(100.0, prSentimentRaw))
+
+plot(prSS ? prSentiment : na, 'Price Sentiment', prSSC, 1, display = display)
+
+if showDash and barstate.islast and syminfo.type == 'crypto'
+    var table infoT = table.new(position.top_right, 2, 5, bgcolor = color.new(chart.fg_color, 95), border_color = color.new(chart.fg_color, 95), border_width = 1, frame_color = color.new(chart.fg_color, 81), frame_width = 1)
+    table.cell(infoT, 0, 0, 'FLOW STATE', text_color = color.gray, text_halign = text.align_left, text_size = size.normal, tooltip = "Positioning regime based on Price and Open Interest: Long Buildup (price ↑, OI ↑), Short Buildup (price ↓, OI ↑), Short Covering (price ↑, OI ↓), Long Unwinding (price ↓, OI ↓). Neutral means there isn't enough synchronized Price + OI evidence to classify a regime; it does not mean there is no market activity.")
+    table.cell(infoT, 1, 0, dispState, text_color = stateColor, text_halign = text.align_left, text_size = size.normal, tooltip = "WEAK/STRONG prefix reflects Signal Strength below, independent of the selected Flow Model.")
+    table.cell(infoT, 0, 1, 'SIGNAL STRENGTH', text_color = color.gray, text_halign = text.align_left, text_size = size.small, tooltip = "Signal Strength is calculated as sqrt(participation × confirmation), where participation comes from |OI Z-score| and confirmation from |Price Z-score|, each capped at 2σ. Independent of the selected Flow Model, it reflects the strength of synchronized Price + OI evidence behind the current classification. This is not a probability that the move will continue.")
+    table.cell(infoT, 1, 1, hasOI ? f_meter(strengthPct) + '  ' + str.tostring(strengthPct, '#') + '%' : 'N/A', text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small, tooltip = "N/A when Open Interest data is unavailable for this symbol/timeframe.")
+    table.cell(infoT, 0, 2, 'PFI', text_color = color.gray, text_halign = text.align_left, text_size = size.small, tooltip = "Positioning Flow Index, bounded -100 to +100, from the selected Flow Model (see the Flow Model tooltip for details). Answers \"What direction and how strongly?\", while Flow State answers \"What does the positioning regime mean?\"")
+    table.cell(infoT, 1, 2, hasOI ? str.tostring(pfi, '#.#') : 'N/A', text_color = hasOI ? (pfi >= 0 ? clUP : clDW) : color.gray, text_halign = text.align_left, text_size = size.small, tooltip = "N/A when Open Interest data is unavailable for this symbol/timeframe.")
+    table.cell(infoT, 0, 3, 'PRICE Z-SCORE', text_color = color.gray, text_halign = text.align_left, text_size = size.small, tooltip = "Shows how unusual the current price move is compared with recent price moves. 0σ means the current move is close to its recent average. Positive values mean the price return is above its recent average; negative values mean it is below its recent average. Around ±1σ means moderately unusual, while around ±2σ means unusually large. The farther the value is from 0, the more unusual the price move.")
+    table.cell(infoT, 1, 3, str.tostring(prZ, '#.##') + 'σ', text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small, tooltip = "PRICE Z-SCORE: 0σ = close to the recent average price move. Positive = stronger upward price return than its recent average; negative = stronger downward price return. Around ±1σ = moderately unusual; around ±2σ = unusually large. Higher absolute values mean the current price move is more unusual compared with the recent Lookback period.")
+    table.cell(infoT, 0, 4, 'OI Z-SCORE', text_color = color.gray, text_halign = text.align_left, text_size = size.small, tooltip = "Shows how unusual the current Open Interest change is compared with recent OI changes. 0σ means the current OI change is close to its recent average. Positive values mean the OI change is above its recent average; negative values mean it is below its recent average. Around ±1σ means moderately unusual, while around ±2σ means unusually large.")
+    table.cell(infoT, 1, 4, hasOI ? str.tostring(oiZ, '#.##') + 'σ' : 'N/A', text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small, tooltip = "OI Z-SCORE: 0σ = close to the recent average OI change. Positive = stronger OI change than its recent average; negative = weaker OI change than its recent average. Around ±1σ = moderately unusual; around ±2σ = unusually large. Higher absolute values mean the current OI change is more unusual compared with the recent Lookback period.")
+
+var table logo  = table.new(position.bottom_right, 1, 1)
+var table logo2 = table.new(position.bottom_right, 1, 1, force_overlay = true)
+if barstate.islast
+    table.cell(logo , 0, 0, '☼☾  ', text_size=size.normal, text_color=color.teal, tooltip = 'SoleMare Analytics')
+    table.cell(logo2, 0, 0, '☼☾  ', text_size=size.normal, text_color=color.teal, tooltip = 'SoleMare Analytics')

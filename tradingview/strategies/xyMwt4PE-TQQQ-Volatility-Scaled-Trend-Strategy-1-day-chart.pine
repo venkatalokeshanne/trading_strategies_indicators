@@ -1,0 +1,363 @@
+//@version=6
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+//  TQQQ AG v16 â€” Volatility Overlay
+//
+//  v15 Armored, unchanged in every signal, PLUS a position-sizing overlay that
+//  scales exposure inversely to realised volatility.
+//
+//  Validated 2026-07-27 over ~250 candidates and 36 test rounds:
+//    walk-forward 2005-2012 (where v15's own params are also out of sample)
+//        CAGR   29.0% -> 37.3%        drawdown  -79.6% -> -54.6%
+//    dot-com 1999-2009 (synthetic 3x QQQ)
+//        CAGR   -7.2% -> +10.2%       drawdown  -92.4% -> -74.2%
+//    360 overlapping windows 1999-2009 : drawdown better in 99-100%
+//    block bootstrap, 5,000 paths      : P(drawdown improves) = 100%
+//    12 other underlyings (SPY/DIA/IWM/EFA/QQQ + 7 sectors), nothing refitted:
+//        MAR better 13/15 cells, crisis drawdown 5/5
+//    benefit scales with leverage exactly as the mechanism predicts:
+//        1x +0.8pp, 2x +14.4pp, 3x +18.2pp, 4x +22.2pp drawdown (corr +0.92)
+//
+//  IT IS INSURANCE. It costs modern return to buy a survivable tail. Use the
+//  Target Volatility input as the dial:
+//    0.55 = most protection   (modern CAGR ~108%, dot-com +10.2%)
+//    0.75 = balanced          (modern CAGR ~132%, dot-com  +7.0%)
+//    0.90 = light             (modern CAGR ~142%, dot-com  +4.0%)
+//    v15 unchanged is the only setting that LOSES money through 1999-2009.
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+strategy(
+    "TQQQ AG v16 â€” Vol Overlay",
+    shorttitle = "AG-v16",
+    overlay    = true,
+    default_qty_type  = strategy.percent_of_equity,
+    default_qty_value = 100,
+    initial_capital   = 10000,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.0,
+    process_orders_on_close = true,
+    max_labels_count  = 500,
+    margin_long  = 20,
+    margin_short = 8)
+
+// â”€â”€ v15 inputs (UNCHANGED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+grpS = "v15 Signals"
+regime_sym     = input.string("QQQ",  "Regime Symbol", group=grpS)
+sma_len        = input.int  (200,     "Regime SMA Length", group=grpS)
+sma_bull_buf   = input.float(0.35,    "Bull Buffer %", group=grpS)
+sma_bear_buf   = input.float(0.75,    "Bear Buffer %", group=grpS)
+rsi_len        = input.int  (10,      "RSI Length", group=grpS)
+ob_thresh      = input.int  (81,      "OB Short Threshold (QQQ RSI)", group=grpS)
+bull_reentry   = input.int  (71,      "Bull Re-entry RSI (TQQQ RSI)", group=grpS)
+ob_rearm       = input.int  (78,      "OB Re-arm (QQQ RSI)", group=grpS)
+ob_retrig      = input.int  (73,      "OB Re-trigger", group=grpS)
+rs_tqqq_filter = input.int  (69,      "Bull Reshort Max TQQQ RSI", group=grpS)
+bear_os        = input.int  (31,      "Bear OS Long Threshold (TQQQ RSI)", group=grpS)
+bear_exit_rs   = input.int  (55,      "Bear Bounce Exit RSI", group=grpS)
+max_bounce     = input.int  (4,       "Max Bear Bounce Bars", group=grpS)
+ob_stop_pct    = input.float(7.0,     "OB Short Fixed Stop %", group=grpS)
+ob_trail_pct   = input.float(1.5,     "OB Short Trailing Stop %", group=grpS)
+reshort_arm    = input.int  (53,      "Re-short Arm RSI (QQQ RSI)", group=grpS)
+reshort_trig   = input.int  (55,      "Re-short Trigger RSI (QQQ RSI)", group=grpS)
+use_macd       = input.bool (false,   "Use Weekly MACD Gate", group=grpS)
+use_fast_bear  = input.bool (true,    "Use Fast Bear (50 SMA)", group=grpS)
+sma50_buf      = input.float(1.0,     "50 SMA Buffer %", group=grpS)
+use_fast_bull  = input.bool (true,    "Use Fast Bull (50 SMA)", group=grpS)
+enable_long    = input.bool (true,    "Enable Longs", group=grpS)
+enable_short   = input.bool (true,    "Enable Shorts", group=grpS)
+gate_a_len     = input.int  (18,      "Gate A: close > EMA(N)", group=grpS)
+gate_b_fast    = input.int  (3,       "Gate B: EMA fast", group=grpS)
+gate_b_slow    = input.int  (22,      "Gate B: EMA slow", group=grpS)
+
+grpL = "v15 Leverage & Armor"
+bull_lev       = input.float(1.25,    "Bull-Long Leverage (state 1)", group=grpL)
+bounce_lev     = input.float(1.5,     "Bear-Bounce Leverage (state 3)", group=grpL)
+bear_short_lev = input.float(1.5,     "Bear-Short Leverage (state 5)", group=grpL)
+ob_short_lev   = input.float(3.0,     "OB-Short Leverage (state 2)", group=grpL)
+show_lev_lbl   = input.bool (true,    "Show leverage labels", group=grpL)
+bs_trail_pct   = input.float(15.0,    "Bear-Short Trailing Stop % (0=off)", group=grpL)
+bs_cd_bars     = input.int  (5,       "Reshort Cooldown Bars after trail stop", group=grpL)
+kill_dd        = input.float(65.0,    "Equity Kill-Switch DD % (0=off)", group=grpL)
+
+// â”€â”€ â˜… v16 VOLATILITY OVERLAY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+grpV = "â˜… v16 Volatility Overlay"
+ovl_on      = input.bool (true,  "Enable Volatility Overlay", group=grpV)
+ovl_target  = input.float(0.55,  "Target Volatility  (0.55 / 0.75 / 0.90)", step=0.05, minval=0.20, maxval=2.0, group=grpV)
+ovl_fast    = input.int  (10,    "Fast Vol Window (bars)", minval=2, group=grpV)
+ovl_slow    = input.int  (60,    "Slow Vol Window (bars)", minval=5, group=grpV)
+ovl_floor   = input.float(0.30,  "Multiplier Floor", step=0.05, minval=0.05, maxval=1.0, group=grpV)
+ovl_gamma   = input.float(0.60,  "Rising-Vol Penalty", step=0.05, minval=0.0, maxval=2.0, group=grpV)
+ovl_restore = input.float(0.02,  "Max Restore per Bar (cut is instant)", step=0.01, minval=0.005, maxval=1.0, group=grpV)
+ovl_band    = input.float(0.03,  "Rebalance Deadband", step=0.01, minval=0.0, maxval=0.50, group=grpV)
+show_rsz_lbl = input.bool(true,  "Show rescale % labels", group=grpV)
+
+// Optional: graded de-levering instead of the binary kill-switch.
+// Structurally safer across instruments (0 chaos-cells vs 5, cross-instrument
+// drawdown 12/12) but statistically weaker on TQQQ itself. OFF by default.
+// If you turn this ON, set the Kill-Switch above to 0.
+grpG = "â˜… v16 Graded De-lever (optional, set Kill-Switch=0)"
+grd_on = input.bool (false, "Enable Graded De-levering", group=grpG)
+grd_x  = input.float(40.0,  "Full size until own drawdown %", group=grpG)
+grd_y  = input.float(75.0,  "Floor reached at own drawdown %", group=grpG)
+grd_fl = input.float(0.25,  "Graded floor multiplier", step=0.05, group=grpG)
+
+// â”€â”€ v15 indicators & state machine (UNCHANGED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+tqqq_rsi  = ta.rsi(close, rsi_len)
+[w_macd, w_sig, _] = request.security("QQQ", "W", ta.macd(close, 12, 26, 9))
+macd_bear  = w_macd < w_sig
+gate_a    = close > ta.ema(close, gate_a_len)
+gate_b    = ta.ema(close, gate_b_fast) > ta.ema(close, gate_b_slow)
+tqqq_gate = gate_a and gate_b
+regime_close = request.security(regime_sym, "D", close)
+qqq_rsi      = ta.rsi(regime_close, rsi_len)
+regime_sma   = ta.sma(regime_close, sma_len)
+bull_threshold = regime_sma * (1 + sma_bull_buf / 100)
+bear_threshold = regime_sma * (1 - sma_bear_buf / 100)
+var bool in_bull = false
+in_bull := regime_close > bull_threshold ? true : regime_close < bear_threshold ? false : in_bull
+trend_up          = in_bull
+bear_just_started = not in_bull and in_bull[1]
+regime_sma50  = ta.sma(regime_close, 50)
+below_sma50   = regime_close < regime_sma50 * (1 - sma50_buf / 100)
+above_sma50   = regime_close > regime_sma50
+fast_bear_trig  = use_fast_bear and not in_bull and below_sma50 and not below_sma50[1] and qqq_rsi < 45
+fast_bull_cross = use_fast_bull and not in_bull and above_sma50 and not above_sma50[1] and tqqq_rsi > 50
+
+var int  state            = 0
+var int  bounce_bars      = 0
+var int  bear_short_bars  = 0
+var bool reshort_primed   = false
+var bool ob_reshort_primed = false
+var float ob_trail_low = na
+if state == 2
+    ob_trail_low := na(ob_trail_low) ? close : math.min(ob_trail_low, close)
+else
+    ob_trail_low := na
+short_entry_price = strategy.position_size < 0 ? strategy.position_avg_price : na
+hit_ob_stop  = not na(short_entry_price) and state == 2 and close >= short_entry_price * (1 + ob_stop_pct  / 100)
+hit_ob_trail = not na(ob_trail_low)      and state == 2 and close >= ob_trail_low      * (1 + ob_trail_pct / 100)
+ob_exit = hit_ob_stop or hit_ob_trail
+
+var float bs_low = na
+var int   bs_cd  = 0
+if state == 5
+    bs_low := na(bs_low) ? close : math.min(bs_low, close)
+else
+    bs_low := na
+bs_exit = bs_trail_pct > 0 and not na(bs_low) and state == 5 and close >= bs_low * (1 + bs_trail_pct / 100)
+
+if trend_up
+    bear_short_bars := 0
+    reshort_primed  := false
+    if qqq_rsi >= ob_thresh
+        state := 2
+        ob_reshort_primed := false
+    else if state == 2 and (tqqq_rsi < bull_reentry or ob_exit)
+        state := tqqq_gate ? 1 : 0
+    else if ob_reshort_primed and qqq_rsi <= ob_retrig and tqqq_rsi < rs_tqqq_filter
+        state := 2
+        ob_reshort_primed := false
+    else if state != 1 and state != 2
+        state := tqqq_gate ? 1 : 0
+    if state == 1 and qqq_rsi >= ob_rearm
+        ob_reshort_primed := true
+    if state != 1
+        ob_reshort_primed := false
+else
+    ob_reshort_primed := false
+    if bear_just_started or fast_bear_trig
+        state := 5
+        bear_short_bars := 0
+        reshort_primed  := false
+    else if fast_bull_cross
+        state := 1
+        bear_short_bars := 0
+    else if state == 1
+        bear_short_bars := 0
+    else if state == 5
+        bear_short_bars += 1
+        if tqqq_rsi <= bear_os
+            state       := 3
+            bounce_bars := 0
+            bear_short_bars := 0
+        else if bs_exit
+            state := 0
+            bear_short_bars := 0
+            bs_cd := bs_cd_bars
+    else if tqqq_rsi <= bear_os
+        if state != 3
+            state       := 3
+            bounce_bars := 0
+    else if state == 3
+        bounce_bars += 1
+        if tqqq_rsi >= bear_exit_rs or bounce_bars >= max_bounce
+            state       := 0
+            bounce_bars := 0
+    else
+        state       := 0
+        bounce_bars := 0
+    if state == 0
+        if bs_cd > 0
+            bs_cd -= 1
+        if qqq_rsi >= reshort_arm
+            reshort_primed := true
+        if reshort_primed and qqq_rsi <= reshort_trig and (not use_macd or macd_bear) and bs_cd == 0
+            state          := 5
+            reshort_primed := false
+            bear_short_bars := 0
+
+// â”€â”€ v15 equity kill-switch (UNCHANGED) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+var bool  halted = false
+var bool  halt_seen_bear = false
+var float risk_peak = na
+eq_now = strategy.equity
+risk_peak := na(risk_peak) ? eq_now : risk_peak
+if kill_dd > 0
+    if not halted and eq_now <= risk_peak * (1 - kill_dd / 100.0)
+        halted := true
+        halt_seen_bear := not trend_up
+        if show_lev_lbl
+            label.new(bar_index, na, "KILL-SWITCH", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.orange, 0), textcolor = color.black, size = size.small)
+    else if halted
+        if not trend_up
+            halt_seen_bear := true
+        if halt_seen_bear and trend_up
+            halted := false
+            risk_peak := eq_now
+            if show_lev_lbl
+                label.new(bar_index, na, "RE-ARM", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.aqua, 0), textcolor = color.black, size = size.small)
+if not halted
+    risk_peak := math.max(risk_peak, eq_now)
+
+// â”€â”€ â˜… v16 OVERLAY MULTIPLIER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// est = max(fast vol, slow vol) -- deliberately ASYMMETRIC. Round 23 showed
+// proper forecasts (EWMA, GARCH, HAR) are all WORSE here: they are accurate but
+// symmetric, so they re-lever too fast after a spike. The edge is being slow to
+// re-lever, not measuring volatility precisely.
+ret1   = nz(close / close[1] - 1.0)
+v_fast = ta.stdev(ret1, ovl_fast) * math.sqrt(252)
+v_slow = ta.stdev(ret1, ovl_slow) * math.sqrt(252)
+v_est  = math.max(v_fast, v_slow)
+ovl_pen = math.min(0.60, math.max(0.0, ovl_gamma * (v_fast / math.max(v_slow, 0.000001) - 1.0)))
+m_raw = na(v_slow) or v_slow <= 0 ? 1.0 : math.max(ovl_floor * 0.5, math.min(1.0, math.max(ovl_floor, ovl_target / math.max(v_est, 0.000001)) * (1.0 - ovl_pen)))
+
+// cut instantly, restore no faster than ovl_restore per bar
+var float m_prev = 1.0
+m_now = m_raw < m_prev ? m_raw : math.min(m_raw, m_prev + ovl_restore)
+m_prev := m_now
+
+// optional graded de-levering on the strategy's OWN drawdown
+var float eq_peak = na
+eq_peak := na(eq_peak) ? strategy.equity : math.max(eq_peak, strategy.equity)
+own_dd = eq_peak > 0 ? (1.0 - strategy.equity / eq_peak) * 100.0 : 0.0
+grd_m = not grd_on ? 1.0 : own_dd <= grd_x ? 1.0 : own_dd >= grd_y ? grd_fl : 1.0 - (1.0 - grd_fl) * (own_dd - grd_x) / math.max(grd_y - grd_x, 0.000001)
+
+ovl_m = (ovl_on ? m_now : 1.0) * grd_m
+
+// â”€â”€ ORDERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+want_long  = (state == 1 or state == 3) and enable_long and not halted
+want_short = (state == 2 or state == 5) and enable_short and not halted
+want_flat  = not want_long and not want_short
+lev_l = state == 3 ? bounce_lev : bull_lev
+lev_s = state == 2 ? ob_short_lev : bear_short_lev
+qty_long  = math.max(1, math.floor(strategy.equity * lev_l * ovl_m / close))
+qty_short = math.max(1, math.floor(strategy.equity * lev_s * ovl_m / close))
+// Entry labels report TARGET EXPOSURE as a % of sleeve equity, e.g. "LONG 83%"
+// means: after this order, hold 83% of your equity in TQQQ. An entry in the
+// opposite direction is a full REVERSAL -- it closes whatever is held and opens
+// the new position in one order.
+if want_long and strategy.position_size <= 0
+    strategy.entry("Long",  strategy.long,  qty = qty_long)
+    if show_lev_lbl
+        label.new(bar_index, na, "LONG " + str.tostring(lev_l * ovl_m * 100, "#") + "%", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.green, 10), textcolor = color.white, size = size.small)
+if want_short and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, qty = qty_short)
+    if show_lev_lbl
+        label.new(bar_index, na, "SHORT " + str.tostring(lev_s * ovl_m * 100, "#") + "%", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 10), textcolor = color.white, size = size.small)
+if want_flat and strategy.position_size != 0
+    strategy.close_all(comment = "Cash")
+
+// â˜… v16 CONTINUOUS RESCALING â€” this is not optional.
+// Sizing only at entry and then holding a fixed share count loses most of the
+// protection, because effective leverage climbs as equity falls: tested at
+// crisis drawdown -72.6% (rescaled every bar) vs -86.5% (sized at entry only).
+// IMPORTANT: only rescale when the position we ALREADY hold points the same way
+// as the position we want. On a flip bar (long->short) strategy.position_size
+// still holds the OLD position while the entry block above is placing the
+// reversal, so rescaling there fires a conflicting order on top of the reversal.
+pos_dir  = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+want_dir = want_long ? 1 : want_short ? -1 : 0
+if ovl_on and pos_dir != 0 and pos_dir == want_dir
+    lev_now = pos_dir > 0 ? lev_l : lev_s
+    tgt_qty = math.max(1, math.floor(strategy.equity * lev_now * ovl_m / close)) * pos_dir
+    dev     = math.abs(tgt_qty - strategy.position_size) / math.max(math.abs(strategy.position_size), 1)
+    if dev > ovl_band
+        dq = tgt_qty - strategy.position_size
+        // Both figures are % of sleeve EQUITY, signed: positive = long exposure,
+        // negative = short. "+8% -> 83%" means add 8% of equity, ending at 83%.
+        d_pct   = dq      * close / strategy.equity * 100.0
+        tgt_pct = tgt_qty * close / strategy.equity * 100.0
+        if dq > 0
+            strategy.order("RescaleUp", strategy.long,  qty = dq)
+            if show_rsz_lbl
+                label.new(bar_index, na, "+" + str.tostring(d_pct, "#.#") + "%\nâ†’ " + str.tostring(tgt_pct, "#") + "%", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.blue, 25), textcolor = color.white, size = size.tiny)
+        else if dq < 0
+            strategy.order("RescaleDn", strategy.short, qty = -dq)
+            if show_rsz_lbl
+                label.new(bar_index, na, str.tostring(d_pct, "#.#") + "%\nâ†’ " + str.tostring(tgt_pct, "#") + "%", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.maroon, 25), textcolor = color.white, size = size.tiny)
+
+// â”€â”€ YEARLY DASHBOARD (kept, top-right) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+var table tbl = table.new(position.top_right, 4, 23, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.new(color.teal, 30))
+var float yr_start_eq = float(na)
+var float yr_start_px = float(na)
+var float yr_peak_eq  = float(na)
+var float yr_min_dd   = 0.0
+var int   tbl_row     = 1
+if barstate.isfirst
+    table.cell(tbl, 0, 0, "Year",  text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.teal, 30))
+    table.cell(tbl, 1, 0, "v16",   text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.teal, 30))
+    table.cell(tbl, 2, 0, "MaxDD", text_color=color.orange, text_size=size.small, bgcolor=color.new(color.teal, 30))
+    table.cell(tbl, 3, 0, "B&H",   text_color=color.yellow, text_size=size.small, bgcolor=color.new(color.teal, 30))
+    yr_start_eq := strategy.initial_capital
+    yr_start_px := close
+    yr_peak_eq  := strategy.initial_capital
+    yr_min_dd   := 0.0
+yr_peak_eq := math.max(nz(yr_peak_eq, strategy.equity), strategy.equity)
+intra_dd   = yr_peak_eq > 0 ? (strategy.equity / yr_peak_eq - 1.0) * 100.0 : 0.0
+yr_min_dd  := math.min(yr_min_dd, intra_dd)
+is_new_year = not na(time[1]) and year(time) != year(time[1])
+if is_new_year and not na(yr_start_eq) and yr_start_eq > 0 and tbl_row <= 21
+    s_ret = (strategy.equity[1] / yr_start_eq - 1.0) * 100.0
+    b_ret = (close[1] / yr_start_px - 1.0) * 100.0
+    beat  = s_ret >= b_ret
+    table.cell(tbl, 0, tbl_row, str.tostring(year(time[1])),               text_color=color.white,                   text_size=size.small)
+    table.cell(tbl, 1, tbl_row, str.tostring(math.round(s_ret,2))+"%",     text_color=s_ret>=0?color.lime:color.red, text_size=size.small, bgcolor=beat?color.new(color.green,80):color.new(color.red,80))
+    table.cell(tbl, 2, tbl_row, str.tostring(math.round(yr_min_dd,1))+"%", text_color=color.orange,                  text_size=size.small)
+    table.cell(tbl, 3, tbl_row, str.tostring(math.round(b_ret,2))+"%",     text_color=b_ret>=0?color.lime:color.red, text_size=size.small)
+    tbl_row     := tbl_row + 1
+    yr_start_eq := strategy.equity
+    yr_start_px := close
+    yr_peak_eq  := strategy.equity
+    yr_min_dd   := 0.0
+if not na(yr_start_eq) and yr_start_eq > 0 and tbl_row <= 22
+    s_ret = (strategy.equity / yr_start_eq - 1.0) * 100.0
+    b_ret = (close / yr_start_px - 1.0) * 100.0
+    beat  = s_ret >= b_ret
+    table.cell(tbl, 0, tbl_row, str.tostring(year(time)),                text_color=color.white,                   text_size=size.small)
+    table.cell(tbl, 1, tbl_row, str.tostring(math.round(s_ret,2))+"%",  text_color=s_ret>=0?color.lime:color.red, text_size=size.small, bgcolor=beat?color.new(color.green,80):color.new(color.red,80))
+    table.cell(tbl, 2, tbl_row, str.tostring(math.round(yr_min_dd,1))+"%", text_color=color.orange,               text_size=size.small)
+    table.cell(tbl, 3, tbl_row, str.tostring(math.round(b_ret,2))+"%",  text_color=b_ret>=0?color.lime:color.red, text_size=size.small)
+
+// â”€â”€ â˜… v16 OVERLAY STATUS (bottom-right) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+var table otb = table.new(position.bottom_right, 2, 6, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.new(color.orange, 40))
+if barstate.islast
+    table.cell(otb, 0, 0, "VOL OVERLAY", text_color=color.orange, text_size=size.small, bgcolor=color.new(color.orange, 80))
+    table.cell(otb, 1, 0, ovl_on ? "ON" : "OFF", text_color=ovl_on?color.lime:color.gray, text_size=size.small, bgcolor=color.new(color.orange, 80))
+    table.cell(otb, 0, 1, "Fast vol " + str.tostring(ovl_fast) + "d", text_color=color.white, text_size=size.small)
+    table.cell(otb, 1, 1, str.tostring(math.round(v_fast*100,0)) + "%", text_color=color.white, text_size=size.small)
+    table.cell(otb, 0, 2, "Slow vol " + str.tostring(ovl_slow) + "d", text_color=color.white, text_size=size.small)
+    table.cell(otb, 1, 2, str.tostring(math.round(v_slow*100,0)) + "%", text_color=color.white, text_size=size.small)
+    table.cell(otb, 0, 3, "Target vol", text_color=color.white, text_size=size.small)
+    table.cell(otb, 1, 3, str.tostring(math.round(ovl_target*100,0)) + "%", text_color=color.white, text_size=size.small)
+    table.cell(otb, 0, 4, "Size multiplier", text_color=color.yellow, text_size=size.small)
+    table.cell(otb, 1, 4, str.tostring(math.round(ovl_m*100,0)) + "%", text_color=ovl_m>=0.95?color.lime:ovl_m>=0.6?color.yellow:color.red, text_size=size.small)
+    table.cell(otb, 0, 5, "State / halted", text_color=color.white, text_size=size.small)
+    table.cell(otb, 1, 5, str.tostring(state) + (halted ? " HALT" : ""), text_color=halted?color.red:color.white, text_size=size.small)

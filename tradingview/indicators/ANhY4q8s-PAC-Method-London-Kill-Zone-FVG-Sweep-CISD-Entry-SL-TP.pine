@@ -1,0 +1,425 @@
+//@version=6
+indicator("PAC Method + London Kill Zone [FVG + Sweep + CISD + Entry/SL/TP]", shorttitle="PAC+LKZ v2", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// =============================================================================================
+//  NOTE ON TIME: session/macro-window inputs are read in the "Timezone" input, matching the ICT
+//  convention in the cheat-sheet screenshots (London Kill Zone quoted in New York time, e.g.
+//  "London opens 2:00 AM"). Change the Timezone input if your source uses a different clock.
+// =============================================================================================
+
+// =============================================================================================
+//  INPUTS
+// =============================================================================================
+grpHTF        = "HTF FVG Management (PAC)"
+htfTF         = input.timeframe("60", "HTF FVG Timeframe", group=grpHTF)
+atrLen        = input.int(14, "HTF ATR Length", minval=1, group=grpHTF)
+atrMult       = input.float(1.5, "FVG Volatility Threshold (x ATR)", minval=0.0, step=0.1, group=grpHTF)
+maxExtBars    = input.int(200, "Max FVG Extension (Bars)", minval=1, group=grpHTF)
+showMitigated = input.bool(false, "Keep Mitigated HTF FVGs Visible (greyed out)", group=grpHTF)
+
+grpSession    = "Session / Asian Range (London KZ)"
+sessionTZ     = input.string("America/New_York", "Timezone", group=grpSession)
+asianSession  = input.session("1900-0200", "Asian Range Session", group=grpSession)
+
+grpMacro      = "ICT Macro Windows (London KZ)"
+macro1        = input.session("0200-0215", "Macro Window 1", group=grpMacro)
+macro2        = input.session("0233-0300", "Macro Window 2 (Golden Window)", group=grpMacro)
+macro3        = input.session("0400-0415", "Macro Window 3", group=grpMacro)
+requireMacro  = input.bool(false, "Only Trigger Sweeps Inside Macro Windows", group=grpMacro)
+showMacroBg   = input.bool(true, "Highlight Macro Windows on Chart", group=grpMacro)
+macroBgColor  = input.color(color.new(color.orange, 88), "Macro Window Background", group=grpMacro)
+
+grpLiq        = "Liquidity Logic"
+sourceMode    = input.string("Both", "Liquidity Source", options=["Session Range", "Swing Lookback", "Both"], group=grpLiq)
+liqLookback   = input.int(15, "Swing Lookback (bars)", minval=2, group=grpLiq)
+setupTimeout  = input.int(50, "Setup Timeout (bars)", minval=5, group=grpLiq)
+
+grpEntry      = "Entry Logic"
+poiMode       = input.string("HTF FVG Zone", "Point of Interest Requirement", options=["HTF FVG Zone", "None (Session/Swing Liquidity Only)"], group=grpEntry, tooltip="'HTF FVG Zone' = classic PAC method (sweep must occur inside an HTF FVG). 'None' = pure London KZ style.")
+entryStyle    = input.string("Immediate (FVG Close)", "Entry Trigger", options=["Immediate (FVG Close)", "CE - % FVG Retracement"], group=grpEntry)
+cePct         = input.float(50, "CE Retracement %", minval=1, maxval=99, group=grpEntry)
+ceTimeout     = input.int(30, "CE Fill Timeout (bars)", minval=1, group=grpEntry)
+
+grpRisk       = "Risk — Entry / Stop Loss / Take Profit"
+slBufferTicks = input.int(0, "SL Buffer (ticks beyond sweep wick)", minval=0, group=grpRisk)
+showTradeLines= input.bool(true, "Show Entry/SL/TP Lines", group=grpRisk)
+lineExtendBars= input.int(150, "Max Trade Line Length (bars, if neither hit)", minval=5, group=grpRisk)
+entryLineColor= input.color(color.new(color.white, 20), "Entry Line", group=grpRisk)
+slLineColor   = input.color(color.red, "Stop Loss Line", group=grpRisk)
+tpLineColor   = input.color(color.new(color.teal, 0), "Take Profit Line", group=grpRisk)
+
+grpVis        = "Visuals"
+bullColor     = input.color(color.new(color.green, 82), "Bullish HTF FVG", group=grpVis)
+bearColor     = input.color(color.new(color.red, 82), "Bearish HTF FVG", group=grpVis)
+buysideColor  = input.color(color.new(color.red, 65), "Buyside Liquidity (highs / BSL)", group=grpVis)
+sellsideColor = input.color(color.new(color.blue, 65), "Sellside Liquidity (lows / SSL)", group=grpVis)
+bullSigColor  = input.color(color.lime, "Bullish Signal", group=grpVis)
+bearSigColor  = input.color(color.red, "Bearish Signal", group=grpVis)
+showCISD      = input.bool(true, "Show CISD Trigger Line", group=grpVis)
+showTable     = input.bool(true, "Show Status Table", group=grpVis)
+
+// =============================================================================================
+//  TYPES
+// =============================================================================================
+type FVGZone
+    box   b
+    float top
+    float bottom
+    bool  mitigated
+    int   createdBar
+
+type Trade
+    int   entryBar
+    float entry
+    float sl
+    float tp
+    bool  isBull
+    bool  closed
+    line  entryLine
+    line  slLine
+    line  tpLine
+    label entryLabel
+    label slLabel
+    label tpLabel
+
+var array<FVGZone> bullZones  = array.new<FVGZone>()
+var array<FVGZone> bearZones  = array.new<FVGZone>()
+var array<Trade>   bullTrades = array.new<Trade>()
+var array<Trade>   bearTrades = array.new<Trade>()
+
+// =============================================================================================
+//  HTF FVG DATA + DETECTION (PAC method)
+// =============================================================================================
+[h0, h2, l0, l2, htfATR, htfTime] = request.security(syminfo.tickerid, htfTF,
+     [high, high[2], low, low[2], ta.atr(atrLen), time], lookahead=barmerge.lookahead_off)
+
+var float pH0 = na
+var float pH2 = na
+var float pL0 = na
+var float pL2 = na
+var float pATR = na
+var int   prevHtfTime = na
+
+newHtfBar = na(prevHtfTime) or htfTime != prevHtfTime
+
+if newHtfBar and not na(prevHtfTime) and not na(pATR)
+    thresh  = pATR * atrMult
+    bullGap = pL0 - pH2
+    bearGap = pL2 - pH0
+
+    if bullGap >= thresh
+        newBox = box.new(bar_index[1], pL0, bar_index + maxExtBars, pH2, border_color=color.new(color.green, 20), bgcolor=bullColor, extend=extend.none)
+        array.push(bullZones, FVGZone.new(newBox, pL0, pH2, false, bar_index[1]))
+
+    if bearGap >= thresh
+        newBox = box.new(bar_index[1], pH0, bar_index + maxExtBars, pL2, border_color=color.new(color.red, 20), bgcolor=bearColor, extend=extend.none)
+        array.push(bearZones, FVGZone.new(newBox, pH0, pL2, false, bar_index[1]))
+
+pH0 := h0
+pH2 := h2
+pL0 := l0
+pL2 := l2
+pATR := htfATR
+prevHtfTime := htfTime
+
+manageZones(array<FVGZone> zones, bool isBull) =>
+    inZone = false
+    if array.size(zones) > 0
+        for i = array.size(zones) - 1 to 0
+            z = array.get(zones, i)
+            expireBar = z.createdBar + maxExtBars
+            if bar_index >= expireBar
+                box.delete(z.b)
+                array.remove(zones, i)
+            else
+                box.set_right(z.b, bar_index)
+                mitigatedNow = isBull ? close < z.bottom : close > z.top
+                if mitigatedNow and not z.mitigated
+                    z.mitigated := true
+                    if showMitigated
+                        box.set_bgcolor(z.b, color.new(color.gray, 90))
+                        box.set_border_color(z.b, color.new(color.gray, 60))
+                    else
+                        box.delete(z.b)
+                        array.remove(zones, i)
+                if not z.mitigated
+                    if isBull and low <= z.top and high >= z.bottom
+                        inZone := true
+                    if (not isBull) and high >= z.bottom and low <= z.top
+                        inZone := true
+    inZone
+
+inBullHTFZone = manageZones(bullZones, true)
+inBearHTFZone = manageZones(bearZones, false)
+
+// =============================================================================================
+//  ASIAN SESSION RANGE (London KZ)
+// =============================================================================================
+inAsianSession   = not na(time(timeframe.period, asianSession, sessionTZ))
+sessionEndedNow  = inAsianSession[1] and not inAsianSession
+
+var float curSessHigh = na
+var float curSessLow  = na
+var float asianHigh   = na
+var float asianLow    = na
+var bool  asianHighSwept = false
+var bool  asianLowSwept  = false
+
+if inAsianSession
+    curSessHigh := na(curSessHigh) ? high : math.max(curSessHigh, high)
+    curSessLow  := na(curSessLow)  ? low  : math.min(curSessLow, low)
+
+var line asianHighLine = na
+var line asianLowLine  = na
+var label asianHighLabel = na
+var label asianLowLabel  = na
+
+if sessionEndedNow
+    asianHigh := curSessHigh
+    asianLow  := curSessLow
+    asianHighSwept := false
+    asianLowSwept  := false
+    curSessHigh := na
+    curSessLow  := na
+    line.delete(asianHighLine)
+    line.delete(asianLowLine)
+    label.delete(asianHighLabel)
+    label.delete(asianLowLabel)
+    asianHighLine  := line.new(bar_index, asianHigh, bar_index, asianHigh, color=buysideColor, width=1)
+    asianLowLine   := line.new(bar_index, asianLow, bar_index, asianLow, color=sellsideColor, width=1)
+    asianHighLabel := label.new(bar_index, asianHigh, "BSL " + str.tostring(asianHigh, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=buysideColor, size=size.small)
+    asianLowLabel  := label.new(bar_index, asianLow, "SSL " + str.tostring(asianLow, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=sellsideColor, size=size.small)
+
+if not na(asianHighLine)
+    line.set_x2(asianHighLine, bar_index)
+    label.set_x(asianHighLabel, bar_index)
+if not na(asianLowLine)
+    line.set_x2(asianLowLine, bar_index)
+    label.set_x(asianLowLabel, bar_index)
+
+// =============================================================================================
+//  ICT MACRO WINDOWS (London KZ)
+// =============================================================================================
+inMacro1   = not na(time(timeframe.period, macro1, sessionTZ))
+inMacro2   = not na(time(timeframe.period, macro2, sessionTZ))
+inMacro3   = not na(time(timeframe.period, macro3, sessionTZ))
+inAnyMacro = inMacro1 or inMacro2 or inMacro3
+
+bgcolor(showMacroBg and inAnyMacro ? macroBgColor : na, title="Macro Window Highlight")
+
+// =============================================================================================
+//  LIQUIDITY SWEEP EVENTS — session range and/or swing lookback
+// =============================================================================================
+recentLow  = ta.lowest(low, liqLookback)[1]
+recentHigh = ta.highest(high, liqLookback)[1]
+
+lookbackSellSwept = low < recentLow and close > recentLow
+lookbackBuySwept  = high > recentHigh and close < recentHigh
+
+sessionSellSwept = not na(asianLow) and not asianLowSwept and low < asianLow and close > asianLow
+sessionBuySwept  = not na(asianHigh) and not asianHighSwept and high > asianHigh and close < asianHigh
+
+if sessionSellSwept
+    asianLowSwept := true
+if sessionBuySwept
+    asianHighSwept := true
+
+sellsideSweptEvent = sourceMode == "Session Range" ? sessionSellSwept : sourceMode == "Swing Lookback" ? lookbackSellSwept : (sessionSellSwept or lookbackSellSwept)
+buysideSweptEvent  = sourceMode == "Session Range" ? sessionBuySwept  : sourceMode == "Swing Lookback" ? lookbackBuySwept  : (sessionBuySwept or lookbackBuySwept)
+
+bullTPLevel = not na(asianHigh) ? asianHigh : recentHigh
+bearTPLevel = not na(asianLow)  ? asianLow  : recentLow
+
+// =============================================================================================
+//  STATE MACHINE — sweep -> CISD -> local FVG -> (immediate signal OR CE fill)
+// =============================================================================================
+var string bullState      = "idle"   // idle -> swept -> cisd -> pendingCE -> idle
+var string bearState      = "idle"
+var float  bullSweepLow   = na
+var float  bullSweepHigh  = na
+var int    bullSweepBar   = na
+var float  bearSweepHigh  = na
+var float  bearSweepLow   = na
+var int    bearSweepBar   = na
+var line   bullCISDLine   = na
+var line   bearCISDLine   = na
+var float  bullCEPrice    = na
+var int    bullCEBarStart = na
+var float  bearCEPrice    = na
+var int    bearCEBarStart = na
+var float  bullEntryPrice = na
+var float  bearEntryPrice = na
+
+bullSignal = false
+bearSignal = false
+
+// ---------------------------- BULLISH SETUP ----------------------------
+if (poiMode == "None (Session/Swing Liquidity Only)" or inBullHTFZone) and bullState == "idle" and (not requireMacro or inAnyMacro)
+    if sellsideSweptEvent
+        bullState     := "swept"
+        bullSweepLow  := low
+        bullSweepHigh := high
+        bullSweepBar  := bar_index
+        box.new(bar_index - 1, bullSweepHigh, bar_index, bullSweepLow, border_color=sellsideColor, bgcolor=sellsideColor)
+
+if bullState == "swept"
+    barsSince = bar_index - bullSweepBar
+    if close > bullSweepHigh
+        bullState := "cisd"
+        if showCISD
+            bullCISDLine := line.new(bullSweepBar, bullSweepHigh, bar_index, bullSweepHigh, color=bullSigColor, style=line.style_dashed)
+    else if close < bullSweepLow or barsSince > setupTimeout
+        bullState := "idle"
+
+if bullState == "cisd"
+    barsSinceCisd = bar_index - bullSweepBar
+    localBullFVG = low > high[2]
+    if localBullFVG
+        fvgTop = low
+        fvgBot = high[2]
+        if entryStyle == "Immediate (FVG Close)"
+            bullSignal      := true
+            bullEntryPrice  := close
+            bullState       := "idle"
+        else
+            bullCEPrice     := fvgTop - (fvgTop - fvgBot) * (cePct / 100)
+            bullCEBarStart  := bar_index
+            bullState       := "pendingCE"
+    else if barsSinceCisd > setupTimeout
+        bullState := "idle"
+
+if bullState == "pendingCE"
+    barsSinceCE = bar_index - bullCEBarStart
+    if low <= bullCEPrice
+        bullSignal     := true
+        bullEntryPrice := bullCEPrice
+        bullState      := "idle"
+    else if barsSinceCE > ceTimeout
+        bullState := "idle"
+
+// ---------------------------- BEARISH SETUP ----------------------------
+if (poiMode == "None (Session/Swing Liquidity Only)" or inBearHTFZone) and bearState == "idle" and (not requireMacro or inAnyMacro)
+    if buysideSweptEvent
+        bearState     := "swept"
+        bearSweepHigh := high
+        bearSweepLow  := low
+        bearSweepBar  := bar_index
+        box.new(bar_index - 1, bearSweepHigh, bar_index, bearSweepLow, border_color=buysideColor, bgcolor=buysideColor)
+
+if bearState == "swept"
+    barsSince = bar_index - bearSweepBar
+    if close < bearSweepLow
+        bearState := "cisd"
+        if showCISD
+            bearCISDLine := line.new(bearSweepBar, bearSweepLow, bar_index, bearSweepLow, color=bearSigColor, style=line.style_dashed)
+    else if close > bearSweepHigh or barsSince > setupTimeout
+        bearState := "idle"
+
+if bearState == "cisd"
+    barsSinceCisd = bar_index - bearSweepBar
+    localBearFVG = high < low[2]
+    if localBearFVG
+        fvgTop = low[2]
+        fvgBot = high
+        if entryStyle == "Immediate (FVG Close)"
+            bearSignal      := true
+            bearEntryPrice  := close
+            bearState       := "idle"
+        else
+            bearCEPrice     := fvgBot + (fvgTop - fvgBot) * (cePct / 100)
+            bearCEBarStart  := bar_index
+            bearState       := "pendingCE"
+    else if barsSinceCisd > setupTimeout
+        bearState := "idle"
+
+if bearState == "pendingCE"
+    barsSinceCE = bar_index - bearCEBarStart
+    if high >= bearCEPrice
+        bearSignal     := true
+        bearEntryPrice := bearCEPrice
+        bearState      := "idle"
+    else if barsSinceCE > ceTimeout
+        bearState := "idle"
+
+// =============================================================================================
+//  TRADE LINES — Entry / SL / TP, auto-extend and auto-resolve
+// =============================================================================================
+if bullSignal and showTradeLines
+    slP = bullSweepLow - slBufferTicks * syminfo.mintick
+    tpP = bullTPLevel
+    rr  = (tpP - bullEntryPrice) / (bullEntryPrice - slP)
+    eLine = line.new(bar_index, bullEntryPrice, bar_index, bullEntryPrice, color=entryLineColor, style=line.style_solid, width=1)
+    sLine = line.new(bar_index, slP, bar_index, slP, color=slLineColor, style=line.style_dashed, width=1)
+    tLine = line.new(bar_index, tpP, bar_index, tpP, color=tpLineColor, style=line.style_dashed, width=1)
+    eLabel = label.new(bar_index, bullEntryPrice, "BUY " + str.tostring(bullEntryPrice, format.mintick), style=label.style_label_left, color=color.new(entryLineColor, 80), textcolor=entryLineColor, size=size.small)
+    sLabel = label.new(bar_index, slP, "SL " + str.tostring(slP, format.mintick), style=label.style_label_left, color=color.new(slLineColor, 80), textcolor=slLineColor, size=size.small)
+    tLabel = label.new(bar_index, tpP, "TP " + str.tostring(tpP, format.mintick) + "  RR " + str.tostring(rr, "#.##"), style=label.style_label_left, color=color.new(tpLineColor, 80), textcolor=tpLineColor, size=size.small)
+    array.push(bullTrades, Trade.new(bar_index, bullEntryPrice, slP, tpP, true, false, eLine, sLine, tLine, eLabel, sLabel, tLabel))
+
+if bearSignal and showTradeLines
+    slP = bearSweepHigh + slBufferTicks * syminfo.mintick
+    tpP = bearTPLevel
+    rr  = (bearEntryPrice - tpP) / (slP - bearEntryPrice)
+    eLine = line.new(bar_index, bearEntryPrice, bar_index, bearEntryPrice, color=entryLineColor, style=line.style_solid, width=1)
+    sLine = line.new(bar_index, slP, bar_index, slP, color=slLineColor, style=line.style_dashed, width=1)
+    tLine = line.new(bar_index, tpP, bar_index, tpP, color=tpLineColor, style=line.style_dashed, width=1)
+    eLabel = label.new(bar_index, bearEntryPrice, "SELL " + str.tostring(bearEntryPrice, format.mintick), style=label.style_label_left, color=color.new(entryLineColor, 80), textcolor=entryLineColor, size=size.small)
+    sLabel = label.new(bar_index, slP, "SL " + str.tostring(slP, format.mintick), style=label.style_label_left, color=color.new(slLineColor, 80), textcolor=slLineColor, size=size.small)
+    tLabel = label.new(bar_index, tpP, "TP " + str.tostring(tpP, format.mintick) + "  RR " + str.tostring(rr, "#.##"), style=label.style_label_left, color=color.new(tpLineColor, 80), textcolor=tpLineColor, size=size.small)
+    array.push(bearTrades, Trade.new(bar_index, bearEntryPrice, slP, tpP, false, false, eLine, sLine, tLine, eLabel, sLabel, tLabel))
+
+manageTrades(array<Trade> arr) =>
+    if array.size(arr) > 0
+        for i = array.size(arr) - 1 to 0
+            t = array.get(arr, i)
+            if not t.closed
+                line.set_x2(t.entryLine, bar_index)
+                line.set_x2(t.slLine, bar_index)
+                line.set_x2(t.tpLine, bar_index)
+                label.set_x(t.entryLabel, bar_index)
+                label.set_x(t.slLabel, bar_index)
+                label.set_x(t.tpLabel, bar_index)
+                barsSinceEntry = bar_index - t.entryBar
+                hitSL = t.isBull ? low <= t.sl : high >= t.sl
+                hitTP = t.isBull ? high >= t.tp : low <= t.tp
+                if hitSL
+                    t.closed := true
+                    line.set_color(t.slLine, color.new(color.red, 0))
+                    line.set_style(t.slLine, line.style_solid)
+                    label.set_text(t.slLabel, "SL HIT " + str.tostring(t.sl, format.mintick))
+                else if hitTP
+                    t.closed := true
+                    line.set_color(t.tpLine, color.new(color.green, 0))
+                    line.set_style(t.tpLine, line.style_solid)
+                    label.set_text(t.tpLabel, "TP HIT " + str.tostring(t.tp, format.mintick))
+                else if barsSinceEntry > lineExtendBars
+                    t.closed := true
+                    label.set_text(t.entryLabel, "Entry (expired)")
+
+manageTrades(bullTrades)
+manageTrades(bearTrades)
+
+// =============================================================================================
+//  PLOTS, TABLE & ALERTS
+// =============================================================================================
+plotshape(bullSignal, title="Bullish Entry", style=shape.triangleup, location=location.belowbar, color=bullSigColor, size=size.small)
+plotshape(bearSignal, title="Bearish Entry", style=shape.triangledown, location=location.abovebar, color=bearSigColor, size=size.small)
+
+alertcondition(bullSignal, title="Bullish Signal", message="Bullish FVG + Liquidity Sweep + CISD setup confirmed")
+alertcondition(bearSignal, title="Bearish Signal", message="Bearish FVG + Liquidity Sweep + CISD setup confirmed")
+
+if showTable and barstate.islast
+    var table statusTable = table.new(position.top_right, 2, 6, border_width=1, bgcolor=color.new(color.black, 70))
+    table.cell(statusTable, 0, 0, "PAC + London KZ", text_color=color.white, text_size=size.small)
+    table.cell(statusTable, 1, 0, "", text_size=size.small)
+    table.cell(statusTable, 0, 1, "Asian High (BSL)", text_color=color.gray, text_size=size.small)
+    table.cell(statusTable, 1, 1, na(asianHigh) ? "-" : str.tostring(asianHigh, format.mintick), text_color=buysideColor, text_size=size.small)
+    table.cell(statusTable, 0, 2, "Asian Low (SSL)", text_color=color.gray, text_size=size.small)
+    table.cell(statusTable, 1, 2, na(asianLow) ? "-" : str.tostring(asianLow, format.mintick), text_color=sellsideColor, text_size=size.small)
+    table.cell(statusTable, 0, 3, "Macro Window", text_color=color.gray, text_size=size.small)
+    table.cell(statusTable, 1, 3, inAnyMacro ? "ACTIVE" : "waiting", text_color=inAnyMacro ? color.lime : color.gray, text_size=size.small)
+    table.cell(statusTable, 0, 4, "Bull State", text_color=color.gray, text_size=size.small)
+    table.cell(statusTable, 1, 4, bullState, text_color=bullSigColor, text_size=size.small)
+    table.cell(statusTable, 0, 5, "Bear State", text_color=color.gray, text_size=size.small)
+    table.cell(statusTable, 1, 5, bearState, text_color=bearSigColor, text_size=size.small)
+

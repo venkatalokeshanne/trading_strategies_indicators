@@ -1,0 +1,536 @@
+//@version=6
+indicator("NQ Adaptive Regime Engine v6.4", shorttitle="NQ Regime v6.4", overlay=true, max_labels_count=500)
+
+//=====================================================================
+// FUNCTIONS
+//=====================================================================
+
+clamp(value, minimum, maximum) =>
+    math.max(minimum, math.min(maximum, value))
+
+getStockScore(symbol, lookback) =>
+    extTicker = ticker.new("NASDAQ", symbol, session.extended)
+    [stockClose, stockEMA9, stockEMA21, stockVWAP, stockMomentum] = request.security(extTicker, timeframe.period, [close, ta.ema(close, 9), ta.ema(close, 21), ta.vwap(hlc3), close - close[lookback]], gaps=barmerge.gaps_off)
+    scoreVWAP = stockClose > stockVWAP ? 25.0 : -25.0
+    scoreEMA = stockEMA9 > stockEMA21 ? 25.0 : -25.0
+    scoreSlope = stockEMA9 > stockEMA9[1] ? 25.0 : -25.0
+    scoreMomentum = stockMomentum > 0 ? 25.0 : -25.0
+    scoreVWAP + scoreEMA + scoreSlope + scoreMomentum
+
+getClose(symbol) =>
+    request.security(symbol, timeframe.period, close, gaps=barmerge.gaps_off)
+
+getDailyOpen(symbol) =>
+    request.security(symbol, "D", open, gaps=barmerge.gaps_off)
+
+pctFromOpen(price, dayOpen) =>
+    dayOpen != 0 ? (price / dayOpen) - 1.0 : 0.0
+
+scoreWord(score) =>
+    score >= 70 ? "STRONG BULL" : score >= 20 ? "BULLISH" : score <= -70 ? "STRONG BEAR" : score <= -20 ? "BEARISH" : "NEUTRAL"
+
+scoreColor(score) =>
+    score > 15 ? color.lime : score < -15 ? color.red : color.yellow
+
+//=====================================================================
+// DISPLAY
+//=====================================================================
+
+groupDisplay = "DISPLAY"
+
+showBigTechFlow = input.bool(true, "Show Big Tech Flow", group=groupDisplay)
+showVWAP = input.bool(true, "Show VWAP", group=groupDisplay)
+showEMAs = input.bool(true, "Show 9 / 21 EMA", group=groupDisplay)
+showSignals = input.bool(true, "Show BUY / SELL Labels", group=groupDisplay)
+showDashboard = input.bool(true, "Show Dashboard", group=groupDisplay)
+showPullbackDots = input.bool(false, "Show Pullback Tests", group=groupDisplay)
+
+dashLocation = input.string("Top Right", "Dashboard Position", options=["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"], group=groupDisplay)
+
+dashPosition = dashLocation == "Top Left" ? position.top_left : dashLocation == "Top Center" ? position.top_center : dashLocation == "Top Right" ? position.top_right : dashLocation == "Middle Left" ? position.middle_left : dashLocation == "Middle Center" ? position.middle_center : dashLocation == "Middle Right" ? position.middle_right : dashLocation == "Bottom Left" ? position.bottom_left : dashLocation == "Bottom Center" ? position.bottom_center : position.bottom_right
+
+//=====================================================================
+// BIG TECH ENGINE SETTINGS
+//=====================================================================
+
+groupBigTech = "BIG TECH ENGINE"
+
+momentumLookback = input.int(3, "Momentum Lookback", minval=1, maxval=20, group=groupBigTech)
+bigTechSmooth = input.int(2, "Big Tech Smoothing", minval=1, maxval=10, group=groupBigTech)
+bigTechThreshold = input.float(15.0, "Big Tech Bias Threshold", minval=0, maxval=100, step=1, group=groupBigTech)
+flowScale = input.float(0.15, "Big Tech Flow Scale", minval=0.01, maxval=1.00, step=0.01, group=groupBigTech)
+
+//=====================================================================
+// REGIME SETTINGS
+//=====================================================================
+
+groupRegime = "REGIME DETECTION"
+
+atrLength = input.int(14, "ATR Length", minval=1, group=groupRegime)
+atrBaseLength = input.int(50, "ATR Baseline", minval=10, group=groupRegime)
+trendSlopeLength = input.int(5, "VWAP Slope Length", minval=1, group=groupRegime)
+emaSpreadThreshold = input.float(0.12, "EMA Spread ATR Threshold", minval=0.01, step=0.01, group=groupRegime)
+highVolRatio = input.float(1.35, "High Volatility ATR Ratio", minval=1.0, step=0.05, group=groupRegime)
+rotationSpreadThreshold = input.float(0.25, "Rotation Spread %", minval=0.05, step=0.05, group=groupRegime)
+
+//=====================================================================
+// PRESSURE / ENTRY SETTINGS
+//=====================================================================
+
+groupEngine = "PRESSURE / ENTRY ENGINE"
+
+bullThreshold = input.float(15.0, "Bull Pressure Threshold", minval=0, maxval=100, step=1, group=groupEngine)
+bearThreshold = input.float(-15.0, "Bear Pressure Threshold", minval=-100, maxval=0, step=1, group=groupEngine)
+breadthSensitivity = input.float(0.60, "Breadth Full Pressure Spread %", minval=0.10, step=0.05, group=groupEngine)
+pressureSmoothLength = input.int(3, "Pressure Smoothing", minval=1, group=groupEngine)
+pullbackATR = input.float(0.40, "Pullback Tolerance ATR", minval=0.10, maxval=1.00, step=0.05, group=groupEngine)
+
+bigTechPressureWeight = input.float(80.0, "Big Tech Pressure Weight %", minval=0, maxval=100, step=1, group=groupEngine)
+breadthPressureWeight = input.float(20.0, "Breadth Pressure Weight %", minval=0, maxval=100, step=1, group=groupEngine)
+
+//=====================================================================
+// PSYCHOLOGY SETTINGS
+//=====================================================================
+
+groupPsych = "MARKET PSYCHOLOGY"
+
+psychStretchATR = input.float(1.20, "Chasing Stretch From VWAP (ATR)", minval=0.50, maxval=3.00, step=0.10, group=groupPsych)
+psychPanicATR = input.float(1.25, "Panic Candle Size (ATR)", minval=0.50, maxval=3.00, step=0.10, group=groupPsych)
+trapLookback = input.int(10, "Trap Lookback", minval=2, maxval=50, group=groupPsych)
+trapBufferATR = input.float(0.10, "Trap Buffer ATR", minval=0.00, maxval=0.50, step=0.05, group=groupPsych)
+
+//=====================================================================
+// MAG-9 WEIGHTS
+//=====================================================================
+
+groupWeights = "MAG-9 WEIGHTS"
+
+wNVDA = input.float(8.7, "NVDA", step=0.1, group=groupWeights)
+wAAPL = input.float(7.6, "AAPL", step=0.1, group=groupWeights)
+wMSFT = input.float(5.6, "MSFT", step=0.1, group=groupWeights)
+wAMZN = input.float(4.6, "AMZN", step=0.1, group=groupWeights)
+wTSLA = input.float(3.8, "TSLA", step=0.1, group=groupWeights)
+wMETA = input.float(3.5, "META", step=0.1, group=groupWeights)
+wGOOGL = input.float(3.4, "GOOGL", step=0.1, group=groupWeights)
+wGOOG = input.float(3.2, "GOOG", step=0.1, group=groupWeights)
+wAVGO = input.float(3.0, "AVGO", step=0.1, group=groupWeights)
+
+//=====================================================================
+// BIG TECH SCORES
+//=====================================================================
+
+nvdaScore = getStockScore("NVDA", momentumLookback)
+aaplScore = getStockScore("AAPL", momentumLookback)
+msftScore = getStockScore("MSFT", momentumLookback)
+amznScore = getStockScore("AMZN", momentumLookback)
+tslaScore = getStockScore("TSLA", momentumLookback)
+metaScore = getStockScore("META", momentumLookback)
+googlScore = getStockScore("GOOGL", momentumLookback)
+googScore = getStockScore("GOOG", momentumLookback)
+avgoScore = getStockScore("AVGO", momentumLookback)
+
+totalMagWeight = wNVDA + wAAPL + wMSFT + wAMZN + wTSLA + wMETA + wGOOGL + wGOOG + wAVGO
+
+weightedBigTech = nvdaScore * wNVDA + aaplScore * wAAPL + msftScore * wMSFT + amznScore * wAMZN + tslaScore * wTSLA + metaScore * wMETA + googlScore * wGOOGL + googScore * wGOOG + avgoScore * wAVGO
+
+bigTechRaw = totalMagWeight != 0 ? weightedBigTech / totalMagWeight : 0.0
+
+bigTechScore = ta.ema(bigTechRaw, bigTechSmooth)
+
+bigTechBull = bigTechScore >= bigTechThreshold
+bigTechBear = bigTechScore <= -bigTechThreshold
+
+//=====================================================================
+// VIX DIRECTION
+//=====================================================================
+
+vix = getClose("CBOE:VIX")
+vixOpen = getDailyOpen("CBOE:VIX")
+vixEMA = request.security("CBOE:VIX", timeframe.period, ta.ema(close, 9), gaps=barmerge.gaps_off)
+vixVWAP = request.security("CBOE:VIX", timeframe.period, ta.vwap(hlc3), gaps=barmerge.gaps_off)
+
+vixVsEMA = vix < vixEMA ? 1.0 : -1.0
+vixVsOpen = vix < vixOpen ? 1.0 : -1.0
+vixSlope = vix < vix[1] ? 1.0 : -1.0
+vixVsVWAP = vix < vixVWAP ? 1.0 : -1.0
+
+vixScoreRaw = (vixVsEMA + vixVsOpen + vixSlope + vixVsVWAP) / 4.0
+
+vixScore = vixScoreRaw * 100.0
+
+//=====================================================================
+// BREADTH
+//=====================================================================
+
+qqew = getClose("NASDAQ:QQEW")
+qqq = getClose("NASDAQ:QQQ")
+
+qqewOpen = getDailyOpen("NASDAQ:QQEW")
+qqqOpen = getDailyOpen("NASDAQ:QQQ")
+
+qqewPct = pctFromOpen(qqew, qqewOpen)
+qqqPct = pctFromOpen(qqq, qqqOpen)
+
+breadthSpread = qqewPct - qqqPct
+breadthScale = breadthSensitivity / 100.0
+breadthRaw = breadthScale != 0 ? breadthSpread / breadthScale : 0.0
+breadthScoreNormalized = clamp(breadthRaw, -1.0, 1.0)
+breadthScore = breadthScoreNormalized * 100.0
+
+//=====================================================================
+// NQ PRICE STRUCTURE
+//=====================================================================
+
+ema9 = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+vwap = ta.vwap(hlc3)
+
+atr = ta.atr(atrLength)
+atrBase = ta.sma(atr, atrBaseLength)
+
+atrRatio = atrBase != 0 ? atr / atrBase : 1.0
+
+emaSpread = math.abs(ema9 - ema21)
+
+emaSpreadATR = atr != 0 ? emaSpread / atr : 0.0
+
+vwapSlope = vwap - vwap[trendSlopeLength]
+
+trendBull = close > vwap and ema9 > ema21 and ema9 > ema9[1]
+
+trendBear = close < vwap and ema9 < ema21 and ema9 < ema9[1]
+
+trendStrength = emaSpreadATR >= emaSpreadThreshold
+
+//=====================================================================
+// REGIME DETECTION
+//=====================================================================
+
+highVolatility = atrRatio >= highVolRatio
+
+rotationStrong = math.abs(breadthSpread * 100.0) >= rotationSpreadThreshold
+
+trendRegime = trendStrength and not highVolatility and not rotationStrong
+
+fastRegime = highVolatility
+
+rotationRegime = not fastRegime and rotationStrong
+
+rangeRegime = not fastRegime and not rotationRegime and not trendRegime
+
+string regimeText = "RANGE DAY"
+
+if fastRegime
+    regimeText := "FAST MARKET"
+else if rotationRegime
+    regimeText := "ROTATION DAY"
+else if trendRegime
+    regimeText := "TREND DAY"
+else
+    regimeText := "RANGE DAY"
+
+//=====================================================================
+// CORE MARKET PRESSURE
+//=====================================================================
+
+coreWeightTotal = bigTechPressureWeight + breadthPressureWeight
+
+marketPressureRaw = coreWeightTotal != 0 ? ((bigTechScore * bigTechPressureWeight) + (breadthScore * breadthPressureWeight)) / coreWeightTotal : 0.0
+
+marketPressure = ta.ema(marketPressureRaw, pressureSmoothLength)
+
+//=====================================================================
+// BIG TECH FLOW LINE
+//=====================================================================
+
+newDay = ta.change(time("D")) != 0
+
+flowStep = atr * (bigTechScore / 100.0) * flowScale
+
+var float bigTechFlow = na
+
+if newDay or na(bigTechFlow[1])
+    bigTechFlow := close
+else
+    bigTechFlow := bigTechFlow[1] + flowStep
+
+//=====================================================================
+// CORE DIRECTION
+//=====================================================================
+
+bullPressure = marketPressure >= bullThreshold
+bearPressure = marketPressure <= bearThreshold
+
+coreBull = bullPressure and bigTechBull
+coreBear = bearPressure and bigTechBear
+
+longBias = coreBull and trendBull
+shortBias = coreBear and trendBear
+
+//=====================================================================
+// VIX CONFIRMATION
+//=====================================================================
+
+vixConfirmBull = coreBull and vixScore > 15
+vixOpposeBull = coreBull and vixScore < -15
+
+vixConfirmBear = coreBear and vixScore < -15
+vixOpposeBear = coreBear and vixScore > 15
+
+vixConfirming = vixConfirmBull or vixConfirmBear
+vixOpposing = vixOpposeBull or vixOpposeBear
+
+//=====================================================================
+// MARKET PSYCHOLOGY
+//=====================================================================
+
+distanceFromVWAP = atr != 0 ? math.abs(close - vwap) / atr : 0.0
+
+candleRange = high - low
+
+candleRangeATR = atr != 0 ? candleRange / atr : 0.0
+
+priorHigh = ta.highest(high[1], trapLookback)
+
+priorLow = ta.lowest(low[1], trapLookback)
+
+trapBuffer = atr * trapBufferATR
+
+trappedLongs = high > priorHigh + trapBuffer and close < priorHigh
+
+trappedShorts = low < priorLow - trapBuffer and close > priorLow
+
+bullChasing = distanceFromVWAP >= psychStretchATR and close > vwap and ema9 > ema21 and close > close[1]
+
+bearChasing = distanceFromVWAP >= psychStretchATR and close < vwap and ema9 < ema21 and close < close[1]
+
+fomoChasing = bullChasing or bearChasing
+
+fearPanic = candleRangeATR >= psychPanicATR and close < open and bigTechBear and vixScore < -15
+
+string psychologyText = "BALANCED"
+
+color psychologyColor = color.yellow
+
+if trappedLongs
+    psychologyText := "TRAPPED LONGS"
+    psychologyColor := color.red
+else if trappedShorts
+    psychologyText := "TRAPPED SHORTS"
+    psychologyColor := color.lime
+else if fearPanic
+    psychologyText := "FEAR / PANIC"
+    psychologyColor := color.red
+else if fomoChasing
+    psychologyText := "FOMO / CHASING"
+    psychologyColor := color.orange
+else
+    psychologyText := "BALANCED"
+    psychologyColor := color.yellow
+
+//=====================================================================
+// PULLBACK ZONE
+//=====================================================================
+
+pullbackTolerance = atr * pullbackATR
+
+touchEMA9 = low <= ema9 + pullbackTolerance and high >= ema9 - pullbackTolerance
+
+touchVWAP = low <= vwap + pullbackTolerance and high >= vwap - pullbackTolerance
+
+touchPullbackZone = touchEMA9 or touchVWAP
+
+//=====================================================================
+// REJECTION CANDLES
+//=====================================================================
+
+bullCandle = close > open
+bearCandle = close < open
+
+bullRejectEMA = touchEMA9 and close > ema9 and bullCandle
+bullRejectVWAP = touchVWAP and close > vwap and bullCandle
+
+bearRejectEMA = touchEMA9 and close < ema9 and bearCandle
+bearRejectVWAP = touchVWAP and close < vwap and bearCandle
+
+bullRejection = bullRejectEMA or bullRejectVWAP
+
+bearRejection = bearRejectEMA or bearRejectVWAP
+
+//=====================================================================
+// READY SETUPS
+//=====================================================================
+
+longReadyBase = longBias and bullRejection
+
+shortReadyBase = shortBias and bearRejection
+
+longTrapBoost = longBias and trappedShorts
+
+shortTrapBoost = shortBias and trappedLongs
+
+longReady = longReadyBase or longTrapBoost
+
+shortReady = shortReadyBase or shortTrapBoost
+
+buySignal = longReady and not longReady[1]
+
+sellSignal = shortReady and not shortReady[1]
+
+//=====================================================================
+// MARKET PRESSURE TEXT
+//=====================================================================
+
+pressureStrongBull = marketPressure >= 60
+
+pressureBull = marketPressure >= bullThreshold and marketPressure < 60
+
+pressureStrongBear = marketPressure <= -60
+
+pressureBear = marketPressure <= bearThreshold and marketPressure > -60
+
+pressureText = pressureStrongBull ? "STRONG BULL" : pressureBull ? "BULLISH" : pressureStrongBear ? "STRONG BEAR" : pressureBear ? "BEARISH" : "MIXED"
+
+pressureColor = pressureStrongBull or pressureBull ? color.lime : pressureStrongBear or pressureBear ? color.red : color.yellow
+
+//=====================================================================
+// DASHBOARD TEXT
+//=====================================================================
+
+bigTechText = scoreWord(bigTechScore)
+
+bigTechColor = scoreColor(bigTechScore)
+
+string vixDirectionText = "NEUTRAL"
+
+color vixDirectionColor = color.yellow
+
+if vixConfirming
+    vixDirectionText := "CONFIRMING"
+    vixDirectionColor := color.lime
+else if vixOpposing
+    vixDirectionText := "OPPOSING"
+    vixDirectionColor := color.orange
+else
+    vixDirectionText := "NEUTRAL"
+    vixDirectionColor := color.yellow
+
+trendText = trendBull ? "BULLISH" : trendBear ? "BEARISH" : "MIXED"
+
+trendColor = trendBull ? color.lime : trendBear ? color.red : color.yellow
+
+regimeColor = trendRegime ? color.lime : fastRegime ? color.orange : rotationRegime ? color.aqua : color.yellow
+
+//=====================================================================
+// ACTION
+//=====================================================================
+
+doNotChaseLong = longBias and (bullChasing or fearPanic)
+
+doNotChaseShort = shortBias and (bearChasing or fearPanic)
+
+string actionText = "NO EDGE"
+
+color actionColor = color.yellow
+
+if doNotChaseLong or doNotChaseShort
+    actionText := "DO NOT CHASE"
+    actionColor := color.orange
+else if longReady
+    actionText := "LONG READY"
+    actionColor := color.lime
+else if shortReady
+    actionText := "SHORT READY"
+    actionColor := color.red
+else if longBias
+    actionText := "BUY PULLBACK"
+    actionColor := color.lime
+else if shortBias
+    actionText := "SELL RALLY"
+    actionColor := color.red
+else
+    actionText := "NO EDGE"
+    actionColor := color.yellow
+
+//=====================================================================
+// PLOTS
+//=====================================================================
+
+plot(showBigTechFlow ? bigTechFlow : na, title="Big Tech Flow", color=color.yellow, linewidth=3)
+
+plot(showVWAP ? vwap : na, title="VWAP", color=color.white, linewidth=2)
+
+plot(showEMAs ? ema9 : na, title="9 EMA", color=color.aqua, linewidth=1)
+
+plot(showEMAs ? ema21 : na, title="21 EMA", color=color.fuchsia, linewidth=1)
+
+//=====================================================================
+// OPTIONAL PULLBACK DOTS
+//=====================================================================
+
+plotshape(showPullbackDots and longBias and touchPullbackZone, title="Long Pullback Test", style=shape.circle, location=location.belowbar, color=color.new(color.lime, 20), size=size.tiny)
+
+plotshape(showPullbackDots and shortBias and touchPullbackZone, title="Short Pullback Test", style=shape.circle, location=location.abovebar, color=color.new(color.red, 20), size=size.tiny)
+
+//=====================================================================
+// BUY / SELL LABELS
+//=====================================================================
+
+plotshape(showSignals and buySignal, title="BUY", text="BUY", style=shape.labelup, location=location.belowbar, color=color.lime, textcolor=color.black, size=size.small)
+
+plotshape(showSignals and sellSignal, title="SELL", text="SELL", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, size=size.small)
+
+//=====================================================================
+// DASHBOARD
+//=====================================================================
+
+var table dash = table.new(dashPosition, 2, 7, border_width=1)
+
+if barstate.islast and showDashboard
+    table.cell(dash, 0, 0, "TODAY'S MARKET", text_color=color.white)
+    table.cell(dash, 1, 0, regimeText, text_color=regimeColor)
+
+    table.cell(dash, 0, 1, "MARKET PRESSURE", text_color=color.white)
+    table.cell(dash, 1, 1, pressureText + " (" + str.tostring(math.round(marketPressure)) + ")", text_color=pressureColor)
+
+    table.cell(dash, 0, 2, "BIG TECH", text_color=color.white)
+    table.cell(dash, 1, 2, bigTechText + " (" + str.tostring(math.round(bigTechScore)) + ")", text_color=bigTechColor)
+
+    table.cell(dash, 0, 3, "VIX", text_color=color.white)
+    table.cell(dash, 1, 3, vixDirectionText, text_color=vixDirectionColor)
+
+    table.cell(dash, 0, 4, "PRICE TREND", text_color=color.white)
+    table.cell(dash, 1, 4, trendText, text_color=trendColor)
+
+    table.cell(dash, 0, 5, "PSYCHOLOGY", text_color=color.white)
+    table.cell(dash, 1, 5, psychologyText, text_color=psychologyColor)
+
+    table.cell(dash, 0, 6, "ACTION", text_color=color.white)
+    table.cell(dash, 1, 6, actionText, text_color=actionColor)
+
+//=====================================================================
+// CLEAR DASHBOARD
+//=====================================================================
+
+if barstate.islast and not showDashboard
+    table.clear(dash, 0, 0, 1, 6)
+
+//=====================================================================
+// ALERTS
+//=====================================================================
+
+alertcondition(buySignal, title="NQ LONG READY", message="NQ Regime v6.4: LONG READY.")
+
+alertcondition(sellSignal, title="NQ SHORT READY", message="NQ Regime v6.4: SHORT READY.")
+
+alertcondition(longBias and not longBias[1], title="NQ BUY PULLBACK", message="NQ Regime v6.4: bullish bias active. Look to buy a pullback.")
+
+alertcondition(shortBias and not shortBias[1], title="NQ SELL RALLY", message="NQ Regime v6.4: bearish bias active. Look to sell a rally.")
+
+alertcondition(fomoChasing and not fomoChasing[1], title="NQ DO NOT CHASE", message="NQ Regime v6.4: market is extended. Do not chase.")
+
+alertcondition(trappedLongs and not trappedLongs[1], title="NQ TRAPPED LONGS", message="NQ Regime v6.4: trapped longs detected.")
+
+alertcondition(trappedShorts and not trappedShorts[1], title="NQ TRAPPED SHORTS", message="NQ Regime v6.4: trapped shorts detected.")
+
+alertcondition(regimeText != regimeText[1], title="NQ MARKET TYPE CHANGE", message="NQ Regime v6.4 detected a market-type change.")

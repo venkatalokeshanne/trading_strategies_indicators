@@ -1,0 +1,555 @@
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/
+// © MQLSoftware
+//@version=6
+//
+// Consolidation Ranges & Breakout Map [MQLSoftware]
+//
+// Reads the market's sideways regime as a measurable object: detects compression,
+// fixes the consolidation box on confirmed evidence, tracks its resolution
+// (breakout → reached projection / false break / expired) and reports the measured
+// base rates of those outcomes on THIS chart's own history.
+// Original contribution (three algorithmic elements):
+//   1. Range Compression Index (RCI) 0-100 — an authored composite of three
+//      measurements: RCI = 100 · (0.40 · ineff + 0.35 · vc + 0.25 · cont), where
+//      ineff = 1 − min(ER, 1) is movement inefficiency (inverse Kaufman efficiency
+//      ratio: |close − close[n]| divided by the bar-to-bar path), vc is volatility
+//      compression (short ATR vs 4× ATR window, rescaled to 0..1), and cont is
+//      containment — the share of closes inside the central 90% of the candidate
+//      box. No single-source mashup: the blend and its gates are the detector.
+//   2. Consolidation → breakout state machine — SEEKING → FORMING → LIVE →
+//      BREAK_UP / BREAK_DN → RESOLVED / FAKEOUT / EXPIRED, confirmed bars only.
+//      A box is fixed only after Min Range Bars of confirmed compression, may
+//      "breathe" at most Max Edge Updates times within Edge Tolerance, and is
+//      invalidated (excluded from statistics) beyond that — pseudo-ranges never
+//      contaminate the base rates.
+//   3. Measured base rates — the panel reports how ranges on THIS chart actually
+//      resolved: share of upside breakouts, share that reached the 1× measured-move
+//      projection, share of false breaks, median bars to 1×, median range length —
+//      each with its sample size, hidden below a minimum sample. Observed
+//      frequencies, not assumptions.
+//
+// Repaint policy: all state transitions, event flags, statistics counters and
+// alerts fire on CONFIRMED bars only. The live box's right edge, the FORMING
+// candidate frame and the panel's live rows update intrabar — visual context,
+// not signals. Box borders never move backwards once fixed.
+
+// House convention: the shorttitle carries the FULL product name. TradingView's
+// SHORT_TITLE_TOO_LONG warning is accepted as normal across the whole line — the
+// chart legend must read the complete name, so this is never "fixed" by truncation.
+indicator("Consolidation Ranges & Breakout Map [MQLSoftware]", shorttitle="MQLSoftware - Consolidation Ranges & Breakout Map", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
+// Neo Slate design tokens — MQLSoftware brand palette
+color NS_WHITE = color.rgb(225, 230, 240)
+color NS_LBL   = color.rgb(170, 178, 195)
+color NS_SEC   = color.rgb( 90,  98, 115)
+color NS_BG    = color.new(color.rgb(  8, 11, 18),  4)
+color NS_ROW   = color.new(color.rgb( 16, 20, 30),  6)
+color NS_INK   = color.rgb( 10,  14,  22)
+
+// Product identity — the unused color axis in the line.
+// Tuned for the dark theme at full chroma: on a dark chart a low-saturation
+// palette behind heavy transparency reads as grey-on-grey, so the structural
+// blue stays cool but saturated and the three event colors are pushed to the
+// vivid end — the signal must be legible at a glance, before any zooming.
+color CR_RANGE_DEF = #7FA5FF  // live range box — steel blue
+color CR_UP_DEF    = #00E68A  // breakout up — vivid green
+color CR_DN_DEF    = #FF3355  // breakout down — vivid red
+color CR_COMP_DEF  = #FFAE00  // compression / false break — amber
+
+// State machine states
+int ST_SEEK = 0
+int ST_FORM = 1
+int ST_LIVE = 2
+int ST_BUP  = 3
+int ST_BDN  = 4
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+var string GRP_D  = "◆ Range Detection"
+var string GRP_B  = "◆ Breakout"
+var string GRP_H  = "◆ Higher-Timeframe Context"
+var string GRP_S  = "◆ Statistics"
+var string GRP_V  = "◆ Visual"
+
+string sens_inp      = input.string("Normal", "Compression Sensitivity", group = GRP_D, options = ["Low", "Normal", "High"],
+     tooltip = "Compression = price stops making net progress while volatility contracts and closes cluster inside a band. This preset sets the Range Compression Index threshold a candidate must hold: Low = 70 (fewer, stricter boxes), Normal = 62, High = 55 (more boxes, looser regime read).")
+int    len_inp       = input.int(20, "Base Length", group = GRP_D, minval = 10, maxval = 100,
+     tooltip = "The evaluation window for the compression measurements: movement inefficiency, volatility compression and close containment are all read over this many bars.")
+int    min_bars_inp  = input.int(8, "Min Range Bars", group = GRP_D, minval = 4, maxval = 100,
+     tooltip = "How many consecutive CONFIRMED bars of compression are required before the candidate is fixed as a live range box. Larger = fewer, more established ranges.")
+float  max_width_inp = input.float(4.0, "Max Range Width (ATR)", group = GRP_D, minval = 0.5, maxval = 10, step = 0.1,
+     tooltip = "A candidate wider than this many ATRs is not a consolidation — it is a regime in motion. Also invalidates a live box that grows beyond the limit. The default sits just under the typical width of a Base Length window (measured at roughly 4.6-5.0 ATR across FX, crypto, metals and indices), so this acts as an outlier cap while the Range Compression Index does the selecting.")
+float  contain_inp   = input.float(0.85, "Containment Threshold", group = GRP_D, minval = 0.5, maxval = 1.0, step = 0.01,
+     tooltip = "Reserved share of closes inside the candidate box that the containment component rewards fully. The containment measurement feeds the RCI composite.")
+float  widen_tol_inp = input.float(0.15, "Edge Tolerance (ATR)", group = GRP_D, minval = 0, maxval = 1, step = 0.05,
+     tooltip = "How far a wick may stretch past a fixed border and still count as the range breathing: the border is widened to the new extreme instead of invalidating the box.")
+int    max_widen_inp = input.int(4, "Max Edge Updates", group = GRP_D, minval = 0, maxval = 10,
+     tooltip = "More edge updates than this means the regime is not a consolidation any more — the box is annulled and excluded from statistics. Lower values annul ranges faster: at 2 roughly six out of ten fixed boxes were being discarded, which starved the base-rate sample.")
+
+float brk_buf_inp     = input.float(0.10, "Breakout Buffer (ATR)", group = GRP_B, minval = 0, maxval = 2, step = 0.05,
+     tooltip = "A breakout requires a CONFIRMED CLOSE at least this many ATRs beyond the border. Wicks and gaps alone never trigger a breakout.")
+int   fake_win_inp    = input.int(5, "Fakeout Window (bars)", group = GRP_B, minval = 1, maxval = 50,
+     tooltip = "A confirmed close back inside the box within this many bars of the breakout is classified as a FALSE BREAK.")
+float t1_mult_inp     = input.float(1.0, "Projection 1 (× range height)", group = GRP_B, minval = 0.1, maxval = 10, step = 0.1,
+     tooltip = "Measured-move projection: range height multiplied by this factor, projected from the broken border. A geometric reference, not a trade target.")
+float t2_mult_inp     = input.float(1.618, "Projection 2 (× range height)", group = GRP_B, minval = 0.1, maxval = 10, step = 0.001)
+int   resolve_cap_inp = input.int(-1, "Resolution Window (bars, -1 = auto)", group = GRP_B, minval = -1, maxval = 500,
+     tooltip = "How long after the breakout the 1× projection may still be reached. Auto (-1) = 3× the range's own duration, capped at 200 bars. Past the window the episode is EXPIRED.")
+bool  vol_confirm_inp = input.bool(false, "Require Volume Expansion", group = GRP_B,
+     tooltip = "Optional quality gate: the breakout close must come with volume above the multiple of its median below. The core detector does not use volume; on symbols without volume data the gate is ignored automatically.")
+float vol_mult_inp    = input.float(1.5, "Volume Expansion × median", group = GRP_B, minval = 1.0, maxval = 5.0, step = 0.1)
+
+bool   show_htf_inp = input.bool(true, "Show HTF Range Band", group = GRP_H,
+     tooltip = "A translucent band with the higher-timeframe rolling high/low — context for whether the local range sits inside or at the edge of the senior structure. Display only.")
+string htf_inp      = input.timeframe("", "HTF", group = GRP_H,
+     tooltip = "Empty = auto: 4× the chart timeframe, capped at 1W.")
+int    htf_len_inp  = input.int(20, "HTF Range Length", group = GRP_H, minval = 5, maxval = 100)
+
+bool show_stats_inp = input.bool(true, "Show Base Rates", group = GRP_S,
+     tooltip = "Adds the measured base-rate section to the Large panel. Display only — statistics are always counted.")
+int  min_n_inp      = input.int(20, "Minimum Sample to Display", group = GRP_S, minval = 1, maxval = 200,
+     tooltip = "Below this sample size the panel prints the sample gate instead of a percentage — small-sample noise is hidden, never dressed up as a statistic.")
+
+string panel_inp        = input.string("Normal", "Panel Size", group = GRP_V, options = ["Off", "Minimal", "Normal", "Large"])
+string panel_pos_inp    = input.string("Bottom Right", "Panel Position", group = GRP_V, options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"],
+     tooltip = "Bottom Right by default: the live range box, its projection lines and their labels all sit at the right edge near the current price, where a top-right panel tends to sit on top of them.")
+string marker_inp       = input.string("Compact", "Marker Style", group = GRP_V, options = ["Descriptive", "Compact"],
+     tooltip = "Compact draws glyph markers (▲ BRK / ✓ / ✕) so neighbouring episodes do not collide. Descriptive spells the event out in full — readable on a single episode, crowded once several sit side by side.")
+bool   show_targets_inp = input.bool(true, "Show Projections", group = GRP_V,
+     tooltip = "Measured-move projection lines for the range being resolved right now.")
+bool   keep_proj_inp    = input.bool(false, "Keep Past Projections", group = GRP_V,
+     tooltip = "Off by default: once an episode is resolved its two projection lines and their × labels are removed, leaving the box and the outcome marker. Turning this on keeps every past projection drawn — the densest of the visual options.")
+bool   show_forming_inp = input.bool(true, "Show Forming Candidates", group = GRP_V,
+     tooltip = "The amber dashed frame for compression that is still building. It appears only once a candidate is at least halfway to Min Range Bars, so short-lived candidates that never become ranges do not flicker on the chart.")
+bool   show_mid_inp     = input.bool(true, "Show Range Midline", group = GRP_V,
+     tooltip = "Midline of the LIVE range only. It is removed together with the episode — past boxes keep their borders, not their midlines.")
+int    show_history_inp = input.int(6, "Keep Past Ranges", group = GRP_V, minval = 0, maxval = 50,
+     tooltip = "How many completed range boxes stay drawn, faded and without their header text. Statistics always use the full loaded history regardless of this number — raise it to audit the past, lower it for a clean chart.")
+color  col_range_inp    = input.color(CR_RANGE_DEF, "Range",      group = GRP_V, inline = "c1")
+color  col_up_inp       = input.color(CR_UP_DEF,    "Up",         group = GRP_V, inline = "c1")
+color  col_dn_inp       = input.color(CR_DN_DEF,    "Down",       group = GRP_V, inline = "c1")
+color  col_comp_inp     = input.color(CR_COMP_DEF,  "Compression", group = GRP_V, inline = "c1",
+     tooltip = "Identity colors: steel-blue range box, green breakout up, red breakout down, amber compression and false break. Defaults are saturated for the dark theme — lower the saturation here if you run a light chart background.")
+
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+// Below minN the sample is too small to quote a percentage — say so instead of
+// printing statistical noise.
+f_pct(int c, int n) =>
+    n >= min_n_inp ? str.tostring(100.0 * c / n, "#") + " %  (n=" + str.tostring(n) + ")" : "n<" + str.tostring(min_n_inp)
+
+f_med(array<float> a) =>
+    a.size() >= min_n_inp ? str.tostring(a.median(), "#") : "n<" + str.tostring(min_n_inp)
+
+// 5-block meter for a 0-100 value — instant visual read in the panel
+f_blocks(float p) =>
+    na(p) ? "" : p >= 90 ? "  ▰▰▰▰▰" : p >= 70 ? "  ▰▰▰▰▱" : p >= 50 ? "  ▰▰▰▱▱" : p >= 30 ? "  ▰▰▱▱▱" : p >= 10 ? "  ▰▱▱▱▱" : "  ▱▱▱▱▱"
+
+f_trimBoxes(array<box> a, int maxN) =>
+    while a.size() > maxN
+        box.delete(a.shift())
+
+f_trimLines(array<line> a, int maxN) =>
+    while a.size() > maxN
+        line.delete(a.shift())
+
+f_trimLabels(array<label> a, int maxN) =>
+    while a.size() > maxN
+        label.delete(a.shift())
+
+// Human timeframe string for the HTF band tag
+f_tfStr(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s >= 604800 ? str.tostring(s / 604800) + "W" : s >= 86400 ? str.tostring(s / 86400) + "D" : s >= 3600 ? str.tostring(s / 3600) + "h" : str.tostring(s / 60) + "m"
+
+// ─── COMPRESSION ENGINE — Range Compression Index ────────────────────────────
+float atr    = ta.atr(14)
+bool  atrOk  = not na(atr) and atr > 0
+bool  warmup = bar_index > len_inp * 4
+
+// 1. Movement inefficiency — inverse Kaufman efficiency ratio, 0..1, higher = more sideways
+float dirMove  = math.abs(close - close[len_inp])
+float volPath  = math.sum(math.abs(close - close[1]), len_inp)
+float er       = nz(volPath) > 0 ? dirMove / volPath : 0.0
+float ineff    = 1.0 - math.min(nz(er), 1.0)
+
+// 2. Volatility compression — short ATR vs the 4× window, rescaled to 0..1
+float atrS   = ta.atr(len_inp)
+float atrL   = ta.atr(len_inp * 4)
+float vcRaw  = nz(atrL) > 0 ? atrS / atrL : 1.0
+float vc     = math.max(0.0, math.min(1.0, (1.15 - nz(vcRaw, 1.0)) / 0.75))
+
+// 3. Containment — share of closes inside the central 90% of the candidate box,
+//    rewarded fully at the Containment Threshold
+float candTop = ta.highest(high, len_inp)
+float candBot = ta.lowest(low, len_inp)
+float candW   = candTop - candBot
+float pad     = candW * 0.05
+float inside  = close <= candTop - pad and close >= candBot + pad ? 1.0 : 0.0
+float contRaw = math.sum(inside, len_inp) / len_inp
+float cont    = math.min(1.0, nz(contRaw) / math.max(contain_inp, 0.01))
+
+// AUTHORED composite: the Range Compression Index 0-100
+float rci = 100.0 * (0.40 * nz(ineff) + 0.35 * nz(vc) + 0.25 * nz(cont))
+
+// Geometry gate + threshold preset
+float rciThr     = sens_inp == "Low" ? 70.0 : sens_inp == "High" ? 55.0 : 62.0
+bool  widthOk    = atrOk and candW <= max_width_inp * atr and candW > 0
+bool  compressed = nz(rci) >= rciThr and widthOk
+
+// Volume gate context (breakout quality tag only — the core never uses volume)
+float volMed = ta.median(nz(volume), 20)
+bool  volOk  = not vol_confirm_inp or na(volume) or nz(volMed) == 0 or volume >= vol_mult_inp * volMed
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+var int   state        = ST_SEEK
+var int   formCount    = 0
+var int   formStartBar = na
+var float boxTop       = na
+var float boxBot       = na
+var float boxH         = na
+var float boxHAtr      = na
+var int   boxStart     = na
+var int   widenN       = 0
+var int   brkBar       = na
+var float brkPrice     = na
+var float t1           = na
+var float t2           = na
+var int   resolveWin   = na
+var int   fakeBar      = na
+
+// Statistics accumulators — confirmed transitions only
+var int nUp   = 0
+var int nDn   = 0
+var int nFake = 0
+var int nFt   = 0
+var array<float> barsToT1 = array.new<float>()
+var array<float> rangeLen = array.new<float>()
+
+// Drawing object refs for the live episode
+var box   liveBox  = box(na)
+var line  liveMid  = line(na)
+var box   formBox  = box(na)
+var line  t1Line   = line(na)
+var line  t2Line   = line(na)
+var label t1Lbl    = label(na)
+var label t2Lbl    = label(na)
+var label brkLbl   = label(na)
+
+// History budget — completed episodes
+var array<box>   hBoxes = array.new<box>()
+var array<line>  hLines = array.new<line>()
+var array<label> hLbls  = array.new<label>()
+
+// Event flags — computed at global scope, never gated by display inputs
+bool fire_range_confirmed = false
+bool fire_break_up        = false
+bool fire_break_dn        = false
+bool fire_fake            = false
+bool fire_t1              = false
+
+bool compact = marker_inp == "Compact"
+
+// Label budget per retained episode: the breakout marker and its outcome marker,
+// plus the two projection labels when past projections are kept.
+int hLblBudget = math.max(show_history_inp * (keep_proj_inp ? 4 : 2), 4)
+
+// Retire the live episode's drawings into faded history (or delete when budget = 0).
+// Past episodes recede: no header text, dimmer borders, no midline, and — unless
+// asked for — no projections, so neighbouring episodes stop competing for the eye.
+// Receding means less opacity, NOT less colour: the retired marker keeps the hue of
+// the outcome it recorded (evCol), so a scroll through history still reads
+// green / red / amber instead of collapsing into one grey wash.
+f_retire(color evCol) =>
+    if not na(liveBox)
+        liveBox.set_text("")
+        liveBox.set_border_color(color.new(col_range_inp, 45))
+        liveBox.set_bgcolor(color.new(col_range_inp, 93))
+        hBoxes.push(liveBox)
+    // The midline reads the live range; it retires with the episode
+    line.delete(liveMid)
+    if not na(brkLbl)
+        brkLbl.set_color(color.new(evCol, 35))
+        brkLbl.set_textcolor(NS_INK)
+        brkLbl.set_size(size.tiny)
+        hLbls.push(brkLbl)
+    if keep_proj_inp
+        if not na(t1Line)
+            t1Line.set_color(color.new(evCol, 55))
+            hLines.push(t1Line)
+        if not na(t2Line)
+            t2Line.set_color(color.new(evCol, 70))
+            hLines.push(t2Line)
+        if not na(t1Lbl)
+            t1Lbl.set_color(color.new(evCol, 55))
+            t1Lbl.set_textcolor(color.new(NS_INK, 20))
+            hLbls.push(t1Lbl)
+        if not na(t2Lbl)
+            t2Lbl.set_color(color.new(evCol, 70))
+            t2Lbl.set_textcolor(color.new(NS_INK, 30))
+            hLbls.push(t2Lbl)
+    else
+        line.delete(t1Line)
+        line.delete(t2Line)
+        label.delete(t1Lbl)
+        label.delete(t2Lbl)
+    f_trimBoxes(hBoxes, show_history_inp)
+    f_trimLines(hLines, show_history_inp * 2)
+    f_trimLabels(hLbls, hLblBudget)
+
+// Invalidated boxes are deleted immediately and never enter the statistics
+f_invalidate() =>
+    box.delete(liveBox)
+    line.delete(liveMid)
+
+// ─── STATE MACHINE — confirmed bars only ─────────────────────────────────────
+if barstate.isconfirmed and warmup and atrOk
+    if state == ST_SEEK
+        if compressed
+            state        := ST_FORM
+            formCount    := 1
+            formStartBar := bar_index
+
+    else if state == ST_FORM
+        if compressed
+            formCount += 1
+            if formCount >= min_bars_inp
+                // Fix the box: borders freeze here and never move backwards
+                state   := ST_LIVE
+                boxTop  := candTop
+                boxBot  := candBot
+                boxH    := boxTop - boxBot
+                boxHAtr := boxH / atr
+                boxStart := formStartBar
+                widenN  := 0
+                box.delete(formBox)
+                liveBox := box.new(boxStart, boxTop, bar_index, boxBot, border_color = color.new(col_range_inp, 0), border_width = 2, bgcolor = color.new(col_range_inp, 88), text_color = color.new(col_range_inp, 0), text_size = size.small, text_halign = text.align_left, text_valign = text.align_top)
+                liveMid := show_mid_inp ? line.new(boxStart, (boxTop + boxBot) / 2, bar_index, (boxTop + boxBot) / 2, color = color.new(col_range_inp, 15), style = line.style_dotted) : line(na)
+                fire_range_confirmed := true
+        else
+            state := ST_SEEK
+            box.delete(formBox)
+
+    else if state == ST_LIVE
+        float upLvl = boxTop + brk_buf_inp * atr
+        float dnLvl = boxBot - brk_buf_inp * atr
+        if close > upLvl and volOk
+            // Breakout up — freeze the box, project the measured move
+            state    := ST_BUP
+            brkBar   := bar_index
+            brkPrice := boxTop
+            t1       := boxTop + t1_mult_inp * boxH
+            t2       := boxTop + t2_mult_inp * boxH
+            resolveWin := resolve_cap_inp == -1 ? math.min(3 * (bar_index - boxStart), 200) : resolve_cap_inp
+            nUp += 1
+            rangeLen.push(bar_index - boxStart)
+            liveBox.set_right(bar_index)
+            fire_break_up := true
+        else if close < dnLvl and volOk
+            state    := ST_BDN
+            brkBar   := bar_index
+            brkPrice := boxBot
+            t1       := boxBot - t1_mult_inp * boxH
+            t2       := boxBot - t2_mult_inp * boxH
+            resolveWin := resolve_cap_inp == -1 ? math.min(3 * (bar_index - boxStart), 200) : resolve_cap_inp
+            nDn += 1
+            rangeLen.push(bar_index - boxStart)
+            liveBox.set_right(bar_index)
+            fire_break_dn := true
+        else
+            // Range breathes: a wick within Edge Tolerance widens the border once,
+            // on a confirmed bar. Beyond tolerance the wick is ignored (close decides).
+            if high > boxTop and high - boxTop <= widen_tol_inp * atr
+                boxTop := high
+                boxH   := boxTop - boxBot
+                widenN += 1
+                liveBox.set_top(boxTop)
+            if low < boxBot and boxBot - low <= widen_tol_inp * atr
+                boxBot := low
+                boxH   := boxTop - boxBot
+                widenN += 1
+                liveBox.set_bottom(boxBot)
+            if not na(liveMid)
+                liveMid.set_y1((boxTop + boxBot) / 2)
+                liveMid.set_y2((boxTop + boxBot) / 2)
+            // Invalidation: breathing beyond budget, or the box outgrew consolidation width
+            if widenN > max_widen_inp or boxH > max_width_inp * atr
+                f_invalidate()
+                state := ST_SEEK
+
+    else if state == ST_BUP or state == ST_BDN
+        bool up = state == ST_BUP
+        bool backInside = close <= boxTop and close >= boxBot
+        // Priority within one bar: FAKEOUT is checked before RESOLVED (conservative)
+        if backInside and bar_index - brkBar <= fake_win_inp
+            nFake += 1
+            fakeBar := bar_index
+            fire_fake := true
+            // Outcome markers are filled chips with ink text — a coloured glyph on a
+            // transparent background disappears into the candles at chart zoom.
+            hLbls.push(label.new(bar_index, up ? boxTop : boxBot, compact ? "✕" : "✕ false break", style = up ? label.style_label_down : label.style_label_up, color = color.new(col_comp_inp, 0), textcolor = NS_INK, size = size.small))
+            f_retire(col_comp_inp)
+            state := ST_SEEK
+        else if (up ? high >= t1 : low <= t1)
+            nFt += 1
+            barsToT1.push(bar_index - brkBar)
+            fire_t1 := true
+            hLbls.push(label.new(bar_index, t1, compact ? "✓" : "✓ 1×", style = up ? label.style_label_down : label.style_label_up, color = color.new(up ? col_up_inp : col_dn_inp, 0), textcolor = NS_INK, size = size.small))
+            f_retire(up ? col_up_inp : col_dn_inp)
+            state := ST_SEEK
+        else if bar_index - brkBar > resolveWin
+            // Expired: the projection window ran out — no extra counters
+            f_retire(up ? col_up_inp : col_dn_inp)
+            state := ST_SEEK
+
+// ─── RENDERING — intrabar updates are visual context, not signals ────────────
+// FORMING candidate frame (amber, dashed): compression building up. Drawn only
+// once the candidate is at least halfway to Min Range Bars — sub-threshold
+// candidates that die after a bar or two never reach the chart. Display only:
+// the state machine still counts every candidate from its first confirmed bar.
+bool formShow = show_forming_inp and state == ST_FORM and formCount * 2 >= min_bars_inp
+if formShow
+    if na(formBox)
+        formBox := box.new(formStartBar, candTop, bar_index, candBot, border_color = color.new(col_comp_inp, 10), border_width = 1, border_style = line.style_dashed, bgcolor = color.new(col_comp_inp, 92))
+    else
+        formBox.set_right(bar_index)
+        formBox.set_top(candTop)
+        formBox.set_bottom(candBot)
+else if not na(formBox)
+    box.delete(formBox)
+    formBox := box(na)
+
+// Live box: right edge follows the current bar; header text tracks duration/height
+if state == ST_LIVE and not na(liveBox)
+    liveBox.set_right(bar_index)
+    liveBox.set_text(compact ? "RNG " + str.tostring(bar_index - boxStart) : "RANGE · " + str.tostring(bar_index - boxStart) + " bars · " + str.tostring(boxHAtr, "#.#") + " ATR")
+    if not na(liveMid)
+        liveMid.set_x2(bar_index)
+
+// Breakout marker + projection lines are created once, on the confirmed breakout bar
+if fire_break_up or fire_break_dn
+    bool up = fire_break_up
+    string mtxt = compact ? (up ? "▲ BRK" : "▼ BRK") : (up ? "▲ BREAKOUT ↑ · " : "▼ BREAKOUT ↓ · ") + str.tostring(t1_mult_inp, "#.#") + "× projection"
+    // Held as a live ref so it can be dimmed when the episode retires
+    brkLbl := label.new(bar_index, up ? boxTop : boxBot, mtxt, style = up ? label.style_label_up : label.style_label_down, color = color.new(up ? col_up_inp : col_dn_inp, 0), textcolor = NS_INK, size = size.small)
+    f_trimLabels(hLbls, hLblBudget)
+    if show_targets_inp
+        color pc = up ? col_up_inp : col_dn_inp
+        // 1× is the projection that carries the base rate, so it is the solid, heavier
+        // line; 1.618× stays a step behind it in weight and opacity. Both × tags are
+        // filled chips, not bare tinted text.
+        t1Line := line.new(brkBar, t1, bar_index + 1, t1, color = color.new(pc, 0), style = line.style_dashed, width = 2)
+        t2Line := line.new(brkBar, t2, bar_index + 1, t2, color = color.new(pc, 30), style = line.style_dashed, width = 1)
+        t1Lbl  := label.new(bar_index + 1, t1, str.tostring(t1_mult_inp, "#.#") + "×", style = label.style_label_left, color = color.new(pc, 0), textcolor = NS_INK, size = size.tiny)
+        t2Lbl  := label.new(bar_index + 1, t2, str.tostring(t2_mult_inp, "#.###") + "×", style = label.style_label_left, color = color.new(pc, 30), textcolor = NS_INK, size = size.tiny)
+
+// Projection lines follow the right edge while the breakout episode is open
+if (state == ST_BUP or state == ST_BDN) and show_targets_inp
+    if not na(t1Line)
+        t1Line.set_x2(bar_index + 1)
+        t1Lbl.set_x(bar_index + 1)
+    if not na(t2Line)
+        t2Line.set_x2(bar_index + 1)
+        t2Lbl.set_x(bar_index + 1)
+if state == ST_SEEK and nz(state[1], ST_SEEK) != ST_SEEK
+    // episode closed on the previous confirmed transition — drop live refs
+    liveBox := box(na)
+    liveMid := line(na)
+    t1Line  := line(na)
+    t2Line  := line(na)
+    t1Lbl   := label(na)
+    t2Lbl   := label(na)
+    brkLbl  := label(na)
+
+// ─── HTF CONTEXT BAND — display only ─────────────────────────────────────────
+int    tfSec = timeframe.in_seconds(timeframe.period)
+string htfTf = htf_inp == "" ? timeframe.from_seconds(math.max(tfSec, math.min(tfSec * 4, 604800))) : htf_inp
+// Confirmed HTF values only ([1] inside the security expression) — no lookahead anywhere
+[htfH, htfL] = request.security(syminfo.tickerid, htfTf, [ta.highest(high, htf_len_inp)[1], ta.lowest(low, htf_len_inp)[1]], lookahead = barmerge.lookahead_off)
+
+var box   htfBox = box(na)
+var label htfTag = label(na)
+if show_htf_inp and not na(htfH) and not na(htfL)
+    if na(htfBox)
+        htfBox := box.new(bar_index - 1, htfH, bar_index + 3, htfL, border_color = na, bgcolor = color.new(NS_SEC, 92))
+        htfTag := label.new(bar_index + 3, htfH, f_tfStr(htfTf) + " range", style = label.style_label_left, color = color.new(NS_SEC, 100), textcolor = color.new(NS_LBL, 45), size = size.tiny)
+    else
+        htfBox.set_lefttop(math.max(0, bar_index - 60), htfH)
+        htfBox.set_rightbottom(bar_index + 3, htfL)
+        htfTag.set_xy(bar_index + 3, htfH)
+else if not na(htfBox)
+    box.delete(htfBox)
+    label.delete(htfTag)
+    htfBox := box(na)
+    htfTag := label(na)
+
+// ─── PANEL ────────────────────────────────────────────────────────────────────
+bool hasBox = state == ST_LIVE or state == ST_BUP or state == ST_BDN
+
+f_stateStr() =>
+    state == ST_FORM ? "COMPRESSING " + str.tostring(formCount) + "/" + str.tostring(min_bars_inp) :
+     state == ST_LIVE ? "RANGE LIVE" :
+     state == ST_BUP ? "BROKE UP" :
+     state == ST_BDN ? "BROKE DOWN" :
+     not na(fakeBar) and bar_index - fakeBar <= 5 ? "FALSE BREAK" : "SEEKING"
+
+var table pnl = table(na)
+if barstate.islast and panel_inp != "Off"
+    if not na(pnl)
+        table.delete(pnl)
+    string pPos = panel_pos_inp == "Top Right" ? position.top_right : panel_pos_inp == "Top Left" ? position.top_left : panel_pos_inp == "Bottom Right" ? position.bottom_right : position.bottom_left
+    bool minimal = panel_inp == "Minimal"
+    bool large   = panel_inp == "Large"
+    pnl := table.new(pPos, 2, 12, bgcolor = NS_BG, border_width = 1, border_color = color.new(NS_SEC, 80))
+    pnl.cell(0, 0, "RANGE MAP", text_color = NS_INK, text_size = size.small, text_halign = text.align_left, bgcolor = color.new(col_range_inp, 0))
+    pnl.cell(1, 0, syminfo.ticker, text_color = NS_INK, text_size = size.small, text_halign = text.align_right, bgcolor = color.new(col_range_inp, 0))
+    if not warmup
+        pnl.cell(0, 1, "warming up", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+        pnl.cell(1, 1, "", text_color = NS_LBL, text_size = size.small)
+        pnl.merge_cells(0, 1, 1, 1)
+    else
+        // The State row is the panel's only live signal, so it carries the event
+        // colour on a tinted row. SEEKING is the one idle readout and stays neutral.
+        bool  stFake = not na(fakeBar) and bar_index - fakeBar <= 5
+        color stCol  = state == ST_FORM ? col_comp_inp : state == ST_LIVE ? col_range_inp : state == ST_BUP ? col_up_inp : state == ST_BDN ? col_dn_inp : stFake ? col_comp_inp : NS_LBL
+        bool  stIdle = state == ST_SEEK and not stFake
+        pnl.cell(0, 1, "State", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+        pnl.cell(1, 1, f_stateStr(), text_color = stCol, text_size = size.small, text_halign = text.align_left, bgcolor = stIdle ? NS_ROW : color.new(stCol, 82))
+        pnl.cell(0, 2, "Compression", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+        pnl.cell(1, 2, str.tostring(rci, "#") + f_blocks(rci), text_color = nz(rci) >= rciThr ? col_comp_inp : NS_WHITE, text_size = size.small, text_halign = text.align_left,
+             tooltip = "Range Compression Index 0-100 = 40% movement inefficiency + 35% volatility compression + 25% close containment. Threshold for this sensitivity: " + str.tostring(rciThr, "#") + ".")
+        if not minimal
+            pnl.cell(0, 3, "Range", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 3, hasBox ? str.tostring(boxHAtr, "#.#") + " ATR · " + str.tostring((state == ST_LIVE ? bar_index : brkBar) - boxStart) + " bars" : "—", text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(0, 4, "Position in range", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 4, hasBox and boxH > 0 ? str.tostring(100 * (close - boxBot) / boxH, "#") + " %" : "—", text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            if vol_confirm_inp and na(volume)
+                pnl.cell(0, 5, "Volume gate", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+                pnl.cell(1, 5, "volume n/a", text_color = NS_SEC, text_size = size.small, text_halign = text.align_left)
+        if large and show_stats_inp
+            int nBroken = nUp + nDn
+            pnl.cell(0, 6, "BASE RATES · measured on this chart", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left,
+                 tooltip = "Observed frequencies counted on confirmed bars over the loaded history. Invalidated boxes are excluded. Percentages appear once the sample reaches " + str.tostring(min_n_inp) + " broken ranges.")
+            pnl.cell(1, 6, "", text_color = NS_LBL, text_size = size.small)
+            pnl.merge_cells(0, 6, 1, 6)
+            pnl.cell(0, 7, "Broke up", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 7, f_pct(nUp, nBroken), text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(0, 8, "Reached 1×", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 8, f_pct(nFt, nBroken), text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(0, 9, "False break", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 9, f_pct(nFake, nBroken), text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(0, 10, "Median bars to 1×", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 10, f_med(barsToT1), text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(0, 11, "Median range", text_color = NS_LBL, text_size = size.small, text_halign = text.align_left)
+            pnl.cell(1, 11, f_med(rangeLen) + (rangeLen.size() >= min_n_inp ? " bars" : ""), text_color = NS_WHITE, text_size = size.small, text_halign = text.align_left)
+
+// ─── ALERTS — all from the confirmed-gated fire flags ────────────────────────
+alertcondition(fire_range_confirmed, "Range confirmed",     "Range confirmed — {{ticker}} {{interval}}")
+alertcondition(fire_break_up,        "Range breakout up",   "Range breakout up — {{ticker}} {{interval}}")
+alertcondition(fire_break_dn,        "Range breakout down", "Range breakout down — {{ticker}} {{interval}}")
+alertcondition(fire_fake,            "False break",         "False break — price returned inside the range — {{ticker}} {{interval}}")
+alertcondition(fire_t1,              "Projection reached",  "1x projection reached — {{ticker}} {{interval}}")
+
+if fire_range_confirmed or fire_break_up or fire_break_dn or fire_fake or fire_t1
+    string ev = fire_range_confirmed ? "range_confirmed" : fire_break_up ? "break_up" : fire_break_dn ? "break_dn" : fire_fake ? "false_break" : "projection_reached"
+    alert('{"event":"' + ev + '","symbol":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","box_top":' + str.tostring(boxTop) + ',"box_bottom":' + str.tostring(boxBot) + ',"break_level":' + str.tostring(nz(brkPrice)) + ',"height_atr":' + str.tostring(boxHAtr, "#.##") + '}', alert.freq_once_per_bar_close)

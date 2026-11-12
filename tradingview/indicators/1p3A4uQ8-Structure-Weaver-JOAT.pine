@@ -1,0 +1,320 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+indicator('Structure Weaver [JOAT]', shorttitle='WEAVER [JOAT]', overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ═════════════════════════════════ INPUTS ═══════════════════════════════════
+
+// ── Swing Detection ──
+swingLen = input.int(10, 'Swing Strength (bars each side)', minval = 2, maxval = 50, group = 'Swing Detection',
+     tooltip = 'Bars required on each side to confirm a swing point.\n\nHigher = major structure only. Lower = fine-grained weave.')
+breakSource = input.string('Close', 'Break Confirmation Source', options = ['Close', 'Wick'], group = 'Swing Detection',
+     tooltip = 'Close → structure breaks need a candle close beyond the swing (recommended).\nWick → any poke beyond the swing counts.')
+
+// ── Structure Threads ──
+showBOS = input.bool(true, 'Show BOS Threads', group = 'Structure Threads',
+     tooltip = 'Break of Structure — trend continuation breaks.')
+showCHoCH = input.bool(true, 'Show CHoCH Threads', group = 'Structure Threads',
+     tooltip = 'Change of Character — the first break against the active trend.')
+maxThreads = input.int(14, 'Max Threads On Chart', minval = 2, maxval = 50, group = 'Structure Threads',
+     tooltip = 'Oldest structure threads are unwoven beyond this limit.')
+threadWidth = input.int(1, 'Thread Width', minval = 1, maxval = 3, group = 'Structure Threads')
+
+// ── Swing Labels ──
+showSwingLabels = input.bool(true, 'Show HH / HL / LH / LL Labels', group = 'Swing Labels')
+swingLabelSizeStr = input.string('Tiny', 'Swing Label Size', options = ['Tiny', 'Small', 'Normal'], group = 'Swing Labels')
+showSwingPrices = input.bool(false, 'Append Price To Swing Labels', group = 'Swing Labels')
+
+// ── Dealing Range ──
+showRange = input.bool(true, 'Shade Premium / Discount', group = 'Dealing Range',
+     tooltip = 'Shades the active dealing range (last confirmed swing low → swing high):\nPremium = upper zone, Discount = lower zone, Equilibrium = center band.')
+eqBandPct = input.float(6.0, 'Equilibrium Band Width (%)', minval = 1.0, maxval = 20.0, step = 0.5, group = 'Dealing Range',
+     tooltip = 'Total width of the equilibrium band, centered at the 50% level of the dealing range.')
+rangeTransp = input.int(90, 'Zone Transparency', minval = 50, maxval = 100, group = 'Dealing Range')
+showEqLine = input.bool(true, 'Show Equilibrium Line', group = 'Dealing Range')
+
+// ── Weave Palette ──
+bullColor = input.color(#6366f1, 'Bullish Structure (Indigo)', group = 'Weave Palette')
+bearColor = input.color(#d946ef, 'Bearish Structure (Orchid)', group = 'Weave Palette')
+premiumColor = input.color(#d946ef, 'Premium Zone Color', group = 'Weave Palette')
+discountColor = input.color(#6366f1, 'Discount Zone Color', group = 'Weave Palette')
+neutralColor = input.color(#94a3b8, 'Equilibrium Color', group = 'Weave Palette')
+colorCandles = input.bool(false, 'Tint Candles By Structure Trend', group = 'Weave Palette')
+
+// ── Weaver Dashboard ──
+showDash = input.bool(true, 'Show Weaver Dashboard', group = 'Weaver Dashboard')
+dashPos = input.string('Top Right', 'Dashboard Position',
+     options = ['Top Left', 'Top Right', 'Bottom Left', 'Bottom Right', 'Top Center', 'Bottom Center', 'Middle Left', 'Middle Right'],
+     group = 'Weaver Dashboard')
+dashSize = input.string('Normal', 'Dashboard Text Size', options = ['Tiny', 'Small', 'Normal', 'Large'], group = 'Weaver Dashboard')
+
+// ══════════════════════════════ SWING ENGINE ════════════════════════════════
+
+float ph = ta.pivothigh(high, swingLen, swingLen)
+float pl = ta.pivotlow(low, swingLen, swingLen)
+
+// Confirmed swing memory
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+
+// Break state: has the current swing already been broken?
+var bool highTaken = false
+var bool lowTaken = false
+
+// Structure trend: 1 = bullish weave, -1 = bearish weave, 0 = undecided
+var int structTrend = 0
+
+// Event log for dashboard
+var string lastEvent = '—'
+var int lastEventBar = na
+var int bosCount = 0
+var int chochCount = 0
+
+f_swingSize(string s) =>
+    s == 'Tiny' ? size.tiny : s == 'Small' ? size.small : size.normal
+
+// ─── Register confirmed swings + classify ───
+if not na(ph)
+    string cls = na(lastSwingHigh) ? 'H' : ph > lastSwingHigh ? 'HH' : 'LH'
+    if showSwingLabels
+        string txt = showSwingPrices ? cls + ' ' + str.tostring(ph, format.mintick) : cls
+        label.new(bar_index - swingLen, ph, txt, style = label.style_label_down,
+             color = color.new(#000000, 100), textcolor = color.new(cls == 'LH' ? bearColor : bullColor, 10),
+             size = f_swingSize(swingLabelSizeStr))
+    lastSwingHigh := ph
+    lastSwingHighBar := bar_index - swingLen
+    highTaken := false
+
+if not na(pl)
+    string cls = na(lastSwingLow) ? 'L' : pl < lastSwingLow ? 'LL' : 'HL'
+    if showSwingLabels
+        string txt = showSwingPrices ? cls + ' ' + str.tostring(pl, format.mintick) : cls
+        label.new(bar_index - swingLen, pl, txt, style = label.style_label_up,
+             color = color.new(#000000, 100), textcolor = color.new(cls == 'LL' ? bearColor : bullColor, 10),
+             size = f_swingSize(swingLabelSizeStr))
+    lastSwingLow := pl
+    lastSwingLowBar := bar_index - swingLen
+    lowTaken := false
+
+// ═══════════════════════════ STRUCTURE BREAKS ═══════════════════════════════
+
+var array<line> threads = array.new<line>()
+var array<label> threadTags = array.new<label>()
+
+f_weaveThread(int x1, float lvl, string tag, color col) =>
+    line th = line.new(x1, lvl, bar_index, lvl, color = color.new(col, 20), width = threadWidth,
+         style = tag == 'CHoCH' ? line.style_dashed : line.style_solid)
+    label tg = label.new(math.round(math.avg(x1, bar_index)), lvl, tag,
+         style = label.style_none, textcolor = color.new(col, 5), size = size.small)
+    array.push(threads, th)
+    array.push(threadTags, tg)
+    if array.size(threads) > maxThreads
+        line.delete(array.shift(threads))
+        label.delete(array.shift(threadTags))
+
+float upBreakSrc = breakSource == 'Close' ? close : high
+float dnBreakSrc = breakSource == 'Close' ? close : low
+
+bool bosUp = false
+bool chochUp = false
+bool bosDown = false
+bool chochDown = false
+
+// Break above the last confirmed swing high
+if not na(lastSwingHigh) and not highTaken and upBreakSrc > lastSwingHigh
+    highTaken := true
+    if structTrend == -1
+        chochUp := true
+        chochCount += 1
+        if showCHoCH
+            f_weaveThread(lastSwingHighBar, lastSwingHigh, 'CHoCH', bullColor)
+        lastEvent := 'CHoCH ▲'
+    else
+        bosUp := true
+        bosCount += 1
+        if showBOS
+            f_weaveThread(lastSwingHighBar, lastSwingHigh, 'BOS', bullColor)
+        lastEvent := 'BOS ▲'
+    structTrend := 1
+    lastEventBar := bar_index
+
+// Break below the last confirmed swing low
+if not na(lastSwingLow) and not lowTaken and dnBreakSrc < lastSwingLow
+    lowTaken := true
+    if structTrend == 1
+        chochDown := true
+        chochCount += 1
+        if showCHoCH
+            f_weaveThread(lastSwingLowBar, lastSwingLow, 'CHoCH', bearColor)
+        lastEvent := 'CHoCH ▼'
+    else
+        bosDown := true
+        bosCount += 1
+        if showBOS
+            f_weaveThread(lastSwingLowBar, lastSwingLow, 'BOS', bearColor)
+        lastEvent := 'BOS ▼'
+    structTrend := -1
+    lastEventBar := bar_index
+
+// ═══════════════════════════ DEALING RANGE ══════════════════════════════════
+
+var box premiumBox = na
+var box discountBox = na
+var box eqBox = na
+var line eqLine = na
+
+bool rangeValid = showRange and not na(lastSwingHigh) and not na(lastSwingLow) and lastSwingHigh > lastSwingLow
+
+if rangeValid
+    int rangeLeft = math.max(math.min(nz(lastSwingHighBar, bar_index), nz(lastSwingLowBar, bar_index)), 0)
+    float mid = (lastSwingHigh + lastSwingLow) / 2
+    float band = (lastSwingHigh - lastSwingLow) * (eqBandPct / 100) / 2
+
+    if na(premiumBox)
+        premiumBox := box.new(rangeLeft, lastSwingHigh, bar_index + 4, mid + band,
+             border_color = color.new(premiumColor, 100), bgcolor = color.new(premiumColor, rangeTransp))
+        discountBox := box.new(rangeLeft, mid - band, bar_index + 4, lastSwingLow,
+             border_color = color.new(discountColor, 100), bgcolor = color.new(discountColor, rangeTransp))
+        eqBox := box.new(rangeLeft, mid + band, bar_index + 4, mid - band,
+             border_color = color.new(neutralColor, 100), bgcolor = color.new(neutralColor, rangeTransp))
+        eqLine := line.new(rangeLeft, mid, bar_index + 4, mid, color = color.new(neutralColor, 45), style = line.style_dotted)
+    else
+        box.set_lefttop(premiumBox, rangeLeft, lastSwingHigh)
+        box.set_rightbottom(premiumBox, bar_index + 4, mid + band)
+        box.set_lefttop(discountBox, rangeLeft, mid - band)
+        box.set_rightbottom(discountBox, bar_index + 4, lastSwingLow)
+        box.set_lefttop(eqBox, rangeLeft, mid + band)
+        box.set_rightbottom(eqBox, bar_index + 4, mid - band)
+        if showEqLine and na(eqLine)
+            eqLine := line.new(rangeLeft, mid, bar_index + 4, mid, color = color.new(neutralColor, 45), style = line.style_dotted)
+        if not na(eqLine)
+            line.set_xy1(eqLine, rangeLeft, mid)
+            line.set_xy2(eqLine, bar_index + 4, mid)
+    if not showEqLine and not na(eqLine)
+        line.delete(eqLine)
+        eqLine := na
+else
+    if not na(premiumBox)
+        box.delete(premiumBox)
+        premiumBox := na
+    if not na(discountBox)
+        box.delete(discountBox)
+        discountBox := na
+    if not na(eqBox)
+        box.delete(eqBox)
+        eqBox := na
+    if not na(eqLine)
+        line.delete(eqLine)
+        eqLine := na
+
+// ─── Candle tint ───
+barcolor(colorCandles and structTrend != 0 ? color.new(structTrend == 1 ? bullColor : bearColor, 25) : na, title = 'Structure Tint')
+
+// ═══════════════════════════ WEAVER DASHBOARD ═══════════════════════════════
+
+finalDashPos =
+     dashPos == 'Top Left' ? position.top_left :
+     dashPos == 'Top Right' ? position.top_right :
+     dashPos == 'Bottom Left' ? position.bottom_left :
+     dashPos == 'Bottom Right' ? position.bottom_right :
+     dashPos == 'Top Center' ? position.top_center :
+     dashPos == 'Bottom Center' ? position.bottom_center :
+     dashPos == 'Middle Left' ? position.middle_left :
+     dashPos == 'Middle Right' ? position.middle_right : position.top_right
+finalDashSize =
+     dashSize == 'Tiny' ? size.tiny :
+     dashSize == 'Small' ? size.small :
+     dashSize == 'Large' ? size.large : size.normal
+
+// range-position gauge: discount ◄ │ ► premium
+f_rangeGaugeW(float pct) =>
+    int slot = math.round(math.max(math.min(pct, 100), 0) / 100 * 10)
+    string g = ''
+    for i = 0 to 10
+        g += i == slot ? '◆' : i == 5 ? '│' : '·'
+    g
+
+var table dash = na
+if barstate.islast and showDash
+    if not na(dash)
+        table.delete(dash)
+        dash := na
+    dash := table.new(finalDashPos, columns = 3, rows = 11, bgcolor = color.new(#15141f, 8),
+         border_width = 1, border_color = color.new(#000000, 100),
+         frame_width = 2, frame_color = color.new(bullColor, 35))
+
+    color rowBg = color.new(#191726, 22)
+    color rowBgAlt = color.new(#13111d, 22)
+    color lblCol = color.new(color.white, 18)
+
+    string trendTxt = structTrend == 1 ? '▲ BULLISH WEAVE' : structTrend == -1 ? '▼ BEARISH WEAVE' : '— FORMING'
+    color trendBg = structTrend == 1 ? color.new(bullColor, 40) : structTrend == -1 ? color.new(bearColor, 40) : rowBg
+
+    // Position within the dealing range
+    string zoneTxt = '—'
+    color zoneCol = color.new(color.white, 40)
+    float posPct = na
+    if rangeValid
+        posPct := (close - lastSwingLow) / (lastSwingHigh - lastSwingLow) * 100
+        posPct := math.max(math.min(posPct, 200), -100)
+        float halfBand = eqBandPct / 2
+        zoneTxt := str.tostring(posPct, '#') + '% · ' + (posPct > 50 + halfBand ? 'PREMIUM' : posPct < 50 - halfBand ? 'DISCOUNT' : 'EQUILIBRIUM')
+        zoneCol := posPct > 50 + halfBand ? premiumColor : posPct < 50 - halfBand ? discountColor : neutralColor
+
+    string eventAge = na(lastEventBar) ? '' : str.tostring(bar_index - lastEventBar) + ' bars ago'
+
+    // ── Title band (indigo → orchid) ──
+    table.cell(dash, 0, 0, '✦ STRUCTURE WEAVER', text_color = color.white, bgcolor = color.new(bullColor, 25), text_size = finalDashSize)
+    table.cell(dash, 1, 0, '', bgcolor = color.new(#a352f0, 30), text_size = finalDashSize)
+    table.cell(dash, 2, 0, syminfo.ticker + ' · ' + timeframe.period, text_color = color.white, bgcolor = color.new(bearColor, 30), text_size = finalDashSize)
+    // ── Gradient accent strip ──
+    table.cell(dash, 0, 1, '', bgcolor = color.new(bullColor, 55), text_size = size.tiny)
+    table.cell(dash, 1, 1, '', bgcolor = color.new(#a352f0, 50), text_size = size.tiny)
+    table.cell(dash, 2, 1, '', bgcolor = color.new(bearColor, 55), text_size = size.tiny)
+    // ── Structure state ──
+    table.cell(dash, 0, 2, 'Structure', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 2, trendTxt, text_color = color.white, bgcolor = trendBg, text_size = finalDashSize)
+    table.cell(dash, 2, 2, structTrend != 0 ? 'since ' + eventAge : '', text_color = color.new(color.white, 40), bgcolor = rowBg, text_size = finalDashSize)
+    // ── Last event ──
+    table.cell(dash, 0, 3, 'Last Event', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 3, lastEvent, text_color = str.contains(lastEvent, '▲') ? bullColor : str.contains(lastEvent, '▼') ? bearColor : color.new(color.white, 35), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 3, eventAge == '' ? '' : eventAge, text_color = color.new(color.white, 40), bgcolor = rowBgAlt, text_size = finalDashSize)
+    // ── Event tally ──
+    table.cell(dash, 0, 4, 'BOS / CHoCH', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 4, str.tostring(bosCount) + ' / ' + str.tostring(chochCount), text_color = color.new(color.white, 15), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 4, 'threads woven', text_color = color.new(color.white, 45), bgcolor = rowBg, text_size = finalDashSize)
+    // ── Swings ──
+    table.cell(dash, 0, 5, 'Swing High', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 5, na(lastSwingHigh) ? '—' : str.tostring(lastSwingHigh, format.mintick), text_color = color.new(bullColor, 10), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 5, na(lastSwingHigh) ? '' : highTaken ? '✕ taken' : '● holding', text_color = highTaken ? color.new(color.white, 45) : bullColor, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 0, 6, 'Swing Low', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 6, na(lastSwingLow) ? '—' : str.tostring(lastSwingLow, format.mintick), text_color = color.new(bearColor, 10), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 6, na(lastSwingLow) ? '' : lowTaken ? '✕ taken' : '● holding', text_color = lowTaken ? color.new(color.white, 45) : bearColor, bgcolor = rowBg, text_size = finalDashSize)
+    // ── Range position + gauge ──
+    table.cell(dash, 0, 7, 'Range Position', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 7, zoneTxt, text_color = zoneCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 7, na(posPct) ? '' : f_rangeGaugeW(posPct), text_color = zoneCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    // ── Range size ──
+    string rangeSizeTxt = rangeValid ? str.tostring(lastSwingHigh - lastSwingLow, format.mintick) : '—'
+    table.cell(dash, 0, 8, 'Dealing Range', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 8, rangeSizeTxt, text_color = color.new(color.white, 15), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 8, rangeValid ? 'EQ band ' + str.tostring(eqBandPct, '0.#') + '%' : '', text_color = color.new(neutralColor, 25), bgcolor = rowBg, text_size = finalDashSize)
+    // ── Break source ──
+    table.cell(dash, 0, 9, 'Break Source', text_color = lblCol, bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 1, 9, breakSource, text_color = color.new(color.white, 30), bgcolor = rowBgAlt, text_size = finalDashSize)
+    table.cell(dash, 2, 9, '', bgcolor = rowBgAlt, text_size = finalDashSize)
+    // ── Swing strength ──
+    table.cell(dash, 0, 10, 'Swing Strength', text_color = lblCol, bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 1, 10, str.tostring(swingLen) + ' bars', text_color = color.new(color.white, 30), bgcolor = rowBg, text_size = finalDashSize)
+    table.cell(dash, 2, 10, '', bgcolor = rowBg, text_size = finalDashSize)
+
+// ════════════════════════════════ ALERTS ════════════════════════════════════
+
+alertcondition(bosUp, title = 'BOS Bullish', message = '[JOAT] Structure Weaver — bullish BOS on {{ticker}} ({{interval}})')
+alertcondition(bosDown, title = 'BOS Bearish', message = '[JOAT] Structure Weaver — bearish BOS on {{ticker}} ({{interval}})')
+alertcondition(chochUp, title = 'CHoCH Bullish', message = '[JOAT] Structure Weaver — bullish CHoCH (trend shift up) on {{ticker}} ({{interval}})')
+alertcondition(chochDown, title = 'CHoCH Bearish', message = '[JOAT] Structure Weaver — bearish CHoCH (trend shift down) on {{ticker}} ({{interval}})')
+alertcondition(chochUp or chochDown, title = 'Any CHoCH', message = '[JOAT] Structure Weaver — change of character on {{ticker}} ({{interval}})')

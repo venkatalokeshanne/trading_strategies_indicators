@@ -1,0 +1,178 @@
+//@version=6
+indicator("PVP - Bounded POC", shorttitle="PVP_Bound_POC", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// 1. SETTINGS INPUTS (MATCHED TO PVP ENGINE)
+// ==========================================
+gp_calc     = "Volume Profile Logic Settings"
+rowsLayout  = input.string("Number of Rows", title="Rows Layout", options=["Number of Rows", "Ticks Per Row"], group=gp_calc)
+rowSize     = input.int(24, title="Row Size", minval=1, group=gp_calc)
+volumeType  = input.string("Total", title="Volume Mode", options=["Total", "Up/Down"], group=gp_calc)
+
+gp_style    = "Timeframe Toggles & Style"
+showDaily   = input.bool(true, title="Show Previous Day POC", group=gp_style)
+dailyColor  = input.color(color.blue, title="Prev Day POC Color", group=gp_style)
+
+showWeekly  = input.bool(true, title="Show Previous Week POC", group=gp_style)
+weeklyColor = input.color(color.orange, title="Prev Week POC Color", group=gp_style)
+
+showMonthly = input.bool(true, title="Show Previous Month POC", group=gp_style)
+monthlyColor= input.color(color.purple, title="Prev Month POC Color", group=gp_style)
+
+lineWidth   = input.int(2, title="Line Width", minval=1, group=gp_style)
+lineStyle   = input.string("Solid", title="Line Style", options=["Solid", "Dashed", "Dotted"], group=gp_style)
+
+// Helper function to map text parameters to native Pine line styles
+getLineStyle(string styleText) =>
+    switch styleText
+        "Dashed" => line.style_dashed
+        "Dotted" => line.style_dotted
+        => line.style_solid
+
+// ==========================================
+// 2. TIMEFRAME ANCHORING & SUB-BAR INGESTION
+// ==========================================
+newDay   = ta.change(time("D")) != 0
+newWeek  = ta.change(time("W")) != 0
+newMonth = ta.change(time("M")) != 0
+
+// Dynamically use a 1-minute lower timeframe for intra-bar breakdown analysis
+ltfString = timeframe.isintraday ? (timeframe.multiplier >= 30 ? "1" : "1") : "5"
+
+type BarData
+    float close
+    float volume
+    float open
+    float high
+    float low
+
+subBars = request.security_lower_tf(syminfo.tickerid, ltfString, BarData.new(close, volume, open, high, low))
+
+// Historical Accumulation Arrays
+var BarData[] dailyBars   = array.new<BarData>(0)
+var BarData[] weeklyBars  = array.new<BarData>(0)
+var BarData[] monthlyBars = array.new<BarData>(0)
+
+if not na(subBars) and array.size(subBars) > 0
+    for i = 0 to array.size(subBars) - 1
+        BarData b = array.get(subBars, i)
+        array.push(dailyBars, b)
+        array.push(weeklyBars, b)
+        array.push(monthlyBars, b)
+
+// ==========================================
+// 3. PROFILE VOLUME ENGINE COMPUTATION
+// ==========================================
+calculatePOC(BarData[] bars, string layout, int size) =>
+    float pocPrice = na
+    if array.size(bars) > 0
+        float highestHigh = na
+        float lowestLow   = na
+        for i = 0 to array.size(bars) - 1
+            BarData b = array.get(bars, i)
+            highestHigh := na(highestHigh) ? b.high : math.max(highestHigh, b.high)
+            lowestLow   := na(lowestLow) ? b.low : math.min(lowestLow, b.low)
+            
+        float step = syminfo.mintick
+        if layout == "Number of Rows"
+            step := (highestHigh - lowestLow) / size
+        else
+            step := size * syminfo.mintick
+            
+        int numBins = math.max(1, math.ceil((highestHigh - lowestLow) / step))
+        float[] bins = array.new_float(numBins, 0.0)
+        
+        for i = 0 to array.size(bars) - 1
+            BarData b = array.get(bars, i)
+            float v = b.volume
+            if volumeType == "Up/Down" and b.close < b.open
+                v := -v
+                
+            int binIdx = math.floor((b.close - lowestLow) / step)
+            if binIdx >= 0 and binIdx < numBins
+                array.set(bins, binIdx, array.get(bins, binIdx) + math.abs(v))
+                
+        int maxIdx = 0
+        float maxVol = 0.0
+        if numBins > 0
+            for b = 0 to numBins - 1
+                float binVol = array.get(bins, b)
+                if binVol > maxVol
+                    maxVol := binVol
+                    maxIdx := b
+            pocPrice := lowestLow + (maxIdx * step) + (step / 2)
+    pocPrice
+
+// ==========================================
+// 4. SESSION TIMING BOUNDARY TRACKING
+// ==========================================
+var int sessionStartTime = na
+var int sessionEndTime = na
+
+// Capture the opening candle time of the current day
+if newDay
+    sessionStartTime := time
+
+// Dynamically approximate the closing time based on current history steps
+if ta.change(time) != 0
+    sessionEndTime := time
+
+// Persistent storage for calculated levels
+var float pdPocVal = na
+var float pwPocVal = na
+var float pmPocVal = na
+
+// Evaluate past windows on timeframe shifts
+if newDay and array.size(dailyBars) > 0
+    pdPocVal := calculatePOC(dailyBars, rowsLayout, rowSize)
+    array.clear(dailyBars)
+
+if newWeek and array.size(weeklyBars) > 0
+    pwPocVal := calculatePOC(weeklyBars, rowsLayout, rowSize)
+    array.clear(weeklyBars)
+
+if newMonth and array.size(monthlyBars) > 0
+    pmPocVal := calculatePOC(monthlyBars, rowsLayout, rowSize)
+    array.clear(monthlyBars)
+
+// ==========================================
+// 5. SESSION BOUNDED DRAWING ENGINE
+// ==========================================
+var line dLine = na
+var line wLine = na
+var line mLine = na
+
+var label dLabel = na
+var label wLabel = na
+var label mLabel = na
+
+// Redraw lines strictly bounded within the current operating day session boundaries
+if barstate.islast
+    // Clear last real-time execution outputs to prevent ghost artifacts
+    if not na(dLine)
+        line.delete(dLine)
+    if not na(wLine)
+        line.delete(wLine)
+    if not na(mLine)
+        line.delete(mLine)
+    if not na(dLabel)
+        label.delete(dLabel)
+    if not na(wLabel)
+        label.delete(wLabel)
+    if not na(mLabel)
+        label.delete(mLabel)
+
+    // Draw Previous Day POC Line
+    if showDaily and not na(pdPocVal) and not na(sessionStartTime)
+        dLine := line.new(x1=sessionStartTime, y1=pdPocVal, x2=sessionEndTime, y2=pdPocVal, xloc=xloc.bar_time, color=dailyColor, width=lineWidth, style=getLineStyle(lineStyle))
+        dLabel := label.new(x=sessionEndTime, y=pdPocVal, text="PD POC (" + str.tostring(pdPocVal, "#.##") + ")", xloc=xloc.bar_time, color=color.new(color.black, 100), textcolor=dailyColor, style=label.style_label_left, textalign=text.align_left)
+
+    // Draw Previous Week POC Line
+    if showWeekly and not na(pwPocVal) and not na(sessionStartTime)
+        wLine := line.new(x1=sessionStartTime, y1=pwPocVal, x2=sessionEndTime, y2=pwPocVal, xloc=xloc.bar_time, color=weeklyColor, width=lineWidth, style=getLineStyle(lineStyle))
+        wLabel := label.new(x=sessionEndTime, y=pwPocVal, text="PW POC (" + str.tostring(pwPocVal, "#.##") + ")", xloc=xloc.bar_time, color=color.new(color.black, 100), textcolor=weeklyColor, style=label.style_label_left, textalign=text.align_left)
+
+    // Draw Previous Month POC Line
+    if showMonthly and not na(pmPocVal) and not na(sessionStartTime)
+        mLine := line.new(x1=sessionStartTime, y1=pmPocVal, x2=sessionEndTime, y2=pmPocVal, xloc=xloc.bar_time, color=monthlyColor, width=lineWidth, style=getLineStyle(lineStyle))
+        mLabel := label.new(x=sessionEndTime, y=pmPocVal, text="PM POC (" + str.tostring(pmPocVal, "#.##") + ")", xloc=xloc.bar_time, color=color.new(color.black, 100), textcolor=monthlyColor, style=label.style_label_left, textalign=text.align_left)

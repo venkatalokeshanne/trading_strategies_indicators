@@ -1,0 +1,750 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//@version=6
+
+// =============================================================================
+//  TRADING SESSIONS  ·  v3
+// -----------------------------------------------------------------------------
+//  Draws the major trading sessions as coloured boxes:
+//      Tokyo (Asia, incl. Singapore) · London · New York · pre-London (Frankfurt)
+//
+//  Each session box spans the session's time window horizontally and its
+//  high/low range vertically, and can show:
+//      · the session name
+//      · the session range in ticks
+//      · the average price of the session
+//      · vertical opening / closing lines
+//
+//  Additionally:
+//      · PDH / PDL  - previous day high / low
+//      · PWH / PWL  - previous week high / low
+//  Each of those lines is anchored at the bar that actually created the level,
+//  so it starts inside the session box in which the high / low was made and
+//  runs from there to the right.
+//
+//  On top of the sessions it marks the three ICT kill zones - Asia, London Open
+//  and New York Open - with a horizontal line on the high and on the low of the
+//  range that the kill zone produced. All three are drawn the same way.
+//
+//  Every kill zone runs in the time zone of the session it belongs to:
+//      Asia KZ      09:00-13:00  Asia/Tokyo
+//      London KZ    07:00-10:00  Europe/London
+//      NY KZ        08:00-10:00  America/New_York
+//  London and New York observe DST, so their single local window reproduces
+//  both UTC windows by itself: London 07:00-10:00 UTC in winter and
+//  06:00-09:00 in summer, New York 13:00-15:00 in winter and 12:00-14:00 in
+//  summer. Tokyo has no DST, so the Asian window cannot follow both rows -
+//  09:00-13:00 JST is 00:00-04:00 UTC, i.e. the summer row. Set it to
+//  10:00-14:00 JST if you would rather have the winter row (01:00-05:00 UTC).
+//
+//  Daylight saving time is handled automatically: every session carries its own
+//  IANA time zone (Asia/Tokyo, Europe/London, America/New_York, Europe/Berlin),
+//  so each region switches on its own DST date - including the weeks in March /
+//  November when the US and Europe are out of sync. Works identically on live
+//  and on historical bars.
+//
+//  Both halves of the clock are shown to the right of the last bar:
+//    · the session that is currently open carries on from the last bar to the
+//      time it is scheduled to close, so the part still ahead is visible; its
+//      height keeps tracking the high and low made so far
+//    · a session that has not started yet is blocked out at its real future
+//      coordinates, with the time left until it opens. There is no price data
+//      out there, so that block borrows the recent high/low for its height -
+//      only its left and right edge carry information
+//  The two hand over automatically at the session open.
+//
+//  Session boxes require an intraday chart timeframe. "Skip weekend" drops
+//  every session and kill zone that starts on a Saturday or a Sunday, which
+//  only makes a difference on symbols that also trade at the weekend.
+//
+//  Settings layout follows "Trading Sessions by @klmn1k from Trading Volium".
+//  That script is closed source - this is an independent implementation.
+// =============================================================================
+
+indicator(title            = "Trading Sessions and Kill Zones V3",
+          shorttitle       = "Sessions/KZ V3",
+          overlay          = true,
+          max_boxes_count  = 500,
+          max_lines_count  = 500,
+          max_labels_count = 500)
+
+// =============================================================================
+//  INPUTS - general
+// =============================================================================
+
+showNames  = input.bool(true,  "Show session names")
+showEdges  = input.bool(false, "Draw session opening and closing lines")
+showTicks  = input.bool(false, "Show tick range for each session")
+showAvg    = input.bool(false, "Show average price per session")
+nameSizeIn = input.string("normal", "Session name size",
+     options = ["tiny", "small", "normal", "large", "huge"])
+skipWeekend = input.bool(true, "Skip weekend",
+     tooltip = "Hides every session and every kill zone that falls on a " +
+     "Saturday or a Sunday. Saturday and Sunday are taken in the time zone of " +
+     "the session concerned. This only changes anything on symbols that trade " +
+     "around the clock, such as crypto - a venue that is closed at the weekend " +
+     "has no weekend bars to draw on in the first place.")
+
+// =============================================================================
+//  INPUTS - previous day high / low
+// =============================================================================
+
+pdShow   = input.bool(false, "Show PDH / PDL")
+pdLabels = input.bool(true,  "Show PDH/PDL labels")
+pdLast   = input.bool(true,  "Show only last day")
+pdExt    = input.string("Current bar", "PDH/PDL extend to",
+     options = ["Current bar", "End of day", "Chart right edge"])
+pdCol    = input.color(#787b86, "PDH/PDL color")
+
+// =============================================================================
+//  INPUTS - previous week high / low
+// =============================================================================
+
+pwShow   = input.bool(false, "Show PWH / PWL")
+pwLabels = input.bool(true,  "Show PWH/PWL labels")
+pwLast   = input.bool(true,  "Show only last week")
+pwExt    = input.string("Current bar", "PWH/PWL extend to",
+     options = ["Current bar", "End of week", "Chart right edge"])
+pwCol    = input.color(#787b86, "PWH/PWL color")
+
+// =============================================================================
+//  INPUTS - sessions
+// =============================================================================
+
+TZ_TIP = "IANA time zone name of the exchange this session belongs to, " +
+     "e.g. Asia/Tokyo, Europe/London, America/New_York, Europe/Berlin. " +
+     "Using an IANA name makes the session follow that region's daylight " +
+     "saving switch automatically. Fixed offsets such as UTC+2 also work, " +
+     "but they ignore DST."
+
+G1 = "First session"
+s1Show = input.bool(true,           "Show session",      group = G1)
+s1Name = input.string("Tokyo",      "Displayed name",    group = G1)
+s1Sess = input.session("0900-1600", "Session time",      group = G1)
+s1Tz   = input.string("Asia/Tokyo", "Session timezone",  group = G1, tooltip = TZ_TIP)
+s1Col  = input.color(color.new(#9c27b0, 88), "Session color", group = G1)
+
+G2 = "Second session"
+s2Show = input.bool(true,             "Show session",     group = G2)
+s2Name = input.string("London",       "Displayed name",   group = G2)
+s2Sess = input.session("0800-1630",   "Session time",     group = G2)
+s2Tz   = input.string("Europe/London", "Session timezone", group = G2, tooltip = TZ_TIP)
+s2Col  = input.color(color.new(#4caf50, 88), "Session color", group = G2)
+
+G3 = "Third session"
+s3Show = input.bool(true,         "Show session",   group = G3)
+s3Name = input.string("New York", "Displayed name", group = G3)
+nyType = input.string("Indices (09:30 - 16:00)", "NY session type",
+     options = ["Indices (09:30 - 16:00)", "Forex (08:00 - 17:00)"], group = G3)
+s3Tz   = input.string("America/New_York", "Session timezone", group = G3, tooltip = TZ_TIP)
+s3Col  = input.color(color.new(#3d7eff, 88), "Session color", group = G3)
+
+G4 = "Fourth session"
+s4Show = input.bool(true,             "Show session",     group = G4)
+s4Name = input.string("pre-London",   "Displayed name",   group = G4)
+s4Sess = input.session("0800-0900",   "Session time",     group = G4)
+s4Tz   = input.string("Europe/Berlin", "Session timezone", group = G4, tooltip = TZ_TIP)
+s4Col  = input.color(color.new(#ff6d00, 88), "Session color", group = G4)
+
+// New York has no free session time - it is derived from the session type.
+s3Sess = nyType == "Forex (08:00 - 17:00)" ? "0800-1700" : "0930-1600"
+
+// =============================================================================
+//  INPUTS - kill zones
+// =============================================================================
+
+KZ_TIP = "Every kill zone runs in the time zone of its own session. London " +
+     "and New York observe DST, so a single local window there covers both " +
+     "the winter and the summer UTC window. Tokyo has no DST: 09:00-13:00 " +
+     "JST is 00:00-04:00 UTC (the summer row), 10:00-14:00 JST is " +
+     "01:00-05:00 UTC (the winter row)."
+
+GK = "Kill zones"
+kzNames  = input.bool(true, "Show kill zone names", group = GK)
+kzSizeIn = input.string("small", "Kill zone name size",
+     options = ["tiny", "small", "normal", "large", "huge"], group = GK)
+kzWidth  = input.int(2, "Kill zone line width", minval = 1, maxval = 5, group = GK)
+
+GK1 = "Asian kill zone"
+k1Show = input.bool(true,           "Show kill zone",     group = GK1)
+k1Name = input.string("Asia KZ",    "Displayed name",     group = GK1)
+k1Sess = input.session("0900-1300", "Kill zone time",     group = GK1)
+k1Tz   = input.string("Asia/Tokyo", "Kill zone timezone", group = GK1, tooltip = KZ_TIP)
+k1Col  = input.color(#ffb300, "Kill zone color", group = GK1)
+
+GK2 = "London Open kill zone"
+k2Show = input.bool(true,           "Show kill zone",     group = GK2)
+k2Name = input.string("London KZ",  "Displayed name",     group = GK2)
+k2Sess = input.session("0700-1000", "Kill zone time",     group = GK2)
+k2Tz   = input.string("Europe/London", "Kill zone timezone", group = GK2, tooltip = KZ_TIP)
+k2Col  = input.color(#00bcd4, "Kill zone color", group = GK2)
+
+GK3 = "New York Open kill zone"
+k3Show = input.bool(true,           "Show kill zone",     group = GK3)
+k3Name = input.string("NY KZ",      "Displayed name",     group = GK3)
+k3Sess = input.session("0800-1000", "Kill zone time",     group = GK3)
+k3Tz   = input.string("America/New_York", "Kill zone timezone", group = GK3, tooltip = KZ_TIP)
+k3Col  = input.color(#e91e63, "Kill zone color", group = GK3)
+
+// =============================================================================
+//  INPUTS - upcoming session preview
+// =============================================================================
+
+GP = "Session projection"
+pvRun   = input.bool(true, "Carry the running session to its close", group = GP,
+     tooltip = "The box of the session that is currently open does not stop at " +
+     "the last bar - it runs on to the time the session is scheduled to close, " +
+     "so you can see how much of it is still ahead. Its height keeps tracking " +
+     "the high and low made so far.")
+pvShow  = input.bool(true, "Show sessions before they start", group = GP,
+     tooltip = "Blocks out the coming session in the empty space to the right " +
+     "of the last bar, so you can see what is next and how long there is to " +
+     "go. There is no price data there yet, so the block spans the recent " +
+     "range vertically - only its left and right edge carry information.")
+pvHours = input.int(12, "Preview horizon, hours", minval = 1, maxval = 72,
+     group = GP,
+     tooltip = "A session is only previewed once it starts within this many " +
+     "hours. Anything further out would sit far off the right edge of the " +
+     "chart anyway.")
+pvClock = input.bool(false, "Show time remaining", group = GP)
+
+// =============================================================================
+//  HELPERS
+// =============================================================================
+
+// Label sizes selected in the settings.
+string nameSize = switch nameSizeIn
+    "tiny"  => size.tiny
+    "small" => size.small
+    "large" => size.large
+    "huge"  => size.huge
+    => size.normal
+
+string kzSize = switch kzSizeIn
+    "tiny"   => size.tiny
+    "normal" => size.normal
+    "large"  => size.large
+    "huge"   => size.huge
+    => size.small
+
+// Fully transparent colour - used for label bubbles so only the text is drawn.
+color CLEAR = color.new(color.black, 100)
+
+// The session picker only produces "HHmm-HHmm", so the day mask is appended
+// here. Pine numbers the days 1 = Sunday ... 7 = Saturday, so "23456" is
+// Monday to Friday and "1234567" is the full week. The mask is evaluated in
+// the session's own time zone, and it refers to the day the session starts on.
+DAYS = skipWeekend ? ":23456" : ":1234567"
+
+spec1 = s1Sess + DAYS
+spec2 = s2Sess + DAYS
+spec3 = s3Sess + DAYS
+spec4 = s4Sess + DAYS
+kSpc1 = k1Sess + DAYS
+kSpc2 = k2Sess + DAYS
+kSpc3 = k3Sess + DAYS
+
+// time() with an explicit IANA time zone -> DST is resolved per region, per bar.
+intraday = timeframe.isintraday
+in1 = s1Show and intraday and not na(time(timeframe.period, spec1, s1Tz))
+in2 = s2Show and intraday and not na(time(timeframe.period, spec2, s2Tz))
+in3 = s3Show and intraday and not na(time(timeframe.period, spec3, s3Tz))
+in4 = s4Show and intraday and not na(time(timeframe.period, spec4, s4Tz))
+ink1 = k1Show and intraday and not na(time(timeframe.period, kSpc1, k1Tz))
+ink2 = k2Show and intraday and not na(time(timeframe.period, kSpc2, k2Tz))
+ink3 = k3Show and intraday and not na(time(timeframe.period, kSpc3, k3Tz))
+
+// Vertical extent of the upcoming-session blocks. There are no bars in the
+// future, so there is no high/low to use - the recent range is taken instead,
+// which keeps the block on screen and inside the current price scale. Roughly
+// the last 24 hours of bars, clamped to something sane on either extreme.
+int   pvBars = math.min(200, math.max(20, int(86400 / timeframe.in_seconds())))
+float rngHi  = ta.highest(high, pvBars)
+float rngLo  = ta.lowest(low, pvBars)
+
+// =============================================================================
+//  SESSION ENGINE
+// =============================================================================
+
+type SessState
+    box   bx    = na
+    label nmL   = na
+    label rgL   = na
+    line  avgL  = na
+    box   pvBx  = na
+    label pvLbl = na
+    float hi    = na
+    float lo    = na
+    float acc   = 0.0
+    int   n     = 0
+    int   x1    = na
+    int   xLast = na
+    bool  wasIn = false
+
+// Builds / maintains one session: box, name label, tick-range label,
+// average price line and the optional open / close markers.
+drawSession(SessState st, bool isIn, string nm, color col) =>
+    color solid = color.new(col, 0)
+    color edgeC = color.new(col, int(math.max(0, color.t(col) - 25)))
+    color avgC  = color.new(col, int(math.max(0, color.t(col) - 55)))
+
+    bool isBeg = isIn and not st.wasIn
+    bool isEnd = not isIn and st.wasIn
+
+    if isBeg
+        // ---- session opens -------------------------------------------------
+        st.hi    := high
+        st.lo    := low
+        st.acc   := hlc3
+        st.n     := 1
+        st.x1    := bar_index
+        st.xLast := bar_index
+        st.nmL   := na
+        st.rgL   := na
+        st.avgL  := na
+        // Background only - no frame around the session.
+        st.bx    := box.new(left         = bar_index,
+                            top          = high,
+                            right        = bar_index,
+                            bottom       = low,
+                            border_color = CLEAR,
+                            border_width = 0,
+                            extend       = extend.none,
+                            xloc         = xloc.bar_index,
+                            bgcolor      = col)
+        if showEdges
+            line.new(bar_index, low, bar_index, high, xloc = xloc.bar_index,
+                 extend = extend.both, color = edgeC, style = line.style_dotted, width = 1)
+    else if isIn
+        // ---- session running -----------------------------------------------
+        st.hi    := math.max(st.hi, high)
+        st.lo    := math.min(st.lo, low)
+        st.acc   := st.acc + hlc3
+        st.n     := st.n + 1
+        st.xLast := bar_index
+
+    if isIn and not na(st.bx)
+        box.set_top(st.bx, st.hi)
+        box.set_bottom(st.bx, st.lo)
+        box.set_right(st.bx, bar_index)
+
+        int xm = int(math.round(math.avg(st.x1, bar_index)))
+
+        if showNames
+            if na(st.nmL)
+                st.nmL := label.new(x         = xm,
+                                    y         = st.hi,
+                                    text      = nm,
+                                    xloc      = xloc.bar_index,
+                                    yloc      = yloc.price,
+                                    color     = CLEAR,
+                                    style     = label.style_label_down,
+                                    textcolor = solid,
+                                    size      = nameSize,
+                                    textalign = text.align_center)
+            label.set_xy(st.nmL, xm, st.hi)
+
+        if showTicks
+            string tx = str.tostring(int(math.round((st.hi - st.lo) / syminfo.mintick))) + " ticks"
+            if na(st.rgL)
+                st.rgL := label.new(x         = xm,
+                                    y         = st.lo,
+                                    text      = tx,
+                                    xloc      = xloc.bar_index,
+                                    yloc      = yloc.price,
+                                    color     = CLEAR,
+                                    style     = label.style_label_up,
+                                    textcolor = solid,
+                                    size      = nameSize,
+                                    textalign = text.align_center)
+            label.set_xy(st.rgL, xm, st.lo)
+            label.set_text(st.rgL, tx)
+
+        if showAvg
+            float ap = st.acc / st.n
+            if na(st.avgL)
+                st.avgL := line.new(st.x1, ap, bar_index, ap, xloc = xloc.bar_index,
+                     extend = extend.none, color = avgC, style = line.style_dashed, width = 1)
+            line.set_xy1(st.avgL, st.x1, ap)
+            line.set_xy2(st.avgL, bar_index, ap)
+
+    if isEnd and showEdges and not na(st.xLast)
+        // ---- session closes -----------------------------------------------
+        line.new(st.xLast, low, st.xLast, high, xloc = xloc.bar_index,
+             extend = extend.both, color = edgeC, style = line.style_dotted, width = 1)
+
+    st.wasIn := isIn
+
+var SessState st1 = SessState.new()
+var SessState st2 = SessState.new()
+var SessState st3 = SessState.new()
+var SessState st4 = SessState.new()
+
+drawSession(st1, in1, s1Name, s1Col)
+drawSession(st2, in2, s2Name, s2Col)
+drawSession(st3, in3, s3Name, s3Col)
+drawSession(st4, in4, s4Name, s4Col)
+
+// =============================================================================
+//  UPCOMING SESSION PREVIEW
+// =============================================================================
+
+// Local clock time HHmm at position `pos` of a "HHmm-HHmm" string, as minutes
+// past midnight. na if the string is not a well formed session.
+clockAt(string sess, int pos) =>
+    float r = na
+    if str.length(sess) >= 9
+        float h = str.tonumber(str.substring(sess, pos, pos + 2))
+        float m = str.tonumber(str.substring(sess, pos + 2, pos + 4))
+        if not na(h) and not na(m)
+            r := h * 60 + m
+    r
+
+// Start of the next occurrence of the session window in `tz` that begins after
+// `from`. Walks forward a day at a time, re-deriving the local date at every
+// step so the answer survives a DST switch, and honours the weekend filter.
+nextStart(string sess, string tz, int from) =>
+    int   startT = na
+    float mins   = clockAt(sess, 0)
+
+    if not na(mins)
+        int hh    = int(mins / 60)
+        int mi    = int(mins % 60)
+        int probe = from
+        for _i = 0 to 8
+            int  cs    = timestamp(tz, year(probe, tz), month(probe, tz),
+                 dayofmonth(probe, tz), hh, mi, 0)
+            int  dw    = dayofweek(cs, tz)
+            bool wknd  = dw == dayofweek.saturday or dw == dayofweek.sunday
+            bool dayOk = not skipWeekend or not wknd
+            if cs > from and dayOk
+                startT := cs
+                break
+            probe := probe + 86400000
+    startT
+
+// Next moment in `tz` at local clock time `mins` (minutes past midnight) that
+// lies strictly after `from`. Used to find the close of a session that is
+// currently open.
+nextClock(string tz, float mins, int from) =>
+    int r = na
+    if not na(mins)
+        int hh    = int(mins / 60)
+        int mi    = int(mins % 60)
+        int probe = from
+        for _i = 0 to 2
+            int c = timestamp(tz, year(probe, tz), month(probe, tz),
+                 dayofmonth(probe, tz), hh, mi, 0)
+            if c > from
+                r := c
+                break
+            probe := probe + 86400000
+    r
+
+// End of the window that starts at `startT`, rolled to the next day when the
+// session runs past midnight.
+windowEnd(string sess, string tz, int startT) =>
+    int   endT = na
+    float mins = clockAt(sess, 5)
+
+    if not na(startT) and not na(mins)
+        int ce = timestamp(tz, year(startT, tz), month(startT, tz),
+             dayofmonth(startT, tz), int(mins / 60), int(mins % 60), 0)
+        endT := ce <= startT ? ce + 86400000 : ce
+    endT
+
+// "in 2h 05m" / "in 45m"
+countdown(int ms) =>
+    int    total = math.max(0, ms)
+    int    hrs   = int(total / 3600000)
+    int    mins  = int(total % 3600000 / 60000)
+    string pad   = mins < 10 ? "0" : ""
+    string out   = "in " + str.tostring(mins) + "m"
+    if hrs > 0
+        out := "in " + str.tostring(hrs) + "h " + pad + str.tostring(mins) + "m"
+    out
+
+// A bar carries the time it opened at, so the last bar of a session that
+// closes at T is the one that opened one bar earlier - the box has to stop
+// there, not at T itself, or it reaches a whole bar too far into the future.
+// Snapping to the timeframe grid keeps that right for sessions that do not
+// close on a round bar boundary.
+int tfMs = timeframe.in_seconds() * 1000
+lastBarIn(int endT) => (endT - 1) / tfMs * tfMs
+
+// Everything that lives to the right of the last bar. Two cases, one block:
+//   running  - carry the open session on to the time it is scheduled to close,
+//              keeping the high / low it has made so far as its height
+//   upcoming - block out where the next session will be, using the recent
+//              range for height because there is no price data out there yet
+drawPreview(SessState st, bool show, bool isIn, string sess, string tz,
+            string nm, color col) =>
+    if show and barstate.islast
+        int    bxL = na
+        int    bxR = na
+        float  bxT = na
+        float  bxB = na
+        color  bxC = col
+        string txt = nm
+
+        // (a) session open: continue it from the last bar to its close.
+        if isIn and pvRun
+            int ce = nextClock(tz, clockAt(sess, 5), time)
+            if not na(ce)
+                int cr = lastBarIn(ce)
+                if cr > time
+                    bxL := time
+                    bxR := cr
+                    bxT := st.hi
+                    bxB := st.lo
+
+        // (b) session not open yet: place it at its real future coordinates.
+        if not isIn and pvShow
+            int ps = nextStart(sess, tz, time)
+            int pe = windowEnd(sess, tz, ps)
+            if not na(pe) and ps - time <= pvHours * 3600000
+                bxL := ps
+                bxR := lastBarIn(pe)
+                bxT := rngHi
+                bxB := rngLo
+                bxC := color.new(col, int(math.min(96, color.t(col) + 5)))
+                int ref = barstate.isrealtime ? timenow : time
+                txt := pvClock ? nm + "  " + countdown(ps - ref) : nm
+
+        bool draw = not na(bxL) and not na(bxT) and bxR >= bxL
+        bool lbl  = draw and not isIn and showNames
+
+        if draw
+            if na(st.pvBx)
+                st.pvBx := box.new(left = bxL, top = bxT, right = bxR, bottom = bxB,
+                     border_color = CLEAR, border_width = 0,
+                     xloc = xloc.bar_time, bgcolor = bxC)
+            box.set_lefttop(st.pvBx, bxL, bxT)
+            box.set_rightbottom(st.pvBx, bxR, bxB)
+            box.set_bgcolor(st.pvBx, bxC)
+
+        // The running session already carries its own name label, so the name
+        // and the countdown belong to case (b) only.
+        if lbl
+            int mid = bxL + (bxR - bxL) / 2
+            if na(st.pvLbl)
+                st.pvLbl := label.new(x = mid, y = bxT, text = txt,
+                     xloc = xloc.bar_time, yloc = yloc.price, color = CLEAR,
+                     style = label.style_label_down, textcolor = color.new(col, 0),
+                     size = nameSize, textalign = text.align_center)
+            label.set_xy(st.pvLbl, mid, bxT)
+            label.set_text(st.pvLbl, txt)
+
+        // Released through locals so these blocks end on a void call.
+        if not draw
+            box oldBx = st.pvBx
+            st.pvBx := na
+            box.delete(oldBx)
+
+        if not lbl
+            label oldLbl = st.pvLbl
+            st.pvLbl := na
+            label.delete(oldLbl)
+
+drawPreview(st1, s1Show and intraday, in1, s1Sess, s1Tz, s1Name, s1Col)
+drawPreview(st2, s2Show and intraday, in2, s2Sess, s2Tz, s2Name, s2Col)
+drawPreview(st3, s3Show and intraday, in3, s3Sess, s3Tz, s3Name, s3Col)
+drawPreview(st4, s4Show and intraday, in4, s4Sess, s4Tz, s4Name, s4Col)
+
+// =============================================================================
+//  KILL ZONE ENGINE
+// =============================================================================
+
+type KzState
+    line  topL  = na
+    line  botL  = na
+    label nmL   = na
+    float hi    = na
+    float lo    = na
+    int   x1    = na
+    bool  wasIn = false
+
+// Marks one kill zone with a horizontal line on its high and one on its low.
+// Same treatment for every zone, so they all read alike on the chart.
+drawKillZone(KzState st, bool isIn, string nm, color col) =>
+    bool isBeg = isIn and not st.wasIn
+
+    if isBeg
+        st.hi   := high
+        st.lo   := low
+        st.x1   := bar_index
+        // Drop the references without deleting - the lines of the previous
+        // kill zone have to stay on the chart.
+        st.topL := na
+        st.botL := na
+        st.nmL  := na
+    else if isIn
+        st.hi := math.max(st.hi, high)
+        st.lo := math.min(st.lo, low)
+
+    if isIn
+        if na(st.topL)
+            st.topL := line.new(st.x1, st.hi, bar_index, st.hi, xloc = xloc.bar_index,
+                 extend = extend.none, color = col, style = line.style_solid,
+                 width = kzWidth)
+            st.botL := line.new(st.x1, st.lo, bar_index, st.lo, xloc = xloc.bar_index,
+                 extend = extend.none, color = col, style = line.style_solid,
+                 width = kzWidth)
+        line.set_xy1(st.topL, st.x1, st.hi)
+        line.set_xy2(st.topL, bar_index, st.hi)
+        line.set_xy1(st.botL, st.x1, st.lo)
+        line.set_xy2(st.botL, bar_index, st.lo)
+
+        if kzNames
+            int xm = int(math.round(math.avg(st.x1, bar_index)))
+            if na(st.nmL)
+                st.nmL := label.new(x = xm, y = st.lo, text = nm,
+                     xloc = xloc.bar_index, yloc = yloc.price, color = CLEAR,
+                     style = label.style_label_up, textcolor = col,
+                     size = kzSize, textalign = text.align_center)
+            label.set_xy(st.nmL, xm, st.lo)
+
+    st.wasIn := isIn
+
+var KzState kz1 = KzState.new()
+var KzState kz2 = KzState.new()
+var KzState kz3 = KzState.new()
+
+drawKillZone(kz1, ink1, k1Name, k1Col)
+drawKillZone(kz2, ink2, k2Name, k2Col)
+drawKillZone(kz3, ink3, k3Name, k3Col)
+
+// =============================================================================
+//  PDH / PDL  and  PWH / PWL
+// =============================================================================
+
+type LevelPair
+    line  hiL  = na
+    line  loL  = na
+    label hiLb = na
+    label loLb = na
+
+// Draws one high/low pair for the previous day or previous week.
+//   hiT / loT - bar time at which the high resp. low was created (left anchor,
+//               this is what makes the line connect back to its session box)
+//   endT      - closing time of the current period (used by "End of ..." mode)
+drawLevels(LevelPair lp, bool show, bool isNew, float hv, float lv, int hiT,
+           int loT, int endT, bool lastOnly, bool wantLbl, string mode, color col,
+           string hiTx, string loTx) =>
+    if show and not na(hv) and not na(lv) and not na(hiT) and not na(loT)
+        // A new period starts: keep the finished lines where they are and
+        // continue with a fresh pair (unless only the last period is wanted).
+        if isNew and not lastOnly and not na(lp.hiL)
+            line.set_extend(lp.hiL, extend.none)
+            line.set_extend(lp.loL, extend.none)
+            lp.hiL  := na
+            lp.loL  := na
+            lp.hiLb := na
+            lp.loLb := na
+
+        int    x2 = str.contains(mode, "End of") and not na(endT) ? endT : time
+        string ex = str.contains(mode, "right edge") ? extend.right : extend.none
+
+        if na(lp.hiL)
+            lp.hiL := line.new(hiT, hv, x2, hv, xloc = xloc.bar_time, extend = ex,
+                 color = col, style = line.style_dashed, width = 1)
+            lp.loL := line.new(loT, lv, x2, lv, xloc = xloc.bar_time, extend = ex,
+                 color = col, style = line.style_dashed, width = 1)
+
+        line.set_xy1(lp.hiL, hiT, hv)
+        line.set_xy2(lp.hiL, x2, hv)
+        line.set_extend(lp.hiL, ex)
+        line.set_color(lp.hiL, col)
+        line.set_xy1(lp.loL, loT, lv)
+        line.set_xy2(lp.loL, x2, lv)
+        line.set_extend(lp.loL, ex)
+        line.set_color(lp.loL, col)
+
+        if wantLbl
+            if na(lp.hiLb)
+                lp.hiLb := label.new(x2, hv, hiTx, xloc = xloc.bar_time, yloc = yloc.price,
+                     color = CLEAR, style = label.style_label_left, textcolor = col,
+                     size = size.small)
+                lp.loLb := label.new(x2, lv, loTx, xloc = xloc.bar_time, yloc = yloc.price,
+                     color = CLEAR, style = label.style_label_left, textcolor = col,
+                     size = size.small)
+            label.set_xy(lp.hiLb, x2, hv)
+            label.set_xy(lp.loLb, x2, lv)
+            label.set_textcolor(lp.hiLb, col)
+            label.set_textcolor(lp.loLb, col)
+
+// Closing time of the current day / week - only used to anchor the right end
+// of the lines when "End of day" / "End of week" is selected. It is a schedule
+// value that is known in advance, so lookahead is harmless here.
+string dTf = intraday ? "D" : timeframe.period
+string wTf = (intraday or timeframe.isdaily) ? "W" : timeframe.period
+dEndT = request.security(syminfo.tickerid, dTf, time_close, lookahead = barmerge.lookahead_on)
+wEndT = request.security(syminfo.tickerid, wTf, time_close, lookahead = barmerge.lookahead_on)
+
+bool newDay  = timeframe.change("D")
+bool newWeek = timeframe.change("W")
+
+// Running extremes of the current period plus the bar time at which each one
+// was made. When the period rolls over they become the previous day / week
+// values, and the stored times become the left anchors of the level lines.
+// Tracking this on the chart's own bars (instead of pulling the HTF high/low)
+// is what makes the "where was it created" information available at all.
+var float dHi  = na
+var float dLo  = na
+var int   dHiT = na
+var int   dLoT = na
+var float wHi  = na
+var float wLo  = na
+var int   wHiT = na
+var int   wLoT = na
+
+var float pdHi  = na
+var float pdLo  = na
+var int   pdHiT = na
+var int   pdLoT = na
+var float pwHi  = na
+var float pwLo  = na
+var int   pwHiT = na
+var int   pwLoT = na
+
+if newDay
+    pdHi  := dHi
+    pdLo  := dLo
+    pdHiT := dHiT
+    pdLoT := dLoT
+    dHi   := high
+    dLo   := low
+    dHiT  := time
+    dLoT  := time
+else
+    if na(dHi) or high > dHi
+        dHi  := high
+        dHiT := time
+    if na(dLo) or low < dLo
+        dLo  := low
+        dLoT := time
+
+if newWeek
+    pwHi  := wHi
+    pwLo  := wLo
+    pwHiT := wHiT
+    pwLoT := wLoT
+    wHi   := high
+    wLo   := low
+    wHiT  := time
+    wLoT  := time
+else
+    if na(wHi) or high > wHi
+        wHi  := high
+        wHiT := time
+    if na(wLo) or low < wLo
+        wLo  := low
+        wLoT := time
+
+var LevelPair pdLv = LevelPair.new()
+var LevelPair pwLv = LevelPair.new()
+
+drawLevels(pdLv, pdShow and intraday, newDay, pdHi, pdLo, pdHiT, pdLoT, dEndT,
+     pdLast, pdLabels, pdExt, pdCol, "PDH", "PDL")
+drawLevels(pwLv, pwShow and (intraday or timeframe.isdaily), newWeek, pwHi, pwLo,
+     pwHiT, pwLoT, wEndT, pwLast, pwLabels, pwExt, pwCol, "PWH", "PWL")

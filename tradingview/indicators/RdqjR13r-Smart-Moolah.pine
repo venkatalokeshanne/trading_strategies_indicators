@@ -1,0 +1,281 @@
+//@version=6
+indicator("Smart Moolah", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================= ORDER BLOCK INPUTS =============================
+grpOB         = "Order Blocks"
+showOB        = input.bool(true, "Show Order Blocks", group=grpOB)
+swingLength   = input.int(10, "Swing Lookback Length (structure)", minval=2, group=grpOB)
+obLookback    = input.int(20, "Max Bars to Search for OB Candle", minval=2, group=grpOB)
+obBullColor   = input.color(color.new(color.lime, 80), "Bullish OB Fill", group=grpOB)
+obBearColor   = input.color(color.new(color.maroon, 70), "Bearish OB Fill", group=grpOB)
+obBorderBull  = input.color(color.new(color.lime, 40), "Bullish OB Border", group=grpOB)
+obBorderBear  = input.color(color.new(color.maroon, 40), "Bearish OB Border", group=grpOB)
+mitigateOB    = input.bool(true, "Delete OB Once Mitigated", group=grpOB)
+
+// ============================= FVG INPUTS =============================
+grpFVG        = "Fair Value Gaps"
+showFVG       = input.bool(true, "Show FVG", group=grpFVG)
+fvgBullColor  = input.color(color.new(color.teal, 70), "Bullish FVG Fill", group=grpFVG)
+fvgBearColor  = input.color(color.new(color.red, 70), "Bearish FVG Fill", group=grpFVG)
+fvgBorderBull = input.color(color.new(color.teal, 40), "Bullish FVG Border", group=grpFVG)
+fvgBorderBear = input.color(color.new(color.red, 40), "Bearish FVG Border", group=grpFVG)
+fvgExtend     = input.int(20, "FVG Box Extend (bars)", minval=1, group=grpFVG)
+mitigateFVG   = input.bool(true, "Delete FVG Once Filled", group=grpFVG)
+maxFvgBoxes   = input.int(20, "Max FVG Boxes Shown (per side)", minval=1, maxval=200, group=grpFVG)
+requireStructuralFVG = input.bool(true, "Only Show FVGs Formed Near a BOS/CHoCH", group=grpFVG)
+structFvgWindow       = input.int(15, "Structural Window (bars after BOS/CHoCH)", minval=1, group=grpFVG)
+
+// ============================= ANCHORED VWAP INPUTS =============================
+grpVWAP      = "Anchored VWAP"
+showVWAP     = input.bool(true, "Show Anchored VWAP", group=grpVWAP)
+vwapSrc      = input.source(hlc3, "VWAP Source", group=grpVWAP)
+anchorPeriod = input.string("Session", "Anchor Period", options=["Session", "Week", "Month", "Custom Bars"], group=grpVWAP)
+anchorBars   = input.int(100, "Custom Bars Length (used if Anchor Period = Custom Bars)", minval=1, group=grpVWAP)
+vwapColor    = input.color(color.new(color.yellow, 0), "VWAP Line Color", group=grpVWAP)
+vwapWidth    = input.int(2, "VWAP Line Width", minval=1, maxval=5, group=grpVWAP)
+showBands    = input.bool(true, "Show Deviation Bands", group=grpVWAP)
+bandMult     = input.float(1.0, "Band Multiplier (Std Dev)", minval=0.1, step=0.1, group=grpVWAP)
+bandColor    = input.color(color.new(color.yellow, 70), "Band Color", group=grpVWAP)
+
+// ============================= MARKET STRUCTURE INPUTS =============================
+grpStruct   = "Market Structure (BOS / CHoCH)"
+showBOS     = input.bool(true, "Show BOS", group=grpStruct)
+showCHoCH   = input.bool(true, "Show CHoCH", group=grpStruct)
+bosBullColor = input.color(color.new(color.green, 30), "BOS Color (Bullish / Upside Break)", group=grpStruct)
+bosBearColor = input.color(color.new(color.red, 30), "BOS Color (Bearish / Downside Break)", group=grpStruct)
+chochBullColor = input.color(color.new(color.green, 30), "CHoCH Color (Bullish / Upside Break)", group=grpStruct)
+chochBearColor = input.color(color.new(color.red, 30), "CHoCH Color (Bearish / Downside Break)", group=grpStruct)
+
+// ============================= CALL / PUT HOLD LEVEL INPUTS =============================
+grpLevels      = "Call / Put Hold Levels"
+showLevels     = input.bool(true, "Show Hold Levels", group=grpLevels)
+callLevelColor = input.color(color.new(color.lime, 0), "Call Hold Level (support)", group=grpLevels)
+putLevelColor  = input.color(color.new(color.red, 0), "Put Hold Level (resistance)", group=grpLevels)
+breachedFade   = input.int(80, "Breached Level Fade %", minval=0, maxval=95, group=grpLevels)
+showLevelTable = input.bool(true, "Show Levels Table", group=grpLevels)
+showRejection       = input.bool(true, "Show Level Rejection Signals", group=grpLevels)
+rejectionUpColor    = input.color(color.new(color.lime, 20), "Support Held Color", group=grpLevels)
+rejectionDownColor  = input.color(color.new(color.red, 20), "Resistance Held Color", group=grpLevels)
+
+// ============================= FUNCTIONS =============================
+f_findOppositeFromOffset(startOffset, bullish) =>
+    float idx = na
+    for i = startOffset to startOffset + obLookback
+        cond = bullish ? close[i] < open[i] : close[i] > open[i]
+        if cond
+            idx := i
+            break
+    idx
+
+// ============================= ORDER BLOCKS =============================
+var float ph1 = na, var int phBar1 = na
+var float pl1 = na, var int plBar1 = na
+
+var box[] bullObBoxes = array.new_box()
+var box[] bearObBoxes = array.new_box()
+
+var int trend        = 0
+var float brokenHigh = na
+var float brokenLow  = na
+var int lastBreakBar = na
+
+swingHigh = ta.pivothigh(high, swingLength, swingLength)
+swingLow  = ta.pivotlow(low, swingLength, swingLength)
+
+if not na(swingHigh)
+    ph1 := swingHigh
+    phBar1 := bar_index - swingLength
+    if showOB
+        idxF = f_findOppositeFromOffset(swingLength, false)
+        if not na(idxF)
+            idx = int(idxF)
+            b = box.new(left=bar_index - idx, top=high[idx], right=bar_index, bottom=low[idx], border_color=obBorderBear, bgcolor=obBearColor, extend=extend.none)
+            array.push(bearObBoxes, b)
+
+if not na(swingLow)
+    pl1 := swingLow
+    plBar1 := bar_index - swingLength
+    if showOB
+        idxF = f_findOppositeFromOffset(swingLength, true)
+        if not na(idxF)
+            idx = int(idxF)
+            b = box.new(left=bar_index - idx, top=high[idx], right=bar_index, bottom=low[idx], border_color=obBorderBull, bgcolor=obBullColor, extend=extend.none)
+            array.push(bullObBoxes, b)
+
+if array.size(bullObBoxes) > 0
+    for i = array.size(bullObBoxes) - 1 to 0
+        bx = array.get(bullObBoxes, i)
+        if mitigateOB and close < box.get_bottom(bx)
+            box.delete(bx)
+            array.remove(bullObBoxes, i)
+        else
+            box.set_right(bx, bar_index)
+
+if array.size(bearObBoxes) > 0
+    for i = array.size(bearObBoxes) - 1 to 0
+        bx = array.get(bearObBoxes, i)
+        if mitigateOB and close > box.get_top(bx)
+            box.delete(bx)
+            array.remove(bearObBoxes, i)
+        else
+            box.set_right(bx, bar_index)
+
+// ============================= MARKET STRUCTURE (BOS / CHoCH) =============================
+bullBreak = not na(ph1) and ta.crossover(close, ph1) and (na(brokenHigh) or ph1 != brokenHigh)
+bearBreak = not na(pl1) and ta.crossunder(close, pl1) and (na(brokenLow) or pl1 != brokenLow)
+
+if bullBreak
+    isChoch = trend == -1
+    midBarBull = math.round((phBar1 + bar_index) / 2)
+    if isChoch and showCHoCH
+        line.new(phBar1, ph1, bar_index, ph1, color=chochBullColor, style=line.style_dashed, width=1)
+        label.new(midBarBull, ph1, "CHoCH", style=label.style_none, textcolor=chochBullColor, size=size.small)
+    if not isChoch and showBOS
+        line.new(phBar1, ph1, bar_index, ph1, color=bosBullColor, style=line.style_dashed, width=1)
+        label.new(midBarBull, ph1, "BOS", style=label.style_none, textcolor=bosBullColor, size=size.small)
+    trend := 1
+    brokenHigh := ph1
+    lastBreakBar := bar_index
+
+if bearBreak
+    isChoch = trend == 1
+    midBarBear = math.round((plBar1 + bar_index) / 2)
+    if isChoch and showCHoCH
+        line.new(plBar1, pl1, bar_index, pl1, color=chochBearColor, style=line.style_dashed, width=1)
+        label.new(midBarBear, pl1, "CHoCH", style=label.style_none, textcolor=chochBearColor, size=size.small)
+    if not isChoch and showBOS
+        line.new(plBar1, pl1, bar_index, pl1, color=bosBearColor, style=line.style_dashed, width=1)
+        label.new(midBarBear, pl1, "BOS", style=label.style_none, textcolor=bosBearColor, size=size.small)
+    trend := -1
+    brokenLow := pl1
+    lastBreakBar := bar_index
+
+// ============================= CALL / PUT HOLD LEVELS =============================
+callLevel = array.size(bullObBoxes) > 0 ? box.get_bottom(array.get(bullObBoxes, array.size(bullObBoxes) - 1)) : pl1
+putLevel  = array.size(bearObBoxes) > 0 ? box.get_top(array.get(bearObBoxes, array.size(bearObBoxes) - 1)) : ph1
+
+callBreached = not na(callLevel) and close < callLevel
+putBreached  = not na(putLevel) and close > putLevel
+
+callPlotColor = callBreached ? color.new(callLevelColor, breachedFade) : callLevelColor
+putPlotColor  = putBreached ? color.new(putLevelColor, breachedFade) : putLevelColor
+
+var line callLine       = na
+var line putLine        = na
+var float callLevelPrev = na
+var float putLevelPrev  = na
+
+if showLevels
+    callChanged = na(callLevelPrev) or (not na(callLevel) and callLevel != callLevelPrev)
+    if callChanged
+        if not na(callLine)
+            line.delete(callLine)
+        if not na(callLevel)
+            callLine := line.new(bar_index, callLevel, bar_index + 1, callLevel, color=callPlotColor, width=2, style=line.style_solid, extend=extend.right)
+        callLevelPrev := callLevel
+    else if not na(callLine)
+        line.set_color(callLine, callPlotColor)
+
+    putChanged = na(putLevelPrev) or (not na(putLevel) and putLevel != putLevelPrev)
+    if putChanged
+        if not na(putLine)
+            line.delete(putLine)
+        if not na(putLevel)
+            putLine := line.new(bar_index, putLevel, bar_index + 1, putLevel, color=putPlotColor, width=2, style=line.style_solid, extend=extend.right)
+        putLevelPrev := putLevel
+    else if not na(putLine)
+        line.set_color(putLine, putPlotColor)
+
+var table levelsTable = na
+if showLevelTable and barstate.islast
+    if not na(levelsTable)
+        table.delete(levelsTable)
+    levelsTable := table.new(position.top_right, 2, 3, bgcolor=color.new(color.black, 70), border_width=1, border_color=color.new(color.gray, 50))
+    table.cell(levelsTable, 0, 0, "Position", text_color=color.white, bgcolor=color.new(color.gray, 40))
+    table.cell(levelsTable, 1, 0, "Must Hold", text_color=color.white, bgcolor=color.new(color.gray, 40))
+    table.cell(levelsTable, 0, 1, "CALLS above", text_color=callLevelColor)
+    table.cell(levelsTable, 1, 1, na(callLevel) ? "n/a" : (callBreached ? "BREACHED" : str.tostring(callLevel, format.mintick)), text_color=callBreached ? color.gray : color.white)
+    table.cell(levelsTable, 0, 2, "PUTS below", text_color=putLevelColor)
+    table.cell(levelsTable, 1, 2, na(putLevel) ? "n/a" : (putBreached ? "BREACHED" : str.tostring(putLevel, format.mintick)), text_color=putBreached ? color.gray : color.white)
+
+// ============================= LEVEL REJECTION SIGNALS =============================
+// A "held" signal fires when a candle's wick touches or pierces the level intrabar,
+// but the CLOSE stays back on the correct side - i.e. the level survived that test.
+// This is a reactive confirmation, not a prediction that the level will hold going forward.
+supportTested   = not na(callLevel) and low <= callLevel
+supportHeld     = supportTested and close > callLevel
+resistanceTested = not na(putLevel) and high >= putLevel
+resistanceHeld   = resistanceTested and close < putLevel
+
+if showRejection and supportHeld
+    label.new(bar_index, low, "Held", style=label.style_label_up, color=color(na), textcolor=rejectionUpColor, size=size.tiny)
+
+if showRejection and resistanceHeld
+    label.new(bar_index, high, "Held", style=label.style_label_down, color=color(na), textcolor=rejectionDownColor, size=size.tiny)
+
+// ============================= FAIR VALUE GAPS =============================
+var box[] bullFvgBoxes = array.new_box()
+var box[] bearFvgBoxes = array.new_box()
+
+bullFVG = low > high[2] and close[1] > high[2]
+bearFVG = high < low[2] and close[1] < low[2]
+withinStructWindow = not na(lastBreakBar) and (bar_index - lastBreakBar) <= structFvgWindow
+fvgAllowed = not requireStructuralFVG or withinStructWindow
+
+if showFVG and bullFVG and fvgAllowed
+    b = box.new(left=bar_index[2], top=low, right=bar_index + fvgExtend, bottom=high[2], border_color=fvgBorderBull, bgcolor=fvgBullColor, extend=extend.none)
+    array.push(bullFvgBoxes, b)
+    if array.size(bullFvgBoxes) > maxFvgBoxes
+        box.delete(array.shift(bullFvgBoxes))
+
+if showFVG and bearFVG and fvgAllowed
+    b = box.new(left=bar_index[2], top=low[2], right=bar_index + fvgExtend, bottom=high, border_color=fvgBorderBear, bgcolor=fvgBearColor, extend=extend.none)
+    array.push(bearFvgBoxes, b)
+    if array.size(bearFvgBoxes) > maxFvgBoxes
+        box.delete(array.shift(bearFvgBoxes))
+
+if mitigateFVG and array.size(bullFvgBoxes) > 0
+    for i = array.size(bullFvgBoxes) - 1 to 0
+        bx = array.get(bullFvgBoxes, i)
+        if low <= box.get_bottom(bx)
+            box.delete(bx)
+            array.remove(bullFvgBoxes, i)
+
+if mitigateFVG and array.size(bearFvgBoxes) > 0
+    for i = array.size(bearFvgBoxes) - 1 to 0
+        bx = array.get(bearFvgBoxes, i)
+        if high >= box.get_top(bx)
+            box.delete(bx)
+            array.remove(bearFvgBoxes, i)
+
+// ============================= ANCHORED VWAP =============================
+isNewAnchor = switch anchorPeriod
+    "Session"      => ta.change(time("D")) != 0
+    "Week"         => ta.change(time("W")) != 0
+    "Month"        => ta.change(time("M")) != 0
+    "Custom Bars"  => bar_index % anchorBars == 0
+    => false
+
+var float cumVol = 0.0
+var float cumPV  = 0.0
+var float cumPV2 = 0.0
+
+if isNewAnchor
+    cumVol := 0.0
+    cumPV  := 0.0
+    cumPV2 := 0.0
+
+cumVol += volume
+cumPV  += vwapSrc * volume
+cumPV2 += vwapSrc * vwapSrc * volume
+
+vwapValue = cumVol > 0 ? cumPV / cumVol : na
+variance  = cumVol > 0 ? (cumPV2 / cumVol) - vwapValue * vwapValue : na
+stdev     = variance > 0 ? math.sqrt(variance) : na
+upperBand = na(vwapValue) or na(stdev) ? na : vwapValue + stdev * bandMult
+lowerBand = na(vwapValue) or na(stdev) ? na : vwapValue - stdev * bandMult
+
+plot(showVWAP ? vwapValue : na, title="Anchored VWAP", color=vwapColor, linewidth=vwapWidth)
+bandUpperPlot = plot(showVWAP and showBands ? upperBand : na, title="VWAP Upper Band", color=bandColor)
+bandLowerPlot = plot(showVWAP and showBands ? lowerBand : na, title="VWAP Lower Band", color=bandColor)
+fill(bandUpperPlot, bandLowerPlot, color=showVWAP and showBands ? color.new(bandColor, 90) : na)

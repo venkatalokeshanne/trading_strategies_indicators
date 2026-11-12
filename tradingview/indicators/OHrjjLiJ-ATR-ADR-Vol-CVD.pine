@@ -1,0 +1,399 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// Based on Swing Data ADR/RVol concepts (MikeC, Fred6724, TheScrutiniser, GlinckEastwoot).
+// Dual-column dashboard: Daily-anchored stats + current chart timeframe + CVD flow.
+
+//@version=6
+indicator("ATR-ADR-Vol-CVD", shorttitle = "AAV-CVD", overlay = true, max_bars_back = 500)
+
+grp_table = "Dashboard"
+posTable = input.string("Top Right", "Position", options = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group = grp_table)
+tblSize = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = grp_table)
+showDailyCol = input.bool(true, "Show Daily column", group = grp_table)
+showTfCol = input.bool(true, "Show chart TF column", group = grp_table, tooltip = "Hidden automatically on Daily chart timeframe.")
+accentCol = input.color(#5D606B, "Accent text", group = grp_table)
+dimCol = input.color(color.new(#8FA3B8, 0), "Dim labels", group = grp_table)
+dashStyle = input.string("Dark panel", "Dashboard style", options = ["Dark panel", "Transparent"], group = grp_table, tooltip = "Transparent prints text only with no cell backgrounds, like the original ADR script.")
+
+grp_disp = "Display"
+showVolatility = input.bool(true, "Volatility section", group = grp_disp)
+showPrice = input.bool(true, "Price position section", group = grp_disp)
+showVolume = input.bool(true, "Volume section", group = grp_disp)
+showFlow = input.bool(true, "CVD flow section", group = grp_disp)
+showStrength = input.bool(true, "RS percentile", group = grp_disp)
+showMeta = input.bool(false, "Market cap / float / sector", group = grp_disp)
+
+grp_param = "Parameters"
+adrpLen = input.int(20, "ADR% length", minval = 5, group = grp_param)
+atrLen = input.int(14, "ATR length", minval = 2, group = grp_param)
+volLen = input.int(50, "Volume MA length", minval = 5, group = grp_param)
+udLen = input.int(50, "U/D ratio lookback", minval = 5, group = grp_param)
+
+grp_cvd = "CVD"
+deltaMode = input.string("CLV", "Delta method", options = ["CLV", "Candle color"], group = grp_cvd)
+useRTHOnly = input.bool(true, "RTH-only delta on intraday", group = grp_cvd)
+sessionTZ = input.string("America/New_York", "RTH timezone", options = ["America/New_York", "America/Chicago", "America/Los_Angeles"], group = grp_cvd)
+zLen = input.int(20, "Z-score lookback", minval = 5, group = grp_cvd)
+zThreshold = input.float(2.0, "Z-score highlight", minval = 0.5, step = 0.1, group = grp_cvd)
+
+grp_rs = "Relative Strength"
+rsBenchmark = input.symbol("SPY", "Benchmark", group = grp_rs)
+rsShortLen = input.int(63, "RS short lookback (bars)", minval = 5, group = grp_rs)
+rsLongLen = input.int(252, "RS long lookback (bars)", minval = 20, group = grp_rs)
+rsPercentileLen = input.int(252, "RS percentile lookback (bars)", minval = 20, group = grp_rs, tooltip = "How many bars of RS score history to rank the current reading against.")
+
+// ---------------------------- HELPERS ----------------------------
+f_tblSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+f_tblPos(string p) =>
+    p == "Top Left" ? position.top_left : p == "Bottom Left" ? position.bottom_left : p == "Bottom Right" ? position.bottom_right : position.top_right
+
+f_tfLabel() =>
+    timeframe.isdaily ? "Daily" : timeframe.isweekly ? "Weekly" : timeframe.period
+
+f_barDelta(float h, float l, float c, float o, float v) =>
+    float clv = h != l ? ((c - l) - (h - c)) / (h - l) : 0.0
+    deltaMode == "CLV" ? clv * v : c > o ? v : c < o ? -v : 0.0
+
+f_fmtVol(float val) =>
+    float av = math.abs(val)
+    string u = av >= 1e9 ? "B" : av >= 1e6 ? "M" : av >= 1e3 ? "K" : ""
+    float d = u == "B" ? 1e9 : u == "M" ? 1e6 : u == "K" ? 1e3 : 1.0
+    (val < 0 ? "-" : "") + str.tostring(math.abs(val) / d, "#.##") + u
+
+f_fmtPct(float val, int dec) =>
+    string fmt = dec <= 1 ? "#.#" : "#.##"
+    (val >= 0 ? "+" : "") + str.tostring(val, fmt) + "%"
+
+f_valCol(float val) =>
+    val > 0 ? color.new(#00C853, 0) : val < 0 ? color.new(#FF5252, 0) : accentCol
+
+f_zCol(float z) =>
+    math.abs(z) >= zThreshold ? color.new(color.yellow, 0) : f_valCol(z)
+
+string sym = syminfo.tickerid
+bool onDaily = timeframe.isdaily
+
+// ---------------------------- CHART TF METRICS ----------------------------
+float barVolTF = useRTHOnly and timeframe.isintraday and na(time(timeframe.period, "0930-1600", sessionTZ)) ? 0.0 : volume
+float barDeltaTF = f_barDelta(high, low, close, open, barVolTF)
+
+bool inRTH = not na(time(timeframe.period, "0930-1600", sessionTZ))
+bool newDaySess = ta.change(time("D", sessionTZ)) != 0
+bool rthOpenTransition = useRTHOnly and inRTH and not inRTH[1]
+var float sessCVDTF = 0.0
+if newDaySess or rthOpenTransition
+    sessCVDTF := 0.0
+sessCVDTF += barDeltaTF
+
+float sessCVDMean = ta.sma(sessCVDTF, zLen)
+float sessCVDStd = ta.stdev(sessCVDTF, zLen)
+float sessCVDZ = sessCVDStd > 0 ? (sessCVDTF - sessCVDMean) / sessCVDStd : 0.0
+
+float atrTF = ta.atr(atrLen)
+float atrPctTF = close > 0 ? 100.0 * atrTF / close : na
+float adrPctTF = 100.0 * (ta.sma(high / low, adrpLen) - 1)
+float lodDistTF = atrTF > 0 ? 100.0 * (close - low) / atrTF : na
+float lodPriceTF = low
+float volMaTF = ta.sma(volume, volLen)
+float relVolTF = volMaTF > 0 ? volume / volMaTF * 100.0 : na
+float volBuzzTF = volMaTF > 0 ? 100.0 * (volume / volMaTF - 1.0) : na
+float upVolTF = close > close[1] ? volume : 0.0
+float dnVolTF = close < close[1] ? volume : 0.0
+float udRatioTF = math.sum(dnVolTF, udLen) > 0 ? math.sum(upVolTF, udLen) / math.sum(dnVolTF, udLen) : na
+
+float timePassed = (timenow - time) / 1000.0
+float timeLeft = (time_close - timenow) / 1000.0
+float projVolTF = volume
+if timeLeft > 0 and timePassed > 0
+    projVolTF := volume + (volume / timePassed) * timeLeft
+
+var float todayVolTF = 0.0
+if newDaySess
+    todayVolTF := 0.0
+float volForTodayTF = useRTHOnly and timeframe.isintraday ? barVolTF : volume
+todayVolTF += volForTodayTF
+float todayVolTFVal = timeframe.isintraday ? todayVolTF : volume
+
+// ---------------------------- DAILY METRICS (always daily-anchored) ----------------------------
+float closeD = request.security(sym, "D", close, lookahead = barmerge.lookahead_off)
+float lowD = request.security(sym, "D", low, lookahead = barmerge.lookahead_off)
+
+float adrPctD = request.security(sym, "D", 100.0 * (ta.sma(high / low, adrpLen) - 1), lookahead = barmerge.lookahead_off)
+float atrD = request.security(sym, "D", ta.atr(atrLen), lookahead = barmerge.lookahead_off)
+float atrPctD = closeD > 0 ? 100.0 * atrD / closeD : na
+float lodDistD = atrD > 0 ? 100.0 * (closeD - lowD) / atrD : na
+float lodPriceD = lowD
+
+float volD = request.security(sym, "D", volume, lookahead = barmerge.lookahead_off)
+float todayVolD = volD
+float volMaD = request.security(sym, "D", ta.sma(volume, volLen), lookahead = barmerge.lookahead_off)
+float relVolD = volMaD > 0 ? volD / volMaD * 100.0 : na
+float volBuzzD = volMaD > 0 ? 100.0 * (volD / volMaD - 1.0) : na
+float avgVolD = volMaD
+float avgDollarVolD = closeD * avgVolD
+
+float udRatioD = request.security(sym, "D", math.sum(close > close[1] ? volume : 0.0, udLen) / math.max(math.sum(close < close[1] ? volume : 0.0, udLen), 1.0), lookahead = barmerge.lookahead_off)
+
+float barDeltaD = request.security(sym, "D", f_barDelta(high, low, close, open, volume), lookahead = barmerge.lookahead_off)
+float sessCVDD = onDaily ? barDeltaD : sessCVDTF
+
+float fiftyTwoHigh = request.security(sym, "W", ta.highest(high, 52), lookahead = barmerge.lookahead_off)
+float fiftyTwoLow = request.security(sym, "W", ta.lowest(low, 52), lookahead = barmerge.lookahead_off)
+float distHighD = closeD / fiftyTwoHigh * 100.0 - 100.0
+float distLowD = closeD / fiftyTwoLow * 100.0 - 100.0
+
+float projVolD = volD
+float dTimePassed = request.security(sym, "D", (timenow - time) / 1000.0, lookahead = barmerge.lookahead_off)
+float dTimeLeft = request.security(sym, "D", (time_close - timenow) / 1000.0, lookahead = barmerge.lookahead_off)
+if dTimeLeft > 0 and dTimePassed > 0
+    projVolD := volD + (volD / dTimePassed) * dTimeLeft
+
+// RS Percentile — original design, not IBD's RS Rating methodology.
+// Computes excess return (stock ROC minus benchmark ROC) over a short and a long lookback,
+// blends them, then ranks that blended score against its own trailing history with Pine's
+// native ta.percentrank(). Self-relative ("stronger than X% of its own recent readings"),
+// not cross-sectional against the whole market — no seed dataset or third-party curve needed.
+f_getRsPercentile(string ticker, string benchmark) =>
+    float closeRs = request.security(ticker, "D", close, lookahead = barmerge.lookahead_off)
+    float benchClose = request.security(benchmark, "D", close, lookahead = barmerge.lookahead_off)
+    int nShort = math.min(bar_index, rsShortLen)
+    int nLong = math.min(bar_index, rsLongLen)
+    float rocStockShort = closeRs[nShort] != 0 ? (closeRs - closeRs[nShort]) / closeRs[nShort] * 100.0 : na
+    float rocBenchShort = benchClose[nShort] != 0 ? (benchClose - benchClose[nShort]) / benchClose[nShort] * 100.0 : na
+    float rocStockLong = closeRs[nLong] != 0 ? (closeRs - closeRs[nLong]) / closeRs[nLong] * 100.0 : na
+    float rocBenchLong = benchClose[nLong] != 0 ? (benchClose - benchClose[nLong]) / benchClose[nLong] * 100.0 : na
+    float excessShort = nz(rocStockShort) - nz(rocBenchShort)
+    float excessLong = nz(rocStockLong) - nz(rocBenchLong)
+    float rsScore = 0.5 * excessShort + 0.5 * excessLong
+    ta.percentrank(rsScore, rsPercentileLen)
+
+float rsRating = f_getRsPercentile(sym, rsBenchmark)
+
+float mCap = request.financial(sym, "MARKET_CAP_BASIC", "D", ignore_invalid_symbol = true)
+if na(mCap)
+    mCap := syminfo.shares_outstanding_total * close
+float sharesTotal = syminfo.shares_outstanding_total
+float floatPct = sharesTotal > 0 ? syminfo.shares_outstanding_float / sharesTotal * 100.0 : na
+string sectorTxt = na(syminfo.sector) ? "N/A" : syminfo.sector
+
+// ---------------------------- DASHBOARD ----------------------------
+var table dash = na
+var int lastCols = na
+
+if barstate.islast
+    bool showTfColEff = showTfCol and not onDaily
+    int colD = showDailyCol ? 1 : -1
+    int colTf = showTfColEff ? (showDailyCol ? 2 : 1) : -1
+    int cols = 1 + (showDailyCol ? 1 : 0) + (showTfColEff ? 1 : 0)
+    bool transDash = dashStyle == "Transparent"
+    color bgTbl = transDash ? #00000000 : color.new(#0A0E14, 0)
+    color bgHd = transDash ? #00000000 : color.new(#1A2332, 0)
+    color bgSec = transDash ? #00000000 : color.new(#131722, 0)
+    color bgA = transDash ? #00000000 : color.new(#0A0E14, 0)
+    color bgB = transDash ? #00000000 : color.new(#121820, 0)
+    int bdrW = transDash ? 0 : 1
+    color bdrC = transDash ? #00000000 : color.new(color.white, 75)
+    color hdrTxt = transDash ? accentCol : color.white
+    color hdrSub = transDash ? accentCol : color.new(color.white, 20)
+    color lblCol = transDash ? accentCol : dimCol
+    if na(dash) or cols != lastCols
+        if not na(dash)
+            table.delete(dash)
+        dash := table.new(f_tblPos(posTable), math.max(cols, 2), 33, bgcolor = bgTbl, border_width = bdrW, border_color = bdrC)
+        lastCols := cols
+    else
+        table.set_bgcolor(dash, bgTbl)
+        table.set_border_width(dash, bdrW)
+        table.set_border_color(dash, bdrC)
+    string tSz = f_tblSize(tblSize)
+    string tfLbl = f_tfLabel()
+    int r = 0
+
+    table.cell(dash, 0, r, syminfo.ticker, text_color = hdrTxt, bgcolor = bgHd, text_size = tSz, text_halign = text.align_left)
+    if colD > 0
+        table.cell(dash, colD, r, "Daily", text_color = hdrSub, bgcolor = bgHd, text_size = tSz)
+    if colTf > 0
+        table.cell(dash, colTf, r, tfLbl, text_color = hdrSub, bgcolor = bgHd, text_size = tSz)
+    r += 1
+
+    if showVolatility
+        color sc = bgSec
+        table.cell(dash, 0, r, "VOLATILITY", text_color = accentCol, bgcolor = sc, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc)
+        r += 1
+        color rb0 = bgA
+        table.cell(dash, 0, r, "ATR%", text_color = lblCol, bgcolor = rb0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(atrPctD, "#.##") + "%", text_color = accentCol, bgcolor = rb0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(atrPctTF, "#.##") + "%", text_color = accentCol, bgcolor = rb0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color rb1 = bgB
+        table.cell(dash, 0, r, "ADR%", text_color = lblCol, bgcolor = rb1, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(adrPctD, "#.##") + "%", text_color = accentCol, bgcolor = rb1, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(adrPctTF, "#.##") + "%", text_color = accentCol, bgcolor = rb1, text_size = tSz, text_halign = text.align_right)
+        r += 1
+
+    if showPrice
+        color sc2 = bgSec
+        table.cell(dash, 0, r, "PRICE", text_color = accentCol, bgcolor = sc2, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc2)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc2)
+        r += 1
+        color rp0 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "LoD dist.", text_color = lblCol, bgcolor = rp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(lodDistD, "#") + "%", text_color = accentCol, bgcolor = rp0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(lodDistTF, "#") + "%", text_color = accentCol, bgcolor = rp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color rp1 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "LoD Price", text_color = lblCol, bgcolor = rp1, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(lodPriceD, format.mintick), text_color = accentCol, bgcolor = rp1, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(lodPriceTF, format.mintick), text_color = accentCol, bgcolor = rp1, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color rp2 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Off 52W High", text_color = lblCol, bgcolor = rp2, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtPct(distHighD, 1), text_color = f_valCol(distHighD), bgcolor = rp2, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtPct(close / fiftyTwoHigh * 100 - 100, 1), text_color = f_valCol(close / fiftyTwoHigh * 100 - 100), bgcolor = rp2, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color rp3 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Above 52W Low", text_color = lblCol, bgcolor = rp3, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtPct(distLowD, 1), text_color = f_valCol(distLowD), bgcolor = rp3, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtPct(close / fiftyTwoLow * 100 - 100, 1), text_color = f_valCol(close / fiftyTwoLow * 100 - 100), bgcolor = rp3, text_size = tSz, text_halign = text.align_right)
+        r += 1
+
+    if showVolume
+        color sc3 = bgSec
+        table.cell(dash, 0, r, "VOLUME", text_color = accentCol, bgcolor = sc3, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc3)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc3)
+        r += 1
+        color vt0 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Today Vol", text_color = lblCol, bgcolor = vt0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(todayVolD), text_color = accentCol, bgcolor = vt0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtVol(todayVolTFVal), text_color = accentCol, bgcolor = vt0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp0 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Avg $ Vol", text_color = lblCol, bgcolor = vp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "$" + f_fmtVol(avgDollarVolD), text_color = accentCol, bgcolor = vp0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, "$" + f_fmtVol(close * volMaTF), text_color = accentCol, bgcolor = vp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp1 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Avg Vol", text_color = lblCol, bgcolor = vp1, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(avgVolD), text_color = accentCol, bgcolor = vp1, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtVol(volMaTF), text_color = accentCol, bgcolor = vp1, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp2 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Proj. Vol", text_color = lblCol, bgcolor = vp2, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(projVolD), text_color = accentCol, bgcolor = vp2, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtVol(projVolTF), text_color = accentCol, bgcolor = vp2, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp3 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Rel. Vol", text_color = lblCol, bgcolor = vp3, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(relVolD, "#") + "%", text_color = f_valCol(relVolD - 100), bgcolor = vp3, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(relVolTF, "#") + "%", text_color = f_valCol(relVolTF - 100), bgcolor = vp3, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp4 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Vol. Buzz", text_color = lblCol, bgcolor = vp4, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtPct(volBuzzD, 0), text_color = f_valCol(volBuzzD), bgcolor = vp4, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtPct(volBuzzTF, 0), text_color = f_valCol(volBuzzTF), bgcolor = vp4, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color vp5 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "U/D Ratio", text_color = lblCol, bgcolor = vp5, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(udRatioD, "#.#"), text_color = f_valCol(udRatioD - 1), bgcolor = vp5, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, str.tostring(udRatioTF, "#.#"), text_color = f_valCol(udRatioTF - 1), bgcolor = vp5, text_size = tSz, text_halign = text.align_right)
+        r += 1
+
+    if showFlow
+        color sc4 = bgSec
+        table.cell(dash, 0, r, "FLOW (CVD)", text_color = accentCol, bgcolor = sc4, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc4)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc4)
+        r += 1
+        color fp0 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Bar Δ", text_color = lblCol, bgcolor = fp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(barDeltaD), text_color = f_valCol(barDeltaD), bgcolor = fp0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, f_fmtVol(barDeltaTF), text_color = f_valCol(barDeltaTF), bgcolor = fp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        color fp1 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "Sess CVD", text_color = lblCol, bgcolor = fp1, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(sessCVDD), text_color = f_valCol(sessCVDD), bgcolor = fp1, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            string zTxt = (sessCVDZ >= 0 ? "+" : "") + str.tostring(sessCVDZ, "#.##") + "σ"
+            table.cell(dash, colTf, r, zTxt, text_color = f_zCol(sessCVDZ), bgcolor = fp1, text_size = tSz, text_halign = text.align_right)
+        r += 1
+
+    if showStrength
+        color sc5 = bgSec
+        table.cell(dash, 0, r, "STRENGTH", text_color = accentCol, bgcolor = sc5, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc5)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc5)
+        r += 1
+        color sp0 = r % 2 == 0 ? bgA : bgB
+        table.cell(dash, 0, r, "RS Percentile", text_color = lblCol, bgcolor = sp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(rsRating, "#.#"), text_color = accentCol, bgcolor = sp0, text_size = tSz, text_halign = text.align_right)
+        if colTf > 0
+            table.cell(dash, colTf, r, onDaily ? str.tostring(rsRating, "#.#") : "—", text_color = lblCol, bgcolor = sp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+
+    if showMeta
+        color sc6 = bgSec
+        table.cell(dash, 0, r, "META", text_color = accentCol, bgcolor = sc6, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, "", bgcolor = sc6)
+        if colTf > 0
+            table.cell(dash, colTf, r, "", bgcolor = sc6)
+        r += 1
+        color mp0 = bgB
+        table.cell(dash, 0, r, "Market Cap", text_color = lblCol, bgcolor = mp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, f_fmtVol(mCap), text_color = accentCol, bgcolor = mp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        table.cell(dash, 0, r, "Float %", text_color = lblCol, bgcolor = mp0, text_size = tSz, text_halign = text.align_left)
+        if colD > 0
+            table.cell(dash, colD, r, str.tostring(floatPct, "#.#") + "%", text_color = accentCol, bgcolor = mp0, text_size = tSz, text_halign = text.align_right)
+        r += 1
+        table.cell(dash, 0, r, sectorTxt, text_color = accentCol, bgcolor = mp0, text_size = tSz, text_halign = text.align_left)
+        int lastCol = math.max(colD, colTf)
+        if lastCol > 0
+            table.merge_cells(dash, 0, r, lastCol, r)

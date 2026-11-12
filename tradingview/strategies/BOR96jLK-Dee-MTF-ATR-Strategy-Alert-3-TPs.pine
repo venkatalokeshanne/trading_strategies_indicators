@@ -1,0 +1,171 @@
+//@version=5
+strategy("NAS-Style MTF ATR Strategy (3 TPs)",
+     overlay = true,
+     initial_capital = 10000,
+     pyramiding = 0,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.01,
+     process_orders_on_close = true)
+
+// ==== Inputs ====
+tfHTF        = input.timeframe("60", "Higher Timeframe")
+stAtrLen     = input.int(10, "Supertrend ATR Length", 1)
+stMult       = input.float(3.0, "Supertrend Multiplier", 0.1, 10.0)
+
+smaFastLen   = input.int(8, "Fast SMA")
+smaSlowLen   = input.int(9, "Slow SMA")
+
+atrLen       = input.int(10, "ATR Length (TP/SL)")
+atrRiskMult  = input.float(1.5, "ATR Stop Multiplier", 0.1, 10.0)
+tp1MultR     = input.float(1.0, "TP1 (R multiples)", 0.5, 5.0)
+tp2MultR     = input.float(2.0, "TP2 (R multiples)", 0.5, 5.0)
+tp3MultR     = input.float(3.0, "TP3 (R multiples)", 0.5, 5.0)
+
+// Risk per trade (optional, fixed quantity here)
+useRiskSizing   = input.bool(false, "Use $ Risk Sizing")
+riskUsdPerTrade = input.float(100.0, "Risk $ per Trade", 10.0)
+fixedQty        = input.float(1.0, "Fixed Quantity (if risk sizing off)", 0.1)
+
+// ==== Supertrend helper (single timeframe) ====
+f_supertrend(price_src, atr_len, mult) =>
+    atr   = ta.atr(atr_len)
+    upper = price_src + mult * atr
+    lower = price_src - mult * atr
+    var float dir  = 1.0
+    var float line = na
+
+    if price_src > nz(line, lower)
+        dir  := 1.0
+        line := math.max(lower, nz(line, lower))
+    else
+        dir  := -1.0
+        line := math.min(upper, nz(line, upper))
+    [dir, line]
+
+// ==== LTF Supertrend (chart timeframe) ====
+[ltfDir, ltfLine] = f_supertrend(close, stAtrLen, stMult)
+
+// ==== HTF Supertrend via security ====
+[htfDir_raw, htfLine_raw] = request.security(syminfo.tickerid, tfHTF, f_supertrend(close, stAtrLen, stMult))
+htfDir  = htfDir_raw
+htfLine = htfLine_raw
+
+// ==== SMAs on LTF ====
+smaFast = ta.sma(close, smaFastLen)
+smaSlow = ta.sma(close, smaSlowLen)
+
+// ==== Trend & entry conditions ====
+// LTF trend must agree with HTF trend
+bullLTF = (ltfDir == 1.0)  and (close > ltfLine)
+bearLTF = (ltfDir == -1.0) and (close < ltfLine)
+
+bullHTF = (htfDir == 1.0)
+bearHTF = (htfDir == -1.0)
+
+bull = bullLTF and bullHTF
+bear = bearLTF and bearHTF
+
+strongBuy  = bull and smaFast >= smaSlow
+strongSell = bear and smaFast <= smaSlow
+
+// Entry triggers on bar close
+longEntry  = strongBuy
+shortEntry = strongSell
+
+// ==== ATR and risk calculations ====
+atr = ta.atr(atrLen)
+
+// Long stop and R per unit
+longSL  = close - atrRiskMult * atr
+longR   = close - longSL
+
+// Short stop and R per unit
+shortSL = close + atrRiskMult * atr
+shortR  = shortSL - close
+
+// ==== Position size (no ternary, avoids syntax issues) ====
+float longQty  = na
+float shortQty = na
+
+if useRiskSizing and (longR > 0)
+    longQty := math.floor(riskUsdPerTrade / longR)
+else
+    longQty := fixedQty
+
+if useRiskSizing and (shortR > 0)
+    shortQty := math.floor(riskUsdPerTrade / shortR)
+else
+    shortQty := fixedQty
+
+// ==== Take-profit level variables ====
+float longTP1 = na
+float longTP2 = na
+float longTP3 = na
+
+float shortTP1 = na
+float shortTP2 = na
+float shortTP3 = na
+
+if longEntry and (longR > 0)
+    longTP1 := close + tp1MultR * longR
+    longTP2 := close + tp2MultR * longR
+    longTP3 := close + tp3MultR * longR
+
+if shortEntry and (shortR > 0)
+    shortTP1 := close - tp1MultR * shortR
+    shortTP2 := close - tp2MultR * shortR
+    shortTP3 := close - tp3MultR * shortR
+
+// ==== Entry orders ====
+// Only enter when flat
+isFlat = strategy.position_size == 0
+
+if longEntry and isFlat and (longQty > 0)
+    strategy.entry("Long", strategy.long, qty = longQty)
+
+if shortEntry and isFlat and (shortQty > 0)
+    strategy.entry("Short", strategy.short, qty = shortQty)
+
+// ==== Exit orders: SL + 3 TPs (scaled exits) ====
+if strategy.position_size > 0
+    avg = strategy.position_avg_price
+    r   = atrRiskMult * atr
+
+    float longSL_now  = avg - atrRiskMult * atr
+    float longTP1_now = avg + tp1MultR * r
+    float longTP2_now = avg + tp2MultR * r
+    float longTP3_now = avg + tp3MultR * r
+
+    strategy.exit("L-TP1", from_entry = "Long",
+                  limit = longTP1_now, qty_percent = 33, comment = "TP1")
+    strategy.exit("L-TP2", from_entry = "Long",
+                  limit = longTP2_now, qty_percent = 33, comment = "TP2")
+    strategy.exit("L-TP3", from_entry = "Long",
+                  limit = longTP3_now, qty_percent = 34, comment = "TP3")
+    strategy.exit("L-SL", from_entry = "Long",
+                  stop = longSL_now, qty_percent = 100, comment = "SL")
+
+if strategy.position_size < 0
+    avg = strategy.position_avg_price
+    r   = atrRiskMult * atr
+
+    float shortSL_now  = avg + atrRiskMult * atr
+    float shortTP1_now = avg - tp1MultR * r
+    float shortTP2_now = avg - tp2MultR * r
+    float shortTP3_now = avg - tp3MultR * r
+
+    strategy.exit("S-TP1", from_entry = "Short",
+                  limit = shortTP1_now, qty_percent = 33, comment = "TP1")
+    strategy.exit("S-TP2", from_entry = "Short",
+                  limit = shortTP2_now, qty_percent = 33, comment = "TP2")
+    strategy.exit("S-TP3", from_entry = "Short",
+                  limit = shortTP3_now, qty_percent = 34, comment = "TP3")
+    strategy.exit("S-SL", from_entry = "Short",
+                  stop = shortSL_now, qty_percent = 100, comment = "SL")
+
+// ==== Plotting ====
+plot(ltfLine, "LTF Supertrend", color = ltfDir == 1.0 ? color.new(color.green, 0) : color.new(color.red, 0), linewidth = 2)
+plot(htfLine, "HTF Supertrend", color = color.new(color.blue, 60), linewidth = 2, style = plot.style_linebr)
+
+plotshape(longEntry,  title = "Strong Buy",  style = shape.triangleup,   location = location.belowbar, color = color.lime, text = "SB", size = size.tiny)
+plotshape(shortEntry, title = "Strong Sell", style = shape.triangledown, location = location.abovebar, color = color.red,  text = "SS", size = size.tiny)

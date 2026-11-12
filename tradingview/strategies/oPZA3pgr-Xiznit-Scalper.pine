@@ -1,0 +1,445 @@
+//@version=6
+strategy("Xiznit Scalper", overlay=true, margin_long=100, margin_short=100,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     calc_on_every_tick=false, process_orders_on_close=false)
+
+// ============================================================
+// INPUTS — Signal Mode
+// ============================================================
+grp_sig = "Signal Mode"
+
+i_signal_mode = input.string("EMA Cross", title="Entry Signal Mode",
+     options=["EMA Cross", "VWAP Deviation", "Heikin Ashi + RSI", "Price Structure"],
+     group=grp_sig,
+     tooltip="EMA Cross: Fast/slow EMA crossover. Trending markets only. Long on bullish cross, short on bearish.\n\nVWAP Deviation: Mean-reversion. Enters when price stretches too far from session VWAP. Works in trending and ranging regimes.\n\nHeikin Ashi + RSI: Two consecutive HA candles in same direction confirmed by RSI threshold. Trending markets only.\n\nPrice Structure: Zero-lag candle-based HH/HL or LH/LL detection. Works in trending and ranging regimes.")
+
+// EMA Cross
+i_ema_fast = input.int(9,  title="EMA Fast Length", group=grp_sig, inline="ema",
+     tooltip="Period for the fast EMA. A crossover of fast over slow triggers a long signal; crossunder triggers short. Used in EMA Cross mode only.")
+i_ema_slow = input.int(21, title="EMA Slow Length", group=grp_sig, inline="ema",
+     tooltip="Period for the slow EMA. Wider separation between fast and slow = stronger trend requirement before signal fires.")
+
+// VWAP Deviation
+i_vwap_dev = input.float(0.0015, title="VWAP Deviation Threshold (%/100)", group=grp_sig, step=0.0001,
+     tooltip="Minimum distance from session VWAP required to trigger a mean-reversion entry, expressed as a decimal. 0.0015 = 0.15% deviation. Increase to require a larger stretch before entering.")
+
+// HA + RSI
+i_rsi_len = input.int(14, title="RSI Length", group=grp_sig,
+     tooltip="Lookback period for the RSI calculation used in Heikin Ashi + RSI mode. Lower values = more reactive, higher values = smoother.")
+i_rsi_ob  = input.int(55, title="RSI Bull Threshold (Long > X)",  group=grp_sig, inline="rsi",
+     tooltip="Long entries require RSI to be above this value. Default 55 avoids neutral-zone longs. Raise to require stronger bullish momentum confirmation.")
+i_rsi_os  = input.int(45, title="RSI Bear Threshold (Short < X)", group=grp_sig, inline="rsi",
+     tooltip="Short entries require RSI to be below this value. Default 45 avoids neutral-zone shorts. Lower to require stronger bearish momentum confirmation.")
+
+// Price Structure
+i_struct_bars = input.int(2, title="Structure Lookback Candles (2–3)", group=grp_sig, minval=2, maxval=3,
+     tooltip="2 = current candle must make HH+HL (long) or LH+LL (short) vs the prior candle. 3 = three consecutive candles must confirm the structure. More candles = stronger confirmation with fewer total signals.")
+
+// ============================================================
+// INPUTS — ER Regime Filter
+// ============================================================
+grp_er = "ER Regime Filter"
+
+i_er_len = input.int(10, title="ER Length", group=grp_er,
+     tooltip="Lookback bars for the Efficiency Ratio calculation. ER measures how directionally efficient price movement is over this period. Lower = more reactive to recent bars, higher = smoother regime classification.")
+i_er_trend_min = input.float(0.6, title="Trending Threshold ≥", group=grp_er, step=0.05,
+     tooltip="ER at or above this value = Trending regime (Grade A). All four signal modes are active. Chart background shows teal.")
+i_er_range_min = input.float(0.3, title="Mild Ranging Threshold ≥", group=grp_er, step=0.05,
+     tooltip="ER at or above this value but below the Trending threshold = Mild Ranging regime (Grade B). Only VWAP Deviation and Price Structure modes are active. Chart background shows yellow. Below this value = Flat/blocked, no entries.")
+
+// ============================================================
+// INPUTS — ATR Stop Loss / Take Profit
+// ============================================================
+grp_atr = "ATR Stop / Target"
+
+i_atr_len = input.int(14, title="ATR Length", group=grp_atr,
+     tooltip="Lookback period for Average True Range. Controls how responsive the stop loss and take profit levels are to recent volatility. Lower = tighter and more reactive, higher = wider and smoother.")
+i_atr_sl  = input.float(1.2, title="SL Multiplier", group=grp_atr, step=0.1,
+     tooltip="Stop loss distance = ATR × this multiplier. For longs: SL = entry - (ATR × multiplier). For shorts: SL = entry + (ATR × multiplier). Higher value = wider stop, more room to breathe but larger risk per trade.")
+i_atr_rr  = input.float(1.5, title="R:R Ratio (TP)", group=grp_atr, step=0.1,
+     tooltip="Take profit is set at SL distance × this ratio. 1.5 means TP is 1.5× the size of the stop. Example: if SL = 10 pts, TP = 15 pts. Higher ratio = larger target, fewer fills but better reward when hit.")
+
+// ============================================================
+// INPUTS — Sessions
+// ============================================================
+grp_sess = "Session Settings"
+
+i_asia_on    = input.bool(true, title="Asia Session",    group=grp_sess, inline="asia",
+     tooltip="Enable trading during the Asia session. Default window: 7:00 PM – 12:00 AM CT. Adjust start/end hours to match your preferred boundaries. Counter resets at session open.")
+i_asia_start = input.int(19,   title="Start Hour (CT)", group=grp_sess, inline="asia",
+     tooltip="Session start hour in CT (America/Chicago). Chart timezone must be set to CT for session detection to be accurate.")
+i_asia_end   = input.int(24,   title="End Hour (CT)",   group=grp_sess, inline="asia",
+     tooltip="Session end hour in CT. Use 24 for midnight. Asia crosses midnight so end=24 is handled correctly as the next calendar day start.")
+i_asia_max   = input.int(5,    title="Max Trades",      group=grp_sess, inline="asia",
+     tooltip="Maximum number of entries allowed during this session. Once the limit is reached no new entries fire until the next session open resets the counter.")
+
+i_lon_on    = input.bool(true, title="London Session",  group=grp_sess, inline="lon",
+     tooltip="Enable trading during the London session. Default window: 2:00 AM – 8:00 AM CT. High-volume session with strong directional moves.")
+i_lon_start = input.int(2,    title="Start Hour (CT)", group=grp_sess, inline="lon",
+     tooltip="Session start hour in CT (America/Chicago). Chart timezone must be set to CT for session detection to be accurate.")
+i_lon_end   = input.int(8,    title="End Hour (CT)",   group=grp_sess, inline="lon",
+     tooltip="Session end hour in CT.")
+i_lon_max   = input.int(5,    title="Max Trades",      group=grp_sess, inline="lon",
+     tooltip="Maximum number of entries allowed during this session. Counter resets at London session open each day.")
+
+i_ny_on    = input.bool(true, title="New York Session", group=grp_sess, inline="ny",
+     tooltip="Enable trading during the New York session. Default window: 8:30 AM – 3:00 PM CT. Highest volume session for US futures. Start hour is floored to 8 — adjust to 9 to skip the open if preferred.")
+i_ny_start = input.int(8,    title="Start Hour (CT)",  group=grp_sess, inline="ny",
+     tooltip="Session start hour in CT. Default 8 covers pre-market. Set to 9 to begin after the equity open if you prefer to avoid early volatility.")
+i_ny_end   = input.int(15,   title="End Hour (CT)",    group=grp_sess, inline="ny",
+     tooltip="Session end hour in CT. Default 15 = 3:00 PM CT, just before the CME equity futures close.")
+i_ny_max   = input.int(5,    title="Max Trades",       group=grp_sess, inline="ny",
+     tooltip="Maximum number of entries allowed during this session. Counter resets at New York session open each day.")
+
+i_cooldown = input.int(3, title="Cooldown Bars Between Entries", group=grp_sess, minval=1,
+     tooltip="Minimum number of bars that must pass after any entry before the next entry is allowed. Prevents signal clustering during fast impulsive moves. Applies globally across all sessions.")
+
+// ============================================================
+// INPUTS — Automation Webhook
+// ============================================================
+grp_gh = "Automation Webhook"
+i_entry_long_msg  = input.string('{"action":"buy","symbol":"{{ticker}}","qty":1}',  title="Long Entry JSON",  group=grp_gh,
+     tooltip="JSON payload sent with long entry alerts. Edit to match your automation platform's expected format. Use {{ticker}} for dynamic symbol.")
+i_entry_short_msg = input.string('{"action":"sell","symbol":"{{ticker}}","qty":1}', title="Short Entry JSON", group=grp_gh,
+     tooltip="JSON payload sent with short entry alerts. Edit to match your automation platform's expected format.")
+i_exit_msg        = input.string('{"action":"exit","symbol":"{{ticker}}"}',          title="Exit JSON",        group=grp_gh,
+     tooltip="JSON payload sent when a trade exits via stop loss or take profit. Fired from strategy.exit — use {{strategy.order.alert_message}} in the TradingView alert message field.")
+
+// ============================================================
+// INPUTS — Display
+// ============================================================
+grp_disp = "Display"
+
+i_show_labels = input.bool(true, title="Show Trade Grade Labels", group=grp_disp,
+     tooltip="Display a grade label above/below each entry candle. A = Trending regime (bright green). B = Mild Ranging regime (dark green). Label also shows which signal mode triggered the entry (EMA, VWAP, HA, STR).")
+i_show_er_bg  = input.bool(true, title="Show ER Regime Background", group=grp_disp,
+     tooltip="Color the chart background based on current ER regime. Teal = Trending (entries allowed for all modes). Yellow = Mild Ranging (VWAP and Price Structure only). Gray = Flat/blocked (no entries).")
+
+// ============================================================
+// INPUTS — Entry Filters
+// ============================================================
+grp_filt = "Entry Filters"
+
+// 1. Volume Surge
+i_vol_on   = input.bool(false, title="Volume Surge", group=grp_filt, inline="vol",
+     tooltip="When enabled, only allows entries when the current bar's volume exceeds its N-bar average by the multiplier. Filters out low-conviction signals on thin or inactive tape. Particularly effective on CME futures where volume is real contract data.")
+i_vol_mult = input.float(1.5,  title="× Avg",        group=grp_filt, inline="vol", step=0.1,
+     tooltip="Volume must exceed the average by this multiple. 1.5 = 50% above average. Raise to require a stronger surge, lower to loosen the filter.")
+i_vol_len  = input.int(20,     title="over N bars",  group=grp_filt, inline="vol", minval=1,
+     tooltip="Lookback period for the volume moving average. 20 bars is a standard baseline. Lower = reacts faster to recent volume shifts.")
+
+// 2. ADX Strength
+i_adx_on  = input.bool(false, title="ADX Strength", group=grp_filt, inline="adx",
+     tooltip="When enabled, only allows entries when ADX is at or above the minimum threshold. ADX measures trend strength independent of direction and complements the ER filter — ER measures efficiency, ADX measures momentum strength. Both above threshold = high-confidence trending environment.")
+i_adx_len = input.int(14,     title="Length",       group=grp_filt, inline="adx", minval=1,
+     tooltip="Smoothing period for ADX and the DI+/DI- calculations. 14 is the standard Wilder period. Lower = more reactive, higher = smoother and slower.")
+i_adx_min = input.int(20,     title="Min ADX",      group=grp_filt, inline="adx", minval=1,
+     tooltip="Minimum ADX value required to allow an entry. 20 is the standard threshold for a trending market. Raise to 25–30 to require stronger trend confirmation.")
+
+// 3. HTF Trend Alignment
+i_htf_on      = input.bool(false,  title="HTF Trend Align", group=grp_filt, inline="htf",
+     tooltip="When enabled, only takes longs when price is above the higher timeframe EMA and shorts when below. Adds a macro directional bias filter. Uses confirmed closed HTF bars with lookahead=off — no repainting.")
+i_htf_tf      = input.timeframe("15", title="Timeframe",    group=grp_filt, inline="htf",
+     tooltip="The higher timeframe to pull the trend EMA from. 15m is a good default for scalping on 1m–5m. Use 1H or 4H for a wider macro bias.")
+i_htf_ema_len = input.int(50,      title="EMA Length",      group=grp_filt, inline="htf", minval=1,
+     tooltip="EMA length calculated on the higher timeframe. 50 is standard for trend alignment. Price above = bullish bias (longs only), price below = bearish bias (shorts only).")
+
+// 4. VWAP Bias
+i_vwap_bias_on = input.bool(false, title="VWAP Bias", group=grp_filt, inline="vbias",
+     tooltip="When enabled, only takes longs when price is above the session VWAP and shorts when below. Uses the same session VWAP already calculated by the strategy — no extra computation. Automatically disabled when VWAP Deviation signal mode is active to avoid conflicting logic.")
+
+// 5. ROC Momentum
+i_roc_on  = input.bool(false, title="ROC Momentum", group=grp_filt, inline="roc",
+     tooltip="When enabled, only enters in the direction of recent price momentum. Positive Rate of Change = longs only. Negative Rate of Change = shorts only. Ensures you are entering with momentum rather than into a stall or reversal.")
+i_roc_len = input.int(9,      title="Length",       group=grp_filt, inline="roc", minval=1,
+     tooltip="Lookback period for the Rate of Change calculation. 9 bars is tight and scalp-appropriate. Lower = reacts faster, higher = smoother momentum reading.")
+
+// ============================================================
+// TIMEZONE HELPER — hour in CT
+// TradingView `hour` built-in returns hour in chart timezone.
+// User must set chart timezone to America/Chicago for accuracy.
+// ============================================================
+ct_hour = hour(time, "America/Chicago")
+
+// ============================================================
+// SESSION DETECTION
+// ============================================================
+// Asia crosses midnight: 19:00–24:00 CT → treat end=24 as end=0 next day
+in_asia   = i_asia_on  and (ct_hour >= i_asia_start or ct_hour < (i_asia_end == 24 ? 0 : i_asia_end))
+in_london = i_lon_on   and (ct_hour >= i_lon_start  and ct_hour < i_lon_end)
+in_ny     = i_ny_on    and (ct_hour >= i_ny_start   and ct_hour < i_ny_end)
+
+in_any_session = in_asia or in_london or in_ny
+
+// Session open bar flags (first bar entering each session)
+var bool prev_asia   = false
+var bool prev_london = false
+var bool prev_ny     = false
+
+asia_open_bar   = in_asia   and not prev_asia
+london_open_bar = in_london and not prev_london
+ny_open_bar     = in_ny     and not prev_ny
+
+// ============================================================
+// SESSION TRADE COUNTERS
+// ============================================================
+var int asia_trades   = 0
+var int london_trades = 0
+var int ny_trades     = 0
+
+if asia_open_bar
+    asia_trades := 0
+if london_open_bar
+    london_trades := 0
+if ny_open_bar
+    ny_trades := 0
+
+// Which session counter / max is active
+sess_count = in_asia ? asia_trades : in_london ? london_trades : in_ny ? ny_trades : 999
+sess_max   = in_asia ? i_asia_max  : in_london ? i_lon_max     : in_ny ? i_ny_max  : 0
+
+trades_ok = in_any_session and sess_count < sess_max
+
+// ============================================================
+// COOLDOWN
+// ============================================================
+var int bars_since_entry = 9999
+
+bars_since_entry := bars_since_entry + 1
+cooldown_ok = bars_since_entry >= i_cooldown
+
+// ============================================================
+// ER REGIME
+// ============================================================
+er_direction = math.abs(close - close[i_er_len])
+er_path      = math.sum(math.abs(close - close[1]), i_er_len)
+er_val       = er_path > 0 ? er_direction / er_path : 0.0
+
+// 0 = flat, 1 = mild ranging, 2 = trending
+er_regime = er_val >= i_er_trend_min ? 2 : er_val >= i_er_range_min ? 1 : 0
+
+// Background color — must be global scope in Pine v6
+bgcolor(i_show_er_bg ? (er_regime == 2 ? color.new(color.teal, 92) :
+        er_regime == 1 ? color.new(color.yellow, 94) :
+        color.new(color.gray, 97)) : na, title="ER Regime Background")
+
+// ============================================================
+// ATR
+// ============================================================
+atr_val = ta.atr(i_atr_len)
+
+// ============================================================
+// SESSION VWAP ACCUMULATOR
+// (computed here so sess_vwap is available to Filter 4 and Signal 2)
+// ============================================================
+var float vwap_num = 0.0
+var float vwap_den = 0.0
+
+if asia_open_bar or london_open_bar or ny_open_bar
+    vwap_num := 0.0
+    vwap_den := 0.0
+
+vwap_num += hlc3 * volume
+vwap_den += volume
+sess_vwap = vwap_den > 0 ? vwap_num / vwap_den : hlc3
+
+// ============================================================
+// FILTER 1 — VOLUME SURGE
+// ============================================================
+vol_avg        = ta.sma(volume, i_vol_len)
+filter_vol     = not i_vol_on or (volume > vol_avg * i_vol_mult)
+
+// ============================================================
+// FILTER 2 — ADX STRENGTH
+// ============================================================
+adx_smooth = i_adx_len
+adx_high   = high
+adx_low    = low
+up_move    = adx_high - adx_high[1]
+down_move  = adx_low[1] - adx_low
+dm_plus    = up_move > down_move and up_move > 0 ? up_move : 0.0
+dm_minus   = down_move > up_move and down_move > 0 ? down_move : 0.0
+atr_adx    = ta.rma(ta.tr(true), adx_smooth)
+di_plus    = 100 * ta.rma(dm_plus,  adx_smooth) / atr_adx
+di_minus   = 100 * ta.rma(dm_minus, adx_smooth) / atr_adx
+dx         = math.abs(di_plus - di_minus) / (di_plus + di_minus) * 100
+adx_val    = ta.rma(dx, adx_smooth)
+filter_adx = not i_adx_on or (adx_val >= i_adx_min)
+
+// ============================================================
+// FILTER 3 — HTF TREND ALIGNMENT
+// ============================================================
+htf_ema_raw      = request.security(syminfo.tickerid, i_htf_tf,
+     ta.ema(close, i_htf_ema_len), lookahead=barmerge.lookahead_off)
+filter_htf_long  = not i_htf_on or (close > htf_ema_raw)
+filter_htf_short = not i_htf_on or (close < htf_ema_raw)
+
+// ============================================================
+// FILTER 4 — VWAP BIAS
+// (auto-disabled when signal mode is VWAP Deviation)
+// ============================================================
+vwap_bias_active   = i_vwap_bias_on and i_signal_mode != "VWAP Deviation"
+filter_vbias_long  = not vwap_bias_active or (close > sess_vwap)
+filter_vbias_short = not vwap_bias_active or (close < sess_vwap)
+
+// ============================================================
+// FILTER 5 — ROC MOMENTUM
+// ============================================================
+roc_val          = (close - close[i_roc_len]) / close[i_roc_len] * 100
+filter_roc_long  = not i_roc_on or (roc_val > 0)
+filter_roc_short = not i_roc_on or (roc_val < 0)
+
+// ============================================================
+// COMBINED FILTER GATE (directional)
+// ============================================================
+filters_long  = filter_vol and filter_adx and filter_htf_long  and filter_vbias_long  and filter_roc_long
+filters_short = filter_vol and filter_adx and filter_htf_short and filter_vbias_short and filter_roc_short
+
+// ============================================================
+// SIGNAL 1 — EMA CROSS
+// ============================================================
+ema_fast = ta.ema(close, i_ema_fast)
+ema_slow = ta.ema(close, i_ema_slow)
+
+ema_long  = ta.crossover(ema_fast, ema_slow)
+ema_short = ta.crossunder(ema_fast, ema_slow)
+
+// ============================================================
+// SIGNAL 2 — SESSION VWAP DEVIATION
+// (accumulator above; deviation signal computed here)
+// ============================================================
+vwap_dev_pct = (close - sess_vwap) / sess_vwap
+
+// Mean reversion: price extended from VWAP → expect return
+vwap_long  = vwap_dev_pct < -i_vwap_dev
+vwap_short = vwap_dev_pct >  i_vwap_dev
+
+// ============================================================
+// SIGNAL 3 — HEIKIN ASHI + RSI
+// ============================================================
+ha_close = (open + high + low + close) / 4
+var float ha_open_val = 0.0
+ha_open_val := na(ha_open_val[1]) ? (open + close) / 2 : (ha_open_val[1] + ha_close[1]) / 2
+ha_high  = math.max(high, math.max(ha_open_val, ha_close))
+ha_low   = math.min(low,  math.min(ha_open_val, ha_close))
+
+ha_bull = ha_close > ha_open_val and ha_close[1] > ha_open_val[1]
+ha_bear = ha_close < ha_open_val and ha_close[1] < ha_open_val[1]
+
+rsi_val   = ta.rsi(close, i_rsi_len)
+ha_long   = ha_bull and rsi_val > i_rsi_ob
+ha_short  = ha_bear and rsi_val < i_rsi_os
+
+// ============================================================
+// SIGNAL 4 — PRICE STRUCTURE (candle-based, zero lag)
+// ============================================================
+// Option B: HH + HL = bullish structure; LH + LL = bearish structure
+// Looks back i_struct_bars candles for confirmation
+struct_long  = i_struct_bars == 2 ?
+     (high > high[1] and low > low[1]) :
+     (high > high[1] and high[1] > high[2] and low > low[1] and low[1] > low[2])
+
+struct_short = i_struct_bars == 2 ?
+     (high < high[1] and low < low[1]) :
+     (high < high[1] and high[1] < high[2] and low < low[1] and low[1] < low[2])
+
+// ============================================================
+// SIGNAL SELECTION + REGIME GATE
+// ============================================================
+// EMA Cross and HA+RSI: trending only (regime 2)
+// VWAP Deviation and Price Structure: trending (2) or mild ranging (1)
+
+mode_ema   = i_signal_mode == "EMA Cross"          and er_regime == 2
+mode_vwap  = i_signal_mode == "VWAP Deviation"      and er_regime >= 1
+mode_ha    = i_signal_mode == "Heikin Ashi + RSI"   and er_regime == 2
+mode_str   = i_signal_mode == "Price Structure"     and er_regime >= 1
+
+sig_long  = (mode_ema  and ema_long)
+          or (mode_vwap and vwap_long)
+          or (mode_ha   and ha_long)
+          or (mode_str  and struct_long)
+
+sig_short = (mode_ema  and ema_short)
+          or (mode_vwap and vwap_short)
+          or (mode_ha   and ha_short)
+          or (mode_str  and struct_short)
+
+sig_label_mode = mode_ema  ? "EMA"  :
+                 mode_vwap ? "VWAP" :
+                 mode_ha   ? "HA"   :
+                 mode_str  ? "STR"  : ""
+
+// Grade: A = trending, B = mild ranging
+trade_grade = er_regime == 2 ? "A" : er_regime == 1 ? "B" : ""
+
+// ============================================================
+// POSITION STATE
+// ============================================================
+is_long  = strategy.position_size > 0
+is_short = strategy.position_size < 0
+is_flat  = strategy.position_size == 0
+
+// ============================================================
+// ENTRY CONDITIONS
+// ============================================================
+can_enter_long  = sig_long  and is_flat and trades_ok and cooldown_ok and in_any_session and filters_long
+can_enter_short = sig_short and is_flat and trades_ok and cooldown_ok and in_any_session and filters_short
+
+// ============================================================
+// ENTRIES
+// ============================================================
+if can_enter_long
+    sl_price = close - atr_val * i_atr_sl
+    tp_price = close + atr_val * i_atr_sl * i_atr_rr
+    strategy.entry("Long", strategy.long, alert_message=i_entry_long_msg)
+    strategy.exit("Long Exit", from_entry="Long", stop=sl_price, limit=tp_price, alert_message=i_exit_msg)
+    bars_since_entry := 0
+    if in_asia
+        asia_trades += 1
+    else if in_london
+        london_trades += 1
+    else if in_ny
+        ny_trades += 1
+
+if can_enter_short
+    sl_price = close + atr_val * i_atr_sl
+    tp_price = close - atr_val * i_atr_sl * i_atr_rr
+    strategy.entry("Short", strategy.short, alert_message=i_entry_short_msg)
+    strategy.exit("Short Exit", from_entry="Short", stop=sl_price, limit=tp_price, alert_message=i_exit_msg)
+    bars_since_entry := 0
+    if in_asia
+        asia_trades += 1
+    else if in_london
+        london_trades += 1
+    else if in_ny
+        ny_trades += 1
+
+// ============================================================
+// TRADE GRADE LABELS
+// ============================================================
+if i_show_labels
+    if can_enter_long and trade_grade != ""
+        lbl_color = trade_grade == "A" ? color.new(#00FF00, 0) : color.new(#2E8B57, 0)
+        label.new(bar_index, high + atr_val * 1.0, text=trade_grade + " | " + sig_label_mode,
+             style=label.style_label_down, color=color.new(color.black, 100),
+             textcolor=lbl_color, size=size.small)
+
+    if can_enter_short and trade_grade != ""
+        lbl_color = trade_grade == "A" ? color.new(#00FF00, 0) : color.new(#2E8B57, 0)
+        label.new(bar_index, low - atr_val * 1.0, text=trade_grade + " | " + sig_label_mode,
+             style=label.style_label_up, color=color.new(color.black, 100),
+             textcolor=lbl_color, size=size.small)
+
+// ============================================================
+// SESSION STATE CARRY-FORWARD
+// ============================================================
+prev_asia   := in_asia
+prev_london := in_london
+prev_ny     := in_ny
+
+// ============================================================
+// PLOTS — EMAs (shown when EMA mode active)
+// ============================================================
+plot(i_signal_mode == "EMA Cross" ? ema_fast : na, title="EMA Fast", color=color.new(color.aqua, 0),  linewidth=1)
+plot(i_signal_mode == "EMA Cross" ? ema_slow : na, title="EMA Slow", color=color.new(color.orange, 0), linewidth=1)
+plot(i_signal_mode == "VWAP Deviation" ? sess_vwap : na, title="Session VWAP", color=color.new(color.purple, 0), linewidth=1)

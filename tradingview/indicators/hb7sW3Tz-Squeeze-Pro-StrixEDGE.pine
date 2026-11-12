@@ -1,0 +1,276 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © StrixEDGE
+
+//@version=6
+indicator(' Squeeze Pro [StrixEDGE]', overlay=false, max_labels_count=500, max_lines_count=500, max_bars_back=5000)
+
+// ═══ INPUTS ═══
+
+// ── Core Parameters ──
+bbLength      = input.int(20, "BB Period", minval=5, maxval=100, tooltip="Bollinger Bands calculation period. Standard: 20. Shorter = detects tighter squeezes faster.", group="⚙️ Core Parameters")
+bbMult        = input.float(2.0, "BB Multiplier", minval=0.5, maxval=5.0, step=0.1, tooltip="Bollinger Bands standard deviation multiplier. Standard: 2.0. Higher = wider bands, fewer squeezes.", group="⚙️ Core Parameters")
+kcLength      = input.int(20, "KC Period", minval=5, maxval=100, tooltip="Keltner Channel EMA period. Standard: 20. Should typically match BB period.", group="⚙️ Core Parameters")
+kcMult        = input.float(1.5, "KC Multiplier", minval=0.5, maxval=5.0, step=0.1, tooltip="Keltner Channel ATR multiplier. Standard: 1.5. Lower = more squeezes detected.", group="⚙️ Core Parameters")
+macdFast      = input.int(12, "MACD Fast", minval=2, maxval=50, tooltip="MACD fast EMA period. Standard: 12.", group="⚙️ Core Parameters")
+macdSlow      = input.int(26, "MACD Slow", minval=5, maxval=200, tooltip="MACD slow EMA period. Standard: 26. Must be greater than fast period.", group="⚙️ Core Parameters")
+macdSignal    = input.int(9, "MACD Signal", minval=2, maxval=50, tooltip="MACD signal smoothing period. Standard: 9.", group="⚙️ Core Parameters")
+statsLookback = input.int(200, "Stats Lookback", minval=50, maxval=2000, tooltip="Number of bars to look back for historical squeeze statistics.", group="⚙️ Core Parameters")
+
+// ── Visual Settings ──
+showDots = input.bool(true, "Show Squeeze Dots", tooltip="Show colored dots on zero line indicating squeeze state and intensity.", group="🎨 Visual Settings")
+
+// ── Table Settings ──
+showTable = input.bool(true, "Show Table", tooltip="Toggle data table visibility.", group="📊 Table Settings")
+tableSize = input.string("Normal", title="📐 Table Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], tooltip="Adjust the display size of the data table.", group="📊 Table Settings")
+tablePos  = input.string("Top Right", title="📍 Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], tooltip="Position of the data table on chart.", group="📊 Table Settings")
+
+
+// ═══ CALCULATIONS ═══
+
+// ── Table size and position mapping ──
+tSize = switch tableSize
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+tPos = switch tablePos
+    "Top Left"      => position.top_left
+    "Bottom Right"  => position.bottom_right
+    "Bottom Left"   => position.bottom_left
+    => position.top_right
+
+// ── Bollinger Bands ──
+bbBasis = ta.sma(close, bbLength)
+bbDev   = ta.stdev(close, bbLength) * bbMult
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+bbWidth = bbUpper - bbLower
+
+// ── Keltner Channels ──
+kcBasis = ta.ema(close, kcLength)
+kcRange = ta.atr(kcLength) * kcMult
+kcUpper = kcBasis + kcRange
+kcLower = kcBasis - kcRange
+kcWidth = kcUpper - kcLower
+
+// ── Squeeze detection: BB fully inside KC = volatility compression ──
+hasData      = not na(bbUpper) and not na(kcUpper)
+squeezeOn    = hasData and bbUpper < kcUpper and bbLower > kcLower
+squeezeOff   = hasData and not squeezeOn
+squeezeFired = squeezeOff and squeezeOn[1] == true
+
+// ── Squeeze intensity: BB width relative to KC width ──
+ratio  = kcWidth > 0 ? bbWidth / kcWidth : 1.0
+level1 = squeezeOn and ratio >= 0.8
+level2 = squeezeOn and ratio >= 0.5 and ratio < 0.8
+level3 = squeezeOn and ratio < 0.5
+
+// ── MACD momentum ──
+macdLine   = ta.ema(close, macdFast) - ta.ema(close, macdSlow)
+signalLine = ta.ema(macdLine, macdSignal)
+histogram  = macdLine - signalLine
+
+
+// ═══ SIGNALS & CONDITIONS ═══
+
+// ── Momentum states (4-color system) ──
+momDarkGreen  = histogram > 0 and histogram > nz(histogram[1])
+momLightGreen = histogram > 0 and histogram <= nz(histogram[1])
+momLightRed   = histogram < 0 and histogram >= nz(histogram[1])
+momDarkRed    = histogram < 0 and histogram < nz(histogram[1])
+
+// Momentum bar color — single-line ternaries to avoid v6 continuation issues
+momColor = momDarkGreen ? #00BA7C : momLightGreen ? #7CDBB4 : momLightRed ? #F58C8C : #F4212E
+
+// ── Historical squeeze statistics tracking ──
+var squeezeFirBars = array.new_int(0)
+var squeezeDurs    = array.new_int(0)
+var squeezeIsBull  = array.new_bool(0)
+var squeezeMoveATR = array.new_float(0)
+
+var int currentDur = 0
+
+if squeezeOn
+    currentDur += 1
+else
+    if squeezeFired
+        array.push(squeezeFirBars, bar_index)
+        array.push(squeezeDurs, currentDur)
+        array.push(squeezeIsBull, histogram > 0)
+    currentDur := 0
+
+// ── Post-fire move measurement (10 bars after squeeze fires) ──
+var float fireClosePrice = na
+var float fireATRVal     = na
+var int   barsSinceFire  = 0
+var float maxMoveSoFar   = 0.0
+var bool  measuringMove  = false
+
+if squeezeFired
+    fireClosePrice := close
+    fireATRVal     := ta.atr(kcLength)
+    barsSinceFire  := 0
+    maxMoveSoFar   := 0.0
+    measuringMove  := true
+
+if measuringMove
+    barsSinceFire += 1
+    maxMoveSoFar := math.max(maxMoveSoFar, math.abs(close - fireClosePrice))
+    if barsSinceFire >= 10
+        moveVal = fireATRVal > 0 ? maxMoveSoFar / fireATRVal : 0.0
+        array.push(squeezeMoveATR, moveVal)
+        measuringMove := false
+
+// ── Compute rolling stats within lookback window ──
+var int    statSqCount  = 0
+var float  statAvgDur   = 0.0
+var float  statBullPct  = 0.0
+var float  statAvgMove  = 0.0
+
+// Squeeze status text/color for table (resolved per bar, used on last bar)
+var string sqStatusTxt = "OFF"
+var color  sqStatusClr = #00BA7C
+var string momTxt      = "NEUTRAL"
+var color  momTxtClr   = #666666
+
+if barstate.islast
+    // Squeeze status for table — cascading if/else avoids multi-line ternary
+    if level3
+        sqStatusTxt := "LEVEL 3 — EXTREME"
+        sqStatusClr := #F4212E
+    else if level2
+        sqStatusTxt := "LEVEL 2 — TIGHT"
+        sqStatusClr := #F7931A
+    else if level1
+        sqStatusTxt := "LEVEL 1 — MILD"
+        sqStatusClr := #FFD700
+    else if squeezeOn
+        sqStatusTxt := "ON"
+        sqStatusClr := #FFD700
+    else
+        sqStatusTxt := "OFF"
+        sqStatusClr := #00BA7C
+
+    // Momentum text for table
+    if momDarkGreen
+        momTxt    := "BULLISH ▲▲"
+        momTxtClr := #00b07c
+    else if momLightGreen
+        momTxt    := "BULLISH ▲"
+        momTxtClr := #00b07c
+    else if momLightRed
+        momTxt    := "BEARISH ▼"
+        momTxtClr := #e53935
+    else if momDarkRed
+        momTxt    := "BEARISH ▼▼"
+        momTxtClr := #e53935
+    else
+        momTxt    := "NEUTRAL"
+        momTxtClr := #666666
+
+    // Rolling statistics from stored squeeze events
+    cnt     = 0
+    durSum  = 0
+    bullCnt = 0
+    moveSum = 0.0
+    moveCnt = 0
+    arrSize = array.size(squeezeFirBars)
+
+    if arrSize > 0
+        for i = arrSize - 1 to 0
+            fb = array.get(squeezeFirBars, i)
+            if bar_index - fb > statsLookback
+                break
+            cnt     += 1
+            durSum  += array.get(squeezeDurs, i)
+            if array.get(squeezeIsBull, i)
+                bullCnt += 1
+            if i < array.size(squeezeMoveATR)
+                moveSum += array.get(squeezeMoveATR, i)
+                moveCnt += 1
+
+    statSqCount := cnt
+    statAvgDur  := cnt > 0 ? durSum / cnt : 0.0
+    statBullPct := cnt > 0 ? bullCnt * 100.0 / cnt : 0.0
+    statAvgMove := moveCnt > 0 ? moveSum / moveCnt : 0.0
+
+
+// ═══ VISUALIZATION ═══
+
+// ── Momentum histogram (4-color columns) ──
+plot(histogram, "Momentum", color=momColor, style=plot.style_columns, linewidth=4)
+
+// ── Squeeze status dots on zero line (mutually exclusive per bar) ──
+plotshape(showDots and level3 ? 0 : na, "Squeeze L3", shape.circle, location.absolute, #F4212E, size=size.tiny)
+plotshape(showDots and level2 ? 0 : na, "Squeeze L2", shape.circle, location.absolute, #F7931A, size=size.tiny)
+plotshape(showDots and level1 ? 0 : na, "Squeeze L1", shape.circle, location.absolute, #FFD700, size=size.tiny)
+plotshape(showDots and squeezeOff ? 0 : na, "No Squeeze", shape.circle, location.absolute, #00BA7C, size=size.tiny)
+
+// ── Zero reference line ──
+hline(0, "Zero", color=color.new(#8B98A5, 50), linestyle=hline.style_dotted)
+
+
+// ═══ DATA TABLE ═══
+
+// ── Style A color constants ──
+var HEADER_BG     = #1a1a2e
+var HEADER_TEXT   = #ffffff
+var SUBHEADER_TXT = #9e9e9e
+var ROW_BG        = #ffffff
+var LABEL_COLOR   = #666666
+var BORDER_COLOR  = #f0f0f0
+var BULL_COLOR    = #00b07c
+var BEAR_COLOR    = #e53935
+var NEUT_COLOR    = #666666
+
+if barstate.islast and showTable
+    var tbl = table.new(tPos, columns=2, rows=9, bgcolor=ROW_BG, border_color=BORDER_COLOR, border_width=1, frame_color=HEADER_BG, frame_width=0)
+
+    // ── Row 0: Dark header bar ──
+    table.cell(tbl, 0, 0, "StrixEDGE Squeeze Pro", bgcolor=HEADER_BG, text_color=HEADER_TEXT, text_size=tSize, text_halign=text.align_left, text_font_family=font.family_default)
+    table.cell(tbl, 1, 0, syminfo.ticker + " · " + timeframe.period, bgcolor=HEADER_BG, text_color=SUBHEADER_TXT, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_default)
+
+    // ── Row 1: Squeeze status ──
+    table.cell(tbl, 0, 1, "Squeeze", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, sqStatusTxt, bgcolor=ROW_BG, text_color=sqStatusClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 2: Momentum direction ──
+    table.cell(tbl, 0, 2, "Momentum", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, momTxt, bgcolor=ROW_BG, text_color=momTxtClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 3: Raw histogram value ──
+    histClr = histogram > 0 ? BULL_COLOR : histogram < 0 ? BEAR_COLOR : NEUT_COLOR
+    table.cell(tbl, 0, 3, "Histogram", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(histogram, "#.#####"), bgcolor=ROW_BG, text_color=histClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 4: BB/KC width ratio ──
+    ratioClr = ratio < 0.5 ? BEAR_COLOR : ratio < 0.8 ? #F7931A : NEUT_COLOR
+    table.cell(tbl, 0, 4, "BB/KC Ratio", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(ratio, "#.##") + "x", bgcolor=ROW_BG, text_color=ratioClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 5: Squeeze count within lookback ──
+    table.cell(tbl, 0, 5, "Squeezes (" + str.tostring(statsLookback) + ")", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(statSqCount), bgcolor=ROW_BG, text_color=NEUT_COLOR, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 6: Average squeeze duration ──
+    table.cell(tbl, 0, 6, "Avg Duration", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(statAvgDur, "#.#") + " bars", bgcolor=ROW_BG, text_color=NEUT_COLOR, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 7: Bullish breakout percentage ──
+    bullClr = statBullPct > 55 ? BULL_COLOR : statBullPct < 45 ? BEAR_COLOR : NEUT_COLOR
+    table.cell(tbl, 0, 7, "Bull Breakout", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, str.tostring(statBullPct, "#.#") + "%", bgcolor=ROW_BG, text_color=bullClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 8: Average move in ATR multiples ──
+    table.cell(tbl, 0, 8, "Avg Move", bgcolor=ROW_BG, text_color=LABEL_COLOR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, str.tostring(statAvgMove, "#.#") + " ATR", bgcolor=ROW_BG, text_color=statAvgMove > 1.5 ? BULL_COLOR : NEUT_COLOR, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+
+// ═══ ALERTS ═══
+
+alertcondition(squeezeFired, "Squeeze Fired", "StrixEDGE Squeeze Pro: Squeeze has fired — expect volatility expansion")
+alertcondition(squeezeFired and histogram > 0, "Bullish Squeeze Fire", "StrixEDGE Squeeze Pro: Squeeze fired BULLISH")
+alertcondition(squeezeFired and histogram < 0, "Bearish Squeeze Fire", "StrixEDGE Squeeze Pro: Squeeze fired BEARISH")
+alertcondition(level3, "Extreme Squeeze", "StrixEDGE Squeeze Pro: Extreme squeeze detected — Level 3")

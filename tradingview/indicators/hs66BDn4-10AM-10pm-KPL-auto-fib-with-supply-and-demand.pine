@@ -1,0 +1,1999 @@
+//@version=6
+// ═════════════════════════════════════════════════════════════
+// KPL MASTER — Fib + Structure / Supply & Demand / Top Down
+//
+// Three previously separate scripts merged into one. Each module
+// has a master switch in group 00 and keeps its own settings
+// group. The modules do NOT share signals with each other yet —
+// they coexist. Cross-module confluence is a separate build.
+//
+// RENAMES made during the merge (collisions between the three):
+//   atrLen   -> fibAtrLen / sdAtrLen / tdaAtrLen
+//   atrMult  -> fibAtrMult / tdaAtrMult
+//   brokeUp  -> brokeUp (fib) / sdBrokeUp (S/D)
+//   brokeDn  -> sdBrokeDn (S/D)
+//   extendBar-> sdExtend
+// Everything else kept its original name.
+//
+// Sources: KPL Fib + Structure v1.5, 5 Min Supply & Demand,
+//          KPL Top Down Analysis v1.6
+//
+// ─────────────────────────────────────────────────────────────
+// POST-MERGE FIXES (this revision)
+//
+// [1] BOX BUDGET. sdMaxZones was capped at 250 per side = 500
+//     boxes, which is the entire max_boxes_count allowance. The
+//     28 pooled Fib boxes are created on barstate.isfirst, so
+//     they are the OLDEST drawing objects on the chart and
+//     TradingView culls oldest-first once the cap is hit. The
+//     pool array kept holding references to dead boxes, so
+//     placeZone() wrote into nothing and the Fib zones silently
+//     vanished with no error. Ceiling lowered to 200 per side
+//     (400 + 28 = 428, safely under 500).
+//
+// [2] MODULE SWITCHES NOW ACTUALLY GATE COMPUTE. enableFib and
+//     enableSD previously gated only drawing, so the leg engine
+//     and the zone maintenance loops ran every bar regardless.
+//     The array work is now inside the switches. The ta.* series
+//     (atr, pivothigh, pivotlow, lowestbars, highestbars) stay
+//     unconditional on purpose — ta.* functions must be called
+//     on every bar or their internal state desynchronises.
+//
+// [3] TDA DASHBOARD ROW OFFSET. Rows were hardcoded with the day
+//     gate at row 0, so turning showGate off left an empty
+//     merged row above the header. Rows are now offset.
+//
+// ─────────────────────────────────────────────────────────────
+// S/D ZONE TRADEABILITY (group 07c / 07d)
+//
+// A zone is a band. A band is not something you can put an entry
+// and a stop against. Three changes turn each band back into a
+// level:
+//
+// [4] BASE-CANDLE OPEN LINE. Draws the base candle's OPEN across
+//     the zone, tracked in a line array kept index-locked to the
+//     box array. This is the reaction level inside the zone —
+//     price respects it far more often than the high or low.
+//
+// [5] MAX ZONE HEIGHT. A base taller than sdMaxHtMult x ATR is
+//     rejected outright. An 80-point band on 5m MNQ is not a
+//     level and drawing it just occupies screen.
+//
+// [6] OVERLAP REJECTION. In a trend every qualifying candle pair
+//     spawned a zone, so they stacked three deep on the same
+//     price. A new base that overlaps a live zone on its own side
+//     is now dropped, keeping the FIRST base — the one that
+//     actually caused the move.
+//
+// ─────────────────────────────────────────────────────────────
+// [7] TDA LEG ANCHOR REBUILT (f_state)
+//
+//     The D row read "- / - / - / 2873pt" and scored 0 while
+//     carrying the heaviest weight (w1=4). Verified against the
+//     printed score: with D neutral the maths gives 57.1%, which
+//     is what the table showed; with D bull it gives 100%. The
+//     single broken row was the whole difference between LEANING
+//     and ALIGNED.
+//
+//     Cause: runHi reset only on a new pivot LOW and runLo only
+//     on a new pivot HIGH, so between opposite pivots both kept
+//     stretching. On the daily the leg grew for months — 2873pt,
+//     ~10% of price — so pos barely moved, parked mid-range, and
+//     the unresolved rule zeroed the bias permanently.
+//
+//     Fix: reset the running extremes on ANY pivot, and drop
+//     anchors older than the per-TF max swing age. Direction
+//     (BOS) still reads the raw anchor; only LOCATION uses the
+//     fresh one.
+//
+//     [7b] The first attempt used ONE global age for all four
+//     timeframes, which is wrong the same way one pivot length
+//     is wrong: 40 bars is ~2 months on D and ~10 hours on 15M.
+//     Now per-TF (age1-age4), D defaulting to 12.
+//
+//     EXPECTED CONSEQUENCE, stated plainly: the D row's "-" was
+//     NOT purely a width bug. The daily bias is latched -1 from
+//     an old swing-low break, price has since rallied to ~96% of
+//     the leg, and the unresolved rule is correctly calling that
+//     latch stale. Shrinking the leg drops pos out of the >unres
+//     band, so D is likely to print BEAR rather than BULL, and
+//     the score to go 57% LEANING LONG -> ~34% CONFLICTED. That
+//     is the more truthful reading, not a regression.
+//
+//     Loc now prints on unresolved rows too, so the pos value
+//     behind a "-" is readable instead of inferred.
+//
+//     [7c] Per-TF ages did NOT fix it either — the D leg went
+//     2873pt -> 3067pt. Root cause found: runHi/runLo reset only
+//     when a pivot CONFIRMS, and in a trend with pullbacks
+//     shorter than _pvt bars no pivot prints for long stretches.
+//     "Reset on any pivot" is not a TIME bound, so no age limit
+//     could bite. Added locMode: "Rolling range" makes the leg
+//     ta.highest/ta.lowest over _maxAge bars — bounded by
+//     construction. "Swing anchored" keeps the old behaviour.
+//
+//     The earlier BEAR prediction was also wrong, but for an
+//     honest reason: price broke out overnight (+380 from the
+//     open) and closed above the daily swing high, so D flipped
+//     BULL legitimately. The market resolved it, not the code.
+//
+// [8] CONFLUENCE LAYER (group 16)
+//
+//     The modules coexisted but never spoke. The 5m chart showed
+//     the cost: Fib printing BOS and BULLISH into supply while
+//     the 15M sat at 97% premium on a grade of C. Five checks —
+//     gate, structure, fib zone, S/D zone, grade — now have to
+//     agree before a mark prints, with an optional sixth for the
+//     base-candle open. Every check is shown separately on the
+//     dashboard so a missing leg is visible, not silent.
+//
+// [9] S/D DISTANCE VISIBILITY (group 07e)
+//
+//     Multi-day view was a graveyard: supply at 30,700 / 30,500 /
+//     30,450 hundreds of points above anything price had touched,
+//     and demand stacked eight deep below. The overlap filter
+//     stops zones stacking on the SAME price; it does nothing
+//     about accumulation at DIFFERENT prices, and a zone that
+//     only dies on a close through it never dies at all.
+//
+//     Implemented as visibility, NOT deletion, on purpose. A zone
+//     500 points away is unreachable today and a perfectly good
+//     level next week. Hidden zones keep extending and keep
+//     running their invalidation test — only the colors change —
+//     so walking back into range restores the zone untouched,
+//     same box, same open line, same history.
+//
+//     Age expiry exists alongside it but is OFF by default and
+//     labelled permanent, because it cannot come back.
+//
+// LINE BUDGET after [4]: one line per live zone, so worst case is
+// 2 x 200 = 400, plus 7 Fib pool + up to 12 TDA levels + up to 30
+// session lines = 449 against max_lines_count 500. Fits, but the
+// line budget is now as tight as the box budget — raising
+// sdMaxZones or sessKeep past their current caps would overrun it
+// and TradingView culls oldest-first, which is the Fib pool.
+// ═════════════════════════════════════════════════════════════
+
+indicator(
+     "KPL Master",
+     shorttitle = "KPL",
+     overlay = true,
+     max_bars_back = 1000,
+     max_lines_count = 500,
+     max_boxes_count = 500,
+     max_labels_count = 500)
+
+// ═════════════════════════════════════════════════════════════
+// 00 — MODULE SWITCHES
+// ═════════════════════════════════════════════════════════════
+
+string gModules = "00 — Modules"
+
+bool enableFib = input.bool(
+     true,
+     "Fib + Structure",
+     group = gModules)
+
+bool enableSD = input.bool(
+     true,
+     "Supply / Demand zones",
+     group = gModules)
+
+bool enableTDA = input.bool(
+     true,
+     "Top Down Analysis",
+     group = gModules)
+
+bool enableSess = input.bool(
+     true,
+     "Session open lines",
+     group = gModules)
+
+bool enableConf = input.bool(
+     true,
+     "Confluence (needs all three modules)",
+     group = gModules,
+     tooltip = "Reads the other three modules and only marks a bar when they agree. Each module's check FAILS if that module is switched off — the dashboard row shows which one, so a dead check is visible rather than silent.")
+
+// ═════════════════════════════════════════════════════════════
+// INPUTS — FIB + STRUCTURE
+// ═════════════════════════════════════════════════════════════
+
+string gSwing = "01 — Swing Engine"
+
+string sigMode = input.string("ATR-gated", "Significance mode", options = ["ATR-gated", "Fixed"], group = gSwing)
+float fibAtrMult = input.float(1.2, "ATR multiple", minval = 0.1, step = 0.1, group = gSwing)
+int fibAtrLen = input.int(14, "ATR length", minval = 1, group = gSwing)
+float fixedMinDistance = input.float(25.0, "Fixed minimum leg distance", minval = 0.0, step = 0.25, group = gSwing)
+int leftMajor = input.int(5, "Major pivot — left bars", minval = 1, group = gSwing)
+int rightMajor = input.int(2, "Major pivot — right bars", minval = 1, group = gSwing)
+int leftMinor = input.int(3, "Minor pivot — left bars", minval = 1, group = gSwing)
+int rightMinor = input.int(1, "Minor pivot — right bars", minval = 1, group = gSwing)
+int maxPairs = input.int(2, "Opposing pivots tested", minval = 1, maxval = 5, group = gSwing)
+int maxLegBars = input.int(40, "Maximum leg width", minval = 4, group = gSwing)
+int maxMajorLegs = input.int(6, "Maximum stored major legs", minval = 1, maxval = 12, group = gSwing)
+int maxMinorLegs = input.int(4, "Maximum stored minor legs", minval = 1, maxval = 12, group = gSwing)
+bool showMinorLegs = input.bool(false, "Show minor-leg zones", group = gSwing)
+bool showProvisionalLegs = input.bool(true, "Show provisional live legs", tooltip = "Provisional legs can repaint until the swing confirms.", group = gSwing)
+
+string gLife = "02 — Leg Lifecycle"
+
+string invalidationMode = input.string("Close beyond origin", "Leg invalidation", options = ["Close beyond origin", "Wick beyond origin"], group = gLife)
+bool useLegExpiry = input.bool(false, "Expire old untouched legs", group = gLife)
+int legLifeBars = input.int(250, "Untouched-leg lifetime", minval = 5, group = gLife)
+bool removeAfterTouch = input.bool(false, "Remove after first touch", tooltip = "Removes the zone on the bar after its first touch.", group = gLife)
+bool removeAfterMidpoint = input.bool(false, "Remove after .50 is crossed", group = gLife)
+bool preserveUntouched = input.bool(true, "Prioritize untouched legs", group = gLife)
+
+string gStructure = "03 — Structure and Bias"
+
+int consolidationBars = input.int(20, "Bars without break = consolidating", minval = 2, group = gStructure)
+string breakConfirmation = input.string("Close", "Break confirmation", options = ["Close", "Wick"], group = gStructure)
+bool showStructureTags = input.bool(true, "Show HH / HL / LH / LL", group = gStructure)
+bool showBreakLabels = input.bool(true, "Show BOS / CHoCH", group = gStructure)
+bool showSweepLabels = input.bool(false, "Show sweep labels", group = gStructure)
+bool showFormingTags = input.bool(true, "Show forming LL / HH tags", group = gStructure)
+bool showBiasPanel = input.bool(true, "Show bias panel", group = gStructure)
+
+string gRender = "04 — Rendering"
+
+bool showZoneBoxes = input.bool(true, "Show zone boxes", group = gRender)
+bool showInactiveBorders = input.bool(true, "Show inactive-zone borders", group = gRender)
+bool showAnchorLines = input.bool(true, "Show 0% and 100% anchors", group = gRender)
+int zoneExtension = input.int(3, "Zone extension bars", minval = 0, maxval = 100, group = gRender)
+int lineExtension = input.int(3, "Line extension bars", minval = 0, maxval = 100, group = gRender)
+int fibLineWidth = input.int(2, "Fib line width", minval = 1, maxval = 5, group = gRender)
+int anchorLineWidth = input.int(1, "Anchor line width", minval = 1, maxval = 5, group = gRender)
+string confirmedStyleInput = input.string("Solid", "Confirmed line style", options = ["Solid", "Dashed", "Dotted"], group = gRender)
+string provisionalStyleInput = input.string("Dashed", "Provisional line style", options = ["Solid", "Dashed", "Dotted"], group = gRender)
+int confirmedZoneTransparency = input.int(88, "Confirmed-zone transparency", minval = 0, maxval = 100, group = gRender)
+int provisionalZoneTransparency = input.int(93, "Provisional-zone transparency", minval = 0, maxval = 100, group = gRender)
+int touchedZoneFade = input.int(6, "Additional fade after touch", minval = 0, maxval = 50, group = gRender)
+int sweptLineTransparency = input.int(70, "Swept-anchor line transparency", minval = 0, maxval = 100, group = gRender)
+int inactiveBorderTransparency = input.int(65, "Inactive border transparency", minval = 0, maxval = 100, group = gRender)
+
+string gColors = "05 — Colors"
+
+color color50 = input.color(color.black, ".50 line", group = gColors)
+color color62 = input.color(color.blue, ".62 line", group = gColors)
+color color705 = input.color(color.lime, ".705 line", group = gColors)
+color color786 = input.color(color.yellow, ".786 line", group = gColors)
+color color85 = input.color(color.red, ".85 line", group = gColors)
+color zeroAnchorColor = input.color(color.black, "0% anchor", group = gColors)
+color hundredAnchorColor = input.color(color.gray, "100% anchor", group = gColors)
+color majorBullZoneColor = input.color(color.teal, "Major bullish zone", group = gColors)
+color majorBearZoneColor = input.color(color.maroon, "Major bearish zone", group = gColors)
+color minorBullZoneColor = input.color(color.aqua, "Minor bullish zone", group = gColors)
+color minorBearZoneColor = input.color(color.orange, "Minor bearish zone", group = gColors)
+color provisionalBullColor = input.color(color.green, "Provisional bullish zone", group = gColors)
+color provisionalBearColor = input.color(color.red, "Provisional bearish zone", group = gColors)
+
+string gLabels = "06 — Labels"
+
+bool showFibLabels = input.bool(true, "Show active fib labels", group = gLabels)
+bool showFibPrices = input.bool(true, "Include prices in fib labels", group = gLabels)
+bool showAnchorLabels = input.bool(false, "Show anchor labels", group = gLabels)
+int fibLabelOffset = input.int(5, "Fib label offset", minval = 0, maxval = 100, group = gLabels)
+string fibLabelSizeInput = input.string("Tiny", "Fib label size", options = ["Tiny", "Small", "Normal", "Large"], group = gLabels)
+color fibLabelTextColor = input.color(color.white, "Fib label text", group = gLabels)
+color fibLabelBackground = input.color(color.black, "Fib label background", group = gLabels)
+int fibLabelTransparency = input.int(25, "Fib label transparency", minval = 0, maxval = 100, group = gLabels)
+string structureLabelSizeInput = input.string("Tiny", "Structure label size", options = ["Tiny", "Small", "Normal"], group = gLabels)
+color structureTextColor = input.color(color.gray, "Structure tag text", group = gLabels)
+color structureBackground = input.color(color.gray, "Structure tag background", group = gLabels)
+int structureTransparency = input.int(85, "Structure tag transparency", minval = 0, maxval = 100, group = gLabels)
+color bullishBosColor = input.color(color.green, "Bullish BOS", group = gLabels)
+color bearishBosColor = input.color(color.red, "Bearish BOS", group = gLabels)
+color chochColor = input.color(color.orange, "CHoCH", group = gLabels)
+color sweepColor = input.color(color.purple, "Sweep labels", group = gLabels)
+
+// ═════════════════════════════════════════════════════════════
+// INPUTS — SUPPLY / DEMAND
+// ═════════════════════════════════════════════════════════════
+
+string sdGD = "07 — S/D Detection"
+
+string sdBreakMode = input.string("Wick", "Validation candle must break base by", options = ["Wick", "Close"], group = sdGD)
+bool sdRequireOpp = input.bool(true, "Validation candle must be opposite color of base", group = sdGD)
+bool sdUseSize = input.bool(true, "Require minimum displacement size", group = sdGD)
+float sdSizeMult = input.float(1.0, "    Displacement body >= ATR x", minval = 0.1, step = 0.1, group = sdGD)
+int sdAtrLen = input.int(14, "    ATR length", minval = 1, group = sdGD)
+
+string sdGI = "07b — S/D Invalidation"
+
+string sdInvMode = input.string("Full body", "Remove zone on", options = ["Close beyond", "Full body"], group = sdGI)
+
+// FIX [1]: was maxval = 250. Two sides at 250 = 500 boxes, which is
+// the whole max_boxes_count budget, and the 28 Fib pool boxes are the
+// oldest objects on the chart so they get culled first — silently
+// killing the Fib zones. 200 per side leaves 100 boxes of headroom.
+int sdMaxZones = input.int(100, "Max live zones per side", minval = 1, maxval = 200, group = sdGI,
+     tooltip = "Both sides plus the 28 pooled Fib boxes share the 500-box chart limit. Above 200 per side TradingView starts culling the oldest boxes, which are the Fib zone boxes.")
+
+int sdExtend = input.int(20, "Extend zones (bars past current)", minval = 0, maxval = 200, group = sdGI)
+
+string sdGS = "07c — S/D Style"
+
+color sdSupCol = input.color(color.new(color.blue, 70), "Supply fill", group = sdGS, inline = "sup")
+color sdSupBrd = input.color(color.new(color.blue, 30), "border", group = sdGS, inline = "sup")
+color sdDemCol = input.color(color.new(color.orange, 70), "Demand fill", group = sdGS, inline = "dem")
+color sdDemBrd = input.color(color.new(color.orange, 30), "border", group = sdGS, inline = "dem")
+bool sdShowTxt = input.bool(true, "Show zone labels", group = sdGS)
+color sdTxtCol = input.color(color.new(color.gray, 20), "    Label color", group = sdGS)
+string sdTxtSize = input.string("Small", "    Label size", options = ["Tiny", "Small", "Normal"], group = sdGS)
+string sdTxtAlign = input.string("Center", "    Label position", options = ["Left", "Center", "Right"], group = sdGS)
+
+// ─── Base-candle open line ───
+// The open of the base candle, not the zone edge. Price reacts here far
+// more often than at the high/low, so it turns a band into a level you
+// can actually place an entry and a stop against.
+
+bool sdShowOpen = input.bool(true, "Show base-candle open line", group = sdGS)
+color sdDemOpenCol = input.color(color.new(color.orange, 0), "    Demand open line", group = sdGS)
+color sdSupOpenCol = input.color(color.new(color.blue, 0), "    Supply open line", group = sdGS)
+int sdOpenWidth = input.int(1, "    Open line width", minval = 1, maxval = 4, group = sdGS)
+string sdOpenStyI = input.string("Dotted", "    Open line style", options = ["Solid", "Dashed", "Dotted"], group = sdGS)
+
+string sdGQ = "07d — S/D Zone Quality"
+
+bool sdUseMaxHt = input.bool(true, "Reject oversized zones", group = sdGQ)
+float sdMaxHtMult = input.float(2.0, "    Max zone height (x ATR)", minval = 0.5, step = 0.1, group = sdGQ,
+     tooltip = "A base candle taller than this gives you a band, not a level. The 80-point 'supply' on the 5m MNQ chart came from a single oversized base.")
+bool sdNoOverlap = input.bool(true, "Skip zones overlapping a live zone", group = sdGQ,
+     tooltip = "In a trending move every qualifying pair spawns a zone and they stack three deep. This keeps the FIRST base — the one that actually caused the move — and drops later copies sitting on top of it.")
+
+string sdGV = "07e — S/D Visibility"
+
+// Distance is a VISIBILITY filter, never a delete. The zone stays live,
+// keeps extending, keeps its invalidation test, and simply stops drawing
+// while price is far away. Walk back into range and it reappears exactly
+// as it was — same box, same open line, same history.
+//
+// This is the right mechanism for the multi-day clutter: zones 500 points
+// away are unreachable today but perfectly valid levels next week, and a
+// zone that only dies on a close through it will otherwise live forever.
+
+bool sdUseDist = input.bool(true, "Hide zones far from price", group = sdGV,
+     tooltip = "Non-destructive. The zone stays live and reappears the moment price comes back within range — nothing is deleted, and it keeps invalidating normally while hidden.")
+float sdMaxDistMult = input.float(10.0, "    Hide beyond (x ATR)", minval = 1.0, step = 0.5, group = sdGV,
+     tooltip = "Measured from price to the NEAR edge of the zone, so a zone price is sitting inside is always at distance 0 and always visible.")
+
+bool sdUseAge = input.bool(false, "Delete zones older than N bars", group = sdGV,
+     tooltip = "PERMANENT — an aged-out zone does NOT come back when price returns. Off by default. The distance filter above is almost always what you want instead, since it declutters without destroying. Use this only if you want old levels genuinely gone.")
+int sdMaxAgeBars = input.int(500, "    Max age (bars)", minval = 20, group = sdGV)
+
+// ═════════════════════════════════════════════════════════════
+// TYPES
+// ═════════════════════════════════════════════════════════════
+
+type PivotPoint
+    float price
+    int pivotBar
+    bool isHigh
+
+type FibLeg
+    float zeroPrice
+    float originPrice
+    int zeroBar
+    int originBar
+    bool bullish
+    bool major
+    bool anchorSwept
+    bool touched
+    int firstTouchBar
+    float strength
+
+// ═════════════════════════════════════════════════════════════
+// ARRAYS AND OBJECT POOLS
+// ═════════════════════════════════════════════════════════════
+
+var array<PivotPoint> majorHighs = array.new<PivotPoint>()
+var array<PivotPoint> majorLows = array.new<PivotPoint>()
+var array<PivotPoint> minorHighs = array.new<PivotPoint>()
+var array<PivotPoint> minorLows = array.new<PivotPoint>()
+
+var array<FibLeg> majorLegs = array.new<FibLeg>()
+var array<FibLeg> minorLegs = array.new<FibLeg>()
+
+const int MAX_DRAW_LOOKBACK = 500
+
+const int BOX_POOL_SIZE = 28
+const int LINE_POOL_SIZE = 7
+const int LABEL_POOL_SIZE = 7
+
+var array<box> boxPool = array.new<box>()
+var array<line> linePool = array.new<line>()
+var array<label> labelPool = array.new<label>()
+
+color hiddenColor = color.new(color.gray, 100)
+
+// Pools are always built, even when the module is off, so the
+// render helpers can never index an empty array.
+
+if barstate.isfirst
+    for i = 0 to BOX_POOL_SIZE - 1
+        box newBox = box.new(bar_index, close, bar_index, close, border_color = hiddenColor, bgcolor = hiddenColor)
+        array.push(boxPool, newBox)
+
+    for i = 0 to LINE_POOL_SIZE - 1
+        line newLine = line.new(bar_index, close, bar_index, close, color = hiddenColor)
+        array.push(linePool, newLine)
+
+    for i = 0 to LABEL_POOL_SIZE - 1
+        label newLabel = label.new(bar_index, close, "", style = label.style_label_left, color = hiddenColor, textcolor = hiddenColor, size = size.tiny)
+        array.push(labelPool, newLabel)
+
+// ═════════════════════════════════════════════════════════════
+// GLOBAL SERIES CALCULATIONS
+// ═════════════════════════════════════════════════════════════
+// These stay unconditional even when enableFib is off. ta.* builds
+// internal state from every bar, so calling it inside a switch would
+// corrupt the series rather than save work. It is also the cheap part
+// — the array work below is what the switch is actually gating.
+
+float atrValue = ta.atr(fibAtrLen)
+
+float majorPivotHigh = ta.pivothigh(high, leftMajor, rightMajor)
+float majorPivotLow = ta.pivotlow(low, leftMajor, rightMajor)
+float minorPivotHigh = ta.pivothigh(high, leftMinor, rightMinor)
+float minorPivotLow = ta.pivotlow(low, leftMinor, rightMinor)
+
+int majorLowestOffsetRaw = ta.lowestbars(low, rightMajor + 1)
+int majorHighestOffsetRaw = ta.highestbars(high, rightMajor + 1)
+
+int majorLowestOffset = math.abs(majorLowestOffsetRaw)
+int majorHighestOffset = math.abs(majorHighestOffsetRaw)
+
+float majorAtrAtPivot = nz(atrValue[rightMajor], atrValue)
+float minorAtrAtPivot = nz(atrValue[rightMinor], atrValue)
+
+float majorMinimumDistance = fixedMinDistance
+
+if sigMode == "ATR-gated"
+    majorMinimumDistance := fibAtrMult * majorAtrAtPivot
+
+float minorMinimumDistance = fixedMinDistance * 0.50
+
+if sigMode == "ATR-gated"
+    minorMinimumDistance := fibAtrMult * 0.50 * minorAtrAtPivot
+
+minorMinimumDistance := math.max(minorMinimumDistance, syminfo.mintick)
+
+// ═════════════════════════════════════════════════════════════
+// DISPLAY HELPERS
+// ═════════════════════════════════════════════════════════════
+
+drawBar(int requestedBar) =>
+    int earliestBar = bar_index - MAX_DRAW_LOOKBACK
+    math.max(requestedBar, earliestBar)
+
+getLineStyle(string selectedStyle) =>
+    result = line.style_solid
+    if selectedStyle == "Dashed"
+        result := line.style_dashed
+    else if selectedStyle == "Dotted"
+        result := line.style_dotted
+    result
+
+getFibLabelSize(string selectedSize) =>
+    result = size.tiny
+    if selectedSize == "Small"
+        result := size.small
+    else if selectedSize == "Normal"
+        result := size.normal
+    else if selectedSize == "Large"
+        result := size.large
+    result
+
+getStructureLabelSize(string selectedSize) =>
+    result = size.tiny
+    if selectedSize == "Small"
+        result := size.small
+    else if selectedSize == "Normal"
+        result := size.normal
+    result
+
+confirmedLineStyle = getLineStyle(confirmedStyleInput)
+provisionalLineStyle = getLineStyle(provisionalStyleInput)
+fibLabelSize = getFibLabelSize(fibLabelSizeInput)
+structureLabelSize = getStructureLabelSize(structureLabelSizeInput)
+
+// ═════════════════════════════════════════════════════════════
+// LEG CALCULATIONS
+// ═════════════════════════════════════════════════════════════
+
+fibPrice(FibLeg leg, float ratio) =>
+    float result = na
+    if leg.bullish
+        result := leg.zeroPrice - ratio * (leg.zeroPrice - leg.originPrice)
+    else
+        result := leg.zeroPrice + ratio * (leg.originPrice - leg.zeroPrice)
+    result
+
+legDistance(FibLeg leg) =>
+    math.abs(leg.zeroPrice - leg.originPrice)
+
+zoneTop(FibLeg leg) =>
+    float price62 = fibPrice(leg, 0.62)
+    float price786 = fibPrice(leg, 0.786)
+    math.max(price62, price786)
+
+zoneBottom(FibLeg leg) =>
+    float price62 = fibPrice(leg, 0.62)
+    float price786 = fibPrice(leg, 0.786)
+    math.min(price62, price786)
+
+zoneTouchedNow(FibLeg leg) =>
+    low <= zoneTop(leg) and high >= zoneBottom(leg)
+
+crossedMidpoint(FibLeg leg) =>
+    float midpoint = fibPrice(leg, 0.50)
+    bool crossed = false
+    if leg.bullish
+        crossed := low <= midpoint
+    else
+        crossed := high >= midpoint
+    crossed
+
+legInvalidated(FibLeg leg) =>
+    bool invalidated = false
+    if invalidationMode == "Wick beyond origin"
+        if leg.bullish
+            invalidated := low < leg.originPrice
+        else
+            invalidated := high > leg.originPrice
+    else
+        if leg.bullish
+            invalidated := close < leg.originPrice
+        else
+            invalidated := close > leg.originPrice
+    invalidated
+
+sameLeg(FibLeg firstLeg, FibLeg secondLeg) =>
+    firstLeg.bullish == secondLeg.bullish and
+     firstLeg.zeroBar == secondLeg.zeroBar and
+     firstLeg.originBar == secondLeg.originBar
+
+legAlreadyExists(array<FibLeg> legs, FibLeg candidate) =>
+    bool exists = false
+    if array.size(legs) > 0
+        for i = 0 to array.size(legs) - 1
+            FibLeg existing = array.get(legs, i)
+            if sameLeg(existing, candidate)
+                exists := true
+                break
+    exists
+
+legPreservationScore(FibLeg leg) =>
+    float atrDenominator = math.max(atrValue, syminfo.mintick)
+    float normalizedDistance = legDistance(leg) / atrDenominator
+    float score = 0.0
+    if leg.major
+        score += 100.0
+    score += normalizedDistance * 10.0
+    score += leg.strength * 5.0
+    if not leg.touched
+        score += 40.0
+    if leg.anchorSwept
+        score -= 10.0
+    score
+
+weakestLegIndex(array<FibLeg> legs) =>
+    int weakestIndex = 0
+    if array.size(legs) > 1
+        float weakestScore = legPreservationScore(array.get(legs, 0))
+        for i = 1 to array.size(legs) - 1
+            FibLeg candidate = array.get(legs, i)
+            float candidateScore = legPreservationScore(candidate)
+            if candidateScore < weakestScore
+                weakestScore := candidateScore
+                weakestIndex := i
+    weakestIndex
+
+enforceLegLimit(array<FibLeg> legs, int maximumLegs) =>
+    while array.size(legs) > maximumLegs
+        int removalIndex = 0
+        if preserveUntouched
+            removalIndex := weakestLegIndex(legs)
+        array.remove(legs, removalIndex)
+
+pushPivot(array<PivotPoint> pivotArray, float pivotPrice, int pivotBarValue, bool pivotIsHigh) =>
+    bool duplicate = false
+    if array.size(pivotArray) > 0
+        PivotPoint latest = array.get(pivotArray, array.size(pivotArray) - 1)
+        duplicate := latest.pivotBar == pivotBarValue and math.abs(latest.price - pivotPrice) <= syminfo.mintick
+    if not duplicate
+        PivotPoint newPivot = PivotPoint.new(pivotPrice, pivotBarValue, pivotIsHigh)
+        array.push(pivotArray, newPivot)
+    while array.size(pivotArray) > 20
+        array.shift(pivotArray)
+
+spawnLegs(array<FibLeg> legArray, array<PivotPoint> opposingPivots, float zeroPrice, int zeroBar, bool bullish, bool major, float minimumDistance, int maximumLegs) =>
+    int created = 0
+    int available = array.size(opposingPivots)
+    int tests = math.min(maxPairs, available)
+    if tests > 0
+        for i = 0 to tests - 1
+            int oppositeIndex = available - 1 - i
+            PivotPoint opposite = array.get(opposingPivots, oppositeIndex)
+            bool correctTime = opposite.pivotBar < zeroBar
+            bool withinSpan = zeroBar - opposite.pivotBar <= maxLegBars
+            bool correctDirection = false
+            if bullish
+                correctDirection := opposite.price < zeroPrice
+            else
+                correctDirection := opposite.price > zeroPrice
+            float candidateDistance = math.abs(zeroPrice - opposite.price)
+            bool significant = candidateDistance >= minimumDistance
+            if correctTime and withinSpan and correctDirection and significant
+                float strengthDenominator = math.max(minimumDistance, syminfo.mintick)
+                float strength = candidateDistance / strengthDenominator
+                FibLeg candidate = FibLeg.new(zeroPrice, opposite.price, zeroBar, opposite.pivotBar, bullish, major, false, false, 0, strength)
+                if not legAlreadyExists(legArray, candidate)
+                    array.push(legArray, candidate)
+                    created += 1
+    enforceLegLimit(legArray, maximumLegs)
+    created
+
+// ═════════════════════════════════════════════════════════════
+// SWING STATE
+// ═════════════════════════════════════════════════════════════
+
+var float previousMajorHigh = na
+var float previousMajorLow = na
+
+var float structureHigh = na
+var float structureLow = na
+
+var bool structureHighBroken = false
+var bool structureLowBroken = false
+
+var float provisionalLowPrice = na
+var int provisionalLowBar = na
+var float runningHigh = na
+var int runningHighBar = na
+
+var float provisionalHighPrice = na
+var int provisionalHighBar = na
+var float runningLow = na
+var int runningLowBar = na
+
+// ═════════════════════════════════════════════════════════════
+// MAJOR PIVOT HIGH
+// ═════════════════════════════════════════════════════════════
+// FIX [2]: gated on enableFib. With the module off the arrays stay
+// empty, which also leaves structureHigh/Low na — so the bias engine
+// and the forming-extreme block below fall through to false on their
+// own and cost nothing.
+
+if enableFib and not na(majorPivotHigh)
+    int pivotBarValue = bar_index - rightMajor
+
+    spawnLegs(majorLegs, majorLows, majorPivotHigh, pivotBarValue, true, true, majorMinimumDistance, maxMajorLegs)
+    pushPivot(majorHighs, majorPivotHigh, pivotBarValue, true)
+
+    structureHigh := majorPivotHigh
+    structureHighBroken := false
+
+    provisionalHighPrice := majorPivotHigh
+    provisionalHighBar := pivotBarValue
+
+    runningLow := low[majorLowestOffset]
+    runningLowBar := bar_index - majorLowestOffset
+
+    if showStructureTags
+        string highTag = "H"
+        if not na(previousMajorHigh)
+            if majorPivotHigh > previousMajorHigh
+                highTag := "HH"
+            else
+                highTag := "LH"
+        label.new(pivotBarValue, majorPivotHigh, highTag, style = label.style_label_down, color = color.new(structureBackground, structureTransparency), textcolor = structureTextColor, size = structureLabelSize)
+
+    previousMajorHigh := majorPivotHigh
+
+// ═════════════════════════════════════════════════════════════
+// MAJOR PIVOT LOW
+// ═════════════════════════════════════════════════════════════
+
+if enableFib and not na(majorPivotLow)
+    int pivotBarValue = bar_index - rightMajor
+
+    spawnLegs(majorLegs, majorHighs, majorPivotLow, pivotBarValue, false, true, majorMinimumDistance, maxMajorLegs)
+    pushPivot(majorLows, majorPivotLow, pivotBarValue, false)
+
+    structureLow := majorPivotLow
+    structureLowBroken := false
+
+    provisionalLowPrice := majorPivotLow
+    provisionalLowBar := pivotBarValue
+
+    runningHigh := high[majorHighestOffset]
+    runningHighBar := bar_index - majorHighestOffset
+
+    if showStructureTags
+        string lowTag = "L"
+        if not na(previousMajorLow)
+            if majorPivotLow < previousMajorLow
+                lowTag := "LL"
+            else
+                lowTag := "HL"
+        label.new(pivotBarValue, majorPivotLow, lowTag, style = label.style_label_up, color = color.new(structureBackground, structureTransparency), textcolor = structureTextColor, size = structureLabelSize)
+
+    previousMajorLow := majorPivotLow
+
+if not na(runningHigh)
+    if high > runningHigh
+        runningHigh := high
+        runningHighBar := bar_index
+
+if not na(runningLow)
+    if low < runningLow
+        runningLow := low
+        runningLowBar := bar_index
+
+// ═════════════════════════════════════════════════════════════
+// FORMING EXTREMES
+// ═════════════════════════════════════════════════════════════
+// Breaking the last major pivot low means a lower low is being made
+// NOW. The pivot engine's LL tag arrives rightMajor bars later, so
+// this fires immediately. It also marks the provisional leg dead —
+// the render block drops it on the same bar.
+// Follows the same wick/close rule chosen for leg invalidation.
+
+var float flaggedLow = na
+var float flaggedHigh = na
+
+bool lowViolated = not na(provisionalLowPrice) and (invalidationMode == "Wick beyond origin" ? low < provisionalLowPrice : close < provisionalLowPrice)
+bool highViolated = not na(provisionalHighPrice) and (invalidationMode == "Wick beyond origin" ? high > provisionalHighPrice : close > provisionalHighPrice)
+
+// Fire once per pivot, not once per bar.
+bool newLowForming = lowViolated and (na(flaggedLow) or flaggedLow != provisionalLowPrice)
+bool newHighForming = highViolated and (na(flaggedHigh) or flaggedHigh != provisionalHighPrice)
+
+if newLowForming
+    flaggedLow := provisionalLowPrice
+    if showFormingTags and enableFib
+        label.new(bar_index, low, "LL forming", style = label.style_label_up, color = color.new(bearishBosColor, 30), textcolor = color.white, size = structureLabelSize)
+
+if newHighForming
+    flaggedHigh := provisionalHighPrice
+    if showFormingTags and enableFib
+        label.new(bar_index, high, "HH forming", style = label.style_label_down, color = color.new(bullishBosColor, 30), textcolor = color.white, size = structureLabelSize)
+
+// ═════════════════════════════════════════════════════════════
+// MINOR PIVOTS
+// ═════════════════════════════════════════════════════════════
+
+if enableFib and not na(minorPivotHigh)
+    int pivotBarValue = bar_index - rightMinor
+    bool duplicatesMajorHigh = false
+    if not na(majorPivotHigh)
+        duplicatesMajorHigh := pivotBarValue == bar_index - rightMajor and math.abs(minorPivotHigh - majorPivotHigh) <= syminfo.mintick
+    if not duplicatesMajorHigh
+        spawnLegs(minorLegs, minorLows, minorPivotHigh, pivotBarValue, true, false, minorMinimumDistance, maxMinorLegs)
+        pushPivot(minorHighs, minorPivotHigh, pivotBarValue, true)
+
+if enableFib and not na(minorPivotLow)
+    int pivotBarValue = bar_index - rightMinor
+    bool duplicatesMajorLow = false
+    if not na(majorPivotLow)
+        duplicatesMajorLow := pivotBarValue == bar_index - rightMajor and math.abs(minorPivotLow - majorPivotLow) <= syminfo.mintick
+    if not duplicatesMajorLow
+        spawnLegs(minorLegs, minorHighs, minorPivotLow, pivotBarValue, false, false, minorMinimumDistance, maxMinorLegs)
+        pushPivot(minorLows, minorPivotLow, pivotBarValue, false)
+
+// ═════════════════════════════════════════════════════════════
+// BIAS ENGINE
+// ═════════════════════════════════════════════════════════════
+
+var int directionBias = 0
+var int lastBreakBar = na
+
+bool sweepUp = false
+
+if not na(structureHigh)
+    sweepUp := not structureHighBroken and high > structureHigh and close <= structureHigh
+
+bool sweepDown = false
+
+if not na(structureLow)
+    sweepDown := not structureLowBroken and low < structureLow and close >= structureLow
+
+bool brokeUp = false
+
+if not na(structureHigh) and not structureHighBroken
+    if breakConfirmation == "Close"
+        brokeUp := close > structureHigh
+    else
+        brokeUp := high > structureHigh
+
+bool brokeDown = false
+
+if not na(structureLow) and not structureLowBroken
+    if breakConfirmation == "Close"
+        brokeDown := close < structureLow
+    else
+        brokeDown := low < structureLow
+
+int resolvedBreak = 0
+
+if brokeUp and not brokeDown
+    resolvedBreak := 1
+else if brokeDown and not brokeUp
+    resolvedBreak := -1
+else if brokeUp and brokeDown
+    float candleDistance = math.max(high - low, syminfo.mintick)
+    float closeLocation = (close - low) / candleDistance
+    if closeLocation >= 0.65
+        resolvedBreak := 1
+    else if closeLocation <= 0.35
+        resolvedBreak := -1
+
+if resolvedBreak == 1
+    bool isChoch = directionBias == -1
+    directionBias := 1
+    structureHighBroken := true
+    lastBreakBar := bar_index
+    if showBreakLabels and enableFib
+        color labelColor = bullishBosColor
+        if isChoch
+            labelColor := chochColor
+        string breakText = "BOS"
+        if isChoch
+            breakText := "CHoCH"
+        label.new(bar_index, structureHigh, breakText, style = label.style_label_down, color = color.new(labelColor, 20), textcolor = color.white, size = structureLabelSize)
+
+if resolvedBreak == -1
+    bool isChoch = directionBias == 1
+    directionBias := -1
+    structureLowBroken := true
+    lastBreakBar := bar_index
+    if showBreakLabels and enableFib
+        color labelColor = bearishBosColor
+        if isChoch
+            labelColor := chochColor
+        string breakText = "BOS"
+        if isChoch
+            breakText := "CHoCH"
+        label.new(bar_index, structureLow, breakText, style = label.style_label_up, color = color.new(labelColor, 20), textcolor = color.white, size = structureLabelSize)
+
+if showSweepLabels and enableFib and sweepUp
+    label.new(bar_index, high, "High sweep", style = label.style_label_down, color = color.new(sweepColor, 25), textcolor = color.white, size = structureLabelSize)
+
+if showSweepLabels and enableFib and sweepDown
+    label.new(bar_index, low, "Low sweep", style = label.style_label_up, color = color.new(sweepColor, 25), textcolor = color.white, size = structureLabelSize)
+
+bool isConsolidating = false
+
+if not na(lastBreakBar)
+    isConsolidating := bar_index - lastBreakBar > consolidationBars
+
+string biasText = "FORMING"
+color biasColor = color.silver
+
+if isConsolidating
+    biasText := "CONSOLIDATING"
+    biasColor := color.gray
+else
+    if directionBias == 1
+        biasText := "BULLISH"
+        biasColor := color.green
+    else if directionBias == -1
+        biasText := "BEARISH"
+        biasColor := color.red
+
+// ═════════════════════════════════════════════════════════════
+// LEG MAINTENANCE
+// ═════════════════════════════════════════════════════════════
+
+maintainLegs(array<FibLeg> legArray) =>
+    int index = 0
+    while index < array.size(legArray)
+        FibLeg leg = array.get(legArray, index)
+        bool invalidated = legInvalidated(leg)
+        bool expired = false
+        if useLegExpiry and not leg.touched
+            expired := bar_index - leg.zeroBar > legLifeBars
+        bool enteredNow = zoneTouchedNow(leg)
+        if enteredNow and not leg.touched
+            leg.touched := true
+            leg.firstTouchBar := bar_index
+        bool sweptNow = false
+        if leg.bullish
+            sweptNow := high > leg.zeroPrice
+        else
+            sweptNow := low < leg.zeroPrice
+        if sweptNow
+            leg.anchorSwept := true
+        array.set(legArray, index, leg)
+        bool deleteForTouch = false
+        if removeAfterTouch and leg.touched
+            deleteForTouch := leg.firstTouchBar < bar_index
+        bool deleteForMidpoint = false
+        if removeAfterMidpoint and leg.touched
+            deleteForMidpoint := crossedMidpoint(leg)
+        bool shouldDelete = invalidated or expired or deleteForTouch or deleteForMidpoint
+        if shouldDelete
+            array.remove(legArray, index)
+        index := shouldDelete ? index : index + 1
+
+// FIX [2]: the per-bar array walk is the expensive part of this module.
+// No ta.* calls inside maintainLegs, so gating it is safe.
+
+if enableFib
+    maintainLegs(majorLegs)
+    maintainLegs(minorLegs)
+
+    enforceLegLimit(majorLegs, maxMajorLegs)
+    enforceLegLimit(minorLegs, maxMinorLegs)
+
+// ═════════════════════════════════════════════════════════════
+// ACTIVE LEG SCORING
+// ═════════════════════════════════════════════════════════════
+
+activeLegScore(FibLeg leg, bool provisional) =>
+    float topPrice = zoneTop(leg)
+    float bottomPrice = zoneBottom(leg)
+    float distanceFromZone = 0.0
+    if close > topPrice
+        distanceFromZone := close - topPrice
+    else if close < bottomPrice
+        distanceFromZone := bottomPrice - close
+    float denominator = math.max(atrValue, syminfo.mintick)
+    float normalizedZoneDistance = distanceFromZone / denominator
+    float normalizedLegDistance = legDistance(leg) / denominator
+    float score = 0.0
+    if zoneTouchedNow(leg)
+        score += 500.0
+    if leg.major
+        score += 150.0
+    if not leg.touched
+        score += 75.0
+    score += normalizedLegDistance * 15.0
+    if provisional
+        score -= 15.0
+    if leg.anchorSwept
+        score -= 10.0
+    score -= normalizedZoneDistance * 20.0
+    score
+
+// ═════════════════════════════════════════════════════════════
+// OBJECT HELPERS
+// ═════════════════════════════════════════════════════════════
+
+hideAllObjects() =>
+    for i = 0 to BOX_POOL_SIZE - 1
+        box currentBox = array.get(boxPool, i)
+        box.set_bgcolor(currentBox, hiddenColor)
+        box.set_border_color(currentBox, hiddenColor)
+        box.set_border_width(currentBox, 0)
+    for i = 0 to LINE_POOL_SIZE - 1
+        line currentLine = array.get(linePool, i)
+        line.set_color(currentLine, hiddenColor)
+    for i = 0 to LABEL_POOL_SIZE - 1
+        label currentLabel = array.get(labelPool, i)
+        label.set_text(currentLabel, "")
+        label.set_color(currentLabel, hiddenColor)
+        label.set_textcolor(currentLabel, hiddenColor)
+
+getZoneColor(FibLeg leg, bool provisional) =>
+    color result = color.gray
+    if provisional
+        if leg.bullish
+            result := provisionalBullColor
+        else
+            result := provisionalBearColor
+    else if leg.major
+        if leg.bullish
+            result := majorBullZoneColor
+        else
+            result := majorBearZoneColor
+    else
+        if leg.bullish
+            result := minorBullZoneColor
+        else
+            result := minorBearZoneColor
+    result
+
+placeZone(int slot, FibLeg leg, bool provisional, bool active) =>
+    if slot < BOX_POOL_SIZE and showZoneBoxes
+        box currentBox = array.get(boxPool, slot)
+        color baseColor = getZoneColor(leg, provisional)
+        int baseTransparency = confirmedZoneTransparency
+        if provisional
+            baseTransparency := provisionalZoneTransparency
+        int finalTransparency = baseTransparency
+        if leg.touched
+            finalTransparency += touchedZoneFade
+        finalTransparency := math.min(finalTransparency, 100)
+        color currentBorderColor = hiddenColor
+        int currentBorderWidth = 0
+        if not active and showInactiveBorders
+            currentBorderColor := color.new(baseColor, inactiveBorderTransparency)
+            currentBorderWidth := 1
+        box.set_lefttop(currentBox, drawBar(leg.zeroBar), zoneTop(leg))
+        box.set_rightbottom(currentBox, bar_index + zoneExtension, zoneBottom(leg))
+        box.set_bgcolor(currentBox, color.new(baseColor, finalTransparency))
+        box.set_border_color(currentBox, currentBorderColor)
+        box.set_border_width(currentBox, currentBorderWidth)
+
+formatFibLabel(string ratioText, float priceValue) =>
+    string result = ratioText
+    if showFibPrices
+        result := ratioText + "  " + str.tostring(priceValue, format.mintick)
+    result
+
+placeFibLabel(int labelIndex, float priceValue, string textValue) =>
+    if labelIndex < LABEL_POOL_SIZE
+        label currentLabel = array.get(labelPool, labelIndex)
+        label.set_xy(currentLabel, bar_index + fibLabelOffset, priceValue)
+        label.set_text(currentLabel, textValue)
+        label.set_style(currentLabel, label.style_label_left)
+        label.set_size(currentLabel, fibLabelSize)
+        label.set_color(currentLabel, color.new(fibLabelBackground, fibLabelTransparency))
+        label.set_textcolor(currentLabel, fibLabelTextColor)
+
+placeActiveLevels(FibLeg leg, bool provisional) =>
+    array<float> ratios = array.from(0.50, 0.62, 0.705, 0.786, 0.85)
+    array<string> ratioNames = array.from(".50", ".62", ".705", ".786", ".85")
+    array<color> levelColors = array.from(color50, color62, color705, color786, color85)
+
+    activeStyle = confirmedLineStyle
+    if provisional
+        activeStyle := provisionalLineStyle
+
+    int activeTransparency = 0
+    if leg.anchorSwept
+        activeTransparency := sweptLineTransparency
+
+    for i = 0 to 4
+        line currentLine = array.get(linePool, i)
+        float ratioValue = array.get(ratios, i)
+        float priceValue = fibPrice(leg, ratioValue)
+        color levelColor = array.get(levelColors, i)
+        line.set_xy1(currentLine, drawBar(leg.zeroBar), priceValue)
+        line.set_xy2(currentLine, bar_index + lineExtension, priceValue)
+        line.set_color(currentLine, color.new(levelColor, activeTransparency))
+        line.set_style(currentLine, activeStyle)
+        line.set_width(currentLine, fibLineWidth)
+        if showFibLabels
+            string ratioName = array.get(ratioNames, i)
+            placeFibLabel(i, priceValue, formatFibLabel(ratioName, priceValue))
+
+    line zeroLine = array.get(linePool, 5)
+    line hundredLine = array.get(linePool, 6)
+
+    if showAnchorLines
+        line.set_xy1(zeroLine, drawBar(leg.zeroBar), leg.zeroPrice)
+        line.set_xy2(zeroLine, bar_index + lineExtension, leg.zeroPrice)
+        line.set_color(zeroLine, color.new(zeroAnchorColor, activeTransparency))
+        line.set_style(zeroLine, activeStyle)
+        line.set_width(zeroLine, anchorLineWidth)
+        line.set_xy1(hundredLine, drawBar(leg.originBar), leg.originPrice)
+        line.set_xy2(hundredLine, bar_index + lineExtension, leg.originPrice)
+        line.set_color(hundredLine, color.new(hundredAnchorColor, activeTransparency))
+        line.set_style(hundredLine, activeStyle)
+        line.set_width(hundredLine, anchorLineWidth)
+        if showFibLabels and showAnchorLabels
+            placeFibLabel(5, leg.zeroPrice, formatFibLabel("0", leg.zeroPrice))
+            placeFibLabel(6, leg.originPrice, formatFibLabel("1.00", leg.originPrice))
+
+// ═════════════════════════════════════════════════════════════
+// FIB RENDERING
+// ═════════════════════════════════════════════════════════════
+
+// Hiding runs unconditionally so switching the module off clears
+// the pooled objects instead of freezing them on screen.
+
+if barstate.islast
+    hideAllObjects()
+
+if barstate.islast and enableFib
+    array<FibLeg> candidates = array.new<FibLeg>()
+    array<bool> provisionalFlags = array.new<bool>()
+
+    if array.size(majorLegs) > 0
+        for i = 0 to array.size(majorLegs) - 1
+            array.push(candidates, array.get(majorLegs, i))
+            array.push(provisionalFlags, false)
+
+    if showProvisionalLegs and not na(provisionalLowPrice) and not na(runningHigh)
+        float provisionalDistance = runningHigh - provisionalLowPrice
+        int provisionalWidth = runningHighBar - provisionalLowBar
+        bool validBullishProvisional = runningHigh > provisionalLowPrice and provisionalDistance >= majorMinimumDistance and provisionalWidth >= 0 and provisionalWidth <= maxLegBars
+        if validBullishProvisional
+            float denominator = math.max(majorMinimumDistance, syminfo.mintick)
+            FibLeg provisionalBullLeg = FibLeg.new(runningHigh, provisionalLowPrice, runningHighBar, provisionalLowBar, true, true, false, false, 0, provisionalDistance / denominator)
+            // Option A: origin violated = dead on the spot. Provisional
+            // legs never enter the leg array, so maintainLegs() cannot
+            // reach them — the test has to happen here or not at all.
+            if not legInvalidated(provisionalBullLeg)
+                array.push(candidates, provisionalBullLeg)
+                array.push(provisionalFlags, true)
+
+    if showProvisionalLegs and not na(provisionalHighPrice) and not na(runningLow)
+        float provisionalDistance = provisionalHighPrice - runningLow
+        int provisionalWidth = runningLowBar - provisionalHighBar
+        bool validBearishProvisional = runningLow < provisionalHighPrice and provisionalDistance >= majorMinimumDistance and provisionalWidth >= 0 and provisionalWidth <= maxLegBars
+        if validBearishProvisional
+            float denominator = math.max(majorMinimumDistance, syminfo.mintick)
+            FibLeg provisionalBearLeg = FibLeg.new(runningLow, provisionalHighPrice, runningLowBar, provisionalHighBar, false, true, false, false, 0, provisionalDistance / denominator)
+            if not legInvalidated(provisionalBearLeg)
+                array.push(candidates, provisionalBearLeg)
+                array.push(provisionalFlags, true)
+
+    int activeIndex = -1
+    float bestScore = -100000000000000000000.0
+
+    if array.size(candidates) > 0
+        for i = 0 to array.size(candidates) - 1
+            FibLeg candidate = array.get(candidates, i)
+            bool provisional = array.get(provisionalFlags, i)
+            float candidateScore = activeLegScore(candidate, provisional)
+            if candidateScore > bestScore
+                bestScore := candidateScore
+                activeIndex := i
+
+    int boxSlot = 0
+
+    if array.size(candidates) > 0
+        for i = 0 to array.size(candidates) - 1
+            FibLeg candidate = array.get(candidates, i)
+            bool provisional = array.get(provisionalFlags, i)
+            bool active = i == activeIndex
+            placeZone(boxSlot, candidate, provisional, active)
+            boxSlot += 1
+            if active
+                placeActiveLevels(candidate, provisional)
+
+    if showMinorLegs and array.size(minorLegs) > 0
+        for i = 0 to array.size(minorLegs) - 1
+            FibLeg minorLeg = array.get(minorLegs, i)
+            placeZone(boxSlot, minorLeg, false, false)
+            boxSlot += 1
+
+// ═════════════════════════════════════════════════════════════
+// FIB BIAS PANEL
+// ═════════════════════════════════════════════════════════════
+
+var table biasPanel = table.new(position.top_right, 1, 3, border_width = 1)
+
+if barstate.islast
+    if showBiasPanel and enableFib
+        table.cell(biasPanel, 0, 0, biasText, text_color = color.white, bgcolor = color.new(biasColor, 20), text_size = size.small)
+
+        string sweepText = "NO ACTIVE SWEEP"
+        color sweepTextColor = color.gray
+        if sweepUp
+            sweepText := "HIGH SWEEP"
+            sweepTextColor := color.white
+        else if sweepDown
+            sweepText := "LOW SWEEP"
+            sweepTextColor := color.white
+
+        table.cell(biasPanel, 0, 1, sweepText, text_color = sweepTextColor, bgcolor = color.new(color.black, 85), text_size = size.tiny)
+
+        string countText = str.tostring(array.size(majorLegs)) + " major / " + str.tostring(array.size(minorLegs)) + " minor"
+        table.cell(biasPanel, 0, 2, countText, text_color = color.gray, bgcolor = color.new(color.black, 85), text_size = size.tiny)
+    else
+        table.clear(biasPanel, 0, 0, 0, 2)
+
+// ═════════════════════════════════════════════════════════════
+// SUPPLY / DEMAND MODULE
+// ═════════════════════════════════════════════════════════════
+
+sdSizeOpt = sdTxtSize == "Tiny" ? size.tiny : sdTxtSize == "Normal" ? size.normal : size.small
+sdAlignOpt = sdTxtAlign == "Left" ? text.align_left : sdTxtAlign == "Right" ? text.align_right : text.align_center
+
+// Auto timeframe label
+sdTfTxt = timeframe.isminutes ? (timeframe.multiplier >= 60 and timeframe.multiplier % 60 == 0 ? str.tostring(timeframe.multiplier / 60) + " Hour" : str.tostring(timeframe.multiplier) + " Min") : timeframe.isdaily ? "Daily" : timeframe.period
+
+// ─── Zone storage ───
+// Declared ahead of detection so the overlap filter can read live zones.
+// The open-line arrays are kept in lockstep with the box arrays — every
+// push, shift and remove happens at the same index under the same
+// sdShowOpen condition, so index i always refers to the same zone.
+
+var array<box>  demandZones = array.new<box>()
+var array<line> demandOpens = array.new<line>()
+var array<box>  supplyZones = array.new<box>()
+var array<line> supplyOpens = array.new<line>()
+
+// Distance from price to the NEAR edge of a zone. Zero while price is
+// inside it, so a zone being traded is never hidden.
+f_sdDist(float top, float btm) =>
+    close > top ? close - top : close < btm ? btm - close : 0.0
+
+// Two price ranges overlap when each one's far edge clears the other's
+// near edge.
+f_sdOverlaps(array<box> zones, float top, float btm) =>
+    bool hit = false
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            box z = array.get(zones, i)
+            if top >= box.get_bottom(z) and btm <= box.get_top(z)
+                hit := true
+                break
+    hit
+
+// ─── Detection logic ───
+// Stays unconditional: ta.atr needs every bar, and newDemand/newSupply
+// feed alertcondition() which must live in global scope.
+sdAtr = ta.atr(sdAtrLen)
+sdIsGreen = close > open
+sdIsRed = close < open
+
+sdBaseHigh = high[1]
+sdBaseLow = low[1]
+sdBaseOpen = open[1]        // the level price keeps reacting to inside the zone
+
+sdBrokeUp = sdBreakMode == "Close" ? close > sdBaseHigh : high > sdBaseHigh
+sdBrokeDn = sdBreakMode == "Close" ? close < sdBaseLow : low < sdBaseLow
+
+sdOppUpOk = not sdRequireOpp or sdIsGreen
+sdOppDnOk = not sdRequireOpp or sdIsRed
+
+sdBodySz = math.abs(close - open)
+sdSizeOk = not sdUseSize or sdBodySz >= nz(sdAtr[1]) * sdSizeMult
+
+// Height filter — a base wider than this is a band, not a level.
+sdZoneHt = sdBaseHigh - sdBaseLow
+sdHtOk = not sdUseMaxHt or sdZoneHt <= nz(sdAtr[1]) * sdMaxHtMult
+
+// Overlap filter — keep the first base, drop later copies stacked on it.
+// Reads the arrays before this bar's creation and cleanup run, so a zone
+// invalidated by this same close still blocks. That is deliberate: it was
+// live at the moment the new base formed.
+sdDemFresh = not sdNoOverlap or not f_sdOverlaps(demandZones, sdBaseHigh, sdBaseLow)
+sdSupFresh = not sdNoOverlap or not f_sdOverlaps(supplyZones, sdBaseHigh, sdBaseLow)
+
+// Both filters fold into newDemand/newSupply so the alerts fire on exactly
+// the zones that get drawn — no alerts for zones the filters threw away.
+newDemand = sdIsRed[1] and sdBrokeUp and sdOppUpOk and sdSizeOk and sdHtOk and sdDemFresh
+newSupply = sdIsGreen[1] and sdBrokeDn and sdOppDnOk and sdSizeOk and sdHtOk and sdSupFresh
+
+sdOpenSty = sdOpenStyI == "Dashed" ? line.style_dashed : sdOpenStyI == "Solid" ? line.style_solid : line.style_dotted
+
+if barstate.isconfirmed and enableSD
+    if newDemand
+        b = box.new(bar_index - 1, sdBaseHigh, bar_index + sdExtend, sdBaseLow, border_color = sdDemBrd, border_width = 1, bgcolor = sdDemCol, text = sdShowTxt ? sdTfTxt + " Demand" : "", text_color = sdTxtCol, text_size = sdSizeOpt, text_halign = sdAlignOpt, text_valign = text.align_center)
+        array.push(demandZones, b)
+        if sdShowOpen
+            line ol = line.new(bar_index - 1, sdBaseOpen, bar_index + sdExtend, sdBaseOpen, color = sdDemOpenCol, width = sdOpenWidth, style = sdOpenSty)
+            array.push(demandOpens, ol)
+        if array.size(demandZones) > sdMaxZones
+            box.delete(array.shift(demandZones))
+            if sdShowOpen
+                line.delete(array.shift(demandOpens))
+    if newSupply
+        b = box.new(bar_index - 1, sdBaseHigh, bar_index + sdExtend, sdBaseLow, border_color = sdSupBrd, border_width = 1, bgcolor = sdSupCol, text = sdShowTxt ? sdTfTxt + " Supply" : "", text_color = sdTxtCol, text_size = sdSizeOpt, text_halign = sdAlignOpt, text_valign = text.align_center)
+        array.push(supplyZones, b)
+        if sdShowOpen
+            line ol = line.new(bar_index - 1, sdBaseOpen, bar_index + sdExtend, sdBaseOpen, color = sdSupOpenCol, width = sdOpenWidth, style = sdOpenSty)
+            array.push(supplyOpens, ol)
+        if array.size(supplyZones) > sdMaxZones
+            box.delete(array.shift(supplyZones))
+            if sdShowOpen
+                line.delete(array.shift(supplyOpens))
+
+// ─── Extend live zones, delete broken ones ───
+// FIX [2]: gated. Walking every live zone and calling box.set_right on
+// each is the per-bar cost of this module.
+
+if enableSD
+    float sdVisDist = sdMaxDistMult * nz(sdAtr, syminfo.mintick)
+
+    if array.size(demandZones) > 0
+        for i = array.size(demandZones) - 1 to 0
+            b = array.get(demandZones, i)
+            dBtm = box.get_bottom(b)
+            dTop = box.get_top(b)
+            dead = sdInvMode == "Full body" ? (close < dBtm and open < dBtm) : close < dBtm
+            // Creation bar is the box's own left coordinate — no parallel
+            // array needed to know a zone's age.
+            aged = sdUseAge and (bar_index - box.get_left(b)) > sdMaxAgeBars
+            if dead or aged
+                box.delete(b)
+                array.remove(demandZones, i)
+                if sdShowOpen
+                    line.delete(array.get(demandOpens, i))
+                    array.remove(demandOpens, i)
+            else
+                // Hidden zones keep extending and keep invalidating. Only
+                // the colors change, so coming back into range restores
+                // the zone untouched.
+                box.set_right(b, bar_index + sdExtend)
+                dVis = not sdUseDist or f_sdDist(dTop, dBtm) <= sdVisDist
+                box.set_bgcolor(b, dVis ? sdDemCol : hiddenColor)
+                box.set_border_color(b, dVis ? sdDemBrd : hiddenColor)
+                box.set_text_color(b, dVis and sdShowTxt ? sdTxtCol : hiddenColor)
+                if sdShowOpen
+                    line dLn = array.get(demandOpens, i)
+                    line.set_x2(dLn, bar_index + sdExtend)
+                    line.set_color(dLn, dVis ? sdDemOpenCol : hiddenColor)
+
+    if array.size(supplyZones) > 0
+        for i = array.size(supplyZones) - 1 to 0
+            b = array.get(supplyZones, i)
+            sTop = box.get_top(b)
+            sBtm = box.get_bottom(b)
+            dead = sdInvMode == "Full body" ? (close > sTop and open > sTop) : close > sTop
+            aged = sdUseAge and (bar_index - box.get_left(b)) > sdMaxAgeBars
+            if dead or aged
+                box.delete(b)
+                array.remove(supplyZones, i)
+                if sdShowOpen
+                    line.delete(array.get(supplyOpens, i))
+                    array.remove(supplyOpens, i)
+            else
+                box.set_right(b, bar_index + sdExtend)
+                sVis = not sdUseDist or f_sdDist(sTop, sBtm) <= sdVisDist
+                box.set_bgcolor(b, sVis ? sdSupCol : hiddenColor)
+                box.set_border_color(b, sVis ? sdSupBrd : hiddenColor)
+                box.set_text_color(b, sVis and sdShowTxt ? sdTxtCol : hiddenColor)
+                if sdShowOpen
+                    line sLn = array.get(supplyOpens, i)
+                    line.set_x2(sLn, bar_index + sdExtend)
+                    line.set_color(sLn, sVis ? sdSupOpenCol : hiddenColor)
+
+// ─── S/D alerts ───
+alertcondition(newDemand, "New demand zone", "New demand zone formed")
+alertcondition(newSupply, "New supply zone", "New supply zone formed")
+
+// ═════════════════════════════════════════════════════════════
+// TOP DOWN ANALYSIS MODULE
+// ═════════════════════════════════════════════════════════════
+
+
+// ------------------------- INPUTS ----------------------------
+grpTF   = "08 — TDA Ladder"
+tf1     = input.timeframe("D",   "TF 1", group = grpTF)
+tf2     = input.timeframe("240", "TF 2", group = grpTF)
+tf3     = input.timeframe("60",  "TF 3", group = grpTF)
+tf4     = input.timeframe("15",  "TF 4", group = grpTF)
+
+w1      = input.int(4, "Weight TF1", minval = 0, maxval = 10, group = grpTF)
+w2      = input.int(3, "Weight TF2", minval = 0, maxval = 10, group = grpTF)
+w3      = input.int(2, "Weight TF3", minval = 0, maxval = 10, group = grpTF)
+w4      = input.int(1, "Weight TF4", minval = 0, maxval = 10, group = grpTF)
+
+grpStr  = "09 — TDA Structure"
+// Per-TF pivot length. Higher TFs have far fewer bars, so the same
+// length there reaches much further back in time and goes stale.
+pv1     = input.int(3, "Pivot length TF1", minval = 2, group = grpStr,
+     tooltip = "Daily: keep this SHORT (2-3). At 5 the last swing can be weeks old and the bias freezes.")
+pv2     = input.int(4, "Pivot length TF2", minval = 2, group = grpStr)
+pv3     = input.int(5, "Pivot length TF3", minval = 2, group = grpStr)
+pv4     = input.int(5, "Pivot length TF4", minval = 2, group = grpStr)
+
+unresThr = input.float(0.70, "Unresolved threshold", minval = 0.5, maxval = 0.95, step = 0.05,
+     group = grpStr,
+     tooltip = "If price retraces this far through the leg AGAINST the latched bias without a new break, the bias is treated as unresolved: it prints '-' and scores 0. Lower = stricter.")
+
+eqBand  = input.float(0.05, "Equilibrium band (± of range)", minval = 0.0, maxval = 0.25,
+     step = 0.01, group = grpStr,
+     tooltip = "0.05 means 45%-55% of the leg counts as equilibrium.")
+
+// Per-TF swing age. A single global value was wrong for the same reason a
+// single pivot length is wrong: 40 bars is ~2 months on the daily and ~10
+// hours on the 15M. The daily needs a far shorter window or the leg spans
+// a multi-month range, pos pins near 1.0, and the unresolved rule zeroes
+// the row permanently — which is exactly what the 2873pt D leg was doing.
+//
+// Direction (BOS) still reads the RAW anchor. Only LOCATION uses this.
+
+// Location basis. "Swing anchored" was the original design and it has a
+// failure mode that bit twice: the running extremes only reset when a
+// pivot CONFIRMS, and in a trending market with pullbacks shorter than
+// _pvt bars no pivot prints for long stretches. The window is then
+// unbounded in time no matter how short the age limit is — which is why
+// the D leg went 2873pt -> 3067pt after the age filter was added.
+//
+// "Rolling range" bounds the leg by construction: the high and low of the
+// last _maxAge bars, no var state, no pivot dependency. Loc then means
+// "where price sits in the last N bars' range" rather than "where price
+// sits in the last swing". Cruder, but bounded and debuggable.
+string locMode = input.string("Rolling range", "Location basis",
+     options = ["Rolling range", "Swing anchored"], group = grpStr,
+     tooltip = "Rolling range = position within the last N bars' high/low. Swing anchored = the original swing-pair logic, which can go unbounded in a trend. Changes what Loc and Grade mean on EVERY row, not just D.")
+
+age1 = input.int(12, "Max swing age TF1", minval = 5, group = grpStr,
+     tooltip = "Daily: keep SHORT (10-15 = 2-3 weeks). At 40 the leg spans ~2 months and pos parks above 0.95.")
+age2 = input.int(30, "Max swing age TF2", minval = 5, group = grpStr)
+age3 = input.int(40, "Max swing age TF3", minval = 5, group = grpStr)
+age4 = input.int(40, "Max swing age TF4", minval = 5, group = grpStr)
+
+grpSD   = "10 — TDA Zone Booster"
+useSD   = input.bool(true,  "Use S/D zone as grade booster", group = grpSD)
+tdaAtrLen  = input.int(14,     "ATR length",     minval = 1,   group = grpSD)
+tdaAtrMult = input.float(1.0,  "ATR multiple for displacement", minval = 0.1, step = 0.1, group = grpSD)
+
+grpScr  = "11 — TDA Scoring"
+adjW    = input.float(0.5, "Adjacent-TF agreement weight", minval = 0.0, maxval = 1.0, step = 0.1,
+     group = grpScr,
+     tooltip = "Neighbouring timeframes agreeing (4H+1H) is a real condition. Scattered agreement (D+1H with 4H against) is not. 0 = off.")
+
+grpLvl  = "12 — TDA Levels"
+shSwing = input.bool(true, "Show untouched HTF swing high/low", group = grpLvl)
+shPD    = input.bool(true, "Show previous DAY high/low",        group = grpLvl)
+shPW    = input.bool(true, "Show previous WEEK high/low",       group = grpLvl)
+lvlLen  = input.int(60, "Line length (bars back)", minval = 5,  group = grpLvl)
+lblOff  = input.int(12, "Label offset (bars right)", minval = 0, group = grpLvl)
+gapMult = input.float(0.5, "Merge distance (x ATR)", minval = 0.0, step = 0.1, group = grpLvl,
+     tooltip = "Levels closer together than this share a single line and label: '4H swing high / PDH'.")
+lineSty = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = grpLvl)
+
+c1      = input.color(color.new(color.black,   0), "TF1 color", group = grpLvl, inline = "c1")
+c2      = input.color(color.new(color.orange,  0), "TF2 color", group = grpLvl, inline = "c1")
+c3      = input.color(color.new(color.blue,    0), "TF3 color", group = grpLvl, inline = "c2")
+c4      = input.color(color.new(color.gray,    0), "TF4 color", group = grpLvl, inline = "c2")
+cPD     = input.color(color.new(color.olive,   0), "Prev day",  group = grpLvl, inline = "c3")
+cPW     = input.color(color.new(color.purple,  0), "Prev week", group = grpLvl, inline = "c3")
+
+grpSess  = "13 — Session Opens"
+sessTZ   = input.string("America/New_York", "Timezone", group = grpSess)
+sessHrs  = input.int(12, "Extend each line (hours)", minval = 1, maxval = 48, group = grpSess)
+sessKeep = input.int(2,  "Past sessions to keep", minval = 1, maxval = 10, group = grpSess,
+     tooltip = "How many previous occurrences of each line stay on the chart.")
+sessStyI = input.string("Solid", "Line style", options = ["Solid", "Dashed", "Dotted"], group = grpSess)
+
+on10a = input.bool(true, "10AM open", group = grpSess, inline = "s1")
+c10a  = input.color(color.new(color.red, 0), "", group = grpSess, inline = "s1")
+w10a  = input.int(2, "", minval = 1, maxval = 5, group = grpSess, inline = "s1")
+
+on10p = input.bool(true, "10PM open", group = grpSess, inline = "s2")
+c10p  = input.color(color.new(color.blue, 0), "", group = grpSess, inline = "s2")
+w10p  = input.int(2, "", minval = 1, maxval = 5, group = grpSess, inline = "s2")
+
+onMid = input.bool(true, "Midnight open", group = grpSess, inline = "s3")
+cMid  = input.color(color.new(color.teal, 0), "", group = grpSess, inline = "s3")
+wMid  = input.int(1, "", minval = 1, maxval = 5, group = grpSess, inline = "s3")
+
+grpGate = "14 — Day Gate"
+showGate = input.bool(true, "Show day gate row", group = grpGate)
+
+grpTbl  = "15 — TDA Dashboard"
+tblPos  = input.string("Bottom Right", "Table position",
+     options = ["Top Right", "Middle Right", "Bottom Right", "Top Left", "Bottom Left"], group = grpTbl)
+tblSize = input.string("Small", "Table text size", options = ["Tiny", "Small", "Normal"], group = grpTbl)
+tblTxt  = input.color(color.new(color.black, 0), "Table text color",   group = grpTbl)
+tblBg   = input.color(color.new(color.white, 0), "Table background",   group = grpTbl)
+colorCd = input.bool(false, "Color-code Bias / Grade text", group = grpTbl,
+     tooltip = "Off = everything prints in the table text color. On = green/red bias and A/B/C grade colors.")
+showPct = input.bool(true, "Show leg % in Loc column", group = grpTbl)
+
+// --------------------- FRIENDLY TF NAMES ---------------------
+f_tfName(string _tf) =>
+    string t = str.upper(_tf)
+    string r = t
+    if t == "D" or t == "1D"
+        r := "D"
+    else if t == "W" or t == "1W"
+        r := "W"
+    else if t == "M" or t == "1M"
+        r := "M"
+    else
+        float mins = str.tonumber(t)
+        if not na(mins)
+            r := mins >= 60 and math.round(mins) % 60 == 0 ?
+                 str.tostring(mins / 60, "#") + "H" : str.tostring(mins, "#") + "M"
+    r
+
+n1 = f_tfName(tf1)
+n2 = f_tfName(tf2)
+n3 = f_tfName(tf3)
+n4 = f_tfName(tf4)
+
+// --------------------- PER-TF STATE ENGINE -------------------
+// Returns: bias (-1/0/1), position in leg (0-1), inDemand, inSupply,
+//          last major swing high, last major swing low
+f_state(int _pvt, float _atrMult, int _atrLen, bool _useSD, float _unres, int _maxAge, string _locMode) =>
+    float ph = ta.pivothigh(high, _pvt, _pvt)
+    float pl = ta.pivotlow(low,  _pvt, _pvt)
+
+    var float lastPH = na
+    var float lastPL = na
+    var int   phBar  = na
+    var int   plBar  = na
+    var int   bias   = 0
+
+    if not na(ph)
+        lastPH := ph
+        phBar  := bar_index - _pvt
+    if not na(pl)
+        lastPL := pl
+        plBar  := bar_index - _pvt
+
+    // BOS / CHoCH: a CLOSE through a major swing flips bias.
+    // Deliberately uses the RAW anchor, not the freshness-filtered one
+    // below. Breaking a months-old high is still a break — direction and
+    // location are different questions and get different inputs.
+    if not na(lastPH) and close > lastPH
+        bias := 1
+    if not na(lastPL) and close < lastPL
+        bias := -1
+
+    // ---- Leg anchor ----
+    // The leg is the most recent swing PAIR, plus whatever price has done
+    // since the most recent pivot of EITHER kind.
+    //
+    // The old version reset runHi only on a new pivot LOW and runLo only on
+    // a new pivot HIGH, so between opposite pivots both extremes kept
+    // stretching. On the daily that meant the leg grew for months — a
+    // 2873pt leg on MNQ, ~10% of price, where pos barely moved and the
+    // unresolved rule zeroed the bias permanently. The whole D row went
+    // silent while carrying the heaviest weight in the score.
+    //
+    // Two changes fix it. Resetting the running extremes on ANY pivot
+    // bounds them to the current swing, and an anchor older than _maxAge
+    // is dropped so a stale pivot cannot define a leg on its own.
+
+    var float runHi = na
+    var float runLo = na
+
+    if not na(ph) or not na(pl)
+        runHi := high
+        runLo := low
+
+    runHi := na(runHi) ? high : math.max(runHi, high)
+    runLo := na(runLo) ? low  : math.min(runLo, low)
+
+    bool phFresh = not na(phBar) and (bar_index - phBar) <= _maxAge
+    bool plFresh = not na(plBar) and (bar_index - plBar) <= _maxAge
+
+    float ancHi = phFresh ? lastPH : na
+    float ancLo = plFresh ? lastPL : na
+
+    // Rolling window — bounded by construction. Called unconditionally
+    // because ta.* must run every bar.
+    float winHi = ta.highest(high, _maxAge)
+    float winLo = ta.lowest(low,  _maxAge)
+
+    // runHi/runLo are never na after the first bar, so the swing-anchored
+    // path is always defined even when both anchors are stale.
+    float legHi = winHi
+    float legLo = winLo
+    if _locMode == "Swing anchored"
+        legHi := na(ancHi) ? runHi : math.max(ancHi, runHi)
+        legLo := na(ancLo) ? runLo : math.min(ancLo, runLo)
+
+    float rng = na(legHi) or na(legLo) ? na : legHi - legLo
+    float pos = na(rng) or rng <= 0 ? 0.5 : (close - legLo) / rng
+    pos := math.max(0.0, math.min(1.0, pos))
+
+    // ---- Supply / Demand (single base candle + explosive move) ----
+    float atrv = ta.atr(_atrLen)
+    bool expUp = close > open and (close - open) > atrv * _atrMult
+    bool expDn = open  > close and (open - close) > atrv * _atrMult
+
+    var float dTop = na
+    var float dBot = na
+    var float sTop = na
+    var float sBot = na
+
+    // demand: last RED candle before an explosive UP move that breaks its high
+    if expUp and close[1] < open[1] and close > high[1]
+        dTop := high[1]
+        dBot := low[1]
+    // supply: last GREEN candle before an explosive DOWN move that breaks its low
+    if expDn and close[1] > open[1] and close < low[1]
+        sTop := high[1]
+        sBot := low[1]
+
+    // invalidation: full body close through the zone
+    if not na(dBot) and close < dBot
+        dTop := na
+        dBot := na
+    if not na(sTop) and close > sTop
+        sTop := na
+        sBot := na
+
+    bool inD = _useSD and not na(dBot) and close <= dTop and close >= dBot
+    bool inS = _useSD and not na(sTop) and close <= sTop and close >= sBot
+
+    // ---- Unresolved bias ----
+    // A bias latches until an opposite break. If price has travelled deep
+    // back through the leg against it and NOT broken the other way, the
+    // latch is stale - it describes an old move, not the current one.
+    int effBias = bias
+    if bias == 1 and pos < 1.0 - _unres
+        effBias := 0
+    if bias == -1 and pos > _unres
+        effBias := 0
+
+    [effBias, pos, inD ? 1 : 0, inS ? 1 : 0, lastPH, lastPL, na(rng) ? 0.0 : rng]
+
+// NOTE ON REPAINTING: these read the *forming* HTF bar, so a row can
+// change until that HTF bar closes. Matches the provisional/confirmed
+// handling in the Fib + Structure script.
+[b1, p1, d1, s1, h1, l1, r1] = request.security(syminfo.tickerid, tf1, f_state(pv1, tdaAtrMult, tdaAtrLen, useSD, unresThr, age1, locMode))
+[b2, p2, d2, s2, h2, l2, r2] = request.security(syminfo.tickerid, tf2, f_state(pv2, tdaAtrMult, tdaAtrLen, useSD, unresThr, age2, locMode))
+[b3, p3, d3, s3, h3, l3, r3] = request.security(syminfo.tickerid, tf3, f_state(pv3, tdaAtrMult, tdaAtrLen, useSD, unresThr, age3, locMode))
+[b4, p4, d4, s4, h4, l4, r4] = request.security(syminfo.tickerid, tf4, f_state(pv4, tdaAtrMult, tdaAtrLen, useSD, unresThr, age4, locMode))
+
+// --------------------- DIRECTION SCORE -----------------------
+int   wTot  = w1 + w2 + w3 + w4
+float rawSc = b1 * w1 + b2 * w2 + b3 * w3 + b4 * w4
+
+// Adjacent agreement: neighbouring timeframes pointing the same way is
+// a stronger statement than the same count of scattered agreement.
+float pairSc = 0.0
+if b1 != 0 and b1 == b2
+    pairSc += b1 * (w1 + w2) * adjW
+if b2 != 0 and b2 == b3
+    pairSc += b2 * (w2 + w3) * adjW
+if b3 != 0 and b3 == b4
+    pairSc += b3 * (w3 + w4) * adjW
+
+float maxPair = ((w1 + w2) + (w2 + w3) + (w3 + w4)) * adjW
+float denom   = wTot + maxPair
+float score   = denom == 0 ? 0.0 : (rawSc + pairSc) / denom * 100.0
+
+string align = math.abs(score) >= 70 ? (score > 0 ? "ALIGNED LONG" : "ALIGNED SHORT") :
+               math.abs(score) >= 35 ? (score > 0 ? "LEANING LONG" : "LEANING SHORT") : "CONFLICTED"
+color alignCol = math.abs(score) >= 70 ? (score > 0 ? color.lime : color.red) :
+                 math.abs(score) >= 35 ? color.orange : color.gray
+
+// Shape string — the net score alone hides which TFs disagree
+f_arrow(int _b) => _b == 1 ? "▲" : _b == -1 ? "▼" : "•"
+string shape = n1 + f_arrow(b1) + "  " + n2 + f_arrow(b2) + "  " + n3 + f_arrow(b3) + "  " + n4 + f_arrow(b4)
+
+// ---------------------- SESSION OPENS ------------------------
+sessSty = sessStyI == "Dashed" ? line.style_dashed : sessStyI == "Dotted" ? line.style_dotted : line.style_solid
+
+// First bar at or after the target minute-of-day, reset each NY day.
+// Using >= rather than == so an odd chart timeframe can't step over
+// the exact minute and skip the session entirely.
+f_sessOpen(int _tmin) =>
+    var float px   = na
+    var int   tx   = na
+    var bool  done = false
+    int  mins   = hour(time, sessTZ) * 60 + minute(time, sessTZ)
+    bool newDay = na(time[1]) ? true : dayofmonth(time, sessTZ) != dayofmonth(time[1], sessTZ)
+    bool fired  = false
+    if newDay
+        done := false
+    if not done and mins >= _tmin
+        px    := open
+        tx    := time
+        done  := true
+        fired := true
+    [px, tx, fired]
+
+f_drawSess(bool _fired, float _px, int _tx, bool _on, color _col, int _w, string _txt) =>
+    var line[]  L = array.new_line()
+    var label[] B = array.new_label()
+    if _fired and _on and not na(_px)
+        int t2 = _tx + sessHrs * 3600000
+        line ln = line.new(_tx, _px, t2, _px, xloc = xloc.bar_time,
+             color = _col, width = _w, style = sessSty)
+        label lb = label.new(t2, _px, _txt, xloc = xloc.bar_time,
+             style = label.style_label_left, color = color.new(color.black, 100),
+             textcolor = _col, size = size.small)
+        array.push(L, ln)
+        array.push(B, lb)
+        while array.size(L) > sessKeep
+            line.delete(array.shift(L))
+            label.delete(array.shift(B))
+
+[a10p, a10t, a10f] = f_sessOpen(600)    // 10:00
+[p10p, p10t, p10f] = f_sessOpen(1320)   // 22:00
+[mdp,  mdt,  mdf ] = f_sessOpen(0)      // 00:00
+
+f_drawSess(a10f, a10p, a10t, on10a and enableSess, c10a, w10a, "10AM open")
+f_drawSess(p10f, p10p, p10t, on10p and enableSess, c10p, w10p, "10PM open")
+f_drawSess(mdf,  mdp,  mdt,  onMid and enableSess, cMid, wMid, "Midnight open")
+
+// ------------------------- DAY GATE --------------------------
+// Green requires agreement between both references. Price above one
+// and below the other is genuinely undecided, so it says so.
+float dOpen = request.security(syminfo.tickerid, "D", open)
+float pdC   = request.security(syminfo.tickerid, "D", close[1], lookahead = barmerge.lookahead_on)
+
+bool gGreen = close > dOpen and close > pdC
+bool gRed   = close < dOpen and close < pdC
+
+string gateTxt = gGreen ? "DAY GREEN - longs only" :
+                 gRed   ? "DAY RED - shorts only"  : "DAY MIXED - no gate"
+string gateDlt = "  (open " + str.tostring(close - dOpen, "+#;-#") +
+                 "  /  pdc " + str.tostring(close - pdC, "+#;-#") + ")"
+
+// ------------------------- GRADING ---------------------------
+// Structure = direction.  Location = permission.
+f_grade(int _bias, float _pos, int _inD, int _inS, float _band) =>
+    float loEq = 0.5 - _band
+    float hiEq = 0.5 + _band
+    string g = "-"
+    if _bias == 1
+        g := _pos < loEq ? "A" : _pos > hiEq ? "C" : "B"
+        if _inD == 1
+            g := g == "C" ? "B" : "A"
+    else if _bias == -1
+        g := _pos > hiEq ? "A" : _pos < loEq ? "C" : "B"
+        if _inS == 1
+            g := g == "C" ? "B" : "A"
+    g
+
+f_locTxt(float _pos, float _band) =>
+    string base = _pos < 0.5 - _band ? "Disc" : _pos > 0.5 + _band ? "Prem" : "Eq"
+    showPct ? base + " " + str.tostring(_pos * 100, "#") + "%" : base
+
+f_biasTxt(int _b) => _b == 1 ? "Bull" : _b == -1 ? "Bear" : "-"
+f_biasCol(int _b) => not colorCd ? tblTxt : _b == 1 ? color.lime : _b == -1 ? color.red : color.gray
+f_gradeCol(string _g) => not colorCd ? tblTxt : _g == "A" ? color.lime : _g == "B" ? color.orange : _g == "C" ? color.red : color.gray
+
+// ═════════════════════════════════════════════════════════════
+// CONFLUENCE
+// ═════════════════════════════════════════════════════════════
+// The three modules answer three different questions, and until now
+// nothing joined them up. On the 5m MNQ chart the Fib module printed BOS
+// and BULLISH while price sat inside supply with the 15M at 97% premium
+// and a grade of C — exactly the trade the TDA grading exists to refuse.
+//
+//   TDA  — WHICH WAY, and is the location good enough to act (grade)
+//   Fib  — is structure pointing the same way, and is price at a
+//          retracement worth entering
+//   S/D  — is there an actual level here to work from
+//
+// A mark only prints when every enabled check agrees. The dashboard row
+// shows each check separately, so when nothing prints you can see which
+// leg is missing instead of guessing.
+
+string gConf = "16 — Confluence"
+
+float confMinScore = input.float(35.0, "Minimum |TDA score|", minval = 0.0, maxval = 100.0, step = 5.0, group = gConf,
+     tooltip = "Below this the ladder is CONFLICTED and no direction is proposed. 35 = LEANING, 70 = ALIGNED.")
+string confExecI = input.string("TF4", "Execution timeframe row", options = ["TF1", "TF2", "TF3", "TF4"], group = gConf,
+     tooltip = "Which row supplies the grade. Should be the timeframe you actually enter on.")
+bool confBlockC = input.bool(true, "Block on grade C or unresolved", group = gConf,
+     tooltip = "Grade C means right direction, wrong location — chasing. This is the check that would have refused the 97%-premium long.")
+bool confNeedGate = input.bool(true, "Require day gate agreement", group = gConf)
+bool confNeedStruct = input.bool(true, "Require Fib structure agreement", group = gConf)
+bool confNeedFib = input.bool(true, "Require price in a Fib retracement zone", group = gConf)
+bool confNeedSD = input.bool(true, "Require price in a matching S/D zone", group = gConf)
+bool confNeedOpen = input.bool(false, "Require price at the base-candle open", group = gConf,
+     tooltip = "Tightest filter. Needs the zone's open line within tolerance, so it only fires at the level rather than anywhere in the band. Needs 'Show base-candle open line' on.")
+float confOpenTol = input.float(0.25, "    Open-line tolerance (x ATR)", minval = 0.05, step = 0.05, group = gConf)
+
+color confLongCol = input.color(color.new(color.lime, 0), "Long mark", group = gConf, inline = "cm")
+color confShortCol = input.color(color.new(color.red, 0), "Short mark", group = gConf, inline = "cm")
+
+// ---- Module readers ----
+// A bullish leg is an up-move, so its .62-.786 band sits BELOW the swing
+// high and is where a long gets filled. Bearish is the mirror.
+f_inFibZone(array<FibLeg> legs, bool wantBull) =>
+    bool hit = false
+    if array.size(legs) > 0
+        for i = 0 to array.size(legs) - 1
+            FibLeg lg = array.get(legs, i)
+            if lg.bullish == wantBull and low <= zoneTop(lg) and high >= zoneBottom(lg)
+                hit := true
+                break
+    hit
+
+f_inSDZone(array<box> zones) =>
+    bool hit = false
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
+            box z = array.get(zones, i)
+            if low <= box.get_top(z) and high >= box.get_bottom(z)
+                hit := true
+                break
+    hit
+
+f_atSDOpen(array<line> opens, float tol) =>
+    bool hit = false
+    if array.size(opens) > 0
+        for i = 0 to array.size(opens) - 1
+            float px = line.get_y1(array.get(opens, i))
+            if low <= px + tol and high >= px - tol
+                hit := true
+                break
+    hit
+
+// ---- Direction under test ----
+int confDir = score >= confMinScore ? 1 : score <= -confMinScore ? -1 : 0
+
+int    confExecB = confExecI == "TF1" ? b1 : confExecI == "TF2" ? b2 : confExecI == "TF3" ? b3 : b4
+float  confExecP = confExecI == "TF1" ? p1 : confExecI == "TF2" ? p2 : confExecI == "TF3" ? p3 : p4
+int    confExecD = confExecI == "TF1" ? d1 : confExecI == "TF2" ? d2 : confExecI == "TF3" ? d3 : d4
+int    confExecS = confExecI == "TF1" ? s1 : confExecI == "TF2" ? s2 : confExecI == "TF3" ? s3 : s4
+string confExecG = f_grade(confExecB, confExecP, confExecD, confExecS, eqBand)
+
+// ---- The five checks ----
+bool confGateOk = not confNeedGate or (confDir == 1 ? gGreen : confDir == -1 ? gRed : false)
+bool confStructOk = not confNeedStruct or directionBias == confDir
+bool confFibOk = not confNeedFib or f_inFibZone(majorLegs, confDir == 1)
+bool confSDOk = not confNeedSD or (confDir == 1 ? f_inSDZone(demandZones) : f_inSDZone(supplyZones))
+bool confGradeOk = not confBlockC or confExecG == "A" or confExecG == "B"
+
+float confTol = ta.atr(14) * confOpenTol
+bool confOpenOk = not confNeedOpen or (confDir == 1 ? f_atSDOpen(demandOpens, confTol) : f_atSDOpen(supplyOpens, confTol))
+
+bool confAll = confDir != 0 and confGateOk and confStructOk and confFibOk and confSDOk and confGradeOk and confOpenOk
+
+bool confLong = confAll and confDir == 1
+bool confShort = confAll and confDir == -1
+
+// Mark the bar the setup COMPLETES, not every bar it stays true.
+bool confLongFire = enableConf and confLong and not confLong[1]
+bool confShortFire = enableConf and confShort and not confShort[1]
+
+plotshape(confLongFire, title = "Confluence long", style = shape.triangleup, location = location.belowbar, color = confLongCol, size = size.small, text = "A+")
+plotshape(confShortFire, title = "Confluence short", style = shape.triangledown, location = location.abovebar, color = confShortCol, size = size.small, text = "A+")
+
+f_tick(bool _b) => _b ? "✓" : "✗"
+
+string confTxt = confDir == 0 ? "NO DIRECTION  (score under " + str.tostring(confMinScore, "#") + ")" :
+     (confDir == 1 ? "LONG  " : "SHORT  ") +
+     "gate" + f_tick(confGateOk) + "  str" + f_tick(confStructOk) +
+     "  fib" + f_tick(confFibOk) + "  s/d" + f_tick(confSDOk) +
+     "  grd" + f_tick(confGradeOk) + (confNeedOpen ? "  open" + f_tick(confOpenOk) : "")
+
+color confTxtCol = not colorCd ? tblTxt : confDir == 0 ? color.gray : confAll ? (confDir == 1 ? color.lime : color.red) : color.orange
+
+// ------------------------- DASHBOARD -------------------------
+var table tbl = table.new(
+     tblPos == "Top Right"    ? position.top_right :
+     tblPos == "Middle Right" ? position.middle_right :
+     tblPos == "Bottom Right" ? position.bottom_right :
+     tblPos == "Top Left"     ? position.top_left : position.bottom_left,
+     5, 9, border_width = 1, frame_width = 1,
+     bgcolor = tblBg, frame_color = tblTxt, border_color = color.new(color.gray, 60))
+
+sz = tblSize == "Tiny" ? size.tiny : tblSize == "Normal" ? size.normal : size.small
+
+// FIX [3]: rows were hardcoded with the gate at row 0, so hiding the
+// gate left an empty merged row above the header. Everything below the
+// gate now shifts up by one when the gate is off. The table is declared
+// with 8 rows; the trailing unused row simply does not render.
+int hdrRow = showGate ? 1 : 0
+
+f_row(int r, string tfName, int b, float p, int inD, int inS, float leg) =>
+    string g = f_grade(b, p, inD, inS, eqBand)
+    table.cell(tbl, 0, r, tfName, text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 1, r, f_biasTxt(b), text_color = f_biasCol(b), text_size = sz)
+    // Loc prints even when bias is 0. Hiding it made the unresolved rows
+    // undiagnosable — you could not see WHERE in the leg price sat, which
+    // is the number that tells you whether the leg is sane. Grade still
+    // prints "-" when bias is 0, so an unresolved row is not mistaken for
+    // an actionable one.
+    table.cell(tbl, 2, r, f_locTxt(p, eqBand), text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 3, r, g, text_color = f_gradeCol(g), text_size = sz)
+    table.cell(tbl, 4, r, str.tostring(leg, "#") + "pt", text_color = tblTxt, text_size = sz)
+
+if barstate.islast and enableTDA
+    if showGate
+        table.cell(tbl, 0, 0, gateTxt + gateDlt, text_color = tblTxt, text_size = sz)
+        table.merge_cells(tbl, 0, 0, 4, 0)
+
+    table.cell(tbl, 0, hdrRow, "TF",    text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 1, hdrRow, "Bias",  text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 2, hdrRow, "Loc",   text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 3, hdrRow, "Grade", text_color = tblTxt, text_size = sz)
+    table.cell(tbl, 4, hdrRow, "Leg",   text_color = tblTxt, text_size = sz)
+
+    f_row(hdrRow + 1, n1, b1, p1, d1, s1, r1)
+    f_row(hdrRow + 2, n2, b2, p2, d2, s2, r2)
+    f_row(hdrRow + 3, n3, b3, p3, d3, s3, r3)
+    f_row(hdrRow + 4, n4, b4, p4, d4, s4, r4)
+
+    int scoreRow = hdrRow + 5
+    int shapeRow = hdrRow + 6
+
+    color rowCol = colorCd ? alignCol : tblTxt
+    table.cell(tbl, 0, scoreRow, str.tostring(score, "#") + "%", text_color = rowCol, text_size = sz)
+    table.cell(tbl, 1, scoreRow, align, text_color = rowCol, text_size = sz)
+    table.merge_cells(tbl, 1, scoreRow, 4, scoreRow)
+
+    table.cell(tbl, 0, shapeRow, shape, text_color = tblTxt, text_size = sz)
+    table.merge_cells(tbl, 0, shapeRow, 4, shapeRow)
+
+    if enableConf
+        int confRow = hdrRow + 7
+        table.cell(tbl, 0, confRow, confTxt, text_color = confTxtCol, text_size = sz)
+        table.merge_cells(tbl, 0, confRow, 4, confRow)
+
+// -------------------- LEVELS ON THE CHART --------------------
+styleOf = lineSty == "Dashed" ? line.style_dashed : lineSty == "Dotted" ? line.style_dotted : line.style_solid
+
+var line[]  LN = array.new_line()
+var label[] LB = array.new_label()
+
+float gapPts = ta.atr(14) * gapMult
+
+// Collect a level. If one is already registered within `gap` points,
+// fold this label into it rather than drawing a second line on top.
+// Merging beats staggering: label width is pixels, bar width is zoom.
+f_push(float[] _p, string[] _t, color[] _c, int[] _w,
+       float price, string txt, color col, int width, float gap) =>
+    if not na(price)
+        int hit = -1
+        if array.size(_p) > 0
+            for i = 0 to array.size(_p) - 1
+                if math.abs(array.get(_p, i) - price) < gap
+                    hit := i
+                    break
+        if hit >= 0
+            array.set(_t, hit, array.get(_t, hit) + " / " + txt)
+        else
+            array.push(_p, price)
+            array.push(_t, txt)
+            array.push(_c, col)
+            array.push(_w, width)
+
+// previous day / week
+pdH = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_on)
+pdL = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_on)
+pwH = request.security(syminfo.tickerid, "W", high[1], lookahead = barmerge.lookahead_on)
+pwL = request.security(syminfo.tickerid, "W", low[1],  lookahead = barmerge.lookahead_on)
+
+if barstate.islast and enableTDA
+    // clear previous draw
+    while array.size(LN) > 0
+        line.delete(array.pop(LN))
+    while array.size(LB) > 0
+        label.delete(array.pop(LB))
+
+    float[] cP = array.new_float()
+    string[] cT = array.new_string()
+    color[]  cC = array.new_color()
+    int[]    cW = array.new_int()
+
+    // A swing the price has already closed through is a BROKEN level -
+    // still worth watching, but it is no longer overhead resistance.
+    string t1h = close > h1 ? n1 + " high (broken)" : n1 + " swing high"
+    string t1l = close < l1 ? n1 + " low (broken)"  : n1 + " swing low"
+    string t2h = close > h2 ? n2 + " high (broken)" : n2 + " swing high"
+    string t2l = close < l2 ? n2 + " low (broken)"  : n2 + " swing low"
+    string t3h = close > h3 ? n3 + " high (broken)" : n3 + " swing high"
+    string t3l = close < l3 ? n3 + " low (broken)"  : n3 + " swing low"
+    string t4h = close > h4 ? n4 + " high (broken)" : n4 + " swing high"
+    string t4l = close < l4 ? n4 + " low (broken)"  : n4 + " swing low"
+
+    // Highest timeframe registers first, so a merged cluster keeps the
+    // HTF colour and the HTF name leads the label.
+    if shSwing
+        f_push(cP, cT, cC, cW, h1, t1h, c1, 3, gapPts)
+        f_push(cP, cT, cC, cW, l1, t1l, c1, 3, gapPts)
+        f_push(cP, cT, cC, cW, h2, t2h, c2, 2, gapPts)
+        f_push(cP, cT, cC, cW, l2, t2l, c2, 2, gapPts)
+        f_push(cP, cT, cC, cW, h3, t3h, c3, 2, gapPts)
+        f_push(cP, cT, cC, cW, l3, t3l, c3, 2, gapPts)
+        f_push(cP, cT, cC, cW, h4, t4h, c4, 1, gapPts)
+        f_push(cP, cT, cC, cW, l4, t4l, c4, 1, gapPts)
+
+    if shPW
+        f_push(cP, cT, cC, cW, pwH, "PWH", cPW, 2, gapPts)
+        f_push(cP, cT, cC, cW, pwL, "PWL", cPW, 2, gapPts)
+
+    if shPD
+        f_push(cP, cT, cC, cW, pdH, "PDH", cPD, 1, gapPts)
+        f_push(cP, cT, cC, cW, pdL, "PDL", cPD, 1, gapPts)
+
+    if array.size(cP) > 0
+        for i = 0 to array.size(cP) - 1
+            float pr = array.get(cP, i)
+            color cl = array.get(cC, i)
+            line ln = line.new(bar_index - lvlLen, pr, bar_index + lblOff, pr,
+                 color = cl, width = array.get(cW, i), style = styleOf)
+            label lb = label.new(bar_index + lblOff, pr, array.get(cT, i),
+                 style = label.style_label_left, color = color.new(color.black, 100),
+                 textcolor = cl, size = size.small)
+            array.push(LN, ln)
+            array.push(LB, lb)
+
+// ------------------------- ALERTS ----------------------------
+alertcondition(ta.cross(score, 70),  title = "Aligned Long",  message = "TDA: aligned long")
+alertcondition(ta.cross(score, -70), title = "Aligned Short", message = "TDA: aligned short")
+alertcondition(gGreen and not gGreen[1], title = "Day gate turned GREEN", message = "TDA: day gate GREEN")
+alertcondition(gRed   and not gRed[1],   title = "Day gate turned RED",   message = "TDA: day gate RED")
+
+// ─── Forming-extreme alerts ───
+alertcondition(newLowForming,  "Lower low forming",   "KPL: lower low forming — provisional leg killed")
+alertcondition(newHighForming, "Higher high forming", "KPL: higher high forming — provisional leg killed")
+
+// ─── Confluence alerts ───
+alertcondition(confLongFire,  "Confluence LONG",  "KPL: all modules agree — long")
+alertcondition(confShortFire, "Confluence SHORT", "KPL: all modules agree — short")

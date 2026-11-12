@@ -1,0 +1,713 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Original Lorentzian Classification logic by jdehorty.
+//
+// TT Backtest Compare — side-by-side equity for the TensorTrader A/B arms:
+//   Arm A = TT-Autotune    (regime-switched sync codes, recent-pool KNN, series-safe features)
+//   Arm B = TT-Lorentzian  (stock jdehorty v2 defaults, oldest-bars pool, library features)
+//
+// A jdehorty-style Backtest Adapter can never read our arms: both are strategy()
+// scripts, and TradingView only offers indicator plots to another script's Source
+// input. So this indicator runs both engines itself.
+//
+// Accounting mirrors scripts/ttv_optimizer/backtest.py::simulate_trades exactly
+// (single position, flip on opposite signal, ATR bracket checked before signals,
+// per-trade ROI net of round-trip cost) so this chart and the optimizer's
+// total_roi / compound_roi / Sortino are the same numbers.
+
+//@version=6
+indicator("TT Backtest Compare", "TTvsLC", overlay=false, precision=2)
+
+import jdehorty/MLExtensions/2 as ml
+import jdehorty/KernelFunctions/2 as kernels
+
+type FeatureArrays
+    array<float> f1
+    array<float> f2
+    array<float> f3
+    array<float> f4
+    array<float> f5
+
+type FeatureSeries
+    float f1
+    float f2
+    float f3
+    float f4
+    float f5
+
+type ArmState
+    int pos = 0
+    float entry = 0.0
+    int entryReg = 0
+    float equity = 1.0
+    float totalRoi = 0.0
+    int trades = 0
+    int wins = 0
+    float grossWin = 0.0
+    float grossLoss = 0.0
+    float sumRoi = 0.0
+    float sumNegSq = 0.0
+    float peak = 1.0
+    float maxDD = 0.0
+    int barsIn = 0
+    array<float> regRoi
+    array<int> regTrades
+
+// -----------------------------------------------------------------------------
+// Trade simulator (one implementation, both arms)
+// -----------------------------------------------------------------------------
+arm_close(ArmState s, float price, float rtCost) =>
+    if s.pos != 0 and s.entry > 0.0
+        roi = ((price - s.entry) / s.entry) * s.pos - rtCost
+        s.trades := s.trades + 1
+        s.wins := s.wins + (roi > 0.0 ? 1 : 0)
+        s.grossWin := s.grossWin + (roi > 0.0 ? roi : 0.0)
+        s.grossLoss := s.grossLoss + (roi < 0.0 ? -roi : 0.0)
+        s.totalRoi := s.totalRoi + roi
+        s.sumRoi := s.sumRoi + roi
+        s.sumNegSq := s.sumNegSq + (roi < 0.0 ? roi * roi : 0.0)
+        s.equity := math.max(0.0, s.equity * (1.0 + roi))
+        s.peak := math.max(s.peak, s.equity)
+        s.maxDD := math.max(s.maxDD, s.peak > 0.0 ? (s.peak - s.equity) / s.peak : 0.0)
+        if s.entryReg >= 1 and s.entryReg <= 6
+            array.set(s.regRoi, s.entryReg - 1, array.get(s.regRoi, s.entryReg - 1) + roi)
+            array.set(s.regTrades, s.entryReg - 1, array.get(s.regTrades, s.entryReg - 1) + 1)
+    s.pos := 0
+    s.entry := 0.0
+
+// Order of operations is load-bearing: the ATR bracket is evaluated against the
+// CURRENT bar's ATR before signals, exactly as simulate_trades does, because the
+// live strategy re-issues strategy.exit() every bar with the current ATR.
+arm_step(ArmState s, bool goLong, bool goShort, bool exitLong, bool exitShort, float atrv, bool useAtr, float slMult, float tpMult, float rtCost, int regNow) =>
+    if s.pos != 0
+        s.barsIn := s.barsIn + 1
+    if useAtr and s.pos != 0 and atrv > 0.0 and s.entry > 0.0
+        sl = s.pos == 1 ? s.entry - slMult * atrv : s.entry + slMult * atrv
+        tp = s.pos == 1 ? s.entry + tpMult * atrv : s.entry - tpMult * atrv
+        if s.pos == 1 and (low <= sl or high >= tp)
+            arm_close(s, low <= sl ? sl : tp, rtCost)
+        else if s.pos == -1 and (high >= sl or low <= tp)
+            arm_close(s, high >= sl ? sl : tp, rtCost)
+    if exitLong and s.pos == 1
+        arm_close(s, close, rtCost)
+    if exitShort and s.pos == -1
+        arm_close(s, close, rtCost)
+    if goLong
+        if s.pos == -1
+            arm_close(s, close, rtCost)
+        if s.pos == 0
+            s.pos := 1
+            s.entry := close
+            s.entryReg := regNow
+    else if goShort
+        if s.pos == 1
+            arm_close(s, close, rtCost)
+        if s.pos == 0
+            s.pos := -1
+            s.entry := close
+            s.entryReg := regNow
+
+// Trade-gated Sortino on per-trade ROI, MAR=0, bounded — backtest.py::on_tester_sortino.
+arm_sortino(ArmState s) =>
+    n = s.trades
+    mean = n > 0 ? s.sumRoi / n : 0.0
+    dev = n > 0 ? math.sqrt(s.sumNegSq / n) : 0.0
+    raw = n < 2 ? 0.0 : dev <= 0.0 ? (mean > 0.0 ? 10.0 : 0.0) : mean / dev
+    math.max(-10.0, math.min(10.0, raw))
+
+// -----------------------------------------------------------------------------
+// Feature helpers — arm A needs series-length-safe versions because sync codes
+// deliver params as series ints; arm B uses the stock library calls.
+// -----------------------------------------------------------------------------
+tt_rma(src, length) =>
+    alpha = 1.0 / math.max(nz(length, 1.0), 1.0)
+    out = 0.0
+    out := na(src) ? na : na(out[1]) ? src : (1.0 - alpha) * out[1] + alpha * src
+    out
+
+tt_rsi(src, length) =>
+    ch = ta.change(src)
+    up = tt_rma(math.max(nz(ch, 0.0), 0.0), length)
+    down = tt_rma(-math.min(nz(ch, 0.0), 0.0), length)
+    down == 0 ? 100.0 : up == 0 ? 0.0 : 100.0 - (100.0 / (1.0 + up / down))
+
+tt_n_rsi(src, n1, n2) =>
+    tt_rma(tt_rsi(src, n1), n2)
+
+tt_cci(src, length) =>
+    mean = tt_rma(src, length)
+    mad = tt_rma(math.abs(src - mean), length)
+    mad == 0 ? 0.0 : (src - mean) / (0.015 * mad)
+
+tt_n_cci(src, n1, n2) =>
+    tt_rma(tt_cci(src, n1), n2)
+
+tt_wt(hlc3Src, n1, n2) =>
+    esa = tt_rma(hlc3Src, n1)
+    de = tt_rma(math.abs(hlc3Src - esa), n1)
+    ci = de == 0 ? 0.0 : (hlc3Src - esa) / (0.015 * de)
+    tt_rma(ci, n2)
+
+tt_adx_feature(highSrc, lowSrc, closeSrc, n1) =>
+    upMove = highSrc - highSrc[1]
+    downMove = lowSrc[1] - lowSrc
+    plusDM = upMove > downMove and upMove > 0 ? upMove : 0.0
+    minusDM = downMove > upMove and downMove > 0 ? downMove : 0.0
+    tr = math.max(highSrc - lowSrc, math.max(math.abs(highSrc - closeSrc[1]), math.abs(lowSrc - closeSrc[1])))
+    atrLen = tt_rma(tr, n1)
+    plusDI = atrLen == 0 ? 0.0 : 100.0 * tt_rma(plusDM, n1) / atrLen
+    minusDI = atrLen == 0 ? 0.0 : 100.0 * tt_rma(minusDM, n1) / atrLen
+    dx = (plusDI + minusDI) == 0 ? 0.0 : 100.0 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    tt_rma(dx, n1)
+
+series_from_tt(feature_string, _close, _high, _low, _hlc3, f_paramA, f_paramB) =>
+    switch feature_string
+        "RSI" => tt_n_rsi(_close, f_paramA, f_paramB)
+        "WT" => tt_wt(_hlc3, f_paramA, f_paramB)
+        "CCI" => tt_n_cci(_close, f_paramA, f_paramB)
+        "ADX" => tt_adx_feature(_high, _low, _close, f_paramA)
+        => tt_n_rsi(_close, f_paramA, f_paramB)
+
+series_from_ml(feature_string, _close, _high, _low, _hlc3, f_paramA, f_paramB) =>
+    switch feature_string
+        "RSI" => ml.n_rsi(_close, f_paramA, f_paramB)
+        "WT" => ml.n_wt(_hlc3, f_paramA, f_paramB)
+        "CCI" => ml.n_cci(_close, f_paramA, f_paramB)
+        "ADX" => ml.n_adx(_high, _low, _close, f_paramA)
+        => ml.n_rsi(_close, f_paramA, f_paramB)
+
+// Const loop bound so the lookback can arrive as a series from a sync code.
+tt_kernel_rq(src, lookback, relativeWeight, startAtBar) =>
+    currentWeight = 0.0
+    cumulativeWeight = 0.0
+    upper = math.min(1 + startAtBar, bar_index)
+    for i = 0 to 499
+        if i <= upper
+            weight = math.pow(1.0 + (i * i) / math.max(lookback * lookback * 2.0 * relativeWeight, 1e-10), -relativeWeight)
+            currentWeight += nz(src[i]) * weight
+            cumulativeWeight += weight
+    cumulativeWeight > 0 ? currentWeight / cumulativeWeight : src
+
+tt_kernel_gauss(src, lookback, startAtBar) =>
+    currentWeight = 0.0
+    cumulativeWeight = 0.0
+    upper = math.min(1 + startAtBar, bar_index)
+    for i = 0 to 499
+        if i <= upper
+            weight = math.exp(-(i * i) / math.max(2.0 * lookback * lookback, 1e-10))
+            currentWeight += nz(src[i]) * weight
+            cumulativeWeight += weight
+    cumulativeWeight > 0 ? currentWeight / cumulativeWeight : src
+
+get_lorentzian_distance(i, featureCount, FeatureSeries featureSeries, FeatureArrays featureArrays) =>
+    switch featureCount
+        5 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i))) + math.log(1 + math.abs(featureSeries.f4 - array.get(featureArrays.f4, i))) + math.log(1 + math.abs(featureSeries.f5 - array.get(featureArrays.f5, i)))
+        4 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i))) + math.log(1 + math.abs(featureSeries.f4 - array.get(featureArrays.f4, i)))
+        3 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i))) + math.log(1 + math.abs(featureSeries.f3 - array.get(featureArrays.f3, i)))
+        2 => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i)))
+        => math.log(1 + math.abs(featureSeries.f1 - array.get(featureArrays.f1, i))) + math.log(1 + math.abs(featureSeries.f2 - array.get(featureArrays.f2, i)))
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+btGroup = "Backtest"
+armsMode = input.string("Both", "Arms", options=["Both", "TT-Autotune only", "TT-Lorentzian only"], group=btGroup, tooltip="Each arm runs a full KNN scan per bar. Drop to one arm if the script times out on a long chart.")
+useStartDate = input.bool(false, "Begin Backtest at Start Date", group=btGroup)
+startDate = input.time(timestamp("2026-01-01T00:00:00"), "Start Date", group=btGroup)
+feeBps = input.float(5.0, "Taker fee (bps per side)", minval=0.0, step=0.5, group=btGroup)
+slipBps = input.float(2.0, "Slippage (bps per side)", minval=0.0, step=0.5, group=btGroup)
+useIndicatorExits = input.bool(true, "Use indicator exits", group=btGroup, tooltip="On = the optimizer's setting (use_indicator_exits=True) and what the live strategies do via strategy.close(). Off = ATR bracket and signal flips only.")
+showEdge = input.bool(true, "Plot edge (Autotune - Control)", group=btGroup)
+
+riskGroup = "ATR SL/TP"
+useAtrRisk = input.bool(true, "Use ATR SL/TP", group=riskGroup)
+atrLength = input.int(14, "ATR Length", minval=1, group=riskGroup)
+atrSlMult = input.float(2.0, "Stop Loss ATR Multiplier", minval=0.1, step=0.1, group=riskGroup)
+atrTpMult = input.float(3.0, "Take Profit ATR Multiplier", minval=0.1, step=0.1, group=riskGroup)
+
+syncGroup = "TT-Autotune Sync (Arm A)"
+regimeSyncCodes = input.string("", "Regime Sync Codes", group=syncGroup, tooltip="MR1|REGIME=TT1,...|... packed codes from TensorTrader. Arm A switches code by live regime; arm B ignores this entirely.")
+syncCode = input.string("", "Sync Code", group=syncGroup, tooltip="Legacy single TT1,... CSV. Used only when Regime Sync Codes is empty.")
+
+// One base input set: verbatim stock Lorentzian v2 defaults. Arm B uses them as
+// its whole configuration; arm A uses them as the fallback under its sync code —
+// which is exactly how the two deployed strategies behave.
+srcIn = input.source(title="Source", defval=close, group="General Settings")
+neighborsIn = input.int(title="Neighbors Count", defval=8, group="General Settings", minval=1, maxval=100, step=1)
+maxBarsIn = input.int(title="Max Bars Back", defval=2000, group="General Settings")
+featureCountIn = input.int(title="Feature Count", defval=5, group="Feature Engineering", minval=2, maxval=5)
+useDynamicExitsIn = input.bool(title="Use Dynamic Exits", defval=false, group="General Settings")
+
+useVolIn = input.bool(title="Use Volatility Filter", defval=true, group="Filters")
+useRegimeIn = input.bool(title="Use Regime Filter", defval=true, group="Filters", inline="regime")
+useAdxIn = input.bool(title="Use ADX Filter", defval=false, group="Filters", inline="adx")
+regimeThIn = input.float(title="Threshold", defval=-0.1, minval=-10, maxval=10, step=0.1, group="Filters", inline="regime")
+adxThIn = input.int(title="Threshold", defval=20, minval=0, maxval=100, step=1, group="Filters", inline="adx")
+useEmaFilter = input.bool(title="Use EMA Filter", defval=false, group="Filters", inline="ema")
+emaPeriod = input.int(title="Period", defval=200, minval=1, step=1, group="Filters", inline="ema")
+useSmaFilter = input.bool(title="Use SMA Filter", defval=false, group="Filters", inline="sma")
+smaPeriod = input.int(title="Period", defval=200, minval=1, step=1, group="Filters", inline="sma")
+
+f1_string_in = input.string(title="Feature 1", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", inline="01", group="Feature Engineering")
+f1_paramA_in = input.int(title="Parameter A", defval=14, inline="02", group="Feature Engineering")
+f1_paramB_in = input.int(title="Parameter B", defval=1, inline="02", group="Feature Engineering")
+f2_string_in = input.string(title="Feature 2", options=["RSI", "WT", "CCI", "ADX"], defval="WT", inline="03", group="Feature Engineering")
+f2_paramA_in = input.int(title="Parameter A", defval=10, inline="04", group="Feature Engineering")
+f2_paramB_in = input.int(title="Parameter B", defval=11, inline="04", group="Feature Engineering")
+f3_string_in = input.string(title="Feature 3", options=["RSI", "WT", "CCI", "ADX"], defval="CCI", inline="05", group="Feature Engineering")
+f3_paramA_in = input.int(title="Parameter A", defval=20, inline="06", group="Feature Engineering")
+f3_paramB_in = input.int(title="Parameter B", defval=1, inline="06", group="Feature Engineering")
+f4_string_in = input.string(title="Feature 4", options=["RSI", "WT", "CCI", "ADX"], defval="ADX", inline="07", group="Feature Engineering")
+f4_paramA_in = input.int(title="Parameter A", defval=20, inline="08", group="Feature Engineering")
+f4_paramB_in = input.int(title="Parameter B", defval=2, inline="08", group="Feature Engineering")
+f5_string_in = input.string(title="Feature 5", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", inline="09", group="Feature Engineering")
+f5_paramA_in = input.int(title="Parameter A", defval=9, inline="10", group="Feature Engineering")
+f5_paramB_in = input.int(title="Parameter B", defval=1, inline="10", group="Feature Engineering")
+
+useKernelFilterIn = input.bool(true, "Trade with Kernel", group="Kernel Settings", inline="kernel")
+useKernelSmoothingIn = input.bool(false, "Enhance Kernel Smoothing", inline="1", group="Kernel Settings")
+hIn = input.int(8, "Lookback Window", minval=3, group="Kernel Settings", inline="kernel")
+rIn = input.float(8.0, "Relative Weighting", step=0.25, group="Kernel Settings", inline="kernel")
+xIn = input.int(25, "Regression Level", group="Kernel Settings", inline="kernel")
+lagIn = input.int(2, "Lag", inline="1", group="Kernel Settings")
+
+runA = armsMode != "TT-Lorentzian only"
+runB = armsMode != "TT-Autotune only"
+rtCost = 2.0 * (feeBps + slipBps) / 10000.0
+
+// -----------------------------------------------------------------------------
+// Market-regime classifier (mirrors regime_classifier.py, same as both strategies)
+// -----------------------------------------------------------------------------
+tt_adx_period = 14
+tt_atr_period = 14
+tt_slope_window = 20
+tt_adx_strong = 25.0
+tt_adx_weak = 18.0
+tt_is_intraday = timeframe.period == "5" or timeframe.period == "15"
+tt_is_1h = timeframe.period == "60"
+tt_is_4h = timeframe.period == "240"
+tt_slope_strong = tt_is_intraday ? 0.0005 : tt_is_1h ? 0.0012 : tt_is_4h ? 0.0020 : 0.0020
+tt_slope_weak = tt_is_intraday ? 0.00015 : tt_is_1h ? 0.00030 : tt_is_4h ? 0.00050 : 0.00050
+tt_chop_vol = tt_is_intraday ? 0.008 : tt_is_1h ? 0.012 : tt_is_4h ? 0.018 : 0.020
+tt_confirm_bars = tt_is_intraday ? 5 : tt_is_1h ? 4 : tt_is_4h ? 3 : 3
+tt_min_hold_bars = tt_is_intraday ? 10 : tt_is_1h ? 8 : tt_is_4h ? 6 : 5
+
+[tt_diplus, tt_diminus, tt_adx] = ta.dmi(tt_adx_period, tt_adx_period)
+tt_atr_pct = ta.atr(tt_atr_period) / close
+tt_lr0 = ta.linreg(close, tt_slope_window, 0)
+tt_lr1 = ta.linreg(close, tt_slope_window, 1)
+tt_slope_pct = close > 0 ? (tt_lr0 - tt_lr1) / close : na
+
+tt_raw_regime() =>
+    adx_v = tt_adx
+    slope_v = tt_slope_pct
+    vol_v = tt_atr_pct
+    if na(adx_v) or na(slope_v) or na(vol_v)
+        "UNKNOWN"
+    else if adx_v >= tt_adx_strong and slope_v >= tt_slope_strong
+        "BULL_STRONG"
+    else if adx_v >= tt_adx_strong and slope_v <= -tt_slope_strong
+        "BEAR_STRONG"
+    else if adx_v >= tt_adx_weak and slope_v >= tt_slope_weak
+        "BULL_WEAK"
+    else if adx_v >= tt_adx_weak and slope_v <= -tt_slope_weak
+        "BEAR_WEAK"
+    else if vol_v >= tt_chop_vol
+        "SIDEWAYS_CHOP"
+    else
+        "SIDEWAYS_QUIET"
+
+var string tt_reg_current = "UNKNOWN"
+var int tt_reg_hold = 0
+var string tt_reg_pending = "UNKNOWN"
+var int tt_reg_streak = 0
+tt_raw = tt_raw_regime()
+if tt_reg_current == "UNKNOWN"
+    tt_reg_current := tt_raw
+    tt_reg_hold := tt_raw != "UNKNOWN" ? 1 : 0
+    tt_reg_pending := "UNKNOWN"
+    tt_reg_streak := 0
+else if tt_raw == tt_reg_current or tt_raw == "UNKNOWN"
+    tt_reg_pending := "UNKNOWN"
+    tt_reg_streak := 0
+    tt_reg_hold += 1
+else
+    if tt_raw == tt_reg_pending
+        tt_reg_streak += 1
+    else
+        tt_reg_pending := tt_raw
+        tt_reg_streak := 1
+    if tt_reg_streak >= tt_confirm_bars and tt_reg_hold >= tt_min_hold_bars
+        tt_reg_current := tt_reg_pending
+        tt_reg_hold := 1
+        tt_reg_pending := "UNKNOWN"
+        tt_reg_streak := 0
+    else
+        tt_reg_hold += 1
+liveRegime = tt_reg_current
+tt_regime_code = switch liveRegime
+    "BULL_STRONG" => 1
+    "BULL_WEAK" => 2
+    "BEAR_STRONG" => 3
+    "BEAR_WEAK" => 4
+    "SIDEWAYS_QUIET" => 5
+    "SIDEWAYS_CHOP" => 6
+    => 0
+
+// -----------------------------------------------------------------------------
+// Sync-code decode (arm A only)
+// -----------------------------------------------------------------------------
+tt_pick_packed(packed, regime) =>
+    string found = ""
+    segs = str.split(packed, "|")
+    prefix = regime + "="
+    if array.size(segs) >= 2 and array.get(segs, 0) == "MR1"
+        for i = 1 to array.size(segs) - 1
+            seg = array.get(segs, i)
+            if str.startswith(seg, prefix)
+                found := str.substring(seg, str.length(prefix))
+    found
+
+tt_regime_deployed(packed, regime) =>
+    str.length(tt_pick_packed(packed, regime)) > 4
+
+packedActive = str.length(regimeSyncCodes) > 4 and str.startswith(regimeSyncCodes, "MR1|")
+activeSyncCode = packedActive ? tt_pick_packed(regimeSyncCodes, liveRegime) : syncCode
+syncSource = packedActive ? "PACKED" : str.length(syncCode) > 0 ? "LEGACY" : "NONE"
+syncParts = str.split(activeSyncCode, ",")
+syncActive = array.size(syncParts) >= 30 and array.get(syncParts, 0) == "TT1"
+sync_int(idx, fallback) =>
+    raw = syncActive ? str.tonumber(array.get(syncParts, idx)) : na
+    na(raw) ? fallback : int(raw)
+sync_float(idx, fallback) =>
+    raw = syncActive ? str.tonumber(array.get(syncParts, idx)) : na
+    na(raw) ? fallback : raw
+sync_bool(idx, fallback) =>
+    syncActive ? array.get(syncParts, idx) == "1" : fallback
+sync_str(idx, fallback) =>
+    syncActive ? array.get(syncParts, idx) : fallback
+
+// -----------------------------------------------------------------------------
+// Shared training labels + trend filters
+// -----------------------------------------------------------------------------
+src = srcIn
+y_train_series = src[4] < src[0] ? -1 : src[4] > src[0] ? 1 : 0
+var y_train_array = array.new_int(0)
+array.push(y_train_array, y_train_series)
+
+isEmaUptrend = useEmaFilter ? close > ta.ema(close, emaPeriod) : true
+isEmaDowntrend = useEmaFilter ? close < ta.ema(close, emaPeriod) : true
+isSmaUptrend = useSmaFilter ? close > ta.sma(close, smaPeriod) : true
+isSmaDowntrend = useSmaFilter ? close < ta.sma(close, smaPeriod) : true
+isDynamicExitValid = not useEmaFilter and not useSmaFilter
+
+// =============================================================================
+// ARM A — TT-Autotune: sync-code params, recent-pool KNN, series-safe features
+// =============================================================================
+neighborsA = sync_int(1, neighborsIn)
+maxBarsA = sync_int(2, maxBarsIn)
+featureCountA = math.max(2, math.min(5, sync_int(3, featureCountIn)))
+hA = sync_int(4, hIn)
+rA = sync_float(5, rIn)
+xA = sync_int(6, xIn)
+lagA = sync_int(7, lagIn)
+useKernelFilterA = sync_bool(8, useKernelFilterIn)
+useKernelSmoothingA = sync_bool(9, useKernelSmoothingIn)
+useVolA = sync_bool(10, useVolIn)
+useRegA = sync_bool(11, useRegimeIn)
+useAdxA = sync_bool(12, useAdxIn)
+regimeThA = sync_float(13, regimeThIn)
+adxThA = sync_int(14, adxThIn)
+
+FeatureSeries fsA = FeatureSeries.new(series_from_tt(sync_str(15, f1_string_in), close, high, low, hlc3, sync_int(16, f1_paramA_in), sync_int(17, f1_paramB_in)), series_from_tt(sync_str(18, f2_string_in), close, high, low, hlc3, sync_int(19, f2_paramA_in), sync_int(20, f2_paramB_in)), series_from_tt(sync_str(21, f3_string_in), close, high, low, hlc3, sync_int(22, f3_paramA_in), sync_int(23, f3_paramB_in)), series_from_tt(sync_str(24, f4_string_in), close, high, low, hlc3, sync_int(25, f4_paramA_in), sync_int(26, f4_paramB_in)), series_from_tt(sync_str(27, f5_string_in), close, high, low, hlc3, sync_int(28, f5_paramA_in), sync_int(29, f5_paramB_in)))
+
+var f1A = array.new_float()
+var f2A = array.new_float()
+var f3A = array.new_float()
+var f4A = array.new_float()
+var f5A = array.new_float()
+array.push(f1A, fsA.f1)
+array.push(f2A, fsA.f2)
+array.push(f3A, fsA.f3)
+array.push(f4A, fsA.f4)
+array.push(f5A, fsA.f5)
+FeatureArrays faA = FeatureArrays.new(f1A, f2A, f3A, f4A, f5A)
+
+filterAllA = ml.filter_volatility(1, 10, useVolA) and ml.regime_filter(ohlc4, regimeThA, useRegA) and ml.filter_adx(src, 14, adxThA, useAdxA)
+maxBarsBackIndexA = last_bar_index >= maxBarsA ? last_bar_index - maxBarsA : 0
+
+var predictionsA = array.new_float(0)
+var distancesA = array.new_float(0)
+var float predictionA = 0.0
+var int signalA = 0
+lastDistanceA = -1.0
+sizeA = math.min(maxBarsA - 1, array.size(y_train_array) - 1)
+// Sliding neighbor pool: the most recent maxBarsBack bars, skip counted back from
+// the current bar. Mirrors the Python port's neighbor_pool="recent" mode.
+poolBaseA = math.max(0, array.size(y_train_array) - maxBarsA)
+if runA and bar_index >= maxBarsBackIndexA
+    for i = 0 to 1999
+        if i <= sizeA
+            idx = poolBaseA + i
+            d = get_lorentzian_distance(idx, featureCountA, fsA, faA)
+            if d >= lastDistanceA and (bar_index - idx) % 4 != 0
+                lastDistanceA := d
+                array.push(distancesA, d)
+                array.push(predictionsA, math.round(array.get(y_train_array, idx)))
+                if array.size(predictionsA) > neighborsA
+                    lastDistanceA := array.get(distancesA, int(math.round(neighborsA * 3 / 4)))
+                    array.shift(distancesA)
+                    array.shift(predictionsA)
+    predictionA := array.sum(predictionsA)
+
+signalA := predictionA > 0 and filterAllA ? 1 : predictionA < 0 and filterAllA ? -1 : nz(signalA[1])
+var int barsHeldA = 0
+signalChangedA = ta.change(signalA) != 0
+barsHeldA := signalChangedA ? 0 : barsHeldA + 1
+isHeldFourBarsA = barsHeldA == 4
+isHeldLessThanFourBarsA = 0 < barsHeldA and barsHeldA < 4
+isBuySignalA = signalA == 1 and isEmaUptrend and isSmaUptrend
+isSellSignalA = signalA == -1 and isEmaDowntrend and isSmaDowntrend
+isLastSignalBuyA = signalA[4] == 1 and isEmaUptrend[4] and isSmaUptrend[4]
+isLastSignalSellA = signalA[4] == -1 and isEmaDowntrend[4] and isSmaDowntrend[4]
+isNewBuySignalA = isBuySignalA and signalChangedA
+isNewSellSignalA = isSellSignalA and signalChangedA
+
+yhat1A = tt_kernel_rq(src, hA, rA, xA)
+yhat2A = tt_kernel_gauss(src, math.max(hA - lagA, 1), xA)
+isBearishRateA = yhat1A[1] > yhat1A
+isBullishRateA = yhat1A[1] < yhat1A
+isBearishChangeA = isBearishRateA and yhat1A[2] < yhat1A[1]
+isBullishChangeA = isBullishRateA and yhat1A[2] > yhat1A[1]
+isBullishSmoothA = yhat2A >= yhat1A
+isBearishSmoothA = yhat2A <= yhat1A
+alertBullishA = useKernelSmoothingA ? ta.crossover(yhat2A, yhat1A) : isBullishChangeA
+alertBearishA = useKernelSmoothingA ? ta.crossunder(yhat2A, yhat1A) : isBearishChangeA
+isBullishA = useKernelFilterA ? (useKernelSmoothingA ? isBullishSmoothA : isBullishRateA) : true
+isBearishA = useKernelFilterA ? (useKernelSmoothingA ? isBearishSmoothA : isBearishRateA) : true
+
+startLongA = isNewBuySignalA and isBullishA and isEmaUptrend and isSmaUptrend
+startShortA = isNewSellSignalA and isBearishA and isEmaDowntrend and isSmaDowntrend
+isValidLongExitA = ta.barssince(alertBearishA) > ta.barssince(startLongA)
+isValidShortExitA = ta.barssince(alertBullishA) > ta.barssince(startShortA)
+endLongDynA = isBearishChangeA and isValidLongExitA[1]
+endShortDynA = isBullishChangeA and isValidShortExitA[1]
+endLongStrictA = ((isHeldFourBarsA and isLastSignalBuyA) or (isHeldLessThanFourBarsA and isNewSellSignalA and isLastSignalBuyA)) and startLongA[4]
+endShortStrictA = ((isHeldFourBarsA and isLastSignalSellA) or (isHeldLessThanFourBarsA and isNewBuySignalA and isLastSignalSellA)) and startShortA[4]
+useDynA = useDynamicExitsIn and isDynamicExitValid and not useKernelSmoothingA
+endLongA = useDynA ? endLongDynA : endLongStrictA
+endShortA = useDynA ? endShortDynA : endShortStrictA
+
+// =============================================================================
+// ARM B — TT-Lorentzian control: stock v2 defaults, oldest-bars pool, library calls
+// =============================================================================
+FeatureSeries fsB = FeatureSeries.new(series_from_ml(f1_string_in, close, high, low, hlc3, f1_paramA_in, f1_paramB_in), series_from_ml(f2_string_in, close, high, low, hlc3, f2_paramA_in, f2_paramB_in), series_from_ml(f3_string_in, close, high, low, hlc3, f3_paramA_in, f3_paramB_in), series_from_ml(f4_string_in, close, high, low, hlc3, f4_paramA_in, f4_paramB_in), series_from_ml(f5_string_in, close, high, low, hlc3, f5_paramA_in, f5_paramB_in))
+
+var f1B = array.new_float()
+var f2B = array.new_float()
+var f3B = array.new_float()
+var f4B = array.new_float()
+var f5B = array.new_float()
+array.push(f1B, fsB.f1)
+array.push(f2B, fsB.f2)
+array.push(f3B, fsB.f3)
+array.push(f4B, fsB.f4)
+array.push(f5B, fsB.f5)
+FeatureArrays faB = FeatureArrays.new(f1B, f2B, f3B, f4B, f5B)
+
+filterAllB = ml.filter_volatility(1, 10, useVolIn) and ml.regime_filter(ohlc4, regimeThIn, useRegimeIn) and ml.filter_adx(src, 14, adxThIn, useAdxIn)
+maxBarsBackIndexB = last_bar_index >= maxBarsIn ? last_bar_index - maxBarsIn : 0
+
+var predictionsB = array.new_float(0)
+var distancesB = array.new_float(0)
+var float predictionB = 0.0
+var int signalB = 0
+lastDistanceB = -1.0
+sizeB = math.min(maxBarsIn - 1, array.size(y_train_array) - 1)
+// Original jdehorty oldest-bars pool — deliberately NOT the TT recent-pool fork.
+if runB and bar_index >= maxBarsBackIndexB
+    for i = 0 to sizeB
+        d = get_lorentzian_distance(i, featureCountIn, fsB, faB)
+        if d >= lastDistanceB and i % 4 != 0
+            lastDistanceB := d
+            array.push(distancesB, d)
+            array.push(predictionsB, math.round(array.get(y_train_array, i)))
+            if array.size(predictionsB) > neighborsIn
+                lastDistanceB := array.get(distancesB, int(math.round(neighborsIn * 3 / 4)))
+                array.shift(distancesB)
+                array.shift(predictionsB)
+    predictionB := array.sum(predictionsB)
+
+signalB := predictionB > 0 and filterAllB ? 1 : predictionB < 0 and filterAllB ? -1 : nz(signalB[1])
+var int barsHeldB = 0
+signalChangedB = ta.change(signalB) != 0
+barsHeldB := signalChangedB ? 0 : barsHeldB + 1
+isHeldFourBarsB = barsHeldB == 4
+isHeldLessThanFourBarsB = 0 < barsHeldB and barsHeldB < 4
+isBuySignalB = signalB == 1 and isEmaUptrend and isSmaUptrend
+isSellSignalB = signalB == -1 and isEmaDowntrend and isSmaDowntrend
+isLastSignalBuyB = signalB[4] == 1 and isEmaUptrend[4] and isSmaUptrend[4]
+isLastSignalSellB = signalB[4] == -1 and isEmaDowntrend[4] and isSmaDowntrend[4]
+isNewBuySignalB = isBuySignalB and signalChangedB
+isNewSellSignalB = isSellSignalB and signalChangedB
+
+yhat1B = kernels.rationalQuadratic(src, hIn, rIn, xIn)
+yhat2B = kernels.gaussian(src, math.max(hIn - lagIn, 1), xIn)
+isBearishRateB = yhat1B[1] > yhat1B
+isBullishRateB = yhat1B[1] < yhat1B
+isBearishChangeB = isBearishRateB and yhat1B[2] < yhat1B[1]
+isBullishChangeB = isBullishRateB and yhat1B[2] > yhat1B[1]
+isBullishSmoothB = yhat2B >= yhat1B
+isBearishSmoothB = yhat2B <= yhat1B
+alertBullishB = useKernelSmoothingIn ? ta.crossover(yhat2B, yhat1B) : isBullishChangeB
+alertBearishB = useKernelSmoothingIn ? ta.crossunder(yhat2B, yhat1B) : isBearishChangeB
+isBullishB = useKernelFilterIn ? (useKernelSmoothingIn ? isBullishSmoothB : isBullishRateB) : true
+isBearishB = useKernelFilterIn ? (useKernelSmoothingIn ? isBearishSmoothB : isBearishRateB) : true
+
+startLongB = isNewBuySignalB and isBullishB and isEmaUptrend and isSmaUptrend
+startShortB = isNewSellSignalB and isBearishB and isEmaDowntrend and isSmaDowntrend
+isValidLongExitB = ta.barssince(alertBearishB) > ta.barssince(startLongB)
+isValidShortExitB = ta.barssince(alertBullishB) > ta.barssince(startShortB)
+endLongDynB = isBearishChangeB and isValidLongExitB[1]
+endShortDynB = isBullishChangeB and isValidShortExitB[1]
+endLongStrictB = ((isHeldFourBarsB and isLastSignalBuyB) or (isHeldLessThanFourBarsB and isNewSellSignalB and isLastSignalBuyB)) and startLongB[4]
+endShortStrictB = ((isHeldFourBarsB and isLastSignalSellB) or (isHeldLessThanFourBarsB and isNewBuySignalB and isLastSignalSellB)) and startShortB[4]
+useDynB = useDynamicExitsIn and isDynamicExitValid and not useKernelSmoothingIn
+endLongB = useDynB ? endLongDynB : endLongStrictB
+endShortB = useDynB ? endShortDynB : endShortStrictB
+
+// =============================================================================
+// Simulate + plot
+// =============================================================================
+var ArmState armA = ArmState.new(regRoi=array.new_float(6, 0.0), regTrades=array.new_int(6, 0))
+var ArmState armB = ArmState.new(regRoi=array.new_float(6, 0.0), regTrades=array.new_int(6, 0))
+
+atrv = ta.atr(atrLength)
+// ponytail: single position per arm, matching simulate_trades. The live Autotune
+// runs pyramiding=5, so its realised P&L scales differently — this compares the
+// signal edge, not the ladder. Upgrade path is a leg array per arm.
+windowOpen = (not useStartDate or time >= startDate) and (bar_index >= maxBarsBackIndexA or bar_index >= maxBarsBackIndexB)
+var int windowBars = 0
+var int windowStartTime = 0
+if windowOpen
+    windowBars := windowBars + 1
+    if windowStartTime == 0
+        windowStartTime := time
+    if runA
+        arm_step(armA, startLongA, startShortA, useIndicatorExits and endLongA, useIndicatorExits and endShortA, atrv, useAtrRisk, atrSlMult, atrTpMult, rtCost, tt_regime_code)
+    if runB
+        arm_step(armB, startLongB, startShortB, useIndicatorExits and endLongB, useIndicatorExits and endShortB, atrv, useAtrRisk, atrSlMult, atrTpMult, rtCost, tt_regime_code)
+
+// Mark to market so an open trade shows on the curve instead of a flat tail.
+arm_mtm(ArmState s, float rtCost) =>
+    s.pos == 0 or s.entry <= 0.0 ? s.equity : s.equity * (1.0 + ((close - s.entry) / s.entry) * s.pos - rtCost)
+
+mtmA = arm_mtm(armA, rtCost)
+mtmB = arm_mtm(armB, rtCost)
+eqA = runA and windowOpen ? (mtmA - 1.0) * 100.0 : na
+eqB = runB and windowOpen ? (mtmB - 1.0) * 100.0 : na
+
+pA = plot(eqA, "TT-Autotune equity %", color=#009988, linewidth=2)
+pB = plot(eqB, "TT-Lorentzian equity %", color=#FF9800, linewidth=2)
+fill(pA, pB, color=nz(eqA) >= nz(eqB) ? color.new(#009988, 82) : color.new(#CC3311, 82))
+plot(showEdge ? nz(eqA) - nz(eqB) : na, "Edge (A - B) %", color=color.new(#9C27B0, 30), linewidth=1)
+hline(0, "Break-even", color=color.new(color.gray, 50), linestyle=hline.style_dotted)
+
+// -----------------------------------------------------------------------------
+// Tables
+// -----------------------------------------------------------------------------
+fmt_pct(v) =>
+    str.tostring(v * 100.0, "#.##") + "%"
+
+fmt_signed(v) =>
+    (v >= 0 ? "+" : "") + str.tostring(v * 100.0, "#.##") + "%"
+
+pf(ArmState s) =>
+    s.grossLoss <= 0.0 ? (s.grossWin > 0.0 ? "inf" : "-") : str.tostring(s.grossWin / s.grossLoss, "#.##")
+
+c_arm_a = color.new(#009988, 70)
+c_arm_b = color.new(#FF9800, 75)
+stat_row(table t, int r, string label, string va, string vb, string d) =>
+    table.cell(t, 0, r, label, text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(t, 1, r, va, text_color=color.white, text_size=size.small, bgcolor=c_arm_a)
+    table.cell(t, 2, r, vb, text_color=color.white, text_size=size.small, bgcolor=c_arm_b)
+    table.cell(t, 3, r, d, text_color=color.white, text_size=size.small)
+
+var table stats = table.new(position.top_right, 4, 10, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 40), frame_width=1, border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast
+    c_hdr = color.new(#2A2E39, 0)
+    c_a = c_arm_a
+    c_b = c_arm_b
+    table.cell(stats, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    table.cell(stats, 1, 0, "TT-Autotune", text_color=color.white, text_size=size.small, bgcolor=c_a)
+    table.cell(stats, 2, 0, "TT-Lorentzian", text_color=color.white, text_size=size.small, bgcolor=c_b)
+    table.cell(stats, 3, 0, "D A-B", text_color=color.white, text_size=size.small, bgcolor=c_hdr)
+    compA = armA.equity - 1.0
+    compB = armB.equity - 1.0
+    stat_row(stats, 1, "Compound", fmt_signed(compA), fmt_signed(compB), fmt_signed(compA - compB))
+    stat_row(stats, 2, "Total ROI (sum)", fmt_signed(armA.totalRoi), fmt_signed(armB.totalRoi), fmt_signed(armA.totalRoi - armB.totalRoi))
+    stat_row(stats, 3, "Trades", str.tostring(armA.trades), str.tostring(armB.trades), str.tostring(armA.trades - armB.trades))
+    wrA = armA.trades > 0 ? armA.wins / armA.trades : 0.0
+    wrB = armB.trades > 0 ? armB.wins / armB.trades : 0.0
+    stat_row(stats, 4, "Win rate", fmt_pct(wrA), fmt_pct(wrB), fmt_signed(wrA - wrB))
+    avgA = armA.trades > 0 ? armA.totalRoi / armA.trades : 0.0
+    avgB = armB.trades > 0 ? armB.totalRoi / armB.trades : 0.0
+    stat_row(stats, 5, "Avg trade", fmt_signed(avgA), fmt_signed(avgB), fmt_signed(avgA - avgB))
+    sortA = arm_sortino(armA)
+    sortB = arm_sortino(armB)
+    stat_row(stats, 6, "Sortino", str.tostring(sortA, "#.###"), str.tostring(sortB, "#.###"), str.tostring(sortA - sortB, "#.###"))
+    stat_row(stats, 7, "Max drawdown", fmt_pct(armA.maxDD), fmt_pct(armB.maxDD), fmt_signed(armA.maxDD - armB.maxDD))
+    stat_row(stats, 8, "Profit factor", pf(armA), pf(armB), "")
+    stat_row(stats, 9, "Time in market", fmt_pct(windowBars > 0 ? armA.barsIn / windowBars : 0.0), fmt_pct(windowBars > 0 ? armB.barsIn / windowBars : 0.0), "")
+
+// Bottom left — keeps the right edge clear for the stats table (top right) and the
+// live tail of the equity curves; in a half-height pane the two right-side tables
+// used to collide.
+var table regTbl = table.new(position.bottom_left, 6, 8, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 40), frame_width=1, border_width=1, border_color=color.new(color.gray, 70))
+if barstate.islast
+    c_hdr2 = color.new(#2A2E39, 0)
+    table.cell(regTbl, 0, 0, "Regime", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    table.cell(regTbl, 1, 0, "Champ", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    table.cell(regTbl, 2, 0, "AT n", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    table.cell(regTbl, 3, 0, "AT ROI", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    table.cell(regTbl, 4, 0, "LC ROI", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    table.cell(regTbl, 5, 0, "D", text_color=color.white, text_size=size.small, bgcolor=c_hdr2)
+    regimes = array.from("BULL_STRONG", "BULL_WEAK", "BEAR_STRONG", "BEAR_WEAK", "SIDEWAYS_QUIET", "SIDEWAYS_CHOP")
+    for i = 0 to 5
+        reg = array.get(regimes, i)
+        roiA = array.get(armA.regRoi, i)
+        roiB = array.get(armB.regRoi, i)
+        nA = array.get(armA.regTrades, i)
+        delta = roiA - roiB
+        live = reg == liveRegime
+        deployed = packedActive ? tt_regime_deployed(regimeSyncCodes, reg) : syncActive
+        bg = nA == 0 and array.get(armB.regTrades, i) == 0 ? color.new(#787b86, 80) : delta > 0.0 ? color.new(#009988, 60) : delta < 0.0 ? color.new(#CC3311, 60) : color.new(#787b86, 70)
+        table.cell(regTbl, 0, i + 1, (live ? "> " : "") + reg, text_color=color.white, text_size=size.small, bgcolor=bg, text_halign=text.align_left)
+        table.cell(regTbl, 1, i + 1, deployed ? "yes" : "no", text_color=deployed ? color.white : color.new(color.white, 45), text_size=size.small, bgcolor=bg)
+        table.cell(regTbl, 2, i + 1, str.tostring(nA), text_color=color.white, text_size=size.small, bgcolor=bg)
+        table.cell(regTbl, 3, i + 1, fmt_signed(roiA), text_color=color.white, text_size=size.small, bgcolor=bg)
+        table.cell(regTbl, 4, i + 1, fmt_signed(roiB), text_color=color.white, text_size=size.small, bgcolor=bg)
+        table.cell(regTbl, 5, i + 1, fmt_signed(delta), text_color=color.white, text_size=size.small, bgcolor=bg)
+    table.cell(regTbl, 0, 7, "Trades bucketed by the regime at ENTRY bar, as regimes.py does.", text_color=color.new(color.gray, 20), text_size=size.tiny, text_halign=text.align_left)
+
+// Top center — top left belongs to the pane's own legend/status line.
+var table hdr = table.new(position.top_center, 2, 5, bgcolor=color.new(#131722, 10), frame_color=color.new(color.gray, 40), frame_width=1)
+if barstate.islast
+    table.cell(hdr, 0, 0, "TT Backtest Compare", text_color=color.white, text_size=size.small)
+    table.cell(hdr, 1, 0, syminfo.ticker + " · " + timeframe.period, text_color=color.white, text_size=size.small)
+    table.cell(hdr, 0, 1, "Arms", text_color=color.gray, text_size=size.small)
+    table.cell(hdr, 1, 1, armsMode, text_color=color.white, text_size=size.small)
+    table.cell(hdr, 0, 2, "Sync (arm A)", text_color=color.gray, text_size=size.small)
+    table.cell(hdr, 1, 2, syncSource + (syncActive ? " · active" : " · defaults"), text_color=color.white, text_size=size.small)
+    table.cell(hdr, 0, 3, "Window", text_color=color.gray, text_size=size.small)
+    table.cell(hdr, 1, 3, str.tostring(windowBars) + " bars from " + (windowStartTime > 0 ? str.format_time(windowStartTime, "yyyy-MM-dd HH:mm", syminfo.timezone) : "-"), text_color=color.white, text_size=size.small)
+    table.cell(hdr, 0, 4, "Cost / exits", text_color=color.gray, text_size=size.small)
+    table.cell(hdr, 1, 4, str.tostring(rtCost * 10000.0, "#.#") + " bps rt · " + (useIndicatorExits ? "indicator+ATR" : "ATR only"), text_color=color.white, text_size=size.small)
+
+// Machine-readable stats for the parity cross-check against the Python simulator.
+plot(armA.trades, "A trades", display=display.data_window)
+plot(armB.trades, "B trades", display=display.data_window)
+plot(armA.totalRoi, "A total ROI", display=display.data_window)
+plot(armB.totalRoi, "B total ROI", display=display.data_window)
+plot(armA.equity - 1.0, "A compound ROI", display=display.data_window)
+plot(armB.equity - 1.0, "B compound ROI", display=display.data_window)
+plot(tt_regime_code, "Regime Code", display=display.data_window)

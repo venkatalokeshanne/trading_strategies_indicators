@@ -1,0 +1,268 @@
+//@version=6
+// =============================================================================
+//  ORIGINALITY AND ATTRIBUTION
+//  Swing-high and swing-low breakouts, relative volume, and the classic
+//  candlestick reversal patterns are all public methodology. None of them are
+//  mine and I claim nothing over them. The implementation is not borrowed.
+//  Every line is written from scratch, no code in it is copied or adapted from
+//  another author's script on this platform or anywhere else, and it is not a
+//  port of any published indicator.
+//
+//  WHY THESE THINGS ARE IN ONE SCRIPT
+//  This is not a breakout tool and a pattern scanner bolted together. It has a
+//  single subject: the bar that takes out a recent high or low, and whether
+//  that bar's own behaviour supports the break or contradicts it.
+//
+//  A break is a liquidity event. Price trades through a level where resting
+//  orders sat. Two very different things produce the same closing price:
+//    - Continuation. Buyers absorbed the supply, the bar closed strong, the
+//      volume was there, and nothing in the bar's structure says rejection.
+//    - A trap. The level was taken, the orders were filled, and the same bar
+//      printed a reversal shape on thin participation.
+//  The close alone cannot distinguish them. The candle structure and the
+//  volume can, which is why they are read HERE, on this bar, rather than
+//  scanned independently across the chart.
+//
+//  So the patterns are not a separate feature. They are the quality read on
+//  the break, and a reversal pattern pointing AGAINST the break direction is
+//  the specific thing this script exists to find. Volume is shared by both
+//  halves rather than computed twice, as it was when these were separate.
+//
+//  HONEST LIMITATIONS
+//   - A failed-break reading is a description of one bar, not a forecast. Some
+//     traps resolve immediately and some run for days before they do.
+//   - Candlestick patterns are shape definitions with no universally agreed
+//     thresholds. The ones used here are stated in the description so you can
+//     check them against your own definitions rather than trust mine.
+//   - Piercing and dark cloud as implemented require a genuine gap beyond the
+//     prior bar's extreme. That is the strict definition, and it means they
+//     fire rarely on intraday charts where gaps are uncommon.
+//   - Everything confirms on bar close by default. Nothing here is intended to
+//     be read intrabar, and turning that off will make marks appear and
+//     disappear while a bar is forming.
+//   - No performance of any kind is claimed, measured or implied. There are no
+//     entries, exits, targets or stops in this script.
+// =============================================================================
+indicator("Break quality: level breaks read against candle structure", "Break quality",
+     overlay = true, max_lines_count = 100, max_labels_count = 200)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+gL = "Level detection"
+lookback   = input.int(5, "Lookback bars", minval = 2, maxval = 50, group = gL,
+     tooltip = "The high and low being watched are the highest high and lowest low of this many PRIOR bars, not including the current one.")
+confirmOnClose = input.bool(true, "Confirm on bar close", group = gL,
+     tooltip = "Strongly recommended. With this off, a break can appear and then vanish while the bar is still forming.")
+minBarsBetween = input.int(5, "Minimum bars between marked breaks", minval = 0, maxval = 100, group = gL,
+     tooltip = "A trending market takes out a new high on almost every bar. This spaces the marks out. Bar colouring is unaffected and stays continuous.")
+
+gV = "Volume"
+volLen     = input.int(20, "Volume average length", minval = 5, maxval = 200, group = gV)
+volStrong  = input.float(1.5, "Strong participation (x average)", minval = 1.0, step = 0.1, group = gV,
+     tooltip = "A break at or above this multiple of average volume is treated as participated. Below 1.0x it is treated as thin.")
+
+gP = "Candle structure read on the break bar"
+usePatterns  = input.bool(true, "Read candle structure at the break", group = gP,
+     tooltip = "Turn this off and the script becomes a plain break-and-volume tool. Nothing else changes.")
+showEngulfing   = input.bool(true, "Engulfing", group = gP)
+showHammer      = input.bool(true, "Hammer and shooting star", group = gP)
+showPiercing    = input.bool(true, "Piercing and dark cloud", group = gP)
+showHarami      = input.bool(true, "Harami", group = gP)
+showHaramiCross = input.bool(true, "Harami cross", group = gP)
+dojiRatio    = input.float(0.1, "Doji body as a fraction of range", minval = 0.01, maxval = 0.5, step = 0.01, group = gP,
+     tooltip = "Defines the doji used by the harami cross: body must be no more than this fraction of the bar's full range.")
+
+gD = "Display"
+showLines    = input.bool(true, "Draw the broken level until price returns to it", group = gD)
+showLabels   = input.bool(true, "Label breaks", group = gD)
+showLevels   = input.bool(true, "Plot the levels being watched", group = gD)
+colorBars    = input.bool(true, "Colour break bars", group = gD)
+labelSize    = input.string("small", "Label size", options = ["tiny", "small", "normal"], group = gD)
+cUp          = input.color(#26a69a, "Break up", inline = "c", group = gD)
+cDn          = input.color(#ef5350, "Break down", inline = "c", group = gD)
+cFail        = input.color(#d9a441, "Contradicted", inline = "c", group = gD)
+
+// =============================================================================
+// LEVELS
+// The highest high and lowest low of the PRIOR bars. Excluding the current bar
+// is what makes a break meaningful: otherwise the level moves with the bar
+// that is trying to break it and nothing can ever exceed it.
+// =============================================================================
+float recentHigh = ta.highest(high[1], lookback)
+float recentLow  = ta.lowest(low[1], lookback)
+
+// =============================================================================
+// BREAK DETECTION
+// =============================================================================
+bool barOk      = not confirmOnClose or barstate.isconfirmed
+bool brokeAbove = barOk and not na(recentHigh) and close > recentHigh
+bool brokeBelow = barOk and not na(recentLow) and close < recentLow
+
+// A trend sets a new high on nearly every bar. Only the FIRST break of a run
+// is treated as an event; the bar colouring below stays continuous.
+bool firstAbove = brokeAbove and not brokeAbove[1]
+bool firstBelow = brokeBelow and not brokeBelow[1]
+
+// Spacing. minBarsBetween was declared but never applied in the original.
+var int lastMarkBar = na
+bool spacedOk = na(lastMarkBar) or bar_index - lastMarkBar >= minBarsBetween
+bool markAbove = firstAbove and spacedOk
+bool markBelow = firstBelow and spacedOk
+if markAbove or markBelow
+    lastMarkBar := bar_index
+
+// =============================================================================
+// VOLUME CONTEXT
+// Shared by both halves of the script. When these were two indicators this
+// average was computed twice from the same data.
+// =============================================================================
+float avgVol   = ta.sma(volume, volLen)
+float volRatio = avgVol > 0 ? volume / avgVol : 1.0
+bool  volHeavy = volRatio >= volStrong
+bool  volThin  = volRatio < 1.0
+
+// =============================================================================
+// CANDLE STRUCTURE
+// Read on the break bar only. Every toggle above is wired: in the original
+// script all seven were declared and none were referenced.
+// =============================================================================
+float bodySize    = math.abs(open - close)
+float candleRange = high - low
+float upperWick   = high - math.max(open, close)
+float lowerWick   = math.min(open, close) - low
+float bodyPrev    = math.abs(open[1] - close[1])
+float open1       = open[1]
+float close1      = close[1]
+float high1       = high[1]
+float low1        = low[1]
+
+// Guarded: a zero-range bar would otherwise satisfy body <= 0.1 * 0 and be
+// classified as a doji.
+bool isDoji = candleRange > 0 and bodySize <= dojiRatio * candleRange
+
+bool bullEngulf = showEngulfing and close > open and close1 < open1 and bodySize > bodyPrev and open <= close1 and close >= open1
+bool bearEngulf = showEngulfing and close < open and close1 > open1 and bodySize > bodyPrev and open >= close1 and close <= open1
+
+bool isHammer       = showHammer and bodySize > 0 and lowerWick >= 2 * bodySize and upperWick <= bodySize
+bool isShootingStar = showHammer and bodySize > 0 and upperWick >= 2 * bodySize and lowerWick <= bodySize
+
+bool piercing  = showPiercing and close1 < open1 and close > open and open < low1  and close >= (open1 + close1) / 2
+bool darkCloud = showPiercing and close1 > open1 and close < open and open > high1 and close <= (open1 + close1) / 2
+
+// HARAMI, CORRECTED. The original had these reversed: its "bullish" harami
+// required a bullish prior bar with a bearish bar inside it, which is the
+// textbook BEARISH harami, and its "bearish" harami was the bullish one. Both
+// also repeated a condition twice. A bullish harami is a large DOWN bar
+// followed by a small UP bar contained within its body.
+bool bullHarami = showHarami and close1 < open1 and close > open and open > close1 and close < open1
+bool bearHarami = showHarami and close1 > open1 and close < open and open < close1 and close > open1
+
+// Same correction applied to the cross variants.
+bool bullHaramiX = showHaramiCross and close1 < open1 and isDoji and math.max(open, close) < open1 and math.min(open, close) > close1
+bool bearHaramiX = showHaramiCross and close1 > open1 and isDoji and math.max(open, close) < close1 and math.min(open, close) > open1
+
+bool bullShape = usePatterns and (bullEngulf or isHammer or piercing or bullHarami or bullHaramiX)
+bool bearShape = usePatterns and (bearEngulf or isShootingStar or darkCloud or bearHarami or bearHaramiX)
+
+f_shapeName() =>
+    string _s = ""
+    _s := bullEngulf ? "bullish engulfing" : bearEngulf ? "bearish engulfing" : isHammer ? "hammer" : isShootingStar ? "shooting star" : piercing ? "piercing" : darkCloud ? "dark cloud" : bullHarami ? "bullish harami" : bearHarami ? "bearish harami" : bullHaramiX ? "bullish harami cross" : bearHaramiX ? "bearish harami cross" : ""
+    _s
+
+// =============================================================================
+// BREAK QUALITY
+// The whole point of the script. A break with a reversal shape pointing the
+// other way is the case worth seeing.
+// =============================================================================
+// 2 supported, 1 unconfirmed, 0 contradicted
+int qualityUp = markAbove ? (bearShape ? 0 : volHeavy ? 2 : 1) : na
+int qualityDn = markBelow ? (bullShape ? 0 : volHeavy ? 2 : 1) : na
+
+bool failedUp = markAbove and bearShape
+bool failedDn = markBelow and bullShape
+
+f_qualityText(int _q) =>
+    _q == 2 ? "supported" : _q == 1 ? (volThin ? "thin" : "unconfirmed") : "contradicted"
+
+// =============================================================================
+// BROKEN LEVEL LINES
+// BUG FIX. The original created the line and then, on the SAME bar, ran its
+// revisit test. Since a break bar closes above the level but almost always has
+// its LOW below it, low <= level was true immediately and the line was deleted
+// on the bar it was drawn. The feature never appeared unless the entire bar
+// gapped past the level. The revisit test now runs only on later bars.
+// =============================================================================
+var line  hiLine  = na
+var float hiLevel = na
+var int   hiBar   = na
+var line  loLine  = na
+var float loLevel = na
+var int   loBar   = na
+
+if markAbove and showLines
+    if not na(hiLine)
+        line.delete(hiLine)
+    hiLevel := recentHigh
+    hiBar   := bar_index
+    hiLine  := line.new(bar_index, hiLevel, bar_index + 1, hiLevel, color = color.new(cUp, 30), style = line.style_dashed, width = 1)
+
+if markBelow and showLines
+    if not na(loLine)
+        line.delete(loLine)
+    loLevel := recentLow
+    loBar   := bar_index
+    loLine  := line.new(bar_index, loLevel, bar_index + 1, loLevel, color = color.new(cDn, 30), style = line.style_dashed, width = 1)
+
+if not na(hiLine) and bar_index > hiBar
+    line.set_x2(hiLine, bar_index)
+    if low <= hiLevel
+        line.delete(hiLine)
+        hiLine  := na
+        hiLevel := na
+        hiBar   := na
+
+if not na(loLine) and bar_index > loBar
+    line.set_x2(loLine, bar_index)
+    if high >= loLevel
+        line.delete(loLine)
+        loLine  := na
+        loLevel := na
+        loBar   := na
+
+// =============================================================================
+// LABELS
+// =============================================================================
+f_lblSize(string _s) =>
+    _s == "tiny" ? size.tiny : _s == "normal" ? size.normal : size.small
+
+if showLabels and (markAbove or markBelow)
+    bool   _up    = markAbove
+    int    _q     = _up ? qualityUp : qualityDn
+    string _shape = usePatterns ? f_shapeName() : ""
+    string _txt   = (_up ? "Break up" : "Break down") + ", " + f_qualityText(_q) + "\n" + str.tostring(volRatio, "#.#") + "x volume" + (_shape == "" ? "" : "\n" + _shape)
+    color  _col   = _q == 0 ? cFail : _up ? cUp : cDn
+    label.new(bar_index, _up ? low : high, _txt,
+         style = _up ? label.style_label_up : label.style_label_down,
+         color = color.new(_col, 20), textcolor = color.white, size = f_lblSize(labelSize))
+
+// =============================================================================
+// PLOTS
+// =============================================================================
+plot(showLevels ? recentHigh : na, "Recent high", color = color.new(cUp, 70), style = plot.style_circles, linewidth = 1)
+plot(showLevels ? recentLow : na, "Recent low", color = color.new(cDn, 70), style = plot.style_circles, linewidth = 1)
+
+// Bar colouring stays continuous through a run of breaks, and a contradicted
+// break takes its own colour so it is not read as a clean one.
+color _barCol = not colorBars ? na : failedUp or failedDn ? cFail : brokeAbove ? cUp : brokeBelow ? cDn : na
+barcolor(_barCol, title = "Break bars")
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(markAbove, "Break above", "Price closed above the recent high")
+alertcondition(markBelow, "Break below", "Price closed below the recent low")
+alertcondition(markAbove and qualityUp == 2, "Break above, supported", "Break above on strong volume with no contradicting candle structure")
+alertcondition(markBelow and qualityDn == 2, "Break below, supported", "Break below on strong volume with no contradicting candle structure")
+alertcondition(failedUp, "Break above, contradicted", "Break above printed a bearish reversal shape on the same bar")
+alertcondition(failedDn, "Break below, contradicted", "Break below printed a bullish reversal shape on the same bar")

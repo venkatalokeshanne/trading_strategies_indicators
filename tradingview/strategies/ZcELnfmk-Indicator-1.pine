@@ -1,0 +1,750 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════
+// NEXUS — Neural Entropic eXchange Unified Signal
+// Version: 8.0 STRATEGY | Pine Script v6 | TradingView
+// Tuned exclusively for: 1D SPOT TRADING (long only)
+// ───────────────────────────────────────────────────────────────────────
+// V8 CORE PHILOSOPHY — THE THING THAT WAS MISSING
+// ───────────────────────────────────────────────────────────────────────
+// Every version before this confused BOUNCES with BREAKS OF STRUCTURE.
+//
+// A bounce in a downtrend can score 4/7:
+//   → Entropy compresses during the downtrend (compression fires)
+//   → EMA8 crosses EMA21 upward on the bounce (phase score 2/4)
+//   → Bounce candle has large body (smart money fires)
+//   → Momentum accelerates for 2-3 bars (velAccel fires)
+//   → Result: 4/7 score, signal fires INTO A DOWNTREND
+//
+// That is not a trade. That is a trap. v7 fired into traps constantly.
+//
+// v8 SOLUTION — MARKET STRUCTURE IS THE CONSTITUTION:
+//   Before any signal can fire, the market must have structurally shifted.
+//   Break of Structure (BOS) = close above the most recent confirmed swing high
+//   Change of Character (CHoCH) = the FIRST BOS after a downtrend
+//                                  = institutional accumulation confirmed
+//   No BOS? No entry. Period. Bounce stays a bounce.
+//
+// v8 ALSO ADDS:
+//   1. Premium/Discount Zone — only buy below 50% of range (never chase)
+//   2. CHoCH scores +2 bonus — highest conviction reversal signal rewarded
+//   3. FVG-in-OB scores +1 bonus — tightest institutional precision zone
+//   4. Score upgraded 0–9 for finer resolution
+//   5. Exit fixed — no longer requires bearGeomOK (was blocking exits)
+//   6. Entropy contamination fixed — exit score uses ONLY expanding entropy
+//   7. OB requires volume confirmation on impulse candle
+//   8. Phase lock now requires close > EMA21 (dynamic support confirmed)
+// ═══════════════════════════════════════════════════════════════════════
+
+strategy("NEXUS — 1D Spot Strategy v8.0",
+         overlay            = true,
+         initial_capital    = 10000,
+         default_qty_type   = strategy.cash,
+         default_qty_value  = 10000,
+         commission_type    = strategy.commission.percent,
+         commission_value   = 0.1,
+         slippage           = 2,
+         max_bars_back      = 500,
+         calc_on_every_tick = false)
+
+// ─────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────
+g1 = "Core Signal Engine"
+entropyLen    = input.int(20,  "Entropy Window",       minval=10, maxval=50, group=g1)
+volLen        = input.int(20,  "Volume SMA Length",    minval=5,  maxval=50, group=g1)
+atrLen        = input.int(14,  "ATR Length",           minval=7,  maxval=30, group=g1)
+minConf       = input.int(5,   "Min Score (out of 9)", minval=3,  maxval=9,  group=g1,
+                           tooltip="Trending uptrend: need minConf. CHoCH mode: need minConf-1 (easier). Soft chop: +1. Default 5/9.")
+
+g2 = "Market Structure Engine (NEW v8)"
+msSwLen       = input.int(10,  "Swing Lookback (bars)",     minval=5, maxval=20, group=g2,
+                           tooltip="Left + right bars for swing high/low confirmation. 10 = meaningful daily pivots.")
+msRangeLen    = input.int(50,  "Range Len (discount zone)", minval=20, maxval=100, group=g2,
+                           tooltip="N-bar high/low range. Entry blocked above 50% midpoint (premium zone).")
+
+g3 = "EMA Phase Stack (Fibonacci)"
+ema1Len = input.int(8,   "EMA 1 fast", minval=3,  group=g3)
+ema2Len = input.int(21,  "EMA 2",      minval=10, group=g3)
+ema3Len = input.int(55,  "EMA 3",      minval=30, group=g3)
+ema4Len = input.int(144, "EMA 4 slow", minval=80, group=g3)
+
+g4 = "Choppiness Gate"
+useChop       = input.bool(true,   "Enable Choppiness Filter",  group=g4)
+chopLen       = input.int(14,    "CHOP Length",                 minval=7,  maxval=30,  group=g4)
+chopHardBlock = input.float(75.0, "Hard Block Threshold",       minval=65.0, maxval=85.0, step=0.5, group=g4)
+chopSoftWarn  = input.float(61.8, "Soft Warn Threshold",        minval=50.0, maxval=70.0, step=0.1, group=g4)
+
+g5 = "Bonus Signals"
+useSweep     = input.bool(true, "Liquidity Sweep Bonus (+1)",   group=g5)
+sweepLen     = input.int(15,   "Sweep Lookback Bars",           minval=5, maxval=30, group=g5,
+                          tooltip="Extended to 15 for 1D — 3-week swing levels are meaningful.")
+sweepAge     = input.int(4,    "Sweep Max Age (bars)",          minval=1, maxval=8,  group=g5)
+useHTF       = input.bool(true, "HTF Weekly Bias Bonus (+1)",   group=g5)
+htfTF        = input.timeframe("W", "HTF Timeframe",            group=g5)
+htfFastLen   = input.int(21,   "HTF EMA Fast",                  minval=8,  maxval=50,  group=g5)
+htfSlowLen   = input.int(55,   "HTF EMA Slow",                  minval=20, maxval=200, group=g5)
+cooldownBars = input.int(5,    "Signal Cooldown (bars)",        minval=0,  maxval=30,  group=g5)
+
+g6 = "Signal Thresholds (1D Tuned)"
+volCompressRatio = input.float(0.85, "Vol Compress Level",      minval=0.3, maxval=1.0, step=0.05, group=g6)
+volSurgeRatio    = input.float(1.40, "Vol Surge Level",         minval=1.1, maxval=3.0, step=0.1,  group=g6)
+bodyRatioThresh  = input.float(0.55, "Smart Money Body Ratio",  minval=0.4, maxval=0.9, step=0.05, group=g6)
+entropyThresh    = input.float(0.35, "Entropy Compress Level",  minval=0.1, maxval=0.5, step=0.05, group=g6)
+rsiLen           = input.int(14,   "RSI Length",                minval=7,  maxval=21,  group=g6)
+rsiOBLevel       = input.float(70.0, "RSI Overbought Block",    minval=60.0, maxval=85.0, step=1.0, group=g6,
+                                tooltip="Tightened to 70 — don't buy when momentum is extended.")
+
+g7 = "Profit Geometry Engine"
+useGeometry  = input.bool(true,   "Enable Geometry Gate",        group=g7)
+obLookback   = input.int(40,    "OB Lookback (bars)",            minval=10, maxval=60, group=g7,
+                           tooltip="Extended to 40 for 1D — 8 weeks of OB history.")
+obImpulse    = input.float(0.7,  "Impulse Threshold (ATR mult)", minval=0.3, maxval=2.0, step=0.1, group=g7)
+minRiskATR   = input.float(0.5,  "Min Risk (ATR)",               minval=0.1, maxval=1.5, step=0.1, group=g7)
+maxRiskATR   = input.float(2.0,  "Max Risk (ATR)",               minval=1.0, maxval=5.0, step=0.1, group=g7)
+tp1Multi     = input.float(2.0,  "TP1 Multiplier (R)",           minval=1.0, maxval=5.0, step=0.1, group=g7)
+tp2Multi     = input.float(3.5,  "TP2 Multiplier (R)",           minval=2.0, maxval=8.0, step=0.1, group=g7)
+obBuffer     = input.float(0.1,  "OB Stop Buffer (ATR)",         minval=0.0, maxval=0.5, step=0.05, group=g7)
+timeStop     = input.int(20,    "Time Stop (bars)",              minval=5,  maxval=50, group=g7)
+
+g8 = "Risk Management"
+riskPercent  = input.float(1.0,  "Risk Per Trade (% equity)",    minval=0.1, maxval=5.0, step=0.1, group=g8)
+
+g9 = "Visuals"
+showBands    = input.bool(true,  "Show Entropy Bands",   group=g9)
+showBgGlow   = input.bool(true,  "Show Pre-move Glow",   group=g9)
+showChopBg   = input.bool(true,  "Show CHOP Background", group=g9)
+showMSLines  = input.bool(true,  "Show Structure Lines", group=g9)
+showOB       = input.bool(true,  "Show Order Blocks",    group=g9)
+showFVG      = input.bool(true,  "Show FVG Zones",       group=g9)
+showTPLines  = input.bool(true,  "Show TP / Stop Lines", group=g9)
+showTable    = input.bool(true,  "Show Dashboard",       group=g9)
+buyColor     = input.color(#00E676, "Buy Color",         group=g9)
+exitColor    = input.color(#FF1744, "Exit Color",        group=g9)
+
+// ─────────────────────────────────────────────────────────────────────
+// BASE CALCULATIONS
+// ─────────────────────────────────────────────────────────────────────
+atr    = ta.atr(atrLen)
+volSMA = ta.sma(volume, volLen)
+rsi    = ta.rsi(close, rsiLen)
+
+// EMAs
+ema1 = ta.ema(close, ema1Len)
+ema2 = ta.ema(close, ema2Len)
+ema3 = ta.ema(close, ema3Len)
+ema4 = ta.ema(close, ema4Len)
+
+// ─────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE ENGINE — THE CONSTITUTION OF v8
+// ─────────────────────────────────────────────────────────────────────
+// Swing highs and lows confirmed with msSwLen bars on each side
+// Pine confirms the pivot msSwLen bars AFTER it occurs — no lookahead
+
+swingHighRaw = ta.pivothigh(high, msSwLen, msSwLen)
+swingLowRaw  = ta.pivotlow(low,   msSwLen, msSwLen)
+
+// Track the two most recent confirmed swing highs and lows
+var float lastSH  = na   // most recent confirmed swing high
+var float prevSH  = na   // the one before that
+var float lastSL  = na   // most recent confirmed swing low
+var float prevSL  = na   // the one before that
+
+if not na(swingHighRaw)
+    prevSH := lastSH
+    lastSH := swingHighRaw
+
+if not na(swingLowRaw)
+    prevSL := lastSL
+    lastSL := swingLowRaw
+
+// Market structure trend state
+// Uptrend   = HH (lastSH > prevSH) + HL (lastSL > prevSL)
+// Downtrend = LH (lastSH < prevSH) + LL (lastSL < prevSL)
+// Transition = mixed signals (one HH one LL, etc.)
+hhExists = not na(lastSH) and not na(prevSH) and lastSH > prevSH
+hlExists = not na(lastSL) and not na(prevSL) and lastSL > prevSL
+lhExists = not na(lastSH) and not na(prevSH) and lastSH < prevSH
+llExists = not na(lastSL) and not na(prevSL) and lastSL < prevSL
+
+msUptrend   = hhExists and hlExists    // confirmed structural uptrend
+msDowntrend = lhExists and llExists    // confirmed structural downtrend
+
+// Break of Structure detection
+// BOS_Bull: current close crosses above the most recent confirmed swing high
+// BOS_Bear: current close crosses below the most recent confirmed swing low
+// Uses [1] comparison to detect FIRST bar of the break (no persistent refire)
+bosBull = not na(lastSH) and close > lastSH and close[1] <= nz(lastSH[1], lastSH)
+bosBear = not na(lastSL) and close < lastSL and close[1] >= nz(lastSL[1], lastSL)
+
+// Trend state machine — updates on every BOS
+var int msTrend = 0  // 0=undefined, 1=uptrend, -1=downtrend
+if bosBull
+    msTrend := 1
+if bosBear
+    msTrend := -1
+
+// Change of Character — the CROWN JEWEL of v8
+// CHoCH_Bull = first bullish BOS after a confirmed downtrend
+// This is the EXACT moment institutions shift from sell to buy
+// Most powerful entry in all of market structure theory
+chochBull = bosBull and msTrend[1] == -1   // BOS up WHILE previously in downtrend
+chochBear = bosBear and msTrend[1] == 1    // BOS down WHILE previously in uptrend
+
+// Structural entry permission:
+// Either we're in an established uptrend (continuation pullback)
+// OR we're experiencing a Change of Character (reversal entry)
+structuralBullOK = msTrend == 1 or chochBull
+
+// ─────────────────────────────────────────────────────────────────────
+// PREMIUM / DISCOUNT ZONE — NO BUYING AT THE TOP
+// ─────────────────────────────────────────────────────────────────────
+// The 50% level of the current range separates discount (buy zone)
+// from premium (exit zone). Institutions accumulate at discount,
+// distribute at premium. This single gate eliminates top-chasing.
+
+rangeHigh   = ta.highest(high, msRangeLen)
+rangeLow    = ta.lowest(low,   msRangeLen)
+rangeMid    = (rangeHigh + rangeLow) / 2.0
+inDiscount  = close < rangeMid    // below midpoint = discount = buy zone
+inPremium   = close > rangeMid    // above midpoint = premium = exit zone
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL 1 — VOLATILITY ENTROPY INDEX
+// ─────────────────────────────────────────────────────────────────────
+logReturn   = math.log(close / close[1])
+absReturn   = math.abs(logReturn)
+meanAbs     = ta.sma(absReturn, entropyLen)
+stdAbs      = ta.stdev(absReturn, entropyLen)
+rawEntropy  = stdAbs / (meanAbs + 1e-10)
+loE         = ta.lowest(rawEntropy,  200)
+hiE         = ta.highest(rawEntropy, 200)
+normEntropy = (rawEntropy - loE) / (hiE - loE + 1e-10)
+
+entropyCompressed = normEntropy < entropyThresh
+entropyExpanding  = normEntropy > (1.0 - entropyThresh)
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL 2 — EMA PHASE LOCK (v8: requires close > EMA21)
+// ─────────────────────────────────────────────────────────────────────
+// v7 flaw: EMA phase could score 3/4 on a bounce because EMA8/21 react
+// fast. v8 fix: the phase lock REQUIRES close > ema2 (21 EMA) as dynamic
+// support. If price is below the 21 EMA, phase lock gives 0.
+
+bullPhaseScore = (close > ema1 ? 1 : 0) + (ema1 > ema2 ? 1 : 0) +
+                 (ema2  > ema3 ? 1 : 0) + (ema3 > ema4 ? 1 : 0)
+bearPhaseScore = (close < ema1 ? 1 : 0) + (ema1 < ema2 ? 1 : 0) +
+                 (ema2  < ema3 ? 1 : 0) + (ema3 < ema4 ? 1 : 0)
+
+bullPhaseLocked = bullPhaseScore >= 3 and close > ema2  // v8: must be above EMA21
+bearPhaseLocked = bearPhaseScore >= 3 and close < ema2
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL 3 — VOLUME RESONANCE
+// ─────────────────────────────────────────────────────────────────────
+volRatio     = volume / (volSMA + 1e-10)
+volRatioMin5 = ta.lowest(volRatio, 5)[1]
+
+volCompressed    = volRatio < volCompressRatio
+volSurge         = volRatio > volSurgeRatio and volume > volume[1] * 1.2
+volResonanceBull = volSurge and close > open and volRatioMin5 < volCompressRatio
+volResonanceBear = volSurge and close < open and volRatioMin5 < volCompressRatio
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL 4 — SMART MONEY CANDLE FOOTPRINT
+// ─────────────────────────────────────────────────────────────────────
+candleBody    = math.abs(close - open)
+candleRange   = high - low + 1e-10
+bodyRatio     = candleBody / candleRange
+closePosition = (close - low) / candleRange
+
+smartMoneyBull = bodyRatio > bodyRatioThresh and close > open and closePosition > 0.6 and volume > volSMA
+smartMoneyBear = bodyRatio > bodyRatioThresh and close < open and closePosition < 0.4 and volume > volSMA
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL 5 — MOMENTUM ACCELERATION
+// ─────────────────────────────────────────────────────────────────────
+priceVelocity = (close - close[3]) / (atr + 1e-10)
+velAccelBull  = priceVelocity > 0 and priceVelocity > priceVelocity[1] and priceVelocity[1] > priceVelocity[2]
+velAccelBear  = priceVelocity < 0 and priceVelocity < priceVelocity[1] and priceVelocity[1] < priceVelocity[2]
+
+// ─────────────────────────────────────────────────────────────────────
+// RSI GATE
+// ─────────────────────────────────────────────────────────────────────
+rsiOK = rsi < rsiOBLevel
+
+// ─────────────────────────────────────────────────────────────────────
+// CHOPPINESS INDEX — TWO-TIER GATE
+// ─────────────────────────────────────────────────────────────────────
+atrSum     = math.sum(ta.atr(1), chopLen)
+chopRange  = ta.highest(high, chopLen) - ta.lowest(low, chopLen) + 1e-10
+choppiness = 100.0 * math.log10(atrSum / chopRange) / math.log10(chopLen)
+
+isHardBlocked = useChop and choppiness > chopHardBlock
+isSoftWarn    = useChop and choppiness > chopSoftWarn and not isHardBlocked
+
+// ─────────────────────────────────────────────────────────────────────
+// BONUS SIGNAL 6 — LIQUIDITY SWEEP (+1)
+// ─────────────────────────────────────────────────────────────────────
+swingLo      = ta.lowest(low,   sweepLen)[1]
+swingHi      = ta.highest(high, sweepLen)[1]
+sweepLowMin  = ta.lowest(low,   sweepAge)
+sweepHighMax = ta.highest(high, sweepAge)
+
+bullSweepBonus = useSweep and sweepLowMin < swingLo and close > swingLo and close > open ? 1 : 0
+bearSweepBonus = useSweep and sweepHighMax > swingHi and close < swingHi and close < open ? 1 : 0
+
+// ─────────────────────────────────────────────────────────────────────
+// BONUS SIGNAL 7 — HTF WEEKLY BIAS (+1)
+// ─────────────────────────────────────────────────────────────────────
+htfFastEMA = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfFastLen), lookahead=barmerge.lookahead_off)
+htfSlowEMA = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfSlowLen), lookahead=barmerge.lookahead_off)
+
+htfBull = htfFastEMA > htfSlowEMA
+htfBear = htfFastEMA < htfSlowEMA
+
+htfBullBonus = useHTF and htfBull ? 1 : 0
+htfBearBonus = useHTF and htfBear ? 1 : 0
+
+// ─────────────────────────────────────────────────────────────────────
+// ORDER BLOCK DETECTOR — v8: REQUIRES VOLUME ON IMPULSE CANDLE
+// ─────────────────────────────────────────────────────────────────────
+// v7 flaw: OB accepted any impulse regardless of volume.
+// v8 fix: impulse candle (candle[i-1]) must have vol >= volSMA.
+// Low-volume impulse = weak institutional interest = unreliable OB.
+
+float obBullLow  = na
+float obBullHigh = na
+float obBearLow  = na
+float obBearHigh = na
+
+impulseSize = obImpulse * atr
+
+// Pre-compute volume-above-SMA as a boolean series BEFORE the loop
+// Pine v6 forbids dynamic series indexing (volSMA[i-1]) inside loops
+// volAboveSMA[i] is safe to index with a runtime variable
+volAboveSMA = volume >= volSMA
+
+for i = 2 to obLookback
+    if na(obBullLow)
+        if close[i] < open[i]
+            bullImpulseOK = (close[i-1] - open[i-1]) >= impulseSize and close[i-1] > open[i-1] and volAboveSMA[i-1]
+            if bullImpulseOK
+                obBullLow  := low[i]
+                obBullHigh := high[i]
+    if na(obBearLow)
+        if close[i] > open[i]
+            bearImpulseOK = (open[i-1] - close[i-1]) >= impulseSize and close[i-1] < open[i-1] and volAboveSMA[i-1]
+            if bearImpulseOK
+                obBearLow  := low[i]
+                obBearHigh := high[i]
+
+obBullValid = not na(obBullLow) and close > obBullLow
+obBearValid = not na(obBearLow) and close < obBearHigh
+
+// ─────────────────────────────────────────────────────────────────────
+// FAIR VALUE GAP DETECTOR
+// ─────────────────────────────────────────────────────────────────────
+bullFVG     = low > high[2] and close > open
+bearFVG     = high < low[2] and close < open
+bullFVGTop  = bullFVG ? low     : na
+bullFVGBot  = bullFVG ? high[2] : na
+bearFVGTop  = bearFVG ? low[2]  : na
+bearFVGBot  = bearFVG ? high    : na
+bullFVGinOB = bullFVG and obBullValid and bullFVGBot >= obBullLow and bullFVGBot <= obBullHigh
+bearFVGinOB = bearFVG and obBearValid and bearFVGTop >= obBearLow and bearFVGTop <= obBearHigh
+
+// ─────────────────────────────────────────────────────────────────────
+// PROFIT GEOMETRY GATE
+// ─────────────────────────────────────────────────────────────────────
+bullStopPrice = obBullValid ? obBullLow  - (obBuffer * atr) : na
+bearStopPrice = obBearValid ? obBearHigh + (obBuffer * atr) : na
+
+bullRisk    = obBullValid ? close - bullStopPrice : 0.0
+bearRisk    = obBearValid ? bearStopPrice - close : 0.0
+bullRiskATR = atr > 0 ? bullRisk / atr : 0.0
+bearRiskATR = atr > 0 ? bearRisk / atr : 0.0
+
+bullTP1     = obBullValid ? close + (bullRisk * tp1Multi) : na
+bullTP2     = obBullValid ? close + (bullRisk * tp2Multi) : na
+bearTP1     = obBearValid ? close - (bearRisk * tp1Multi) : na
+bearTP2     = obBearValid ? close - (bearRisk * tp2Multi) : na
+
+bullRROK    = obBullValid and bullRiskATR >= minRiskATR and bullRiskATR <= maxRiskATR
+bullGeomOK  = useGeometry ? bullRROK : true
+
+// ─────────────────────────────────────────────────────────────────────
+// COMPOSITE BUY SCORE 0–9
+// ─────────────────────────────────────────────────────────────────────
+// 5 core + 2 structural bonuses + 2 precision bonuses
+bc1 = entropyCompressed ? 1 : 0           // pre-move coil
+bc2 = bullPhaseLocked   ? 1 : 0           // EMA stack aligned + above EMA21
+bc3 = (volCompressed or volResonanceBull) ? 1 : 0  // volume coil/surge
+bc4 = smartMoneyBull    ? 1 : 0           // institutional candle
+bc5 = velAccelBull      ? 1 : 0           // momentum accelerating
+
+b_sweep  = bullSweepBonus                 // +1 liquidity sweep
+b_htf    = htfBullBonus                   // +1 weekly trend aligned
+b_choch  = chochBull ? 2 : 0             // +2 CHoCH — highest conviction
+b_fvgOB  = bullFVGinOB ? 1 : 0          // +1 FVG inside OB — tightest zone
+
+buyScore = bc1 + bc2 + bc3 + bc4 + bc5 + b_sweep + b_htf + b_choch + b_fvgOB
+
+// ─────────────────────────────────────────────────────────────────────
+// EXIT SCORE 0–5 (v8 fix: ONLY uses entropyExpanding, not compressed)
+// ─────────────────────────────────────────────────────────────────────
+// v7 flaw: sc1 = entropyCompressed OR entropyExpanding — contaminated
+// Compressed entropy means anticipation of EITHER direction
+// Exit score should only count EXHAUSTION signals (expanding entropy)
+
+es1 = entropyExpanding  ? 1 : 0          // FIXED: expanding only
+es2 = bearPhaseLocked   ? 1 : 0
+es3 = (volCompressed or volResonanceBear) ? 1 : 0
+es4 = smartMoneyBear    ? 1 : 0
+es5 = velAccelBear      ? 1 : 0
+exitScore = es1 + es2 + es3 + es4 + es5
+
+// ─────────────────────────────────────────────────────────────────────
+// DYNAMIC THRESHOLD
+// CHoCH mode is given -1 on threshold (already scored +2 from b_choch)
+// Soft chop mode adds +1 (harder to reach in transitional market)
+// ─────────────────────────────────────────────────────────────────────
+chochMode       = chochBull and not msUptrend
+baseThr         = chochMode ? minConf - 1 : minConf
+effectiveThresh = isSoftWarn ? baseThr + 1 : baseThr
+
+// ─────────────────────────────────────────────────────────────────────
+// MASTER ENTRY GATE — ALL LAYERS MUST PASS
+// ─────────────────────────────────────────────────────────────────────
+// The complete list of what must be true to enter a trade:
+//   1. Score >= effectiveThresh (signal confluence)
+//   2. Score crossed threshold (new signal, not persistent)
+//   3. NOT hard chop blocked
+//   4. Structural permission: in uptrend OR Change of Character
+//   5. Price in discount zone (below 50% of range — no premium buying)
+//   6. Valid OB with correct ATR-based geometry
+//   7. RSI not overbought
+//   8. Cooldown cleared (5 days since last signal)
+//   9. No existing position
+
+var int  lastSignalBar = 0
+cooldownOK = (bar_index - lastSignalBar) >= cooldownBars
+
+buyRaw     = buyScore >= effectiveThresh
+buyTrigger = buyScore >= effectiveThresh and buyScore[1] < effectiveThresh
+
+buySignal = buyTrigger
+          and not isHardBlocked
+          and structuralBullOK
+          and inDiscount
+          and bullGeomOK
+          and rsiOK
+          and cooldownOK
+          and strategy.position_size == 0
+
+// ─────────────────────────────────────────────────────────────────────
+// EXIT CONDITIONS — v8 fix: removed bearGeomOK requirement
+// ─────────────────────────────────────────────────────────────────────
+// v7 flaw: exitSignal required bearGeomOK = valid bear OB with ATR risk
+// This is wrong — to exit a LONG we don't need a bear OB to exist
+// We just need confluence that the move is done:
+//   A. Exit score reaches threshold (bearish confluence)
+//   B. CHoCH_Bear fires (structure has broken down — GET OUT NOW)
+//   C. Price is in premium zone AND a bearish smart money bar appears
+
+exitByScore  = exitScore >= 3 and strategy.position_size > 0
+exitByCHoCH  = chochBear and strategy.position_size > 0
+exitByPremium = inPremium and smartMoneyBear and strategy.position_size > 0
+
+exitSignal = exitByScore or exitByCHoCH or exitByPremium
+
+// ─────────────────────────────────────────────────────────────────────
+// POSITION STATE MACHINE
+// ─────────────────────────────────────────────────────────────────────
+var float activeStop  = na
+var float activeTP1   = na
+var float activeTP2   = na
+var float activeEntry = na
+var bool  tp1Filled   = false
+var int   entryBar    = 0
+
+if buySignal
+    lastSignalBar := bar_index
+
+calcQty(float stopDist) =>
+    riskAmt = strategy.equity * (riskPercent / 100.0)
+    stopDist > 0 ? riskAmt / stopDist : 0.0
+
+// ─────────────────────────────────────────────────────────────────────
+// ENTRY EXECUTION
+// ─────────────────────────────────────────────────────────────────────
+if buySignal
+    activeStop  := bullStopPrice
+    activeTP1   := bullTP1
+    activeTP2   := bullTP2
+    activeEntry := close
+    tp1Filled   := false
+    entryBar    := bar_index
+    posQty = calcQty(bullRisk)
+    if posQty > 0
+        entryComment = chochBull ? "CHoCH " + str.tostring(buyScore) + "/9" : "BOS " + str.tostring(buyScore) + "/9"
+        strategy.entry("Long", strategy.long, qty=posQty, comment=entryComment)
+        strategy.exit("SL",  from_entry="Long", stop=activeStop,  comment="OB Stop")
+        strategy.exit("TP1", from_entry="Long", qty_percent=50, limit=activeTP1, comment="TP1 2R")
+        strategy.exit("TP2", from_entry="Long", limit=activeTP2, comment="TP2 3.5R")
+
+// ─────────────────────────────────────────────────────────────────────
+// BREAKEVEN MANAGEMENT — move stop after TP1
+// ─────────────────────────────────────────────────────────────────────
+if strategy.position_size > 0 and not tp1Filled and not na(activeTP1)
+    if high >= activeTP1
+        tp1Filled := true
+        strategy.cancel("SL")
+        strategy.cancel("TP2")
+        strategy.exit("BE_TP2", from_entry="Long",
+                      limit=activeTP2, stop=activeEntry,
+                      comment="TP2 / BE")
+
+// ─────────────────────────────────────────────────────────────────────
+// EXIT EXECUTION
+// ─────────────────────────────────────────────────────────────────────
+if exitSignal
+    exitReason = exitByCHoCH ? "CHoCH Bear" : exitByPremium ? "Premium Exit" : "Exit Score"
+    strategy.close("Long", comment=exitReason)
+
+// Time stop — close dead trades
+barsHeld = strategy.position_size > 0 ? bar_index - entryBar : 0
+if strategy.position_size > 0 and barsHeld >= timeStop and not tp1Filled
+    strategy.close("Long", comment="Time Stop " + str.tostring(timeStop) + "d")
+
+// ─────────────────────────────────────────────────────────────────────
+// ENTROPY-WEIGHTED DYNAMIC BANDS
+// ─────────────────────────────────────────────────────────────────────
+emaBase     = ta.ema(close, ema2Len)
+entropyMult = 0.5 + normEntropy * 2.0
+bandWidth   = atr * entropyMult
+upperBand   = emaBase + bandWidth
+lowerBand   = emaBase - bandWidth
+
+p_upper = plot(showBands ? upperBand : na, "Upper Band", color.new(color.blue, 75), linewidth=1)
+p_lower = plot(showBands ? lowerBand : na, "Lower Band", color.new(color.blue, 75), linewidth=1)
+fill(p_upper, p_lower, color.new(color.blue, 90))
+plot(emaBase, "EMA21 Base", color.new(color.gray, 60), linewidth=1)
+
+// ─────────────────────────────────────────────────────────────────────
+// MARKET STRUCTURE VISUALS
+// ─────────────────────────────────────────────────────────────────────
+// Last swing high and low as horizontal reference lines
+// BOS and CHoCH marked on chart
+
+var array<line> msLines = array.new<line>()
+
+if showMSLines and not na(swingHighRaw)
+    if msLines.size() >= 10
+        line.delete(msLines.shift())
+    shCol = msUptrend ? color.new(color.green, 60) : color.new(color.red, 60)
+    msLines.push(line.new(bar_index - msSwLen, swingHighRaw, bar_index + 15, swingHighRaw,
+                          color=shCol, width=1, style=line.style_dotted))
+
+if showMSLines and not na(swingLowRaw)
+    if msLines.size() >= 10
+        line.delete(msLines.shift())
+    slCol = msUptrend ? color.new(color.green, 60) : color.new(color.red, 60)
+    msLines.push(line.new(bar_index - msSwLen, swingLowRaw, bar_index + 15, swingLowRaw,
+                          color=slCol, width=1, style=line.style_dotted))
+
+// Discount zone midline
+plot(showMSLines ? rangeMid : na, "Discount/Premium Mid", color.new(color.yellow, 60), linewidth=1, style=plot.style_stepline)
+
+// BOS label on chart
+plotshape(showMSLines and bosBull and not chochBull, title="BOS", style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 40), size=size.tiny, text="BOS")
+plotshape(showMSLines and chochBull,                 title="CHoCH", style=shape.labelup,    location=location.belowbar, color=color.new(#FFD700, 20),   size=size.small, text="CHoCH", textcolor=color.black)
+plotshape(showMSLines and bosBear,                   title="BOS DN", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 40),  size=size.tiny, text="BOS")
+
+// ─────────────────────────────────────────────────────────────────────
+// ORDER BLOCK BOXES
+// ─────────────────────────────────────────────────────────────────────
+var array<box> obBoxes = array.new<box>()
+
+if showOB and barstate.islast
+    for b in obBoxes
+        box.delete(b)
+    obBoxes.clear()
+    if obBullValid
+        obBoxes.push(box.new(bar_index - obLookback, obBullHigh, bar_index + 10, obBullLow,
+                             border_color=color.new(#00E676, 40), border_width=1,
+                             bgcolor=color.new(#00E676, 88), border_style=line.style_dashed))
+    if obBearValid
+        obBoxes.push(box.new(bar_index - obLookback, obBearHigh, bar_index + 10, obBearLow,
+                             border_color=color.new(#FF1744, 40), border_width=1,
+                             bgcolor=color.new(#FF1744, 88), border_style=line.style_dashed))
+
+// ─────────────────────────────────────────────────────────────────────
+// FVG BOXES
+// ─────────────────────────────────────────────────────────────────────
+var array<box> fvgBoxes = array.new<box>()
+
+if showFVG and bullFVG
+    if fvgBoxes.size() >= 6
+        box.delete(fvgBoxes.shift())
+    fvgBoxes.push(box.new(bar_index - 2, bullFVGTop, bar_index + 8, bullFVGBot,
+                          border_color=color.new(color.teal, 50), border_width=1,
+                          bgcolor=color.new(color.teal, 85)))
+
+if showFVG and bearFVG
+    if fvgBoxes.size() >= 6
+        box.delete(fvgBoxes.shift())
+    fvgBoxes.push(box.new(bar_index - 2, bearFVGTop, bar_index + 8, bearFVGBot,
+                          border_color=color.new(color.orange, 50), border_width=1,
+                          bgcolor=color.new(color.orange, 85)))
+
+// ─────────────────────────────────────────────────────────────────────
+// TP / STOP LINES
+// ─────────────────────────────────────────────────────────────────────
+var array<line> tpLines = array.new<line>()
+
+if showTPLines and buySignal and not na(bullStopPrice) and not na(bullTP1) and not na(bullTP2)
+    if tpLines.size() >= 16
+        for i = 1 to 4
+            line.delete(tpLines.shift())
+    ext = bar_index + 30
+    tpLines.push(line.new(bar_index, bullStopPrice, ext, bullStopPrice, color=color.new(color.red,   20), width=1, style=line.style_dashed))
+    tpLines.push(line.new(bar_index, bullTP1,       ext, bullTP1,       color=color.new(color.green, 20), width=1, style=line.style_dashed))
+    tpLines.push(line.new(bar_index, bullTP2,       ext, bullTP2,       color=color.new(color.teal,  20), width=2, style=line.style_dashed))
+    tpLines.push(line.new(bar_index, close,         ext, close,         color=color.new(color.white, 40), width=1, style=line.style_dotted))
+
+// ─────────────────────────────────────────────────────────────────────
+// BACKGROUNDS
+// ─────────────────────────────────────────────────────────────────────
+preMove = entropyCompressed and volCompressed and not isHardBlocked and structuralBullOK
+bgcolor(showChopBg and isHardBlocked ? color.new(color.red,    93) : na, title="Hard Chop Block")
+bgcolor(showChopBg and isSoftWarn    ? color.new(color.orange, 96) : na, title="Soft Chop Warn")
+bgcolor(showBgGlow and preMove       ? color.new(color.yellow, 93) : na, title="Pre-move Setup")
+bgcolor(showMSLines and msDowntrend and not isHardBlocked ? color.new(#440000, 97) : na, title="Structural Downtrend")
+
+// ─────────────────────────────────────────────────────────────────────
+// SIGNAL SHAPES
+// ─────────────────────────────────────────────────────────────────────
+plotshape(buySignal and chochBull,      title="CHoCH BUY", style=shape.labelup, location=location.belowbar,
+          color=#FFD700, size=size.normal, text="CHoCH BUY", textcolor=color.black)
+plotshape(buySignal and not chochBull,  title="BUY",       style=shape.labelup, location=location.belowbar,
+          color=buyColor, size=size.normal, text="BUY",     textcolor=color.black)
+plotshape(exitSignal, title="EXIT", style=shape.labeldown, location=location.abovebar,
+          color=exitColor, size=size.normal, text="EXIT",   textcolor=color.white)
+
+barcolor(buySignal  ? color.new(buyColor,  70) : na)
+barcolor(exitSignal ? color.new(exitColor, 70) : na)
+
+// ─────────────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 3, 20,
+     bgcolor=color.new(#0d0d0d, 40),
+     border_color=color.new(color.gray, 55), border_width=1,
+     frame_color=color.new(color.gray, 40), frame_width=2)
+
+f_row(int row, string icon, string label, string val, color valCol) =>
+    table.cell(dash, 0, row, icon,  text_color=valCol,                       text_size=size.small,
+               bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_center, width=3)
+    table.cell(dash, 1, row, label, text_color=color.new(color.silver, 0),   text_size=size.small,
+               bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_left,   width=11)
+    table.cell(dash, 2, row, val,   text_color=valCol,                       text_size=size.small,
+               bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_right,  width=11)
+
+f_div(int row, string label) =>
+    table.cell(dash, 0, row, label, text_color=color.new(color.gray, 30), text_size=size.tiny, bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_center)
+    table.cell(dash, 1, row, "",    text_color=color.gray,               text_size=size.tiny, bgcolor=color.new(#0d0d0d, 40))
+    table.cell(dash, 2, row, "",    text_color=color.gray,               text_size=size.tiny, bgcolor=color.new(#0d0d0d, 40))
+
+if showTable and barstate.islast
+    inTrade   = strategy.position_size > 0
+    isCHoCH   = chochBull
+    headerBg  = isHardBlocked ? color.new(color.red, 30) : buySignal and isCHoCH ? color.new(#FFD700, 25) : buySignal ? color.new(#00E676, 30) : inTrade ? color.new(#001a00, 30) : color.new(#1a1aff, 40)
+    headerTxt = isHardBlocked ? "BLOCKED" : buySignal and isCHoCH ? "CHoCH FIRED" : buySignal ? "BUY FIRED" : exitSignal ? "EXIT" : inTrade ? (tp1Filled ? "IN TRADE BE" : "IN TRADE") : msDowntrend ? "DOWNTREND" : preMove ? "SETUP" : "WATCHING"
+    headerCol = isHardBlocked ? color.red : buySignal and isCHoCH ? #FFD700 : buySignal ? buyColor : exitSignal ? exitColor : inTrade ? color.green : msDowntrend ? color.red : preMove ? color.yellow : color.white
+    table.cell(dash, 0, 0, "NEXUS  v8  1D", text_color=color.white, text_size=size.normal, bgcolor=headerBg, text_halign=text.align_center)
+    table.cell(dash, 1, 0, "",              text_color=color.white, text_size=size.normal, bgcolor=headerBg, text_halign=text.align_center)
+    table.cell(dash, 2, 0, headerTxt,       text_color=headerCol,  text_size=size.normal, bgcolor=headerBg, text_halign=text.align_center)
+
+    // Structure section
+    f_div(1, "market structure")
+
+    msCol  = msUptrend ? color.green : msDowntrend ? color.red : color.gray
+    msIcon = msUptrend ? "▲" : msDowntrend ? "▼" : "~"
+    msVal  = msUptrend ? "uptrend (HH+HL)" : msDowntrend ? "downtrend (LH+LL)" : "transition"
+    f_row(2, msIcon, "Structure", msVal, msCol)
+
+    bosCol  = chochBull ? #FFD700 : bosBull ? color.green : bosBear ? color.red : color.gray
+    bosIcon = chochBull ? "!" : bosBull ? "+" : bosBear ? "-" : "○"
+    bosVal  = chochBull ? "CHoCH  REVERSAL" : bosBull ? "BOS up" : bosBear ? "BOS down" : "none"
+    f_row(3, bosIcon, "BOS / CHoCH", bosVal, bosCol)
+
+    discCol  = inDiscount ? color.green : color.red
+    discIcon = inDiscount ? "✔" : "✖"
+    discVal  = inDiscount ? "discount (buy ok)" : "PREMIUM (blocked)"
+    f_row(4, discIcon, "Zone", discVal, discCol)
+
+    chopCol  = isHardBlocked ? color.red : isSoftWarn ? color.orange : color.green
+    chopIcon = isHardBlocked ? "✖" : isSoftWarn ? "~" : "✔"
+    chopMode = isHardBlocked ? "hard block" : isSoftWarn ? "strict +1" : "trending"
+    f_row(5, chopIcon, "CHOP " + str.tostring(math.round(choppiness, 1)), chopMode, chopCol)
+
+    rsiCol  = rsiOK ? color.green : color.red
+    rsiIcon = rsiOK ? "✔" : "✖"
+    f_row(6, rsiIcon, "RSI " + str.tostring(math.round(rsi, 1)), rsiOK ? "ok" : "BLOCKED >" + str.tostring(rsiOBLevel), rsiCol)
+
+    htfCol  = htfBull ? color.green : htfBear ? color.red : color.gray
+    htfIcon = htfBull ? "+" : htfBear ? "-" : "○"
+    htfVal  = htfBull ? "wkly bull +1" : htfBear ? "wkly bear  0" : "flat  0"
+    f_row(7, htfIcon, "HTF", htfVal, htfCol)
+
+    // Signal section
+    f_div(8, "signal score 0-9")
+
+    eCol  = entropyCompressed ? color.yellow : color.gray
+    f_row(9,  entropyCompressed ? "+" : "○", "Entropy",    entropyCompressed ? "compressed +1" : "neutral   +0", eCol)
+    pCol  = bullPhaseLocked ? color.green : color.gray
+    f_row(10, bullPhaseLocked ? "+" : "○", "Phase+EMA21", bullPhaseLocked ? str.tostring(bullPhaseScore) + "/4 +1" : "no   +0", pCol)
+    vCol  = volResonanceBull ? #00E676 : volCompressed ? color.yellow : color.gray
+    f_row(11, volResonanceBull or volCompressed ? "+" : "○", "Volume", volResonanceBull ? "launch +1" : volCompressed ? "coiling +1" : "normal  +0", vCol)
+    smCol = smartMoneyBull ? color.green : color.gray
+    f_row(12, smartMoneyBull ? "+" : "○", "Smart $", smartMoneyBull ? "bull bar +1" : "none     +0", smCol)
+    mCol  = velAccelBull ? color.green : color.gray
+    f_row(13, velAccelBull ? "+" : "○", "Momentum", velAccelBull ? "accel +1" : "flat  +0", mCol)
+    swCol = bullSweepBonus > 0 ? color.green : color.gray
+    f_row(14, bullSweepBonus > 0 ? "+" : "○", "Sweep", bullSweepBonus > 0 ? "hunt +1" : "none  +0", swCol)
+    chochScoreCol = chochBull ? #FFD700 : color.gray
+    f_row(15, chochBull ? "!" : "○", "CHoCH", chochBull ? "reversal +2" : "none    +0", chochScoreCol)
+    fvgCol = bullFVGinOB ? color.green : color.gray
+    f_row(16, bullFVGinOB ? "+" : "○", "FVG in OB", bullFVGinOB ? "PRIME +1" : "none    +0", fvgCol)
+
+    // Score bar
+    f_div(17, "score")
+    bBar = ""
+    for i = 1 to 9
+        bBar := bBar + (i <= buyScore ? "█" : "░")
+    bScoreCol = buyScore >= effectiveThresh ? buyColor : color.gray
+    bLabel = "B:" + str.tostring(buyScore) + "/9  need " + str.tostring(effectiveThresh)
+    eLabel = "E:" + str.tostring(exitScore) + "/5"
+    table.cell(dash, 0, 18, bBar,   text_color=bScoreCol, text_size=size.small, bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_center)
+    table.cell(dash, 1, 18, bLabel, text_color=bScoreCol, text_size=size.small, bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_left)
+    table.cell(dash, 2, 18, eLabel, text_color=exitScore >= 3 ? exitColor : color.gray, text_size=size.small, bgcolor=color.new(#0d0d0d, 40), text_halign=text.align_right)
+
+    // Active trade
+    if inTrade and not na(activeTP1)
+        dispCol  = tp1Filled ? #00FFFF : color.green
+        slDisp   = na(activeStop) ? "—" : str.tostring(math.round(activeStop, 2))
+        tp1Disp  = str.tostring(math.round(activeTP1, 2))
+        tp2Disp  = str.tostring(math.round(activeTP2, 2))
+        beLabel  = tp1Filled ? "BE stop" : "SL " + slDisp
+        table.cell(dash, 0, 19, "T",    text_color=dispCol, text_size=size.small, bgcolor=color.new(#001a00, 60), text_halign=text.align_center)
+        table.cell(dash, 1, 19, beLabel, text_color=dispCol, text_size=size.small, bgcolor=color.new(#001a00, 60), text_halign=text.align_left)
+        table.cell(dash, 2, 19, "T1:" + tp1Disp + " T2:" + tp2Disp, text_color=dispCol, text_size=size.small, bgcolor=color.new(#001a00, 60), text_halign=text.align_right)
+
+// ─────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────
+alertcondition(buySignal and chochBull, "NEXUS CHoCH BUY", "NEXUS v8 CHoCH: Structural reversal + full confluence. Highest conviction entry.")
+alertcondition(buySignal and not chochBull, "NEXUS BOS BUY", "NEXUS v8 BOS Continuation: Uptrend pullback entry confirmed.")
+alertcondition(exitSignal,              "NEXUS EXIT",     "NEXUS v8: Exit signal. Close long position.")
+alertcondition(chochBull,              "NEXUS CHoCH",    "NEXUS v8: Change of Character detected. Watch for entry setup.")
+alertcondition(not isHardBlocked and isHardBlocked[1], "NEXUS TREND BACK", "NEXUS v8: Chop cleared.")

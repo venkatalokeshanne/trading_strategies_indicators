@@ -1,0 +1,586 @@
+//@version=6
+indicator("Smart Zones & ORB Breakout Engine", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ==========================================
+// ─── HELPER FUNCTIONS & TYPES ─────────────
+// ==========================================
+f_style(s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+f_pad(x) => (x < 10 ? "0" : "") + str.tostring(x)
+
+f_buildSess(string choice, int h, int m) =>
+    int mins = choice == "15 min" ? 15 : choice == "30 min" ? 30 : 60
+    int startTot = h * 60 + m
+    int endTot   = startTot + mins
+    int eH       = int(math.floor(endTot / 60)) % 24
+    int eM       = endTot % 60
+    f_pad(h) + f_pad(m) + "-" + f_pad(eH) + f_pad(eM)
+
+// --- Smart Zone Types ---
+type Zone
+    float top
+    float bottom
+    box   drawBox
+    int   touches
+    int   reversals
+    bool  isCurrentlyInside
+
+// --- Trading Session Types ---
+type SessionDisplay
+    box   sessionBox
+    label sessionLabel
+    line  openLine
+    line  avgLine
+    line  closeLine
+    float sumClose
+    int   numOfBars
+
+type SessionInfo
+    color  color
+    string name
+    string session
+    string timezone
+    SessionDisplay active = na
+
+// --- ORB State Engine Type ---
+type ORB_State
+    bool   enabled
+    string sessionStr
+    string sigSessStr
+    string cutoffSessStr
+    string tz
+    color  c_orb
+    int    tp_ticks      = 0
+    int    sl_ticks      = 0
+    
+    float  orbHigh   = na
+    float  orbLow    = na
+    bool   orbReady  = false
+    bool   buyFired  = false
+    bool   sellFired = false
+    int    bo_state  = 0
+    bool   just_broke_out = false
+    
+    box    bg_box = na
+    line   l_h = na
+    line   l_m = na
+    line   l_l = na
+    
+    bool   buySig  = false
+    bool   sellSig = false
+    bool   just_closed = false
+    
+    // Trade Tracking
+    int    trade_dir = 0
+    float  trade_tp  = na
+    float  trade_sl  = na
+    box    box_tp    = na
+    box    box_sl    = na
+    line   line_tp   = na
+    line   line_sl   = na
+    label  lbl_tp    = na
+    label  lbl_sl    = na
+
+// ==========================================
+// ─── INPUTS & TOGGLES (SECTIONS) ──────────
+// ==========================================
+
+// --- Section 1: Smart Zones ---
+grp_z_main  = "1. Smart Zones: Master Toggle"
+show_zones  = input.bool(true, "Enable Smart Zones", group=grp_z_main)
+
+grp1 = "1a. Zone Detection & Cleanup"
+pivotLen    = input.int(60, "Major Pivot Lookback", group=grp1, tooltip="Optimized for 5m charts. Higher = fewer zones.")
+zoneWidth   = input.float(0.15, "Zone Merge Radius (%)", step=0.01, group=grp1) / 100
+approachPct = input.float(0.08, "Approach Warning Distance (%)", step=0.01, group=grp1) / 100
+maxZones    = input.int(10, "Max Active Zones", group=grp1)
+
+grp2 = "1b. Smart Zone Colors"
+colNormal   = input.color(color.new(color.gray, 85), "Dormant", group=grp2)
+colApproach = input.color(color.new(color.yellow, 70), "Approaching Warning", group=grp2)
+colRevHigh  = input.color(color.new(color.red, 60), "Inside: High Rev Prob (Bounce)", group=grp2)
+colBreakHigh= input.color(color.new(color.green, 60), "Inside: Low Rev Prob (Break)", group=grp2)
+
+// --- Section 2: Moving Averages & VWAP ---
+g_ema = "2. Moving Averages & VWAP"
+show_vwap = input.bool(true, title="Show VWAP", inline="vwap", group=g_ema)
+col_vwap  = input.color(color.new(color.yellow, 0), title="Color", inline="vwap", group=g_ema)
+
+show_ema1 = input.bool(true, title="Show EMA 1", inline="e1", group=g_ema)
+len1      = input.int(9, title="Len", inline="e1", group=g_ema)
+col_ema1  = input.color(color.blue, title="Col", inline="e1", group=g_ema)
+
+show_ema2 = input.bool(true, title="Show EMA 2", inline="e2", group=g_ema)
+len2      = input.int(21, title="Len", inline="e2", group=g_ema)
+col_ema2  = input.color(color.orange, title="Col", inline="e2", group=g_ema)
+
+show_ema3 = input.bool(true, title="Show EMA 3", inline="e3", group=g_ema)
+len3      = input.int(50, title="Len", inline="e3", group=g_ema)
+col_ema3  = input.color(color.green, title="Col", inline="e3", group=g_ema)
+
+show_ema4 = input.bool(true, title="Show EMA 4", inline="e4", group=g_ema)
+len4      = input.int(200, title="Len", inline="e4", group=g_ema)
+col_ema4  = input.color(color.red, title="Col", inline="e4", group=g_ema)
+
+// --- Section 3: ORB Engine & Breakouts ---
+g_orb_main = "3. ORB Engine: Master Toggle"
+show_orb_engine = input.bool(true, "Enable ORB Engine", group=g_orb_main)
+
+g_o1 = "3a. ORB 1 Setup (New York)"
+orb1_en     = input.bool(true, "Enable ORB 1", group=g_o1)
+orb1_len    = input.string("15 min", "Length", options=["15 min","30 min","1 hour"], group=g_o1)
+orb1_h      = input.int(9, "Start Hour", group=g_o1)
+orb1_m      = input.int(30, "Start Min", group=g_o1)
+orb1_tz     = input.string("America/New_York", "Timezone", group=g_o1)
+orb1_sig    = input.session("0930-1400", "Signal Trading Window", group=g_o1)
+orb1_cutoff = input.session("0930-1640", "Max Hold Window (Auto-Close)", group=g_o1)
+orb1_tp     = input.int(600, "Take Profit (Ticks)", group=g_o1)
+orb1_sl     = input.int(250, "Stop Loss (Ticks)", group=g_o1)
+
+g_o2 = "3b. ORB 2 Setup (Tokyo)"
+orb2_en     = input.bool(true, "Enable ORB 2", group=g_o2)
+orb2_len    = input.string("15 min", "Length", options=["15 min","30 min","1 hour"], group=g_o2)
+orb2_h      = input.int(9, "Start Hour", group=g_o2)
+orb2_m      = input.int(0, "Start Min", group=g_o2)
+orb2_tz     = input.string("Asia/Tokyo", "Timezone", group=g_o2)
+orb2_sig    = input.session("0900-1500", "Signal Trading Window", group=g_o2)
+orb2_cutoff = input.session("0900-1500", "Max Hold Window (Auto-Close)", group=g_o2)
+orb2_tp     = input.int(250, "Take Profit (Ticks)", group=g_o2)
+orb2_sl     = input.int(125, "Stop Loss (Ticks)", group=g_o2)
+
+g2 = "3c. Breakout Signals & Triggers"
+show_signals= input.bool(true, title="Show Breakout Signals", group=g2)
+signalStyle = input.string("Triangles", title="Signal Visual Style", options=["Triangles", "Text Only"], group=g2)
+breakChoice = input.string("Close", title="Breakout Trigger", options=["Close","Wick (High/Low)"], group=g2)
+confirmType = input.string("Strict Retest (3-Candle)", title="Confirmation Mode", options=["Immediate", "Strict Retest (3-Candle)"], group=g2)
+retestTol   = input.float(0.05, title="Retest Tolerance (%)", step=0.01, group=g2, tooltip="How close price must pull back to the ORB line to count as a retest.") / 100
+oncePerDay  = input.bool(true, title="One signal per direction per day", group=g2)
+
+g4 = "3d. Visuals & Colors (Global ORB)"
+show_orb_l   = input.bool(true, title="Show ORB Lines", group=g4)
+shadeORB     = input.bool(true, title="Shade opening-range window", group=g4)
+sty_orb      = input.string("Solid", title="ORB Line Style", options=["Solid", "Dashed", "Dotted"], group=g4)
+col_buy      = input.color(color.new(color.green, 0), title="BUY Signal Color", group=g4)
+col_sell     = input.color(color.new(color.red, 0), title="SELL Signal Color", group=g4)
+
+// --- Section 4: Trading Sessions ---
+g_sess_main = "4. Trading Sessions: Master Toggle"
+show_sessions_engine = input.bool(true, "Enable Trading Sessions Engine", group=g_sess_main)
+
+showSessionNames     = input.bool(true, "Show session names", group=g_sess_main)
+showSessionOC        = input.bool(true, "Draw session open and close lines", group=g_sess_main)
+showSessionTickRange = input.bool(true, "Show tick range for each session", group=g_sess_main)
+showSessionAverage   = input.bool(true, "Show average price per session", group=g_sess_main)
+
+const string TZ_TOOLTIP_TEXT = "The session's time zone, specified in either GMT notation (e.g., 'GMT-5') or as an IANA time zone database name (e.g., 'America/New_York'). We recommend the latter since it includes other time-related changes, such as daylight savings."
+
+const string FIRST_SESSION_GROUP = "4a. First Session (Tokyo)"
+showFirst         = input.bool(true, "Show session", group = FIRST_SESSION_GROUP, inline="fs1")
+firstSessionName  = input.string("Tokyo", "", group = FIRST_SESSION_GROUP, inline="fs1")
+firstSessionTime  = input.session("0900-1500", "Session time", group = FIRST_SESSION_GROUP)
+firstSessionTZ    = input.string("Asia/Tokyo", "Session timezone", group = FIRST_SESSION_GROUP, tooltip = TZ_TOOLTIP_TEXT)
+firstSessionColor = input.color(color.new(#2962FF, 85), "Session color", group = FIRST_SESSION_GROUP)
+
+const string SECOND_SESSION_GROUP = "4b. Second session (New York)"
+showSecond         = input.bool(true, "Show session", group = SECOND_SESSION_GROUP, inline="ss1")
+secondSessionName  = input.string("New York", "", group = SECOND_SESSION_GROUP, inline="ss1")
+secondSessionTime  = input.session("0930-1600", "Session time", group = SECOND_SESSION_GROUP)
+secondSessionTZ    = input.string("America/New_York", "Session timezone", group = SECOND_SESSION_GROUP, tooltip = TZ_TOOLTIP_TEXT)
+secondSessionColor = input.color(color.new(#089981, 85), "Session color", group = SECOND_SESSION_GROUP)
+
+
+// ==========================================
+// ─── DATA FETCHING (STANDARD CANDLES ONLY) 
+// ==========================================
+r_o = open
+r_h = high
+r_l = low
+r_c = close
+r_vwap = ta.vwap((r_h + r_l + r_c) / 3)
+
+
+// ==========================================
+// ─── METHODS FOR TRADING SESSIONS ─────────
+// ==========================================
+
+method setName(SessionDisplay this, string name) =>
+    sessionLabel = this.sessionLabel
+    sessionBox = this.sessionBox
+    boxText = array.new<string>()
+    if showSessionTickRange
+        boxText.push("Range: " + str.tostring((sessionBox.get_top() - sessionBox.get_bottom()) / syminfo.mintick, format.mintick))
+    if showSessionAverage
+        boxText.push("Avg: " + str.tostring(this.sumClose / this.numOfBars, format.mintick))
+    if showSessionNames
+        boxText.push(name)
+    
+    sessionLabel.set_y(sessionBox.get_bottom())
+    sessionLabel.set_text(array.join(boxText, "\n"))
+
+method createSessionDisplay(SessionInfo this, float o, float h, float l, float c) =>
+    boxColor = this.color
+    opaqueColor = color.new(boxColor, 0)
+    dis = SessionDisplay.new(
+      sessionBox = box.new(bar_index, h, bar_index, l, bgcolor = boxColor, border_color = na),
+      sessionLabel = label.new(bar_index, l, "", style = label.style_label_upper_left, textalign = text.align_left, textcolor = opaqueColor, color = color(na)),
+      openLine   = showSessionOC ? line.new(bar_index, o, bar_index, o, color = opaqueColor, style = line.style_dashed, width = 1) : na,
+      closeLine  = showSessionOC ? line.new(bar_index, c, bar_index, c, color = opaqueColor, style = line.style_dashed, width = 1) : na,
+      avgLine    = showSessionAverage ? line.new(bar_index, c, bar_index, c, style = line.style_dotted, width = 2, color = opaqueColor) : na,
+      sumClose   = c,
+      numOfBars  = 1
+      )
+    if showSessionOC
+        linefill.new(dis.openLine, dis.closeLine, boxColor)
+    dis.setName(this.name)
+    this.active := dis
+    
+method updateSessionDisplay(SessionInfo this, float h, float l, float c) =>
+    sessionDisp = this.active
+    sessionBox = sessionDisp.sessionBox
+    openLine = sessionDisp.openLine
+    closeLine = sessionDisp.closeLine
+    avgLine = sessionDisp.avgLine
+    sessionDisp.sumClose += c
+    sessionDisp.numOfBars += 1
+
+    sessionBox.set_top(math.max(sessionBox.get_top(), h))
+    sessionBox.set_bottom(math.min(sessionBox.get_bottom(), l))
+    sessionBox.set_right(bar_index)
+    sessionDisp.setName(this.name)
+
+    if showSessionOC
+        openLine.set_x2(bar_index)
+        closeLine.set_x2(bar_index)
+        closeLine.set_y1(c)
+        closeLine.set_y2(c)
+
+    if showSessionAverage
+        avgLine.set_x2(bar_index)
+        avg = sessionDisp.sumClose / sessionDisp.numOfBars
+        avgLine.set_y1(avg)
+        avgLine.set_y2(avg)
+    sessionDisp
+
+method update(SessionInfo this, float o, float h, float l, float c) =>
+    bool isChange = timeframe.change("1D")
+    if (not na(time("", this.session, this.timezone))) 
+        if na(this.active) or isChange
+            this.createSessionDisplay(o, h, l, c)
+        else 
+            this.updateSessionDisplay(h, l, c)
+    else if not na(this.active)
+        this.active := na
+
+getSessionInfos()=>
+    array<SessionInfo> infos = array.new<SessionInfo>()
+    if showFirst
+        infos.push(SessionInfo.new(firstSessionColor, firstSessionName, firstSessionTime, firstSessionTZ))
+    if showSecond
+        infos.push(SessionInfo.new(secondSessionColor, secondSessionName, secondSessionTime, secondSessionTZ))
+    infos
+
+
+// ==========================================
+// ─── EXECUTION & ENGINE LOGIC ─────────────
+// ==========================================
+
+// --- Memory Management ---
+var all_lines  = array.new_line()
+var all_labels = array.new_label()
+var all_boxes  = array.new_box()
+
+if ta.change(time("W")) != 0
+    while array.size(all_lines) > 0
+        line.delete(array.pop(all_lines))
+    while array.size(all_labels) > 0
+        label.delete(array.pop(all_labels))
+    while array.size(all_boxes) > 0
+        box.delete(array.pop(all_boxes))
+
+// --- 2. EMAs & VWAP ---
+plot(show_vwap ? r_vwap : na, title="VWAP", color=col_vwap, linewidth=2)
+plot(show_ema1 ? ta.ema(r_c, len1) : na, title="[EMA] 1", color=col_ema1, linewidth=2)
+plot(show_ema2 ? ta.ema(r_c, len2) : na, title="[EMA] 2", color=col_ema2, linewidth=2)
+plot(show_ema3 ? ta.ema(r_c, len3) : na, title="[EMA] 3", color=col_ema3, linewidth=2)
+plot(show_ema4 ? ta.ema(r_c, len4) : na, title="[EMA] 4", color=col_ema4, linewidth=3)
+
+
+// --- 1. Smart Zones ---
+var array<Zone> activeZones = array.new<Zone>()
+float ph = ta.pivothigh(r_h, pivotLen, pivotLen)
+float pl = ta.pivotlow(r_l, pivotLen, pivotLen)
+
+f_createZone(float priceLevel) =>
+    float top = priceLevel * (1 + (zoneWidth / 2))
+    float bot = priceLevel * (1 - (zoneWidth / 2))
+    
+    bool zoneExists = false
+    if array.size(activeZones) > 0
+        for z in activeZones
+            float midPoint = (z.top + z.bottom) / 2
+            if math.abs(priceLevel - midPoint) <= (priceLevel * zoneWidth)
+                zoneExists := true
+                break
+                
+    if not zoneExists
+        b = box.new(left=bar_index - pivotLen, top=top, bottom=bot, right=bar_index,
+             bgcolor=colNormal, border_color=color.new(color.white, 80), 
+             text="New", text_color=color.new(color.white, 30), text_size=size.small, text_halign=text.align_right)
+        
+        newZone = Zone.new(top, bot, b, 0, 0, false)
+        array.push(activeZones, newZone)
+        
+        if array.size(activeZones) > maxZones
+            Zone oldZone = array.shift(activeZones)
+            box.delete(oldZone.drawBox)
+
+if show_zones
+    if not na(ph)
+        f_createZone(ph)
+    if not na(pl)
+        f_createZone(pl)
+
+    if array.size(activeZones) > 0
+        for i = array.size(activeZones) - 1 to 0
+            Zone z = array.get(activeZones, i)
+            box.set_right(z.drawBox, bar_index + 5)
+
+            bool isInside       = r_c <= z.top and r_c >= z.bottom
+            bool approachingTop = r_c > z.top and r_c <= z.top * (1 + approachPct)
+            bool approachingBot = r_c < z.bottom and r_c >= z.bottom * (1 - approachPct)
+            bool isApproaching  = approachingTop or approachingBot
+
+            if isInside and not z.isCurrentlyInside
+                z.touches += 1
+                z.isCurrentlyInside := true
+            else if not isInside and z.isCurrentlyInside
+                z.isCurrentlyInside := false
+                if (r_c > z.top and r_l[1] >= z.bottom) or (r_c < z.bottom and r_h[1] <= z.top)
+                    z.reversals += 1
+
+            float prob = z.touches == 0 ? 50 : (z.reversals / z.touches) * 100
+
+            if isInside
+                color smartInsideCol = prob >= 50 ? colRevHigh : colBreakHigh
+                box.set_bgcolor(z.drawBox, smartInsideCol)
+                box.set_border_color(z.drawBox, color.new(color.white, 30))
+            else if isApproaching
+                box.set_bgcolor(z.drawBox, colApproach)
+                box.set_border_color(z.drawBox, color.new(color.yellow, 30))
+            else
+                box.set_bgcolor(z.drawBox, colNormal)
+                box.set_border_color(z.drawBox, color.new(color.white, 80))
+
+            if z.touches > 0
+                string statText = str.tostring(prob, "#") + "% Rev (" + str.tostring(z.touches) + " Touches)"
+                box.set_text(z.drawBox, statText)
+                box.set_text_color(z.drawBox, color.new(color.white, 30))
+            else
+                box.set_text(z.drawBox, "")
+
+
+// --- 3. GLOBAL ORB ENGINE (MULTI-SESSION) ---
+method execute(ORB_State this, float _o, float _h, float _l, float _c) =>
+    if this.enabled
+        inORB         = not na(time(timeframe.period, this.sessionStr, this.tz))
+        inSignalSess  = not na(time(timeframe.period, this.sigSessStr, this.tz))
+        inHoldSess    = not na(time(timeframe.period, this.cutoffSessStr, this.tz))
+        newORB        = inORB and not inORB[1]
+        orbEnded      = not inORB and inORB[1]
+        
+        this.buySig      := false
+        this.sellSig     := false
+        this.just_closed := false
+        
+        // Dynamic Risk/Reward Extension Engine & Time Cutoff
+        if this.trade_dir != 0
+            bool hit_tp   = (this.trade_dir == 1 and _h >= this.trade_tp) or (this.trade_dir == -1 and _l <= this.trade_tp)
+            bool hit_sl   = (this.trade_dir == 1 and _l <= this.trade_sl) or (this.trade_dir == -1 and _h >= this.trade_sl)
+            bool hit_time = not inHoldSess
+            
+            // Only extend visuals if the auto-close time hasn't been triggered
+            if not hit_time
+                box.set_right(this.box_tp, bar_index)
+                box.set_right(this.box_sl, bar_index)
+                line.set_x2(this.line_tp, bar_index)
+                line.set_x2(this.line_sl, bar_index)
+                label.set_x(this.lbl_tp, bar_index)
+                label.set_x(this.lbl_sl, bar_index)
+            
+            // Force close trade if TP, SL, or max hold time is hit
+            if hit_tp or hit_sl or hit_time
+                this.trade_dir   := 0
+                this.just_closed := true
+        
+        if newORB
+            this.orbHigh   := _h
+            this.orbLow    := _l
+            this.orbReady  := false
+            this.buyFired  := false
+            this.sellFired := false
+            this.bo_state  := 0
+            this.just_broke_out := false
+            this.trade_dir := 0 
+            
+            if shadeORB
+                this.bg_box := box.new(left=time, top=_h, right=time, bottom=_l, xloc=xloc.bar_time, border_color=na, bgcolor=color.new(color.blue, 90))
+                
+        else if inORB
+            this.orbHigh := math.max(nz(this.orbHigh, _h), _h)
+            this.orbLow  := math.min(nz(this.orbLow, _l), _l)
+            if shadeORB
+                box.set_right(this.bg_box, time)
+                box.set_top(this.bg_box, this.orbHigh)
+                box.set_bottom(this.bg_box, this.orbLow)
+                
+        if orbEnded
+            this.orbReady := true
+            mid_orb = (this.orbHigh + this.orbLow) / 2
+    
+            if show_orb_l
+                this.l_h := line.new(time, this.orbHigh, time, this.orbHigh, xloc.bar_time, color=this.c_orb, width=2, style=f_style(sty_orb))
+                this.l_l := line.new(time, this.orbLow, time, this.orbLow, xloc.bar_time, color=this.c_orb, width=2, style=f_style(sty_orb))
+                this.l_m := line.new(time, mid_orb, time, mid_orb, xloc.bar_time, color=this.c_orb, width=1, style=line.style_dotted)
+    
+        disp_lines = inHoldSess   and this.orbReady
+        can_signal = inSignalSess and this.orbReady
+        
+        if disp_lines
+            if show_orb_l
+                line.set_x2(this.l_h, time)
+                line.set_x2(this.l_l, time)
+                line.set_x2(this.l_m, time)
+    
+        useClose = breakChoice == "Close"
+        upSrc = useClose ? _c : _h
+        dnSrc = useClose ? _c : _l
+    
+        // --- State Invalidation ---
+        if this.bo_state > 0 and _c < this.orbHigh
+            this.bo_state := 0
+        if this.bo_state < 0 and _c > this.orbLow
+            this.bo_state := 0
+            
+        // --- Custom Logic: Green Candle Invalidation ---
+        if this.just_broke_out
+            if _c > _o 
+                this.bo_state := 0
+            this.just_broke_out := false
+    
+        // --- Evaluation Parameters ---
+        bool is_breakout_up = ta.crossover(upSrc, this.orbHigh)
+        bool is_breakout_dn = ta.crossunder(dnSrc, this.orbLow)
+        bool is_touch_up    = _l <= (this.orbHigh * (1 + retestTol))
+        bool is_touch_dn    = _h >= (this.orbLow * (1 - retestTol))
+        bool is_confirm_up  = _c > _o and _c > this.orbHigh
+        bool is_confirm_dn  = _c < _o and _c < this.orbLow
+    
+        bool ret_buy  = false
+        bool ret_sell = false
+    
+        // Engine state progresses only if lines are active
+        if disp_lines
+            if this.bo_state == 0
+                if is_breakout_up
+                    this.bo_state := 1
+                    this.just_broke_out := true
+                else if is_breakout_dn
+                    this.bo_state := -1
+                    this.just_broke_out := true
+                    
+            else if this.bo_state == 1
+                if is_touch_up
+                    this.bo_state := 2 
+            else if this.bo_state == -1
+                if is_touch_dn
+                    this.bo_state := -2 
+                    
+            else if this.bo_state == 2
+                if is_confirm_up
+                    ret_buy := true
+                    this.bo_state := 3 
+            else if this.bo_state == -2
+                if is_confirm_dn
+                    ret_sell := true
+                    this.bo_state := -3 
+    
+        // Trigger condition restricted specifically to the 'can_signal' window
+        bool _rawBuy  = confirmType == "Immediate" ? (can_signal and is_breakout_up) : (can_signal and ret_buy)
+        bool _rawSell = confirmType == "Immediate" ? (can_signal and is_breakout_dn) : (can_signal and ret_sell)
+    
+        this.buySig  := _rawBuy  and (not oncePerDay or not this.buyFired)
+        this.sellSig := _rawSell and (not oncePerDay or not this.sellFired)
+    
+        // Buy Label Execution
+        if this.buySig and show_signals
+            this.buyFired := true
+            b_style  = signalStyle == "Triangles" ? label.style_label_up : label.style_none
+            b_color  = signalStyle == "Triangles" ? col_buy : color.new(color.white, 100)
+            b_tcolor = signalStyle == "Triangles" ? color.white : col_buy
+            label.new(time, na, text="BUY", xloc=xloc.bar_time, yloc=yloc.belowbar, color=b_color, textcolor=b_tcolor, style=b_style, size=size.small)
+            
+            if this.tp_ticks > 0 and this.sl_ticks > 0
+                this.trade_dir := 1
+                this.trade_tp  := _c + (this.tp_ticks * syminfo.mintick)
+                this.trade_sl  := _c - (this.sl_ticks * syminfo.mintick)
+                
+                this.box_tp  := box.new(left=bar_index, top=this.trade_tp, right=bar_index, bottom=_c, bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_dashed)
+                this.box_sl  := box.new(left=bar_index, top=_c, right=bar_index, bottom=this.trade_sl, bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_dashed)
+                this.line_tp := line.new(bar_index, this.trade_tp, bar_index, this.trade_tp, color=color.green, width=2)
+                this.line_sl := line.new(bar_index, this.trade_sl, bar_index, this.trade_sl, color=color.red, width=2)
+                this.lbl_tp  := label.new(bar_index, this.trade_tp, "TP", color=color.new(color.green, 100), textcolor=color.green, style=label.style_label_left, size=size.small)
+                this.lbl_sl  := label.new(bar_index, this.trade_sl, "SL", color=color.new(color.red, 100), textcolor=color.red, style=label.style_label_left, size=size.small)
+    
+        // Sell Label Execution
+        if this.sellSig and show_signals
+            this.sellFired := true
+            s_style  = signalStyle == "Triangles" ? label.style_label_down : label.style_none
+            s_color  = signalStyle == "Triangles" ? col_sell : color.new(color.white, 100)
+            s_tcolor = signalStyle == "Triangles" ? color.white : col_sell
+            label.new(time, na, text="SELL", xloc=xloc.bar_time, yloc=yloc.abovebar, color=s_color, textcolor=s_tcolor, style=s_style, size=size.small)
+
+            if this.tp_ticks > 0 and this.sl_ticks > 0
+                this.trade_dir := -1
+                this.trade_tp  := _c - (this.tp_ticks * syminfo.mintick)
+                this.trade_sl  := _c + (this.sl_ticks * syminfo.mintick)
+                
+                this.box_tp  := box.new(left=bar_index, top=_c, right=bar_index, bottom=this.trade_tp, bgcolor=color.new(color.green, 85), border_color=color.green, border_style=line.style_dashed)
+                this.box_sl  := box.new(left=bar_index, top=this.trade_sl, right=bar_index, bottom=_c, bgcolor=color.new(color.red, 85), border_color=color.red, border_style=line.style_dashed)
+                this.line_tp := line.new(bar_index, this.trade_tp, bar_index, this.trade_tp, color=color.green, width=2)
+                this.line_sl := line.new(bar_index, this.trade_sl, bar_index, this.trade_sl, color=color.red, width=2)
+                this.lbl_tp  := label.new(bar_index, this.trade_tp, "TP", color=color.new(color.green, 100), textcolor=color.green, style=label.style_label_left, size=size.small)
+                this.lbl_sl  := label.new(bar_index, this.trade_sl, "SL", color=color.new(color.red, 100), textcolor=color.red, style=label.style_label_left, size=size.small)
+
+// Hardcoded NY / Tokyo ORB configurations
+var orb1 = ORB_State.new(enabled=orb1_en, sessionStr=f_buildSess(orb1_len, orb1_h, orb1_m), sigSessStr=orb1_sig, cutoffSessStr=orb1_cutoff, tz=orb1_tz, c_orb=color.aqua,   tp_ticks=orb1_tp, sl_ticks=orb1_sl)
+var orb2 = ORB_State.new(enabled=orb2_en, sessionStr=f_buildSess(orb2_len, orb2_h, orb2_m), sigSessStr=orb2_sig, cutoffSessStr=orb2_cutoff, tz=orb2_tz, c_orb=color.purple, tp_ticks=orb2_tp, sl_ticks=orb2_sl)
+
+bool globalBuySig    = false
+bool globalSellSig   = false
+bool globalJustClose = false
+
+if show_orb_engine
+    orb1.execute(r_o, r_h, r_l, r_c)
+    orb2.execute(r_o, r_h, r_l, r_c)
+    
+    globalBuySig    := orb1.buySig  or orb2.buySig 
+    globalSellSig   := orb1.sellSig or orb2.sellSig 
+    globalJustClose := orb1.just_closed or orb2.just_closed
+
+// Override Candle Colors based on Entry/Exit Triggers (using hex #FF69B4 for Hot Pink)
+barcolor(globalBuySig or globalSellSig ? color.new(#FF69B4, 0) : globalJustClose ? color.blue : na)
+
+// --- Alerts ---
+alertcondition(globalBuySig,  title="ORB Breakout BUY",   message="ORB breakout long")
+alertcondition(globalSellSig, title="ORB Breakdown SELL", message="ORB breakout short")
+
+// --- 4. Trading Sessions Execution ---
+var array<SessionInfo> sessionInfos = getSessionInfos()
+
+if show_sessions_engine
+    if timeframe.isdwm
+        runtime.error("The Trading Sessions engine can only be used on intraday timeframes.")
+    
+    for info in sessionInfos
+        info.update(r_o, r_h, r_l, r_c)

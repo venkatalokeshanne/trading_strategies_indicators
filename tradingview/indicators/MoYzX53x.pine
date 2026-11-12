@@ -1,0 +1,249 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════
+//  PIVOT MATRIX + Dashboard   |   Version 1.3   |   2026-08-13
+//  13 ระดับ : S3 MS3 S2 MS2 S1 MS1 PIVOT MR1 R1 MR2 R2 MR3 R3
+//  สถิติ "แตะ%" และ "ไปต่อ%" คำนวณจากข้อมูลจริงบนกราฟที่เปิดอยู่
+//  v1.2 : แก้ "ไปต่อ%" ให้เป็นความน่าจะเป็นแบบมีเงื่อนไขจริง (ไม่เกิน 100%)
+//  v1.3 : เพิ่มคอลัมน์ราคาทองไทย = USD/oz × 0.4729 × USDTHB
+// ═══════════════════════════════════════════════════════════════════
+indicator("Pivot Matrix + Dashboard", shorttitle="PIVOT MATRIX", overlay=true, max_labels_count=100, max_lines_count=100)
+
+// ─────────────────────────── ① ตั้งค่าหลัก ──────────────────────────
+gM = "① ตั้งค่าหลัก"
+pTF     = input.timeframe("D", "รอบของ Pivot (D=วัน W=สัปดาห์ M=เดือน)", group = gM)
+pType   = input.string("Classic", "สูตร", options = ["Classic", "Fibonacci"], group = gM)
+showMid = input.bool(true, "แสดงเส้นกึ่งกลาง MR / MS", group = gM)
+maxP    = input.int(250, "จำนวนรอบย้อนหลังที่ใช้ทำสถิติ", minval = 20, maxval = 1000, group = gM)
+
+// ─────────────────────────── ② เส้นและป้าย ──────────────────────────
+gL = "② เส้นและป้าย"
+showLine  = input.bool(true, "วาดเส้นบนกราฟ", group = gL)
+showLabel = input.bool(true, "แสดงป้ายชื่อระดับ", group = gL)
+colR      = input.color(#FF1744, "สีแนวต้าน", group = gL, inline = "c1")
+colS      = input.color(#00C853, "สีแนวรับ", group = gL, inline = "c1")
+colP      = input.color(#FFC107, "สี Pivot", group = gL, inline = "c1")
+midTrans  = input.int(45, "ความจางของเส้นกึ่งกลาง", minval = 0, maxval = 90, group = gL)
+
+// ──────────────────────────── ③ ทองไทย ──────────────────────────────
+gT = "③ ราคาทองไทย (บาททองคำ)"
+showThai = input.bool(true, "แสดงคอลัมน์ทองไทย", group = gT)
+fxSym    = input.symbol("FX_IDC:USDTHB", "สัญลักษณ์อัตราแลกเปลี่ยน USDTHB", group = gT)
+thaiK    = input.float(0.4729, "ตัวคูณ (บาททองคำ ÷ ออนซ์ × 96.5%)", minval = 0.1, maxval = 1.0, step = 0.0001, group = gT)
+thaiRnd  = input.int(50, "ปัดเศษเป็นหลัก (0 = ไม่ปัด)", minval = 0, maxval = 100, step = 10, group = gT)
+colThai  = input.color(#FFB300, "สีคอลัมน์ทองไทย", group = gT)
+
+// ──────────────────────────── ④ Dashboard ───────────────────────────
+gD = "③ Dashboard"
+showDB    = input.bool(true, "แสดง Dashboard", group = gD)
+dbPosStr  = input.string("บนขวา", "ตำแหน่ง", options = ["บนซ้าย", "บนขวา", "ล่างซ้าย", "ล่างขวา"], group = gD)
+dbSizeStr = input.string("เล็ก", "ขนาดตัวอักษร", options = ["จิ๋ว", "เล็ก", "ปกติ"], group = gD)
+showStat  = input.bool(true, "แสดงคอลัมน์สถิติ", group = gD)
+
+// ─────────────────── ตัวแปรเก็บสถานะข้ามแท่ง ────────────────────────
+var array<float>  lv   = array.new_float(13, na)
+var array<int>    cnt  = array.new_int(13, 0)
+var matrix<int>   hist = matrix.new<int>(0, 13, 0)
+var array<label>  labs = array.new_label()
+var float curH = na
+var float curL = na
+var array<string> nm = array.from("S3", "MS3", "S2", "MS2", "S1", "MS1", "PIVOT", "MR1", "R1", "MR2", "R2", "MR3", "R3")
+
+bool newP = ta.change(time(pTF)) != 0
+
+// ────────────────────────── ตรรกะหลักต่อแท่ง ────────────────────────
+if newP
+    // ---- ขั้นที่ 1 : ปิดบัญชีสถิติของรอบที่เพิ่งจบ ----
+    if not na(curH) and not na(array.get(lv, 6))
+        array<int> row = array.new_int(13, 0)
+        for i = 0 to 12
+            float L = array.get(lv, i)
+            bool tch = i > 6 ? curH >= L : i < 6 ? curL <= L : (curH >= L and curL <= L)
+            array.set(row, i, tch ? 1 : 0)
+            array.set(cnt, i, array.get(cnt, i) + (tch ? 1 : 0))
+        matrix.add_row(hist, matrix.rows(hist), row)
+        if matrix.rows(hist) > maxP
+            for i = 0 to 12
+                array.set(cnt, i, array.get(cnt, i) - matrix.get(hist, 0, i))
+            matrix.remove_row(hist, 0)
+
+    // ---- ขั้นที่ 2 : คำนวณระดับใหม่จาก HLC ของรอบที่เพิ่งจบ ----
+    if not na(curH)
+        float H = curH
+        float L2 = curL
+        float C = close[1]
+        float P = (H + L2 + C) / 3
+        float RG = H - L2
+        float r1 = pType == "Classic" ? 2 * P - L2 : P + 0.382 * RG
+        float s1 = pType == "Classic" ? 2 * P - H  : P - 0.382 * RG
+        float r2 = pType == "Classic" ? P + RG     : P + 0.618 * RG
+        float s2 = pType == "Classic" ? P - RG     : P - 0.618 * RG
+        float r3 = pType == "Classic" ? H + 2 * (P - L2) : P + RG
+        float s3 = pType == "Classic" ? L2 - 2 * (H - P) : P - RG
+        array.set(lv, 0,  s3)
+        array.set(lv, 1,  (s3 + s2) / 2)
+        array.set(lv, 2,  s2)
+        array.set(lv, 3,  (s2 + s1) / 2)
+        array.set(lv, 4,  s1)
+        array.set(lv, 5,  (s1 + P) / 2)
+        array.set(lv, 6,  P)
+        array.set(lv, 7,  (P + r1) / 2)
+        array.set(lv, 8,  r1)
+        array.set(lv, 9,  (r1 + r2) / 2)
+        array.set(lv, 10, r2)
+        array.set(lv, 11, (r2 + r3) / 2)
+        array.set(lv, 12, r3)
+
+    // ---- ขั้นที่ 3 : เริ่มนับ High/Low ของรอบใหม่ ----
+    curH := high
+    curL := low
+else
+    curH := math.max(nz(curH, high), high)
+    curL := math.min(nz(curL, low), low)
+
+// ─────────────────── ดึงค่าออกมาเป็นตัวแปรเพื่อวาดเส้น ───────────────
+bool drawOK = showLine
+float vS3  = drawOK ? array.get(lv, 0)  : na
+float vMS3 = drawOK ? array.get(lv, 1)  : na
+float vS2  = drawOK ? array.get(lv, 2)  : na
+float vMS2 = drawOK ? array.get(lv, 3)  : na
+float vS1  = drawOK ? array.get(lv, 4)  : na
+float vMS1 = drawOK ? array.get(lv, 5)  : na
+float vP   = drawOK ? array.get(lv, 6)  : na
+float vMR1 = drawOK ? array.get(lv, 7)  : na
+float vR1  = drawOK ? array.get(lv, 8)  : na
+float vMR2 = drawOK ? array.get(lv, 9)  : na
+float vR2  = drawOK ? array.get(lv, 10) : na
+float vMR3 = drawOK ? array.get(lv, 11) : na
+float vR3  = drawOK ? array.get(lv, 12) : na
+
+colMidR = color.new(colR, midTrans)
+colMidS = color.new(colS, midTrans)
+
+plot(vR3,  "R3",  color = colR, style = plot.style_linebr, linewidth = 2)
+plot(showMid ? vMR3 : na, "MR3", color = colMidR, style = plot.style_linebr, linewidth = 1)
+plot(vR2,  "R2",  color = colR, style = plot.style_linebr, linewidth = 2)
+plot(showMid ? vMR2 : na, "MR2", color = colMidR, style = plot.style_linebr, linewidth = 1)
+plot(vR1,  "R1",  color = colR, style = plot.style_linebr, linewidth = 2)
+plot(showMid ? vMR1 : na, "MR1", color = colMidR, style = plot.style_linebr, linewidth = 1)
+plot(vP,   "PIVOT", color = colP, style = plot.style_linebr, linewidth = 3)
+plot(showMid ? vMS1 : na, "MS1", color = colMidS, style = plot.style_linebr, linewidth = 1)
+plot(vS1,  "S1",  color = colS, style = plot.style_linebr, linewidth = 2)
+plot(showMid ? vMS2 : na, "MS2", color = colMidS, style = plot.style_linebr, linewidth = 1)
+plot(vS2,  "S2",  color = colS, style = plot.style_linebr, linewidth = 2)
+plot(showMid ? vMS3 : na, "MS3", color = colMidS, style = plot.style_linebr, linewidth = 1)
+plot(vS3,  "S3",  color = colS, style = plot.style_linebr, linewidth = 2)
+
+// ─────────────────────────── ป้ายชื่อระดับ ──────────────────────────
+if barstate.islast and showLabel
+    if array.size(labs) > 0
+        for i = 0 to array.size(labs) - 1
+            label.delete(array.get(labs, i))
+        array.clear(labs)
+    for i = 0 to 12
+        float L = array.get(lv, i)
+        bool isMid = i == 1 or i == 3 or i == 5 or i == 7 or i == 9 or i == 11
+        if not na(L) and (showMid or not isMid)
+            color lc = i > 6 ? (isMid ? colMidR : colR) : i < 6 ? (isMid ? colMidS : colS) : colP
+            array.push(labs, label.new(bar_index + 5, L, array.get(nm, i) + "  " + str.tostring(L, format.mintick), color = lc, textcolor = #FFFFFF, style = label.style_label_left, size = size.small))
+
+// ──────────────────────────── สัญญาณเตือน ───────────────────────────
+alertcondition(ta.cross(close, array.get(lv, 6)),  "ราคาตัด PIVOT", "ราคา {{ticker}} ตัดผ่านเส้น Pivot")
+alertcondition(ta.crossover(close, array.get(lv, 8)),  "ทะลุ R1 ขึ้น", "ราคา {{ticker}} ทะลุ R1 ขึ้นไป")
+alertcondition(ta.crossunder(close, array.get(lv, 4)), "หลุด S1 ลง",  "ราคา {{ticker}} หลุด S1 ลงมา")
+
+// ───────────────── อัตราแลกเปลี่ยน + ฟังก์ชันแปลงทองไทย ─────────────
+float usdthb = request.security(fxSym, timeframe.period, close, ignore_invalid_symbol = true)
+
+f_thai(float usdOz) =>
+    float v = na(usdOz) or na(usdthb) ? na : usdOz * thaiK * usdthb
+    float o = na(v) ? na : thaiRnd > 0 ? math.round(v / thaiRnd) * thaiRnd : v
+    o
+
+f_thaiStr(float usdOz) =>
+    float v = f_thai(usdOz)
+    na(v) ? "-" : str.tostring(v, thaiRnd > 0 ? "#,###" : "#,###.##")
+
+// ──────────────────────────── DASHBOARD ────────────────────────────
+dbPos = dbPosStr == "บนซ้าย" ? position.top_left : dbPosStr == "บนขวา" ? position.top_right : dbPosStr == "ล่างซ้าย" ? position.bottom_left : position.bottom_right
+dbSize = dbSizeStr == "จิ๋ว" ? size.tiny : dbSizeStr == "เล็ก" ? size.small : size.normal
+
+var table db = table.new(position.top_right, 5, 17, border_width = 1, border_color = color.new(#546E7A, 40))
+
+// ดัชนีคอลัมน์ : เลื่อนอัตโนมัติเมื่อเปิด/ปิดคอลัมน์ทองไทย
+int cLv = 0
+int cPr = 1
+int cTh = showThai ? 2 : -1
+int cA  = showThai ? 3 : 2
+int cB  = showThai ? 4 : 3
+
+if showDB and barstate.islast
+    table.clear(db, 0, 0, 4, 16)
+    table.set_position(db, dbPos)
+    table.set_bgcolor(db, color.new(#000000, 8))
+
+    int total = matrix.rows(hist)
+
+    // ---- แถวหัวข้อ ----
+    table.cell(db, cLv, 0, "ระดับ", text_color = #ECEFF1, text_size = dbSize, bgcolor = color.new(#37474F, 0))
+    table.cell(db, cPr, 0, "USD/oz", text_color = #ECEFF1, text_size = dbSize, bgcolor = color.new(#37474F, 0))
+    if showThai
+        table.cell(db, cTh, 0, "ทองไทย", text_color = colThai, text_size = dbSize, bgcolor = color.new(#37474F, 0))
+    table.cell(db, cA, 0, showStat ? "แตะ%" : "ห่าง%", text_color = #ECEFF1, text_size = dbSize, bgcolor = color.new(#37474F, 0))
+    table.cell(db, cB, 0, showStat ? "ไปต่อ%" : "", text_color = #ECEFF1, text_size = dbSize, bgcolor = color.new(#37474F, 0))
+
+    // ---- 13 ระดับ เรียงจากบนลงล่าง ----
+    for k = 0 to 12
+        int i = 12 - k
+        int r = k + 1
+        float L = array.get(lv, i)
+        bool isMid = i == 1 or i == 3 or i == 5 or i == 7 or i == 9 or i == 11
+        color lc = i > 6 ? colR : i < 6 ? colS : colP
+        color tc = isMid ? color.new(lc, 30) : lc
+        color bg = i == 6 ? color.new(#37474F, 20) : color.new(#000000, 100)
+        table.cell(db, cLv, r, array.get(nm, i), text_color = tc, text_size = dbSize, bgcolor = bg, text_halign = text.align_left)
+        table.cell(db, cPr, r, na(L) ? "-" : str.tostring(L, format.mintick), text_color = tc, text_size = dbSize, bgcolor = bg, text_halign = text.align_right)
+        if showThai
+            table.cell(db, cTh, r, f_thaiStr(L), text_color = isMid ? color.new(colThai, 30) : colThai, text_size = dbSize, bgcolor = bg, text_halign = text.align_right)
+        if showStat
+            float tp = total == 0 ? na : array.get(cnt, i) / total * 100
+            int inner = i > 6 ? i - 1 : i < 6 ? i + 1 : -1
+            float cp = na
+            if inner >= 0 and total > 0 and array.get(cnt, inner) > 0
+                int joint = 0
+                for q = 0 to total - 1
+                    if matrix.get(hist, q, i) == 1 and matrix.get(hist, q, inner) == 1
+                        joint := joint + 1
+                cp := joint / array.get(cnt, inner) * 100
+            table.cell(db, cA, r, na(tp) ? "-" : str.tostring(tp, "#.#") + "%", text_color = tc, text_size = dbSize, bgcolor = bg, text_halign = text.align_right)
+            table.cell(db, cB, r, na(cp) ? "-" : str.tostring(cp, "#.#") + "%", text_color = #B0BEC5, text_size = dbSize, bgcolor = bg, text_halign = text.align_right)
+        else
+            float dp = na(L) ? na : (close - L) / L * 100
+            table.cell(db, cA, r, na(dp) ? "-" : str.tostring(dp, "#.##") + "%", text_color = tc, text_size = dbSize, bgcolor = bg, text_halign = text.align_right)
+            table.cell(db, cB, r, "", bgcolor = bg)
+
+    // ---- แถวสรุป ----
+    float pv = array.get(lv, 6)
+    string zone = na(pv) ? "-" : close > pv ? "เหนือ Pivot (ฝั่งซื้อได้เปรียบ)" : "ใต้ Pivot (ฝั่งขายได้เปรียบ)"
+    color  zcol = na(pv) ? #B0BEC5 : close > pv ? colS : colR
+    table.cell(db, cLv, 14, "ราคาล่าสุด", text_color = #ECEFF1, text_size = dbSize, bgcolor = color.new(#263238, 0), text_halign = text.align_left)
+    table.cell(db, cPr, 14, str.tostring(close, format.mintick), text_color = #FFEB3B, text_size = dbSize, bgcolor = color.new(#263238, 0), text_halign = text.align_right)
+    if showThai
+        table.cell(db, cTh, 14, f_thaiStr(close), text_color = colThai, text_size = dbSize, bgcolor = color.new(#263238, 0), text_halign = text.align_right)
+    table.cell(db, cA, 14, zone, text_color = zcol, text_size = dbSize, bgcolor = color.new(#263238, 0), text_halign = text.align_center)
+    table.cell(db, cB, 14, "", bgcolor = color.new(#263238, 0))
+
+    table.cell(db, cLv, 15, "กลุ่มตัวอย่าง", text_color = #78909C, text_size = dbSize, text_halign = text.align_left)
+    table.cell(db, cPr, 15, str.tostring(total) + " รอบ", text_color = total < 30 ? #FF5252 : #78909C, text_size = dbSize, text_halign = text.align_right)
+    if showThai
+        table.cell(db, cTh, 15, na(usdthb) ? "ไม่พบเรต" : "฿" + str.tostring(usdthb, "#.###"), text_color = na(usdthb) ? #FF5252 : colThai, text_size = dbSize, text_halign = text.align_right)
+    table.cell(db, cA, 15, total < 30 ? "น้อยเกินไป" : total < 100 ? "พอใช้" : "เชื่อถือได้", text_color = total < 30 ? #FF5252 : total < 100 ? #FFC107 : #00C853, text_size = dbSize, text_halign = text.align_center)
+    table.cell(db, cB, 15, "", text_size = dbSize)
+
+    bool tfBad = timeframe.in_seconds() >= timeframe.in_seconds(pTF)
+    table.cell(db, cLv, 16, "รอบ / กราฟ", text_color = #78909C, text_size = dbSize, text_halign = text.align_left)
+    table.cell(db, cPr, 16, pTF + " / " + timeframe.period, text_color = tfBad ? #FF5252 : #78909C, text_size = dbSize, text_halign = text.align_right)
+    if showThai
+        table.cell(db, cTh, 16, "×" + str.tostring(thaiK, "#.####"), text_color = #78909C, text_size = dbSize, text_halign = text.align_right)
+    table.cell(db, cA, 16, tfBad ? "ต้องใช้กราฟย่อยกว่านี้" : pType, text_color = tfBad ? #FF5252 : #78909C, text_size = dbSize, text_halign = text.align_center)
+    table.cell(db, cB, 16, "", text_size = dbSize)
+// ═══════════════════════ จบสคริปต์ ════════════════════════════════

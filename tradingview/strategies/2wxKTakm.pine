@@ -1,0 +1,401 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © DearmasTrader - Arquitecto Senior & Algorithmic Quantitative Trader
+// @version=6
+
+// ============================================================
+// DearmasTrader Pro V4 - Multi-Strategy & Panic Shield
+// CAMBIOS V4 (sobre V3):
+//   - BUG FIX: f_alert_json ahora tipifica float sl_val / tp_val
+//              (resuelve error "na as value for non-typified argument")
+//   - NUEVO: Motor de entradas y motor de salidas INDEPENDIENTES
+//            Cada uno tiene su propio selector de estrategia + opción "Off"
+//            → "Off" en entradas = sólo salidas activas
+//            → "Off" en salidas  = sólo entradas activas (SL/TP siguen vigentes)
+//   - LIMPIEZA: enable_exits bool eliminado (reemplazado por exit_mode "Off")
+//   - TABLA: muestra motor de entradas y motor de salidas por separado
+// ============================================================
+
+strategy("DearmasTrader Pro V4 - Multi-Strategy & Panic Shield",
+     overlay          = true,
+     initial_capital  = 1000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.05,
+     slippage         = 2)
+
+// ==========================================
+// 🛡️ SEGURIDAD Y PÁNICO
+// ==========================================
+gp_panic        = "🛡️ SEGURIDAD Y PÁNICO"
+panic_button    = input.bool(false, "🔥 BOTÓN DE PÁNICO (CIERRE INMEDIATO)", group=gp_panic,
+     tooltip="Cierra todas las posiciones al instante.")
+trade_direction = input.string("Bidirectional", "Dirección de Trading",
+     options=["Long Only", "Short Only", "Bidirectional"], group=gp_panic)
+
+// ==========================================
+// 📊 MOTOR DE SEÑALES — ENTRADAS
+// ==========================================
+gp_entry      = "📊 MOTOR DE ENTRADAS"
+entry_mode    = input.string("Zero Lag Signals", "Estrategia de ENTRADA",
+     options=["Zero Lag Signals", "Bollinger + ATR", "RSI Divergence",
+              "MACD / SMA Cross", "Magical DCA Shield", "Off"],
+     group=gp_entry,
+     tooltip="'Off' desactiva todas las entradas. Las salidas y SL/TP siguen funcionando.")
+src           = input.source(close, "Fuente de Datos", group=gp_entry)
+
+// ==========================================
+// 🚪 MOTOR DE SEÑALES — SALIDAS
+// ==========================================
+gp_exit       = "🚪 MOTOR DE SALIDAS"
+exit_mode     = input.string("Zero Lag Signals", "Estrategia de SALIDA",
+     options=["Zero Lag Signals", "Bollinger + ATR", "RSI Divergence",
+              "MACD / SMA Cross", "Magical DCA Shield", "Off"],
+     group=gp_exit,
+     tooltip="'Off' desactiva señales de salida. SL/TP del grupo Riesgo siguen activos.")
+
+// ==========================================
+// 💰 GESTIÓN DE RIESGO
+// ==========================================
+gp_risk       = "💰 GESTIÓN DE RIESGO"
+sl_type       = input.string("ATR", "Tipo de Stop Loss",
+     options=["ATR", "Porcentaje", "Ninguno"], group=gp_risk)
+sl_atr_mult   = input.float(2.0, "SL — Multiplicador ATR",  minval=0.1, step=0.1, group=gp_risk)
+sl_pct        = input.float(1.5, "SL — Porcentaje (%)",     minval=0.1, step=0.1, group=gp_risk)
+tp_type       = input.string("ATR", "Tipo de Take Profit",
+     options=["ATR", "Porcentaje", "Ninguno"], group=gp_risk)
+tp_atr_mult   = input.float(4.0, "TP — Multiplicador ATR",  minval=0.1, step=0.1, group=gp_risk)
+tp_pct        = input.float(3.0, "TP — Porcentaje (%)",     minval=0.1, step=0.1, group=gp_risk)
+use_trailing  = input.bool(true, "Trailing Stop (sólo Bollinger+ATR)", group=gp_risk)
+
+// ==========================================
+// 🔍 FILTROS GLOBALES
+// ==========================================
+gp_filter        = "🔍 FILTROS GLOBALES"
+use_trend_filter = input.bool(false, "Filtro de Tendencia EMA", group=gp_filter,
+     tooltip="Longs sólo cuando precio > EMA. Shorts sólo cuando precio < EMA.")
+trend_ema_len    = input.int(200,  "EMA Tendencia (periodos)", minval=10, group=gp_filter)
+use_vol_filter   = input.bool(false, "Filtro de Volumen Mínimo", group=gp_filter)
+vol_ema_len      = input.int(20,   "Volumen — EMA periodos",   minval=5,  group=gp_filter)
+vol_mult         = input.float(1.0, "Volumen — Mínimo (× EMA)", minval=0.1, step=0.1, group=gp_filter)
+
+// ==========================================
+// ⚙️ SELECTOR DE COMANDOS (WEBHOOK)
+// ==========================================
+gp_cmd          = "⚙️ SELECTOR DE COMANDOS"
+cmd_long_entry  = input.string("LONG",  "Comando Entrada Long",  group=gp_cmd)
+cmd_short_entry = input.string("SHORT", "Comando Entrada Short", group=gp_cmd)
+cmd_exit        = input.string("CLOSE", "Comando Salida",        group=gp_cmd)
+// Volumen opcional — si es 0 el campo no se incluye en el JSON
+// El backend de DearmasTrader lo acepta pero prioriza el tamaño configurado en el bot
+webhook_volume  = input.float(0.0, "Volumen Webhook (0 = omitir)",
+     minval=0.0, step=100, group=gp_cmd,
+     tooltip="Si > 0, se añade el campo 'volume' al JSON. Útil para sobreescribir el tamaño de orden desde TradingView.")
+
+// ==========================================
+// --- 1. ZERO LAG SIGNALS (ZLEMA + ATR) ---
+// ==========================================
+z_len  = input.int(20,    "ZLEMA — Longitud",          minval=1,   group="1. Zero Lag Settings")
+z_mult = input.float(2.0, "ZLEMA — Multiplicador ATR", minval=0.1, group="1. Zero Lag Settings")
+
+f_zlema(s, l) =>
+    ema1 = ta.ema(s, l)
+    2 * ema1 - ta.ema(ema1, l)
+
+zlema   = f_zlema(src, z_len)
+z_atr   = ta.atr(14)
+upper_z = zlema + z_atr * z_mult
+lower_z = zlema - z_atr * z_mult
+
+z_long   = ta.crossover(src, upper_z)  and zlema > zlema[1]
+z_short  = ta.crossunder(src, lower_z) and zlema < zlema[1]
+z_exit_l = ta.crossunder(src, zlema)
+z_exit_s = ta.crossover(src, zlema)
+
+// ==========================================
+// --- 2. BOLLINGER + ATR TRAILING ---
+// ==========================================
+bb_len  = input.int(20,    "BB — Longitud",              minval=2,   group="2. Bollinger Settings")
+bb_mult = input.float(2.0, "BB — Desviación Estándar",   minval=0.1, group="2. Bollinger Settings")
+ts_mult = input.float(3.0, "ATR Trailing — Multiplicador", minval=0.1, group="2. Bollinger Settings")
+
+[bb_mid, bb_up, bb_lo] = ta.bb(src, bb_len, bb_mult)
+
+var float trailing_stop = na
+atr_val = ta.atr(14)
+
+if strategy.position_size > 0
+    new_stop      = src - atr_val * ts_mult
+    trailing_stop := na(trailing_stop) ? new_stop : math.max(new_stop, trailing_stop)
+else if strategy.position_size < 0
+    new_stop      = src + atr_val * ts_mult
+    trailing_stop := na(trailing_stop) ? new_stop : math.min(new_stop, trailing_stop)
+else
+    trailing_stop := na
+
+bb_long   = ta.crossover(src, bb_up)
+bb_short  = ta.crossunder(src, bb_lo)
+bb_exit_l = use_trailing and strategy.position_size > 0 and not na(trailing_stop) and ta.crossunder(src, trailing_stop)
+bb_exit_s = use_trailing and strategy.position_size < 0 and not na(trailing_stop) and ta.crossover(src, trailing_stop)
+
+// ==========================================
+// --- 3. RSI DIVERGENCE ---
+// ==========================================
+rsi_len = input.int(14, "RSI — Longitud",          minval=2, group="3. RSI Div Settings")
+lb_l    = input.int(5,  "Pivote — Lookback izq.",  minval=1, group="3. RSI Div Settings")
+lb_r    = input.int(5,  "Pivote — Lookback der.",  minval=1, group="3. RSI Div Settings")
+
+rsi_val = ta.rsi(src, rsi_len)
+
+f_div_bullish() =>
+    pivot_low = ta.pivotlow(rsi_val, lb_l, lb_r)
+    if not na(pivot_low)
+        prev_p = ta.valuewhen(not na(pivot_low), pivot_low, 1)
+        prev_s = ta.valuewhen(not na(pivot_low), src[lb_r], 1)
+        rsi_val[lb_r] > prev_p and src[lb_r] < prev_s
+    else
+        false
+
+f_div_bearish() =>
+    pivot_high = ta.pivothigh(rsi_val, lb_l, lb_r)
+    if not na(pivot_high)
+        prev_p = ta.valuewhen(not na(pivot_high), pivot_high, 1)
+        prev_s = ta.valuewhen(not na(pivot_high), src[lb_r], 1)
+        rsi_val[lb_r] < prev_p and src[lb_r] > prev_s
+    else
+        false
+
+rsi_long   = f_div_bullish()
+rsi_short  = f_div_bearish()
+rsi_exit_l = ta.crossover(rsi_val, 70)
+rsi_exit_s = ta.crossunder(rsi_val, 30)
+
+// ==========================================
+// --- 4. MACD / SMA CROSS ---
+// ==========================================
+macd_fast = input.int(12, "MACD — Rápido", group="4. MACD Settings")
+macd_slow = input.int(26, "MACD — Lento",  group="4. MACD Settings")
+macd_sig  = input.int(9,  "MACD — Señal",  group="4. MACD Settings")
+
+[macd_line, macd_signal, _] = ta.macd(src, macd_fast, macd_slow, macd_sig)
+
+macd_long   = ta.crossover(macd_line, macd_signal)
+macd_short  = ta.crossunder(macd_line, macd_signal)
+macd_exit_l = ta.crossunder(macd_line, macd_signal)
+macd_exit_s = ta.crossover(macd_line, macd_signal)
+
+// ==========================================
+// --- 5. MAGICAL DCA SHIELD ENGINE ---
+// ==========================================
+gp_magic       = "✨ MAGICAL DCA SHIELD"
+ema_macro_len  = input.int(200, "EMA Macro Filter",         minval=10, group=gp_magic)
+pivot_lookback = input.int(50,  "Pivot Lookback Estructural", minval=5, group=gp_magic)
+magic_rsi_ob   = input.int(65,  "RSI — Sobrecompra",         minval=50, group=gp_magic)
+magic_rsi_os   = input.int(35,  "RSI — Sobreventa",          maxval=50, group=gp_magic)
+
+ema_macro        = ta.ema(src, ema_macro_len)
+structural_floor = ta.lowest(low, pivot_lookback)
+structural_ceil  = ta.highest(high, pivot_lookback)
+
+magic_long    = src > ema_macro and ta.crossover(src, zlema)  and rsi_val < magic_rsi_ob
+magic_short   = src < ema_macro and ta.crossunder(src, zlema) and rsi_val > magic_rsi_os
+magic_crash_l = ta.crossunder(src, structural_floor) or ta.crossunder(src, ema_macro)
+magic_crash_s = ta.crossover(src, structural_ceil)   or ta.crossover(src, ema_macro)
+
+// ==========================================
+// 🔍 FILTROS GLOBALES
+// ==========================================
+trend_ema  = ta.ema(src, trend_ema_len)
+vol_ema    = ta.ema(volume, vol_ema_len)
+trend_ok_l = not use_trend_filter or src > trend_ema
+trend_ok_s = not use_trend_filter or src < trend_ema
+vol_ok     = not use_vol_filter   or volume >= vol_ema * vol_mult
+can_long   = trade_direction != "Short Only" and trend_ok_l and vol_ok
+can_short  = trade_direction != "Long Only"  and trend_ok_s and vol_ok
+
+// ==========================================
+// 🚀 RESOLUCIÓN DE SEÑALES — ENTRADAS (independiente)
+// ==========================================
+bool entry_long  = false
+bool entry_short = false
+
+switch entry_mode
+    "Zero Lag Signals"  => entry_long := z_long,    entry_short := z_short
+    "Bollinger + ATR"   => entry_long := bb_long,   entry_short := bb_short
+    "RSI Divergence"    => entry_long := rsi_long,  entry_short := rsi_short
+    "MACD / SMA Cross"  => entry_long := macd_long, entry_short := macd_short
+    "Magical DCA Shield"=> entry_long := magic_long, entry_short := magic_short
+    "Off"               => entry_long := false,     entry_short := false
+
+// ==========================================
+// 🚀 RESOLUCIÓN DE SEÑALES — SALIDAS (independiente)
+// ==========================================
+bool exit_long  = false
+bool exit_short = false
+
+switch exit_mode
+    "Zero Lag Signals"  => exit_long := z_exit_l,    exit_short := z_exit_s
+    "Bollinger + ATR"   => exit_long := bb_exit_l,   exit_short := bb_exit_s
+    "RSI Divergence"    => exit_long := rsi_exit_l,  exit_short := rsi_exit_s
+    "MACD / SMA Cross"  => exit_long := macd_exit_l, exit_short := macd_exit_s
+    "Magical DCA Shield"=> exit_long := magic_crash_l, exit_short := magic_crash_s
+    "Off"               => exit_long := false,       exit_short := false
+
+// ==========================================
+// 💰 CÁLCULO DE SL / TP DINÁMICOS
+// ==========================================
+// FIX V4: parámetros tipificados como "float" — resuelve error Pine v6
+// con na como argumento no tipificado
+f_sl_long() =>
+    float result = na
+    if sl_type == "ATR"
+        result := close - z_atr * sl_atr_mult
+    else if sl_type == "Porcentaje"
+        result := close * (1 - sl_pct / 100)
+    result
+
+f_sl_short() =>
+    float result = na
+    if sl_type == "ATR"
+        result := close + z_atr * sl_atr_mult
+    else if sl_type == "Porcentaje"
+        result := close * (1 + sl_pct / 100)
+    result
+
+f_tp_long() =>
+    float result = na
+    if tp_type == "ATR"
+        result := close + z_atr * tp_atr_mult
+    else if tp_type == "Porcentaje"
+        result := close * (1 + tp_pct / 100)
+    result
+
+f_tp_short() =>
+    float result = na
+    if tp_type == "ATR"
+        result := close - z_atr * tp_atr_mult
+    else if tp_type == "Porcentaje"
+        result := close * (1 - tp_pct / 100)
+    result
+
+// ==========================================
+// 🔔 HELPER DE ALERTA
+// Campos alineados con SignalProcessorWorker.cs:
+//   "action"  → requerido  (LONG / SHORT / CLOSE / EXIT)
+//   "volume"  → opcional   (omitido si webhook_volume == 0)
+//   El resto son informativos; el backend los ignora sin error.
+// ==========================================
+f_alert_json(string act, float sl_val, float tp_val) =>
+    sl_str  = na(sl_val) ? 'null' : str.tostring(math.round(sl_val, 2))
+    tp_str  = na(tp_val) ? 'null' : str.tostring(math.round(tp_val, 2))
+    vol_str = webhook_volume > 0 ? ',"volume":' + str.tostring(webhook_volume) : ''
+    '{"action":"'  + act                              + '"'  +
+     vol_str                                                  +
+     ',"symbol":"' + syminfo.ticker                  + '"'  +
+     ',"price":'   + str.tostring(close)                     +
+     ',"sl":'      + sl_str                                   +
+     ',"tp":'      + tp_str                                   +
+     ',"panic":'   + (panic_button ? 'true' : 'false') + '}'
+
+// ==========================================
+// 🔔 EJECUCIÓN DE ÓRDENES
+// ==========================================
+
+// Botón de Pánico
+if panic_button
+    strategy.close_all(comment="PANIC EXIT")
+    // FIX V4: float(na) — tipo explícito al llamar la función
+    alert(f_alert_json(cmd_exit, float(na), float(na)), alert.freq_once_per_bar_close)
+
+// Entradas Long
+if entry_long and can_long and not panic_button
+    sl_l = f_sl_long()
+    tp_l = f_tp_long()
+    strategy.entry("Long", strategy.long, comment=cmd_long_entry,
+         alert_message=f_alert_json(cmd_long_entry, sl_l, tp_l))
+    if not na(sl_l) or not na(tp_l)
+        strategy.exit("Long SL/TP", from_entry="Long", stop=sl_l, limit=tp_l, comment=cmd_exit)
+
+// Entradas Short
+if entry_short and can_short and not panic_button
+    sl_s = f_sl_short()
+    tp_s = f_tp_short()
+    strategy.entry("Short", strategy.short, comment=cmd_short_entry,
+         alert_message=f_alert_json(cmd_short_entry, sl_s, tp_s))
+    if not na(sl_s) or not na(tp_s)
+        strategy.exit("Short SL/TP", from_entry="Short", stop=sl_s, limit=tp_s, comment=cmd_exit)
+
+// Salidas por señal — sólo si exit_mode != "Off"
+if exit_mode != "Off" and not panic_button
+    if exit_long and strategy.position_size > 0
+        strategy.close("Long", comment=cmd_exit,
+             alert_message=f_alert_json(cmd_exit, float(na), float(na)))
+    if exit_short and strategy.position_size < 0
+        strategy.close("Short", comment=cmd_exit,
+             alert_message=f_alert_json(cmd_exit, float(na), float(na)))
+
+// ==========================================
+// 📈 VISUALIZACIÓN
+// ==========================================
+plot(zlema,         color=color.new(color.yellow, 0),  linewidth=1, title="ZLEMA")
+plot(upper_z,       color=color.new(color.red,    50), linewidth=1, title="Upper ATR Band")
+plot(lower_z,       color=color.new(color.green,  50), linewidth=1, title="Lower ATR Band")
+plot(bb_mid,        color=color.new(color.blue,   60), linewidth=1, title="BB Media")
+plot(bb_up,         color=color.new(color.red,    70), linewidth=1, title="BB Upper")
+plot(bb_lo,         color=color.new(color.green,  70), linewidth=1, title="BB Lower")
+plot(trailing_stop, color=color.new(color.purple, 0),  linewidth=2, style=plot.style_linebr, title="ATR Trailing Stop")
+plot(use_trend_filter ? trend_ema  : na, color=color.new(color.orange, 30), linewidth=2, title="EMA Tendencia")
+plot(entry_mode == "Magical DCA Shield" or exit_mode == "Magical DCA Shield" ? ema_macro : na,
+     color=color.new(color.white, 50), linewidth=1, title="EMA Macro DCA")
+
+plotshape(entry_long  and can_long,  "Long Entry",  shape.triangleup,   location.belowbar, color.lime,   size=size.small)
+plotshape(entry_short and can_short, "Short Entry", shape.triangledown, location.abovebar, color.red,    size=size.small)
+plotshape(exit_long  and strategy.position_size > 0, "Exit Long",  shape.xcross, location.abovebar, color.orange, size=size.tiny)
+plotshape(exit_short and strategy.position_size < 0, "Exit Short", shape.xcross, location.belowbar, color.orange, size=size.tiny)
+plotshape(panic_button, "PANIC", shape.labeldown, location.abovebar, color.red, text="PANIC", size=size.large)
+
+// ==========================================
+// 📊 TABLA DE ESTADO
+// ==========================================
+var table info_table = table.new(position.top_right, 2, 8,
+     bgcolor=color.new(color.black, 75),
+     border_color=color.new(color.gray, 60), border_width=1,
+     frame_color=color.new(color.gray,  60), frame_width=1)
+
+f_cell(int col, int row, string txt, color txt_color) =>
+    table.cell(info_table, col, row, txt, text_color=txt_color, text_size=size.small)
+
+if barstate.islast
+    pos_col = strategy.position_size > 0 ? color.lime : strategy.position_size < 0 ? color.red : color.gray
+    win_r   = strategy.closedtrades > 0 ?
+         math.round(strategy.wintrades / strategy.closedtrades * 100, 1) : 0.0
+
+    f_cell(0, 0, "Entradas",    color.gray)
+    f_cell(1, 0, entry_mode == "Off" ? "— Off —" : entry_mode,
+         entry_mode == "Off" ? color.gray : color.lime)
+
+    f_cell(0, 1, "Salidas",     color.gray)
+    f_cell(1, 1, exit_mode == "Off" ? "— Off —" : exit_mode,
+         exit_mode == "Off" ? color.gray : color.orange)
+
+    f_cell(0, 2, "Dirección",   color.gray)
+    f_cell(1, 2, trade_direction, color.white)
+
+    f_cell(0, 3, "Posición",    color.gray)
+    f_cell(1, 3, str.tostring(strategy.position_size, "#.####"), pos_col)
+
+    f_cell(0, 4, "Net Profit",  color.gray)
+    f_cell(1, 4, str.tostring(strategy.netprofit, "currency"),
+         strategy.netprofit >= 0 ? color.lime : color.red)
+
+    f_cell(0, 5, "Operaciones", color.gray)
+    f_cell(1, 5, str.tostring(strategy.closedtrades), color.white)
+
+    f_cell(0, 6, "Winrate %",   color.gray)
+    f_cell(1, 6, str.tostring(win_r) + "%", win_r >= 50 ? color.lime : color.orange)
+
+    f_cell(0, 7, "Pánico",      color.gray)
+    f_cell(1, 7, panic_button ? "🔥 ACTIVO" : "Off",
+         panic_button ? color.red : color.gray)
+
+

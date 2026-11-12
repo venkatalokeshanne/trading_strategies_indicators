@@ -1,0 +1,228 @@
+
+//@version=6
+strategy("SMC Fractal Strategy [Jamol] v3",
+         overlay=true,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=2,
+         commission_type=strategy.commission.percent,
+         commission_value=0.01,
+         slippage=1,
+         max_bars_back=500)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────────
+use_ny    = input.bool(true,       "NY + London Close (7am-3pm EST)", group="Sessions")
+use_asian = input.bool(false,      "Asian Session",                   group="Sessions")
+swing_len = input.int(10,          "Swing Length",  minval=5, maxval=30, group="Structure")
+htf       = input.timeframe("240", "HTF Bias Timeframe",               group="Structure")
+sweep_exp = input.int(20,          "Sweep expiry (bars)",              group="Structure")
+rr_ratio  = input.float(2.0,      "R:R Ratio",     minval=1.0, step=0.5, group="Risk")
+sl_buf    = input.float(0.00010,   "SL Buffer",     minval=0, step=0.00001, group="Risk")
+fvg_min   = input.float(0.00010,   "Min FVG Size",  minval=0, step=0.00001, group="FVG")
+
+// ─── SESSION ───────────────────────────────────────────────────────────────────
+ny_time    = time(timeframe.period, "0700-1500", "America/New_York")
+asian_time = time(timeframe.period, "2000-0000", "America/New_York")
+in_ses     = (use_ny and not na(ny_time)) or (use_asian and not na(asian_time))
+
+// ─── HTF BIAS ──────────────────────────────────────────────────────────────────
+htf_ema   = request.security(syminfo.tickerid, htf, ta.ema(close, 20), lookahead=barmerge.lookahead_off)
+htf_close = request.security(syminfo.tickerid, htf, close, lookahead=barmerge.lookahead_off)
+htf_trend = htf_close > htf_ema ? 1 : htf_close < htf_ema ? -1 : 0
+
+// ─── SWING HIGHS / LOWS ────────────────────────────────────────────────────────
+ph = ta.pivothigh(high, swing_len, swing_len)
+pl = ta.pivotlow(low,   swing_len, swing_len)
+
+var float last_hi     = na
+var float last_lo     = na
+var int   last_hi_bar = na
+var int   last_lo_bar = na
+
+if not na(ph)
+    last_hi     := ph
+    last_hi_bar := bar_index - swing_len
+if not na(pl)
+    last_lo     := pl
+    last_lo_bar := bar_index - swing_len
+
+// ─── LIQUIDITY SWEEP ───────────────────────────────────────────────────────────
+bull_sweep = not na(last_lo) and low < last_lo and close > last_lo
+bear_sweep = not na(last_hi) and high > last_hi and close < last_hi
+
+var int swept_bull_bar = -999
+var int swept_bear_bar = -999
+
+if bull_sweep
+    swept_bull_bar := bar_index
+if bear_sweep
+    swept_bear_bar := bar_index
+
+sweep_bull_ok = (bar_index - swept_bull_bar) <= sweep_exp
+sweep_bear_ok = (bar_index - swept_bear_bar) <= sweep_exp
+
+// ─── BOS ───────────────────────────────────────────────────────────────────────
+bull_bos = sweep_bull_ok and not na(last_hi) and close > last_hi and close[1] <= last_hi
+bear_bos = sweep_bear_ok and not na(last_lo) and close < last_lo and close[1] >= last_lo
+
+var int trend = 0
+if bull_bos
+    trend          := 1
+    swept_bull_bar := -999
+if bear_bos
+    trend          := -1
+    swept_bear_bar := -999
+
+// ─── ORDER BLOCKS ──────────────────────────────────────────────────────────────
+var float bull_ob_hi  = na
+var float bull_ob_lo  = na
+var int   bull_ob_bar = na
+var float bear_ob_hi  = na
+var float bear_ob_lo  = na
+var int   bear_ob_bar = na
+
+if bull_bos
+    for i = 1 to 30
+        if close[i] < open[i]
+            bull_ob_hi  := high[i]
+            bull_ob_lo  := low[i]
+            bull_ob_bar := bar_index - i
+            break
+
+if bear_bos
+    for i = 1 to 30
+        if close[i] > open[i]
+            bear_ob_hi  := high[i]
+            bear_ob_lo  := low[i]
+            bear_ob_bar := bar_index - i
+            break
+
+// OB Invalidation: close through only (wick = possible sweep, still valid)
+if not na(bull_ob_lo) and close < bull_ob_lo
+    bull_ob_hi := na
+    bull_ob_lo := na
+
+if not na(bear_ob_hi) and close > bear_ob_hi
+    bear_ob_hi := na
+    bear_ob_lo := na
+
+// ─── BREAKER BLOCKS ────────────────────────────────────────────────────────────
+prior_bear3   = close[1] < open[1] and close[2] < open[2] and close[3] < open[3]
+prior_bull3   = close[1] > open[1] and close[2] > open[2] and close[3] > open[3]
+bear_body_top = math.max(open[1], math.max(open[2], open[3]))
+bull_body_bot = math.min(open[1], math.min(open[2], open[3]))
+
+bull_brk_formed = trend == 1  and prior_bear3 and close > bear_body_top
+bear_brk_formed = trend == -1 and prior_bull3 and close < bull_body_bot
+
+var float bull_brk_hi  = na
+var float bull_brk_lo  = na
+var int   bull_brk_bar = na
+var float bear_brk_hi  = na
+var float bear_brk_lo  = na
+var int   bear_brk_bar = na
+
+if bull_brk_formed
+    bull_brk_hi  := math.max(high[1], math.max(high[2], high[3]))
+    bull_brk_lo  := math.min(low[1],  math.min(low[2],  low[3]))
+    bull_brk_bar := bar_index - 3
+
+if bear_brk_formed
+    bear_brk_hi  := math.max(high[1], math.max(high[2], high[3]))
+    bear_brk_lo  := math.min(low[1],  math.min(low[2],  low[3]))
+    bear_brk_bar := bar_index - 3
+
+if not na(bull_brk_lo) and close < bull_brk_lo
+    bull_brk_hi := na
+    bull_brk_lo := na
+
+if not na(bear_brk_hi) and close > bear_brk_hi
+    bear_brk_hi := na
+    bear_brk_lo := na
+
+// ─── FAIR VALUE GAPS ───────────────────────────────────────────────────────────
+bull_fvg = trend == 1  and high[2] < low  and (low   - high[2]) >= fvg_min
+bear_fvg = trend == -1 and low[2]  > high and (low[2] - high)   >= fvg_min
+
+var float bull_fvg_hi = na
+var float bull_fvg_lo = na
+var float bear_fvg_hi = na
+var float bear_fvg_lo = na
+
+if bull_fvg
+    bull_fvg_hi := low
+    bull_fvg_lo := high[2]
+if bear_fvg
+    bear_fvg_hi := low[2]
+    bear_fvg_lo := high
+
+// ─── ENTRY CONDITIONS ──────────────────────────────────────────────────────────
+bull_ob_tap  = not na(bull_ob_hi)  and close <= bull_ob_hi  and close >= bull_ob_lo
+bull_fvg_tap = not na(bull_fvg_hi) and close <= bull_fvg_hi and close >= bull_fvg_lo
+bull_brk_tap = not na(bull_brk_hi) and close <= bull_brk_hi and close >= bull_brk_lo
+bear_ob_tap  = not na(bear_ob_hi)  and close >= bear_ob_lo  and close <= bear_ob_hi
+bear_fvg_tap = not na(bear_fvg_hi) and close >= bear_fvg_lo and close <= bear_fvg_hi
+bear_brk_tap = not na(bear_brk_hi) and close >= bear_brk_lo and close <= bear_brk_hi
+
+long_zone  = bull_ob_tap or bull_fvg_tap or bull_brk_tap
+short_zone = bear_ob_tap or bear_fvg_tap or bear_brk_tap
+
+long_sig  = in_ses and trend == 1  and htf_trend == 1  and long_zone  and strategy.position_size == 0
+short_sig = in_ses and trend == -1 and htf_trend == -1 and short_zone and strategy.position_size == 0
+
+// ─── EXECUTION ─────────────────────────────────────────────────────────────────
+if long_sig
+    float lo_ref = bull_ob_tap ? bull_ob_lo : bull_fvg_tap ? bull_fvg_lo : bull_brk_lo
+    float sl     = lo_ref - sl_buf
+    float tp     = close + (close - sl) * rr_ratio
+    string tag   = bull_ob_tap ? "OB" : bull_fvg_tap ? "FVG" : "BRK"
+    strategy.entry("Long", strategy.long, comment=tag)
+    strategy.exit("LX", "Long", limit=tp, stop=sl)
+    bull_ob_hi  := na
+    bull_fvg_hi := na
+    bull_brk_hi := na
+
+if short_sig
+    float hi_ref = bear_ob_tap ? bear_ob_hi : bear_fvg_tap ? bear_fvg_hi : bear_brk_hi
+    float sl     = hi_ref + sl_buf
+    float tp     = close - (sl - close) * rr_ratio
+    string tag   = bear_ob_tap ? "OB" : bear_fvg_tap ? "FVG" : "BRK"
+    strategy.entry("Short", strategy.short, comment=tag)
+    strategy.exit("SX", "Short", limit=tp, stop=sl)
+    bear_ob_hi  := na
+    bear_fvg_hi := na
+    bear_brk_hi := na
+
+// ─── VISUALS ───────────────────────────────────────────────────────────────────
+var box bx_bull_ob  = na
+var box bx_bear_ob  = na
+var box bx_bull_brk = na
+var box bx_bear_brk = na
+
+if not na(bull_ob_hi) and not na(bull_ob_bar)
+    box.delete(bx_bull_ob)
+    bx_bull_ob := box.new(bull_ob_bar, bull_ob_hi, bar_index, bull_ob_lo, border_color=color.lime, bgcolor=color.new(color.lime, 85))
+
+if not na(bear_ob_hi) and not na(bear_ob_bar)
+    box.delete(bx_bear_ob)
+    bx_bear_ob := box.new(bear_ob_bar, bear_ob_hi, bar_index, bear_ob_lo, border_color=color.red, bgcolor=color.new(color.red, 85))
+
+if not na(bull_brk_hi) and not na(bull_brk_bar)
+    box.delete(bx_bull_brk)
+    bx_bull_brk := box.new(bull_brk_bar, bull_brk_hi, bar_index, bull_brk_lo, border_color=color.aqua, bgcolor=color.new(color.aqua, 85))
+
+if not na(bear_brk_hi) and not na(bear_brk_bar)
+    box.delete(bx_bear_brk)
+    bx_bear_brk := box.new(bear_brk_bar, bear_brk_hi, bar_index, bear_brk_lo, border_color=color.orange, bgcolor=color.new(color.orange, 85))
+
+bgcolor(bull_fvg ? color.new(color.teal,   90) : na, title="Bull FVG")
+bgcolor(bear_fvg ? color.new(color.orange, 90) : na, title="Bear FVG")
+
+plotshape(bull_sweep, "Sweep+", shape.circle,       location.belowbar, color.yellow, size=size.tiny,  text="SW")
+plotshape(bear_sweep, "Sweep-", shape.circle,       location.abovebar, color.yellow, size=size.tiny,  text="SW")
+plotshape(bull_bos,   "BOS+",   shape.triangleup,   location.belowbar, color.lime,   size=size.small, text="BOS")
+plotshape(bear_bos,   "BOS-",   shape.triangledown, location.abovebar, color.red,    size=size.small, text="BOS")
+plotshape(long_sig,   "Long",   shape.labelup,      location.belowbar, color.green,  textcolor=color.white, text="L", size=size.normal)
+plotshape(short_sig,  "Short",  shape.labeldown,    location.abovebar, color.red,    textcolor=color.white, text="S", size=size.normal)
+
+plot(htf_ema, "HTF EMA", color=color.new(color.orange, 20), linewidth=2)
+bgcolor(htf_trend == 1 ? color.new(color.green, 95) : htf_trend == -1 ? color.new(color.red, 95) : na, title="HTF Bias")

@@ -1,0 +1,1639 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AC AUTO-STRUCTURE  —  Fibonacci Channel + Supply/Demand + Elliott Wave
+//  Version 2.4 · Pine Script v6
+//
+//  ما الذي أُصلح في 2.4  ·  what 2.4 fixes
+//  ─────────────────────────────────────────────────────────────────────────────
+//  1. القناة لم تكن تُرسم إطلاقاً — "not enough data" على كل الشارتات التسعة.
+//     السبب: انحدار v2.2/v2.3 كان حلقة على chSrc[i] داخل barstate.islast،
+//     وإزاحة تاريخية ديناميكية على متغير input.source ترجع na بصمت — نفس خلل
+//     v1.x الذي أُصلح في v1.3 ثم عاد في إعادة الكتابة. العلاج نفسه: كل
+//     الإحصاء عبر نوافذ ta.* دوّارة تُقيَّم على كل شمعة، بلا حلقة على المصدر.
+//  2. سقف الوقف الافتراضي صار مزدوجاً: نسبة مئوية أو مضاعف ATR — الأقرب
+//     منهما — فيتدرّج تلقائياً مع الفاصل (12% على الساعة لا تقيّد شيئاً،
+//     وعلى الشهري ضيقة).
+//  3. سلالم «الهدف خلف السعر» اكتملت للموجة 4 وللتصحيحات A/B/C وللدفعة
+//     الجديدة: درجتان إلى ثلاث ثم الاعتراف (beyond model) — كما فُعل
+//     للموجتين 3 و5 في 2.3. حالة جرير: هدف B تحت السعر بـ 1.1%.
+//  4. اختبار الدقة يرفض هدفاً أقرب من ATR واحد — صفقة بلا مسافة ليست إشارة.
+//  5. وضع "Match the Elliott count" يختار أقرب نافذة إحصائية لامتداد العدّ.
+//
+//  موروث من 2.3  ·  inherited from 2.3
+//  ─────────────────────────────────────────────────────────────────────────────
+//  · سقف الوقف في الاختبار (كان الإبطال النظري على بُعد 75% → إصابة 100% وهمية)
+//  · المهلة تُحتسب إخفاقاً (جرير: 62.5% الحقيقية 46.4%) · حاجز عيّنة n≥20
+//  · كاشف الفجوات (NVEC: 40% من «الموجة 1» لم يُتداول) · إبطال للعدّات التصحيحية
+//  · تحذير الفاصل الأعلى يقارن اتجاه الهدف لا اتجاه الدفعة المنتهية
+//  · Bias ينقلب NO-TRADE عند توقّع سالب بعيّنة كافية · العدّ يُحسب مرة واحدة
+// ═══════════════════════════════════════════════════════════════════════════════
+indicator("AC Auto-Structure [Fib Channel + S&D + Elliott]", "AC Auto-Structure",
+     overlay          = true,
+     max_boxes_count  = 500,
+     max_lines_count  = 500,
+     max_labels_count = 500,
+     max_bars_back    = 1000)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const string G0 = "⓪ Drawing safety"
+const string G1 = "① Fibonacci Channel"
+const string G2 = "② Supply & Demand"
+const string G3 = "③ Elliott Wave"
+const string G6 = "⑥ Confluence cluster"
+const string G4 = "④ Dashboard"
+const string G5 = "⑤ Walk-forward accuracy test"
+
+// ── ⓪ Drawing safety ─────────────────────────────────────────────────────────
+bool   safeOn   = input.bool(true, "Keep every drawing inside the chart", group = G0)
+float  safeOver = input.float(15.0, "Allow drawings beyond the chart's range by (%)",
+     minval = 0.0, maxval = 300.0, step = 5.0, group = G0)
+int    safeFwd  = input.int(40, "Max bars into the future", minval = 5, maxval = 300, group = G0)
+float  safeDrift = input.float(20.0, "Max forward drift of the channel (%)",
+     minval = 1.0, maxval = 200.0, step = 1.0, group = G0)
+float  invMaxD  = input.float(35.0, "Hide the invalidation line beyond (%) from price",
+     minval = 5.0, maxval = 300.0, step = 5.0, group = G0)
+string mSpace   = input.string("Proportional (recommended)", "Measurement",
+     options = ["Proportional (recommended)", "Absolute (linear)"], group = G0,
+     tooltip = "Elliott ratios are ratios of MOVEMENT, not of currency. Proportional measures every wave as a percentage move. Use Absolute only for instruments that can print zero or below.")
+
+// ── ① Fibonacci Channel ──────────────────────────────────────────────────────
+bool   chOn     = input.bool(true, "Enable Fibonacci channel", group = G1)
+float  chSrc    = input.source(close, "Source", group = G1)
+string chMode   = input.string("Auto (best fit)", "Length mode",
+     options = ["Auto (best fit)", "Fixed", "Match the Elliott count"], group = G1,
+     tooltip = "Auto fits 8 look-backs and keeps the highest |Pearson R|. Match the Elliott count picks the statistical window closest to the span the count covers, so the two modules stop contradicting each other.")
+int    chLen    = input.int(150, "Fixed length", minval = 20, maxval = 500, step = 10, group = G1)
+int    chMin    = input.int(60,  "Auto · shortest look-back", minval = 20, maxval = 300, step = 10, group = G1)
+int    chStep   = input.int(20,  "Auto · scan step", minval = 5, maxval = 50, step = 5, group = G1,
+     tooltip = "The scan fits 8 look-backs: min + {0,1,2,3,5,7,10,14} x step.")
+float  chMinR2  = input.float(0.45, "Hide the channel below R²", minval = 0.0, maxval = 0.9, step = 0.05, group = G1,
+     tooltip = "A regression through noise is still a regression, it just means nothing.")
+string fcAnchor = input.string("Std-Dev (balanced)", "Channel width",
+     options = ["Std-Dev (balanced)", "Extremes (touch the wicks)"], group = G1)
+float  chMult   = input.float(2.0, "Std-Dev multiplier", minval = 0.5, maxval = 5.0, step = 0.1, group = G1)
+float  chExtCap = input.float(3.0, "Extremes mode · cap at (× Std-Dev)", minval = 1.0, maxval = 8.0, step = 0.5, group = G1)
+string fcLvls   = input.string("0, 0.236, 0.382, 0.5, 0.618, 0.786, 1", "Levels", group = G1,
+     tooltip = "Level 0 always sits on the TREND side: lower rail in an up-trend, upper rail in a down-trend.")
+bool   fcExtOn  = input.bool(true, "Extensions", group = G1, inline = "f1")
+string fcExtLv  = input.string("1.272, 1.618, 2.618", "", group = G1, inline = "f1")
+bool   fcMirror = input.bool(false, "Mirror the extensions below level 0", group = G1)
+int    chFwd    = input.int(30, "Extend right (bars)", minval = 0, maxval = 200, group = G1)
+float  chMinSeg = input.float(0.16, "Drop a rail segment shorter than (× fit length)",
+     minval = 0.02, maxval = 0.60, step = 0.02, group = G1,
+     tooltip = "A 3-bar stub spanning the whole band vertically is a near-vertical line across the chart — not a rail.")
+bool   fcFillOn = input.bool(true,  "Shade",  group = G1, inline = "f2")
+bool   fcLabels = input.bool(true,  "Labels", group = G1, inline = "f2")
+bool   chInfo   = input.bool(true,  "Info",   group = G1, inline = "f2")
+color  chColUp  = input.color(#089981, "Up",   group = G1, inline = "c2")
+color  chColDn  = input.color(#f23645, "Down", group = G1, inline = "c2")
+color  fcColExt = input.color(#9598a1, "Ext",  group = G1, inline = "c2")
+
+// ── ② Supply & Demand ────────────────────────────────────────────────────────
+bool   sdOn      = input.bool(true, "Enable zones", group = G2)
+int    sdAtrLen  = input.int(14, "ATR length", minval = 5, maxval = 100, group = G2)
+float  sdImpulse = input.float(1.4, "Departure strength (× ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = G2)
+float  sdBodyR   = input.float(0.55, "Departure body/range ratio", minval = 0.3, maxval = 1.0, step = 0.05, group = G2)
+float  sdBaseR   = input.float(0.50, "Base candle body/range max", minval = 0.1, maxval = 0.9, step = 0.05, group = G2)
+int    sdMaxBase = input.int(3, "Max base candles", minval = 1, maxval = 6, group = G2)
+bool   sdFallbck = input.bool(true, "Order-Block fallback (no base candle)", group = G2)
+bool   sdWide    = input.bool(false, "Wide zones (wick-to-wick)", group = G2)
+float  sdMaxW    = input.float(3.0, "Max zone height (× ATR)", minval = 0.5, maxval = 10.0, step = 0.5, group = G2)
+int    sdMaxZ    = input.int(5, "Max zones per side", minval = 1, maxval = 20, group = G2)
+float  sdMaxDist = input.float(60.0, "Drop zones farther than (%)", minval = 2.0, maxval = 200.0, step = 1.0, group = G2,
+     tooltip = "At 30 this quietly broke the confluence module: zones were deleted at 30% while wave targets sit 40-53% away, so a target could never land inside a zone.")
+string sdMitig   = input.string("Close", "Mitigation", options = ["Close", "Wick"], group = G2)
+bool   sdDelBrk  = input.bool(true, "Delete broken zones", group = G2)
+int    sdFwd     = input.int(20, "Extend right (bars)", minval = 0, maxval = 200, group = G2)
+bool   sdLabels  = input.bool(true, "Zone labels", group = G2)
+int    sdTransp  = input.int(85, "Fill transparency", minval = 0, maxval = 100, group = G2)
+color  sdColDem  = input.color(#26a69a, "Demand", group = G2, inline = "s1")
+color  sdColSup  = input.color(#ef5350, "Supply", group = G2, inline = "s1")
+
+// ── ③ Elliott Wave ───────────────────────────────────────────────────────────
+bool   ewOn      = input.bool(true, "Enable Elliott count", group = G3)
+int    ewLen     = input.int(8, "Pivot depth", minval = 2, maxval = 50, group = G3,
+     tooltip = "Left/right bars used to confirm a swing pivot. Bigger = higher wave degree.")
+bool   ewZig     = input.bool(true, "Show ZigZag", group = G3)
+bool   ewStrict  = input.bool(true, "Apply Fibonacci guidelines", group = G3)
+float  ewR2Hard  = input.float(0.85, "HARD · reject wave 2 deeper than (× wave 1)",
+     minval = 0.5, maxval = 1.0, step = 0.01, group = G3,
+     tooltip = "Elliott's rule only forbids 100%, but a wave 2 eating more than ~85% of wave 1 is a broken count. Applied in BOTH passes.")
+float  ewGapMax  = input.float(0.35, "HARD · reject a wave more than (×) untraded gap",
+     minval = 0.05, maxval = 1.0, step = 0.05, group = G3,
+     tooltip = "A wave that is mostly an overnight gap has no internal five-wave structure, so it can be neither confirmed nor falsified. A violent gap at maximum momentum is the signature of a THIRD wave, not a first.")
+float  ewR2Min   = input.float(0.382, "W2 retrace min", minval = 0.1, maxval = 0.9, step = 0.001, group = G3)
+float  ewR2Max   = input.float(0.786, "W2 retrace max", minval = 0.2, maxval = 1.0, step = 0.001, group = G3)
+float  ewW3Min   = input.float(1.000, "W3 / W1 min",    minval = 0.5, maxval = 3.0, step = 0.001, group = G3)
+float  ewR4Min   = input.float(0.120, "W4 retrace min", minval = 0.05, maxval = 0.6, step = 0.001, group = G3)
+float  ewR4Max   = input.float(0.618, "W4 retrace max", minval = 0.2, maxval = 1.0, step = 0.001, group = G3)
+float  ewEvProv  = input.float(0.382, "Evidence · wave must have travelled (× prior wave)",
+     minval = 0.0, maxval = 0.9, step = 0.001, group = G3,
+     tooltip = "A target for a wave that has not started is a guess dressed as a forecast.")
+float  ewTimeMax = input.float(5.0, "Penalise a wave 2 taking more than (×) the time of wave 1",
+     minval = 2.0, maxval = 20.0, step = 0.5, group = G3,
+     tooltip = "A correction six times the impulse in TIME behaves like a wave 4 or a B, not a wave 2.")
+bool   ewRelax   = input.bool(true, "Auto-relax if no strict count is found", group = G3)
+float  ewRelaxM  = input.float(25.0, "Relaxed count must beat the strict one by",
+     minval = 0.0, maxval = 100.0, step = 5.0, group = G3,
+     tooltip = "Without a margin, a relaxed six-pivot count beats a strict three-pivot one by a hair and the strict rules stop binding.")
+bool   ewTrunc   = input.bool(true, "Allow a truncated 5th wave (relaxed pass)", group = G3)
+bool   ewTargets = input.bool(true, "Fibonacci target lines", group = G3)
+bool   ewProject = input.bool(true, "Draw the projected future path", group = G3)
+int    ewLegs    = input.int(3, "Legs to project", minval = 1, maxval = 4, group = G3)
+bool   ewInvLine = input.bool(true, "Show invalidation level", group = G3)
+float  ewFeasK   = input.float(3.0, "Flag a target needing more than (× ATR·√bars)",
+     minval = 1.0, maxval = 10.0, step = 0.5, group = G3)
+color  ewColBull = input.color(#2962ff, "Bullish count", group = G3, inline = "e1")
+color  ewColBear = input.color(#ff9800, "Bearish count", group = G3, inline = "e1")
+color  ewColZig  = input.color(#787b86, "ZigZag",        group = G3, inline = "e1")
+color  ewColProj = input.color(#ab47bc, "Projection",    group = G3, inline = "e2")
+color  ewColInv  = input.color(#f23645, "Invalidation",  group = G3, inline = "e2")
+
+// ── ⑥ Confluence cluster ─────────────────────────────────────────────────────
+bool   clOn    = input.bool(true, "Enable confluence cluster", group = G6)
+float  clTol   = input.float(0.5, "Cluster tolerance (× ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = G6)
+int    clMin   = input.int(1, "Components required to flag", minval = 1, maxval = 2, group = G6,
+     tooltip = "1 = the target sits on a channel rail OR inside a zone. 2 = both.")
+bool   clBox   = input.bool(true, "Draw the cluster zone", group = G6)
+bool   clAlert = input.bool(true, "Alert when price enters the cluster", group = G6)
+color  clCol   = input.color(#ffeb3b, "Cluster", group = G6)
+
+// ── ④ Dashboard ──────────────────────────────────────────────────────────────
+bool   dashOn   = input.bool(true, "Show dashboard", group = G4)
+string dashPos  = input.string("Top right", "Position",
+     options = ["Top right", "Top left", "Bottom right", "Bottom left", "Middle right"], group = G4)
+string dashLang = input.string("EN", "Language", options = ["EN", "AR"], group = G4)
+string dashSize = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = G4)
+bool   htfOn    = input.bool(true, "Read the higher timeframe", group = G4,
+     tooltip = "The warning marks the TARGET when it fights the higher-timeframe trend — not the finished impulse.")
+string htfSel   = input.string("Auto", "Higher timeframe",
+     options = ["Auto", "60", "240", "D", "W", "M", "3M"], group = G4)
+
+// ── ⑤ Walk-forward accuracy test ─────────────────────────────────────────────
+bool   btOn      = input.bool(true, "Run the accuracy test", group = G5,
+     tooltip = "Replays the count bar by bar. Each new count opens a virtual trade at that close — target = the projection, stop = the invalidation capped below — and records which was reached first. No look-ahead.")
+int    btHold    = input.int(60, "Give up after (bars)", minval = 5, maxval = 500, group = G5,
+     tooltip = "Capped per timeframe: 60 monthly bars is five years.")
+float  btStopCap = input.float(12.0, "Cap the virtual stop at (% from entry)",
+     minval = 1.0, maxval = 60.0, step = 0.5, group = G5,
+     tooltip = "The theoretical invalidation can sit 75% away — a stop that far is never touched and the hit rate prints 100% on a sample of four.")
+float  btStopATR = input.float(5.0, "… or cap at (× ATR), whichever is nearer",
+     minval = 1.0, maxval = 20.0, step = 0.5, group = G5,
+     tooltip = "A percentage cap alone does not travel across timeframes: 12% on a 1h chart never binds, 12% on a monthly chart is tight. ATR scales with the timeframe by construction.")
+int    btMinN    = input.int(20, "Hide the statistics below N closed signals",
+     minval = 5, maxval = 200, group = G5,
+     tooltip = "Four signals cannot produce a hit rate.")
+bool   btTOloss  = input.bool(true, "Count a timeout as a miss", group = G5,
+     tooltip = "A position held 40 bars and closed flat is not a win.")
+bool   btVeto    = input.bool(true, "Override the Bias to NO-TRADE on negative expectancy", group = G5)
+float  btMinRR   = input.float(1.5, "Only count signals with R:R ≥", minval = 0.0, maxval = 5.0, step = 0.1, group = G5)
+bool   btMarks   = input.bool(false, "Mark every signal on the chart", group = G5)
+string btPos     = input.string("Bottom left", "Results position",
+     options = ["Bottom left", "Bottom right", "Top left", "Middle left"], group = G5)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TYPES
+// ═══════════════════════════════════════════════════════════════════════════════
+type Zone
+    float top     = na
+    float bot     = na
+    int   born    = 0
+    bool  demand  = false
+    int   touches = 0
+    bool  broken  = false
+    bool  inside  = false
+    float power   = 0.0
+    box   bx      = na
+    label lb      = na
+
+type Cnt
+    int   s     = -1
+    int   cnt   = 0
+    bool  bull  = false
+    bool  loose = false
+    int   corr  = 0
+    int   ev    = 0
+    int   why   = 0        // 0 none · 1 no structure · 2 W2 too deep · 3 invalidated · 4 not started
+    float gap   = 0.0      // share of wave 1 that was an untraded gap
+
+type Proj
+    string nm    = ""
+    float  mid   = na
+    float  lo    = na
+    float  hi    = na
+    int    dur   = 5
+    string n2nm  = ""
+    float  n2    = na
+    int    n2dur = 5
+    string n3nm  = ""
+    float  n3    = na
+    int    n3dur = 5
+    bool   dead  = false
+
+type Cluster
+    int   score = 0
+    bool  rail  = false
+    bool  zone  = false
+    float lo    = na
+    float hi    = na
+    float railY = na
+
+type Trade
+    float entry = na
+    float tgt   = na
+    float stop  = na
+    bool  long  = false
+    int   bar   = 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<Zone>  zones = array.new<Zone>()
+var array<float> zzP   = array.new<float>()     // pivot price
+var array<int>   zzB   = array.new<int>()       // pivot bar_index
+var array<int>   zzD   = array.new<int>()       // +1 swing high · -1 swing low
+var array<float> zzHi  = array.new<float>()     // running high since that pivot
+var array<float> zzLo  = array.new<float>()     // running low  since that pivot
+var array<float> zzGap = array.new<float>()     // largest untraded gap inside the leg ending here
+var array<line>  ewLn  = array.new<line>()
+var array<label> ewLb  = array.new<label>()
+var array<box>   ewBx  = array.new<box>()
+var array<float> chLv  = array.new<float>()
+var float gapAcc = 0.0                          // gap accumulator, reset at every pivot
+var Cnt   cBar   = Cnt.new()                    // the count, computed ONCE per closed bar
+
+float  chUpNow  = na
+float  chMidNow = na
+float  chLoNow  = na
+float  chRNow   = na
+int    chLenNow = 0
+float  chFib    = na
+string chWhy    = "disabled"
+float  chA      = na
+float  chB      = na
+float  chO0     = na
+float  chSp     = na
+
+int    ewCl     = 0
+bool   ewClRail = false
+bool   ewClZone = false
+int    ewStart  = -1
+int    ewCount  = 0
+bool   ewBull   = false
+int    ewCorr   = 0
+bool   ewLoose  = false
+int    ewEv     = 0
+int    ewWhy    = 0
+float  ewGapSh  = 0.0
+float  ewInvLv  = na
+float  ewNextP  = na
+string ewNextL  = ""
+bool   ewFeas   = true
+float  ewNeed   = 0.0
+
+bool sigNewDem = false
+bool sigNewSup = false
+bool sigTouch  = false
+bool sigBreak  = false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PER-BAR BASICS  (global scope — every ta.* call lives here)
+// ═══════════════════════════════════════════════════════════════════════════════
+var float cHi = na
+var float cLo = na
+cHi := na(cHi) ? high : math.max(cHi, high)
+cLo := na(cLo) ? low  : math.min(cLo, low)
+var bool pxPos = true
+pxPos := pxPos and low > 0.0
+
+float bandK  = 1.0 + math.max(safeOver, 0.0) / 100.0
+float bandHi = safeOn ? cHi * bandK : 1.0e12
+float bandLo = math.max(safeOn ? cLo / bandK : syminfo.mintick, syminfo.mintick)
+
+bool  useLog = pxPos and mSpace != "Absolute (linear)"
+
+// ── channel source in measurement space, evaluated on EVERY bar ──────────────
+//    THE v2.2/v2.3 channel bug: the regression looped over chSrc[i] inside a
+//    barstate.islast block. A dynamic history offset on an input.source series
+//    silently returns na — so the fit never had enough points and every chart
+//    read "not enough data". Same failure fixed once in v1.3; same cure: no
+//    history loops on the source, everything through rolling ta.* windows.
+float mSrc = useLog and chSrc > 0.0 ? math.log(chSrc) : chSrc
+
+float atrVal   = ta.atr(sdAtrLen)
+float atrEW    = ta.atr(14)
+float trendRef = ta.ema(close, 50)
+float pvHi     = ta.highest(high, ewLen + 1)
+float pvLo     = ta.lowest(low,  ewLen + 1)
+float phv      = ta.pivothigh(high, ewLen, ewLen)
+float plv      = ta.pivotlow(low,  ewLen, ewLen)
+
+float bodySz = math.abs(close - open)
+float rngSz  = math.max(high - low, syminfo.mintick)
+bool  bullEx = close > open and bodySz >= sdImpulse * atrVal and bodySz / rngSz >= sdBodyR
+bool  bearEx = close < open and bodySz >= sdImpulse * atrVal and bodySz / rngSz >= sdBodyR
+bool  isBase = bodySz / rngSz <= sdBaseR
+
+int chFwdS = math.min(chFwd, safeFwd)
+int sdFwdS = math.min(sdFwd, safeFwd)
+
+int btHoldEff = timeframe.isintraday ? btHold :
+     timeframe.isdaily  ? math.min(btHold, 40) :
+     timeframe.isweekly ? math.min(btHold, 20) : math.min(btHold, 12)
+
+// ── higher-timeframe context: two windows, because 100 bars of 3M is 25 years
+f_ctx() =>
+    float c80 = ta.correlation(close, bar_index, 80)
+    float c30 = ta.correlation(close, bar_index, 30)
+    float s80 = ta.stdev(close, 80)
+    float s30 = ta.stdev(close, 30)
+    float x80 = ta.stdev(bar_index, 80)
+    float x30 = ta.stdev(bar_index, 30)
+    float h80 = ta.highest(high, 80)
+    float h30 = ta.highest(high, 30)
+    float l80 = ta.lowest(low, 80)
+    float l30 = ta.lowest(low, 30)
+    bool  u80 = not na(c80)
+    float cc  = u80 ? c80 : c30
+    float sy  = u80 ? s80 : s30
+    float sx  = u80 ? x80 : x30
+    float hh  = u80 ? h80 : h30
+    float ll  = u80 ? l80 : l30
+    int   nn  = u80 ? 80  : 30
+    float sl  = (na(cc) or na(sx) or sx == 0.0) ? na : cc * sy / sx
+    float po  = (na(hh) or hh <= ll) ? na : (close - ll) / (hh - ll)
+    [sl, po, nn]
+
+string tfAuto = timeframe.isseconds ? "60" :
+     timeframe.isminutes ? (timeframe.multiplier <= 15 ? "240" : "D") :
+     timeframe.isdaily   ? "W" : timeframe.isweekly ? "M" : "3M"
+string htfTF  = htfSel == "Auto" ? tfAuto : htfSel
+[htfSlope, htfPos, htfN] = request.security(syminfo.tickerid, htfTF, f_ctx(),
+     lookahead = barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+tr(string en, string ar) => dashLang == "AR" ? ar : en
+
+f_m(float p) => useLog and p > 0.0 ? math.log(p) : p
+f_p(float v) => useLog ? math.exp(v) : v
+
+f_ok(float p)   => not na(p) and p >= bandLo and p <= bandHi
+f_clip(float p) => na(p) ? na : math.min(math.max(p, bandLo), bandHi)
+
+f_d4(float v, float a, float b, float c, float d) =>
+    math.min(math.min(math.abs(v - a), math.abs(v - b)),
+             math.min(math.abs(v - c), math.abs(v - d)))
+
+// how much of THIS bar was never traded, in the active measurement space
+float gapBar = math.abs(f_m(open) - f_m(nz(close[1], open)))
+
+// ── the regression, entirely through rolling ta.* windows (the v2.4 fix) ─────
+//    a = the fitted value AT the current bar, b = slope per bar, both in
+//    measurement space, so y(x) = a + b·x with x relative to the current bar.
+f_regS(simple int L) =>
+    float r  = ta.correlation(mSrc, bar_index, L)
+    float sy = ta.stdev(mSrc, L)
+    float sx = ta.stdev(bar_index, L)
+    float my = ta.sma(mSrc, L)
+    float mx = ta.sma(bar_index, L)
+    float b  = (na(r) or na(sx) or sx == 0.0) ? na : r * sy / sx
+    float a  = na(b) ? na : my + b * (float(bar_index) - mx)
+    float se = (na(r) or na(sy)) ? na : sy * math.sqrt(math.max(1.0 - r * r, 0.0))
+    [b, a, r, se]
+
+// ── ZigZag: strictly alternating pivots, each carrying its own running range ──
+f_addPivot(float p, int b, int d, float hSince, float lSince, float g) =>
+    int n = array.size(zzP)
+    if n == 0
+        array.push(zzP, p)
+        array.push(zzB, b)
+        array.push(zzD, d)
+        array.push(zzHi, hSince)
+        array.push(zzLo, lSince)
+        array.push(zzGap, g)
+    else if array.get(zzD, n - 1) == d
+        float lp = array.get(zzP, n - 1)
+        if (d == 1 and p > lp) or (d == -1 and p < lp)
+            array.set(zzP, n - 1, p)
+            array.set(zzB, n - 1, b)
+            array.set(zzHi, n - 1, hSince)
+            array.set(zzLo, n - 1, lSince)
+            array.set(zzGap, n - 1, math.max(array.get(zzGap, n - 1), g))
+    else
+        array.push(zzP, p)
+        array.push(zzB, b)
+        array.push(zzD, d)
+        array.push(zzHi, hSince)
+        array.push(zzLo, lSince)
+        array.push(zzGap, g)
+    if array.size(zzP) > 40
+        array.shift(zzP)
+        array.shift(zzB)
+        array.shift(zzD)
+        array.shift(zzHi)
+        array.shift(zzLo)
+        array.shift(zzGap)
+
+f_gapShare(int s, float w1) =>
+    float g = (s + 1) < array.size(zzGap) ? array.get(zzGap, s + 1) : 0.0
+    w1 > 0.0 ? math.min(g / w1, 1.0) : 0.0
+
+// ── the 3 hard rules (+ the Fibonacci guidelines when strict) ────────────────
+f_valid(int s, int cnt, bool bull, bool strict) =>
+    bool ok = s >= 0 and (s + cnt) <= array.size(zzP)
+    if ok
+        int d0 = bull ? -1 : 1
+        for k = 0 to cnt - 1
+            int want = (k % 2 == 0) ? d0 : -d0
+            if array.get(zzD, s + k) != want
+                ok := false
+    float sgn = bull ? 1.0 : -1.0
+    float p0  = ok ? f_m(array.get(zzP, s))     : na
+    float p1  = ok ? f_m(array.get(zzP, s + 1)) : na
+    float p2  = ok ? f_m(array.get(zzP, s + 2)) : na
+    float p3  = (ok and cnt >= 4) ? f_m(array.get(zzP, s + 3)) : na
+    float p4  = (ok and cnt >= 5) ? f_m(array.get(zzP, s + 4)) : na
+    float p5  = (ok and cnt >= 6) ? f_m(array.get(zzP, s + 5)) : na
+    float w1  = (p1 - p0) * sgn
+    float w2  = (p1 - p2) * sgn
+    float w3  = (p3 - p2) * sgn
+    float w4  = (p3 - p4) * sgn
+    float w5  = (p5 - p4) * sgn
+    // RULE 1: wave 2 never retraces beyond the origin of wave 1 …
+    if ok
+        ok := w1 > 0 and w2 > 0 and (p2 - p0) * sgn > 0
+    // … and in practice never eats more than ewR2Hard of it
+    if ok
+        ok := (w2 / w1) <= ewR2Hard
+    // GAP RULE: a wave that is mostly an untraded gap cannot be subdivided
+    if ok
+        ok := f_gapShare(s, w1) <= ewGapMax
+    if ok and strict
+        float r2 = w2 / w1
+        ok := r2 >= ewR2Min and r2 <= ewR2Max
+    if ok and cnt >= 4
+        ok := w3 > 0 and (p3 - p1) * sgn > 0
+        if ok and strict
+            ok := w3 >= ewW3Min * w1
+    // RULE 3: wave 4 never enters the price territory of wave 1
+    if ok and cnt >= 5
+        ok := w4 > 0 and (p4 - p1) * sgn > 0
+        if ok and strict
+            float r4 = w4 / w3
+            ok := r4 >= ewR4Min and r4 <= ewR4Max
+    // RULE 2: wave 3 is never the shortest of 1 / 3 / 5
+    if ok and cnt >= 6
+        ok := w5 > 0 and not (w3 < w1 and w3 < w5)
+        if ok and (p5 - p3) * sgn <= 0
+            ok := ewTrunc and not strict and w5 >= 0.5 * w1
+    ok
+
+// ── the price that kills an IMPULSIVE count while the wave is still forming ──
+f_invLevel(int s, int cnt) =>
+    array.get(zzP, s + (cnt == 3 ? 0 : cnt == 4 ? 1 : cnt == 5 ? 4 : 5))
+
+// ── … and the one that kills a CORRECTIVE count ──────────────────────────────
+f_invAny(int s, int cnt, int corr) =>
+    corr == 0 ? f_invLevel(s, cnt) :
+         corr == 1 ? array.get(zzP, s + 5) :
+         corr == 2 ? array.get(zzP, s + 7) : array.get(zzP, s + 8)
+
+// ── has anything since the last pivot already broken that rule? ──────────────
+f_alive(int s, int cnt, bool bull) =>
+    int   k   = s + cnt - 1
+    float hi  = math.max(array.get(zzHi, k), high)
+    float lo  = math.min(array.get(zzLo, k), low)
+    float lvl = f_invLevel(s, cnt)
+    cnt == 6 ? (bull ? hi <= lvl : lo >= lvl) : (bull ? lo >= lvl : hi <= lvl)
+
+// ── has the wave we are about to project actually STARTED? ───────────────────
+//    0 = no evidence, do not project · 1 = provisional · 2 = confirmed
+f_evidence(int s, int cnt, bool bull, int corr) =>
+    float sgn = bull ? 1.0 : -1.0
+    float px  = f_m(close)
+    float q0  = f_m(array.get(zzP, s))
+    float q1  = f_m(array.get(zzP, s + 1))
+    float q2  = f_m(array.get(zzP, s + 2))
+    int   res = 0
+    if cnt == 3
+        float rng = (q1 - q2) * sgn
+        if rng > 0
+            res := (px - q1) * sgn > 0 ? 2 :
+                 (((px - q2) * sgn) / rng >= ewEvProv ? 1 : 0)
+    else if cnt == 4
+        float q3  = f_m(array.get(zzP, s + 3))
+        float rng = (q3 - q2) * sgn
+        if rng > 0
+            float back = ((q3 - px) * sgn) / rng
+            res := back >= 0.236 ? 2 : (back >= 0.146 ? 1 : 0)
+    else if cnt == 5
+        float q3  = f_m(array.get(zzP, s + 3))
+        float q4  = f_m(array.get(zzP, s + 4))
+        float rng = (q3 - q4) * sgn
+        if rng > 0
+            res := (px - q3) * sgn > 0 ? 2 :
+                 (((px - q4) * sgn) / rng >= ewEvProv ? 1 : 0)
+    else
+        float q5   = f_m(array.get(zzP, s + 5))
+        float full = (q5 - q0) * sgn
+        if full > 0
+            if corr == 0
+                float back = ((q5 - px) * sgn) / full
+                res := back >= 0.146 ? 2 : (back >= 0.05 ? 1 : 0)
+            else
+                res := 2
+    res
+
+// ── the wave-2 retracement of a candidate, or na if the shape is not there ───
+f_r2of(int s, int cnt, bool bull) =>
+    float res = na
+    if s >= 0 and (s + 3) <= array.size(zzP)
+        int  d0  = bull ? -1 : 1
+        bool okd = array.get(zzD, s) == d0 and array.get(zzD, s + 1) == -d0 and
+             array.get(zzD, s + 2) == d0
+        if okd
+            float sgn = bull ? 1.0 : -1.0
+            float p0  = f_m(array.get(zzP, s))
+            float p1  = f_m(array.get(zzP, s + 1))
+            float p2  = f_m(array.get(zzP, s + 2))
+            float w1  = (p1 - p0) * sgn
+            float w2  = (p1 - p2) * sgn
+            if w1 > 0 and w2 > 0
+                res := w2 / w1
+    res
+
+// ── how well does this candidate behave like a real impulse? ─────────────────
+f_score(int s, int cnt, bool bull, bool strict, int ev) =>
+    float sgn = bull ? 1.0 : -1.0
+    float p0  = f_m(array.get(zzP, s))
+    float p1  = f_m(array.get(zzP, s + 1))
+    float p2  = f_m(array.get(zzP, s + 2))
+    float w1  = (p1 - p0) * sgn
+    float w2  = (p1 - p2) * sgn
+    float sc  = 30.0 + (strict ? 45.0 : 0.0) + float(cnt) * 5.0 + float(ev - 1) * 22.0
+    float r2  = w1 > 0.0 ? w2 / w1 : 1.0
+    sc += 18.0 * (1.0 - math.min(f_d4(r2, 0.382, 0.5, 0.618, 0.786) / 0.25, 1.0))
+    if cnt >= 4
+        float p3 = f_m(array.get(zzP, s + 3))
+        float w3 = (p3 - p2) * sgn
+        float r3 = w1 > 0.0 ? w3 / w1 : 0.0
+        sc += 18.0 * (1.0 - math.min(f_d4(r3, 1.0, 1.618, 2.618, 4.236) / 0.60, 1.0))
+    if cnt >= 5
+        float p3b = f_m(array.get(zzP, s + 3))
+        float p4  = f_m(array.get(zzP, s + 4))
+        float w3b = (p3b - p2) * sgn
+        float w4  = (p3b - p4) * sgn
+        float r4  = w3b > 0.0 ? w4 / w3b : 1.0
+        sc += 12.0 * (1.0 - math.min(f_d4(r4, 0.236, 0.382, 0.5, 0.618) / 0.20, 1.0))
+        if math.abs(r2 - r4) > 0.15
+            sc += 8.0
+    // the untraded share, graded rather than binary
+    sc -= 60.0 * math.min(f_gapShare(s, w1) / 0.40, 1.0)
+    // TIME proportion: a correction six times the impulse in time is not a wave 2
+    float t1 = float(array.get(zzB, s + 1) - array.get(zzB, s))
+    float t2 = float(array.get(zzB, s + 2) - array.get(zzB, s + 1))
+    if t1 > 0.0 and t2 / t1 > ewTimeMax
+        sc -= 22.0
+    // a count whose last pivot is ancient is a museum piece
+    float span = float(array.get(zzB, s + cnt - 1) - array.get(zzB, s))
+    float age  = float(bar_index - array.get(zzB, s + cnt - 1))
+    sc -= 25.0 * math.min(age / math.max(span, 1.0), 1.0)
+    sc += na(trendRef) ? 0.0 : ((bull == (close > trendRef)) ? 6.0 : -6.0)
+    sc
+
+// ── search EVERY admissible count and keep the best-scoring one ──────────────
+f_findCount() =>
+    int   m    = array.size(zzP)
+    int   bs   = -1
+    int   bc   = 0
+    bool  bb   = false
+    bool  bl   = false
+    int   bk   = 0
+    int   be   = 0
+    float bg   = 0.0
+    int   why  = 0
+    float best = -1.0e9
+    for ci = 0 to 6
+        int cnt = ci < 4 ? 6 : 9 - ci
+        int k   = ci < 4 ? ci : 0
+        int s   = m - cnt - k
+        if s >= 0
+            for di = 0 to 1
+                bool bull = di == 0
+                for pi = 0 to 1
+                    bool strict = (pi == 0) and ewStrict
+                    bool run    = pi == 0 or (ewStrict and ewRelax)
+                    if run
+                        if f_valid(s, cnt, bull, strict)
+                            if not f_alive(s, cnt, bull)
+                                why := math.max(why, 3)
+                            else
+                                int ev = f_evidence(s, cnt, bull, k)
+                                if ev == 0
+                                    why := math.max(why, 4)
+                                else
+                                    float sc = f_score(s, cnt, bull, strict, ev)
+                                    float need = (not strict and ewStrict and bs != -1 and not bl) ? ewRelaxM : 0.0
+                                    if sc > best + need
+                                        float sgn = bull ? 1.0 : -1.0
+                                        float w1x = (f_m(array.get(zzP, s + 1)) - f_m(array.get(zzP, s))) * sgn
+                                        best := sc
+                                        bs   := s
+                                        bc   := cnt
+                                        bb   := bull
+                                        bl   := ewStrict and not strict
+                                        bk   := k
+                                        be   := ev
+                                        bg   := f_gapShare(s, w1x)
+                        else
+                            float rr = f_r2of(s, cnt, bull)
+                            int   wy = (not na(rr) and rr > ewR2Hard) ? 2 : 1
+                            why := math.max(why, wy)
+    Cnt.new(s = bs, cnt = bc, bull = bb, loose = bl, corr = bk, ev = be, gap = bg,
+         why = bs == -1 ? (m < 3 ? 1 : why) : 0)
+
+// ── where the wave in progress is headed, and the two waves after it ─────────
+//    Every branch climbs at most two or three Fibonacci rungs; beyond that it
+//    returns na — nothing drawn, nothing shown, nothing traded in the test.
+//    v2.4 extends the same ladder-then-admit logic to wave 4 and to the
+//    corrective waves A/B/C, which v2.3 left fixed (Jarir: B target -1.1%
+//    BELOW price on a bullish count).
+f_proj(int s, int cnt, bool bull, int corr, bool soft) =>
+    float sgn = bull ? 1.0 : -1.0
+    float now = f_m(close)
+    float q0  = f_m(array.get(zzP, s))
+    float q1  = f_m(array.get(zzP, s + 1))
+    float q2  = f_m(array.get(zzP, s + 2))
+    int   b0  = array.get(zzB, s)
+    int   b1  = array.get(zzB, s + 1)
+    int   b2  = array.get(zzB, s + 2)
+    float ww1 = math.abs(q1 - q0)
+    int   d1  = math.max(b1 - b0, 3)
+    int   d2  = math.max(b2 - b1, 3)
+    Proj p = Proj.new()
+    if cnt == 3
+        float  m1 = soft ? 1.000 : 1.618
+        float  m2 = soft ? 1.618 : 2.618
+        float  t  = q2 + sgn * m1 * ww1
+        string tg = "3"
+        if (now - t) * sgn > 0
+            t  := q2 + sgn * m2 * ww1
+            tg := "3 ext"
+        if (now - t) * sgn > 0
+            p.dead := true
+            tg     := tr("beyond model", "تجاوز النموذج")
+        p.nm    := tg
+        p.mid   := f_p(t)
+        p.lo    := f_p(t - sgn * 0.236 * ww1)
+        p.hi    := f_p(t + sgn * 0.236 * ww1)
+        p.dur   := math.max(int(d1 * 1.618), 3)
+        p.n2nm  := "4"
+        p.n2    := f_p(t - sgn * 0.382 * math.abs(t - q2))
+        p.n2dur := d2
+        p.n3nm  := "5"
+        p.n3    := f_p(t - sgn * 0.382 * math.abs(t - q2) + sgn * ww1)
+        p.n3dur := d1
+    else if cnt == 4
+        float  q3  = f_m(array.get(zzP, s + 3))
+        int    b3  = array.get(zzB, s + 3)
+        float  ww3 = math.abs(q3 - q2)
+        int    d3  = math.max(b3 - b2, 3)
+        float  t   = q3 - sgn * 0.382 * ww3
+        float  rl  = 0.500
+        float  rh  = 0.236
+        string tg  = "4"
+        if (t - now) * sgn > 0
+            t  := q3 - sgn * 0.500 * ww3
+            rl := 0.618
+            rh := 0.382
+            tg := "4 deep"
+        if (t - now) * sgn > 0
+            p.dead := true
+            tg     := tr("beyond model", "تجاوز النموذج")
+        p.nm    := tg
+        p.mid   := f_p(t)
+        p.lo    := f_p(q3 - sgn * rl * ww3)
+        p.hi    := f_p(q3 - sgn * rh * ww3)
+        p.dur   := math.max(int(d3 * 0.618), 3)
+        p.n2nm  := "5"
+        p.n2    := f_p(t + sgn * ww1)
+        p.n2dur := d1
+        p.n3nm  := "A"
+        p.n3    := f_p(t + sgn * ww1 - sgn * 0.382 * math.abs(q3 - q0))
+        p.n3dur := math.max(int((b3 - b0) * 0.382), 3)
+    else if cnt == 5
+        float  q3  = f_m(array.get(zzP, s + 3))
+        float  q4  = f_m(array.get(zzP, s + 4))
+        float  w13 = math.abs(q3 - q0)
+        float  t   = q4 + sgn * ww1
+        string tg  = "5"
+        if (now - t) * sgn > 0
+            t  := q4 + sgn * 0.618 * w13
+            tg := "5"
+        if (now - t) * sgn > 0
+            t  := q4 + sgn * 1.000 * w13
+            tg := "5 ext"
+        if (now - t) * sgn > 0
+            t  := q4 + sgn * 1.618 * w13
+            tg := "5 ext"
+        if (now - t) * sgn > 0
+            p.dead := true
+            tg     := tr("degree too small", "الدرجة أصغر من الحركة")
+        p.nm    := tg
+        p.mid   := f_p(t)
+        p.lo    := f_p(t - sgn * 0.236 * ww1)
+        p.hi    := f_p(t + sgn * 0.236 * ww1)
+        p.dur   := d1
+        p.n2nm  := "A"
+        p.n2    := f_p(t - sgn * 0.382 * math.abs(t - q0))
+        p.n2dur := math.max(int(d1 * 0.8), 3)
+        p.n3nm  := "B"
+        p.n3    := f_p(t - sgn * 0.382 * math.abs(t - q0) + sgn * 0.500 * 0.382 * math.abs(t - q0))
+        p.n3dur := math.max(int(d1 * 0.5), 3)
+    else
+        float q5   = f_m(array.get(zzP, s + 5))
+        int   b5   = array.get(zzB, s + 5)
+        float full = math.abs(q5 - q0)
+        int   dFul = math.max(int((b5 - b0) * 0.382), 3)
+        if corr == 0
+            float  t  = q5 - sgn * 0.382 * full
+            float  rl = 0.500
+            float  rh = 0.236
+            string tg = "A"
+            if (t - now) * sgn > 0
+                t  := q5 - sgn * 0.500 * full
+                rl := 0.618
+                rh := 0.382
+            if (t - now) * sgn > 0
+                t  := q5 - sgn * 0.618 * full
+                rl := 0.786
+                rh := 0.500
+                tg := "A deep"
+            if (t - now) * sgn > 0
+                p.dead := true
+                tg     := tr("beyond model", "تجاوز النموذج")
+            p.nm    := tg
+            p.mid   := f_p(t)
+            p.lo    := f_p(q5 - sgn * rl * full)
+            p.hi    := f_p(q5 - sgn * rh * full)
+            p.dur   := dFul
+            p.n2nm  := "B"
+            p.n2    := f_p(t + sgn * 0.500 * math.abs(q5 - t))
+            p.n2dur := math.max(int(dFul * 0.6), 3)
+            p.n3nm  := "C"
+            p.n3    := f_p(q5 - sgn * 0.618 * full)
+            p.n3dur := dFul
+        else if corr == 1
+            float  qa = f_m(array.get(zzP, s + 6))
+            int    ba = array.get(zzB, s + 6)
+            float  wa = math.abs(q5 - qa)
+            float  t  = qa + sgn * 0.500 * wa
+            float  rl = 0.382
+            float  rh = 0.786
+            string tg = "B"
+            if (now - t) * sgn > 0
+                t  := qa + sgn * 0.786 * wa
+                rl := 0.618
+                rh := 1.000
+            if (now - t) * sgn > 0
+                t  := qa + sgn * 1.130 * wa
+                rl := 1.000
+                rh := 1.236
+                tg := "B irr"
+            if (now - t) * sgn > 0
+                p.dead := true
+                tg     := tr("beyond model", "تجاوز النموذج")
+            p.nm    := tg
+            p.mid   := f_p(t)
+            p.lo    := f_p(qa + sgn * rl * wa)
+            p.hi    := f_p(qa + sgn * rh * wa)
+            p.dur   := math.max(int((ba - b5) * 0.6), 3)
+            p.n2nm  := "C"
+            p.n2    := f_p(t - sgn * wa)
+            p.n2dur := math.max(ba - b5, 3)
+        else if corr == 2
+            float  qa = f_m(array.get(zzP, s + 6))
+            float  qb = f_m(array.get(zzP, s + 7))
+            int    ba = array.get(zzB, s + 6)
+            float  wa = math.abs(q5 - qa)
+            float  t  = qb - sgn * 1.000 * wa
+            float  rl = 0.618
+            float  rh = 1.618
+            string tg = "C"
+            if (t - now) * sgn > 0
+                t  := qb - sgn * 1.618 * wa
+                rl := 1.272
+                rh := 2.000
+                tg := "C ext"
+            if (t - now) * sgn > 0
+                p.dead := true
+                tg     := tr("beyond model", "تجاوز النموذج")
+            p.nm    := tg
+            p.mid   := f_p(t)
+            p.lo    := f_p(qb - sgn * rl * wa)
+            p.hi    := f_p(qb - sgn * rh * wa)
+            p.dur   := math.max(ba - b5, 3)
+            p.n2nm  := "1"
+            p.n2    := f_p(t + sgn * 0.382 * full)
+            p.n2dur := math.max(int(dFul * 0.8), 3)
+        else
+            float  qc = f_m(array.get(zzP, s + 8))
+            float  t  = qc + sgn * 0.382 * full
+            float  rl = 0.236
+            float  rh = 0.618
+            string tg = "1"
+            if (now - t) * sgn > 0
+                t  := qc + sgn * 0.618 * full
+                rl := 0.500
+                rh := 0.786
+            if (now - t) * sgn > 0
+                p.dead := true
+                tg     := tr("beyond model", "تجاوز النموذج")
+            p.nm  := tg
+            p.mid := f_p(t)
+            p.lo  := f_p(qc + sgn * rl * full)
+            p.hi  := f_p(qc + sgn * rh * full)
+            p.dur := math.max(int(dFul * 0.8), 3)
+    if p.dead
+        p.mid := na
+        p.lo  := na
+        p.hi  := na
+        p.n2  := na
+        p.n3  := na
+    if not na(p.mid) and p.mid <= 0.0
+        p.mid := na
+    if not na(p.lo) and p.lo <= 0.0
+        p.lo := na
+    if not na(p.hi) and p.hi <= 0.0
+        p.hi := na
+    if not na(p.n2) and p.n2 <= 0.0
+        p.n2 := na
+    if not na(p.n3) and p.n3 <= 0.0
+        p.n3 := na
+    p
+
+f_clearEW() =>
+    while array.size(ewLn) > 0
+        line.delete(array.pop(ewLn))
+    while array.size(ewLb) > 0
+        label.delete(array.pop(ewLb))
+    while array.size(ewBx) > 0
+        box.delete(array.pop(ewBx))
+
+f_target(int x1, int x2, float y, string txt, color c) =>
+    if f_ok(y)
+        array.push(ewLn, line.new(x1, y, x2, y, xloc = xloc.bar_index,
+             color = color.new(c, 30), style = line.style_dotted, width = 1))
+        array.push(ewLb, label.new(x2, y, txt, xloc = xloc.bar_index,
+             style = label.style_label_left, color = color.new(c, 25),
+             textcolor = color.white, size = size.tiny))
+
+f_leg(int x1, float y1, int x2, float y2, string tag, color c) =>
+    float a1 = f_clip(y1)
+    float a2 = f_clip(y2)
+    if not na(a1) and not na(a2)
+        array.push(ewLn, line.new(x1, a1, x2, a2, xloc = xloc.bar_index,
+             color = c, style = line.style_dashed, width = 2))
+        array.push(ewLb, label.new(x2, a2, tag, xloc = xloc.bar_index,
+             style = label.style_label_center, color = color.new(c, 15),
+             textcolor = color.white, size = size.small))
+
+// ── does the projected reversal zone coincide with anything else? ────────────
+f_cluster(float pLo, float pHi, int fwdOff) =>
+    Cluster c = Cluster.new()
+    float tolv = clTol * nz(atrEW, close * 0.01)
+    float zl   = math.min(pLo, pHi) - tolv
+    float zh   = math.max(pLo, pHi) + tolv
+    c.lo := zl
+    c.hi := zh
+    if not na(chA) and not na(chB) and array.size(chLv) > 0
+        for i = 0 to array.size(chLv) - 1
+            float v = array.get(chLv, i)
+            float y = f_p(chA + chB * float(fwdOff) + chO0 + v * chSp)
+            if y >= zl and y <= zh and not c.rail
+                c.rail  := true
+                c.railY := y
+    int nzc = array.size(zones)
+    if nzc > 0
+        for k = 0 to nzc - 1
+            Zone z = array.get(zones, k)
+            if not z.broken and not c.zone
+                if math.min(zh, z.top) - math.max(zl, z.bot) > 0
+                    c.zone := true
+    c.score := (c.rail ? 1 : 0) + (c.zone ? 1 : 0)
+    c
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ③  ELLIOTT WAVE — pivots and the count, ONCE per closed bar
+// ═══════════════════════════════════════════════════════════════════════════════
+if ewOn and barstate.isconfirmed
+    gapAcc := math.max(gapAcc, gapBar)
+    int np = array.size(zzP)
+    if np > 0
+        for k = 0 to np - 1
+            array.set(zzHi, k, math.max(array.get(zzHi, k), high))
+            array.set(zzLo, k, math.min(array.get(zzLo, k), low))
+    if not na(phv)
+        f_addPivot(phv, bar_index - ewLen, 1, pvHi, pvLo, gapAcc)
+        gapAcc := 0.0
+    if not na(plv)
+        f_addPivot(plv, bar_index - ewLen, -1, pvHi, pvLo, gapAcc)
+        gapAcc := 0.0
+    cBar := f_findCount()
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ①  FIBONACCI CHANNEL
+//     Eight candidate look-backs are fitted on EVERY bar through global ta.*
+//     windows (the v2.4 fix) and the winner is chosen on the last bar only.
+// ═══════════════════════════════════════════════════════════════════════════════
+[cB1, cA1, cR1, cE1] = f_regS(chMin)
+[cB2, cA2, cR2, cE2] = f_regS(chMin + chStep)
+[cB3, cA3, cR3, cE3] = f_regS(chMin + chStep * 2)
+[cB4, cA4, cR4, cE4] = f_regS(chMin + chStep * 3)
+[cB5, cA5, cR5, cE5] = f_regS(chMin + chStep * 5)
+[cB6, cA6, cR6, cE6] = f_regS(chMin + chStep * 7)
+[cB7, cA7, cR7, cE7] = f_regS(chMin + chStep * 10)
+[cB8, cA8, cR8, cE8] = f_regS(chMin + chStep * 14)
+[cBF, cAF, cRF, cEF] = f_regS(chLen)
+
+var array<line>     fcLn = array.new<line>()
+var array<label>    fcLb = array.new<label>()
+var array<linefill> fcLf = array.new<linefill>()
+var array<float>    fcOk = array.new<float>()
+
+if chOn and barstate.islast
+    while array.size(fcLf) > 0
+        linefill.delete(array.pop(fcLf))
+    while array.size(fcLn) > 0
+        line.delete(array.pop(fcLn))
+    while array.size(fcLb) > 0
+        label.delete(array.pop(fcLb))
+    array.clear(fcOk)
+    chWhy := "chart has only " + str.tostring(bar_index + 1) + " bars"
+
+if chOn and barstate.islast and bar_index > 25
+    float b      = na
+    float a      = na
+    float rC     = na
+    float se     = na
+    int   useLen = 0
+    array<float> bs = array.from(cB1, cB2, cB3, cB4, cB5, cB6, cB7, cB8)
+    array<float> az = array.from(cA1, cA2, cA3, cA4, cA5, cA6, cA7, cA8)
+    array<float> rs = array.from(cR1, cR2, cR3, cR4, cR5, cR6, cR7, cR8)
+    array<float> es = array.from(cE1, cE2, cE3, cE4, cE5, cE6, cE7, cE8)
+    array<int>   ls = array.from(chMin, chMin + chStep, chMin + chStep * 2,
+         chMin + chStep * 3, chMin + chStep * 5, chMin + chStep * 7,
+         chMin + chStep * 10, chMin + chStep * 14)
+    if chMode == "Fixed"
+        b      := cBF
+        a      := cAF
+        rC     := cRF
+        se     := cEF
+        useLen := chLen
+    else if chMode == "Match the Elliott count" and cBar.s != -1
+        int span  = bar_index - array.get(zzB, cBar.s) + 1
+        int bestD = 1000000000
+        for k = 0 to 7
+            if not na(array.get(rs, k))
+                int d = math.abs(array.get(ls, k) - span)
+                if d < bestD
+                    bestD  := d
+                    useLen := array.get(ls, k)
+                    b      := array.get(bs, k)
+                    a      := array.get(az, k)
+                    rC     := array.get(rs, k)
+                    se     := array.get(es, k)
+    else
+        float bestR = -1.0
+        for k = 0 to 7
+            float rk = array.get(rs, k)
+            if not na(rk) and math.abs(rk) > bestR
+                bestR  := math.abs(rk)
+                useLen := array.get(ls, k)
+                b      := array.get(bs, k)
+                a      := array.get(az, k)
+                rC     := array.get(rs, k)
+                se     := array.get(es, k)
+    chWhy := na(b) ? tr("not enough data — need ", "بيانات غير كافية — يلزم ") + str.tostring(chMin) +
+         tr(" bars, chart has ", " شمعة والمتوفر ") + str.tostring(bar_index + 1) :
+         rC * rC < chMinR2 ? tr("weak fit", "ارتباط ضعيف") + "  R²=" + str.tostring(rC * rC, "#.00") : ""
+    if not na(b) and chWhy == ""
+        int L = useLen
+        float mUp = chMult * nz(se)
+        float mDn = mUp
+        if fcAnchor != "Std-Dev (balanced)"
+            float u = 0.0
+            float d = 0.0
+            for i = 0 to L - 1
+                float fitv = a + b * (-1.0 * float(i))
+                u := math.max(u, f_m(high[i]) - fitv)
+                d := math.max(d, fitv - f_m(low[i]))
+            float cap = chExtCap * nz(se, u)
+            mUp := math.min(u, cap)
+            mDn := math.min(d, cap)
+        float minW = f_m(close * 1.01) - f_m(close)
+        if na(mUp) or mUp <= 0.0
+            mUp := minW
+        if na(mDn) or mDn <= 0.0
+            mDn := minW
+        bool  up   = b > 0
+        float off0 = up ? -mDn : mUp
+        float off1 = up ? mUp  : -mDn
+        float span = off1 - off0
+        float drift = useLog ? math.log(1.0 + safeDrift / 100.0) : safeDrift / 100.0 * close
+        int   fwd   = chFwdS
+        if b != 0.0
+            fwd := int(math.min(float(chFwdS), drift / math.abs(b)))
+        fwd := math.max(fwd, 0)
+        array.clear(chLv)
+        array<string> ps = str.split(fcLvls, ",")
+        if array.size(ps) > 0
+            for i = 0 to array.size(ps) - 1
+                float v = str.tonumber(str.replace_all(array.get(ps, i), " ", ""))
+                if not na(v)
+                    array.push(chLv, v)
+        if fcExtOn
+            array<string> pe = str.split(fcExtLv, ",")
+            if array.size(pe) > 0
+                for i = 0 to array.size(pe) - 1
+                    float v = str.tonumber(str.replace_all(array.get(pe, i), " ", ""))
+                    if not na(v)
+                        array.push(chLv, v)
+                        if fcMirror
+                            array.push(chLv, 1.0 - v)
+        array.sort(chLv, order.ascending)
+        color cCh    = up ? chColUp : chColDn
+        float mLo    = f_m(bandLo)
+        float mHi    = f_m(bandHi)
+        float bandH  = math.abs(mHi - mLo)
+        int   minSeg = math.max(10, int(float(L) * chMinSeg))
+        int   n      = array.size(chLv)
+        if n > 0
+            for k = 0 to n - 1
+                float v      = array.get(chLv, k)
+                float off    = off0 + v * span
+                bool  isRail = v == 0.0 or v == 1.0
+                bool  isExt  = v < 0.0 or v > 1.0
+                color c      = isExt ? fcColExt : cCh
+                float f1 = -1.0 * float(L - 1)
+                float f2 = float(fwd)
+                if b > 0.0
+                    f1 := math.max(f1, (mLo - off - a) / b)
+                    f2 := math.min(f2, (mHi - off - a) / b)
+                else if b < 0.0
+                    f1 := math.max(f1, (mHi - off - a) / b)
+                    f2 := math.min(f2, (mLo - off - a) / b)
+                else if not (a + off >= mLo and a + off <= mHi)
+                    f2 := f1 - 1.0
+                int   x1 = int(math.ceil(f1))
+                int   x2 = int(math.floor(f2))
+                float dY = math.abs(b) * float(math.max(x2 - x1, 0))
+                if x2 - x1 >= minSeg and dY <= bandH * 1.2
+                    float y1 = f_p(a + b * float(x1) + off)
+                    float y2 = f_p(a + b * float(x2) + off)
+                    array.push(fcLn, line.new(bar_index + x1, y1, bar_index + x2, y2,
+                         xloc = xloc.bar_index,
+                         color = isRail ? c : color.new(c, 30),
+                         width = isRail ? 2 : 1,
+                         style = isExt ? line.style_dotted : line.style_solid))
+                    array.push(fcOk, v)
+                    if fcLabels
+                        array.push(fcLb, label.new(bar_index + x2, y2,
+                             str.tostring(v) + "   " + str.tostring(y2, format.mintick),
+                             xloc = xloc.bar_index, style = label.style_label_left,
+                             color = color.new(c, isRail ? 15 : 50),
+                             textcolor = color.white, size = size.tiny))
+            if fcFillOn and array.size(fcLn) > 1
+                for k = 0 to array.size(fcLn) - 2
+                    float v0 = array.get(fcOk, k)
+                    bool  ex = v0 < 0.0 or v0 >= 1.0
+                    array.push(fcLf, linefill.new(array.get(fcLn, k), array.get(fcLn, k + 1),
+                         color.new(ex ? fcColExt : cCh, k % 2 == 0 ? 91 : 96)))
+        float yN = a
+        chUpNow  := f_p(yN + math.max(off0, off1))
+        chLoNow  := f_p(yN + math.min(off0, off1))
+        chMidNow := f_p(yN + off0 + 0.5 * span)
+        chRNow   := rC
+        chLenNow := L
+        chA      := a
+        chB      := b
+        chO0     := off0
+        chSp     := span
+        chFib    := span == 0.0 ? na : (f_m(close) - (yN + off0)) / span
+        if chInfo
+            float yInfo = f_clip(f_p(a + b * float(fwd) + off1))
+            if not na(yInfo)
+                array.push(fcLb, label.new(bar_index + fwd, yInfo,
+                     (up ? "▲ " : "▼ ") + "FIB " + str.tostring(L) + "B  R²=" +
+                     str.tostring(rC * rC, "#.00") + (useLog ? "  ·log" : ""),
+                     xloc = xloc.bar_index, style = label.style_label_left,
+                     color = color.new(cCh, 15), textcolor = color.white, size = size.tiny))
+        if barstate.isconfirmed
+            if close > chUpNow
+                alert("AC Auto-Structure: price closed OUTSIDE the fib channel (upper rail)", alert.freq_once_per_bar_close)
+            if close < chLoNow
+                alert("AC Auto-Structure: price closed OUTSIDE the fib channel (lower rail)", alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ②  SUPPLY & DEMAND ZONES
+// ═══════════════════════════════════════════════════════════════════════════════
+if sdOn and barstate.isconfirmed
+    int nZ = array.size(zones)
+    if nZ > 0
+        for k = nZ - 1 to 0
+            Zone z = array.get(zones, k)
+            float dist = math.abs((z.demand ? z.top : z.bot) - close) / close * 100.0
+            if not z.broken and dist > sdMaxDist
+                box.delete(z.bx)
+                if not na(z.lb)
+                    label.delete(z.lb)
+                array.remove(zones, k)
+                z.broken := true
+            if not z.broken
+                bool inNow = high >= z.bot and low <= z.top
+                if inNow and not z.inside
+                    z.touches := z.touches + 1
+                    sigTouch  := true
+                z.inside := inNow
+                bool byCls = sdMitig == "Close"
+                bool brk   = z.demand ? (byCls ? close < z.bot : low < z.bot) :
+                     (byCls ? close > z.top : high > z.top)
+                if brk
+                    z.broken := true
+                    sigBreak := true
+                    if not na(z.lb)
+                        label.delete(z.lb)
+                        z.lb := na
+                    if sdDelBrk
+                        box.delete(z.bx)
+                        array.remove(zones, k)
+                    else
+                        box.set_bgcolor(z.bx, color.new(color.gray, 90))
+                        box.set_border_color(z.bx, color.new(color.gray, 60))
+                        box.set_right(z.bx, bar_index)
+
+if sdOn and barstate.isconfirmed and (bullEx or bearEx) and not na(atrVal)
+    bool  isDem = bullEx
+    float zTop  = na
+    float zBot  = na
+    int   nBase = 0
+    bool  halt  = false
+    for j = 1 to sdMaxBase
+        if not halt
+            if isBase[j]
+                nBase := nBase + 1
+                float bt = isDem ? (sdWide ? high[j] : math.max(open[j], close[j])) : high[j]
+                float bb = isDem ? low[j] : (sdWide ? low[j] : math.min(open[j], close[j]))
+                zTop := na(zTop) ? bt : math.max(zTop, bt)
+                zBot := na(zBot) ? bb : math.min(zBot, bb)
+            else
+                halt := true
+    if nBase == 0 and sdFallbck
+        zTop := isDem ? open : high
+        zBot := isDem ? low  : open
+    bool okSize = not na(zTop) and not na(zBot) and zTop > zBot and (zTop - zBot) <= sdMaxW * atrVal
+    if okSize
+        int nZ2 = array.size(zones)
+        if nZ2 > 0
+            for k = nZ2 - 1 to 0
+                Zone zz = array.get(zones, k)
+                if zz.demand == isDem and not zz.broken and
+                   math.min(zTop, zz.top) - math.max(zBot, zz.bot) > 0
+                    box.delete(zz.bx)
+                    if not na(zz.lb)
+                        label.delete(zz.lb)
+                    array.remove(zones, k)
+        color cz  = isDem ? sdColDem : sdColSup
+        int   lft = bar_index - math.max(nBase, 1)
+        box   bx  = box.new(lft, zTop, bar_index + sdFwdS, zBot, xloc = xloc.bar_index,
+             border_color = color.new(cz, 40), border_width = 1, bgcolor = color.new(cz, sdTransp))
+        label lb = na
+        if sdLabels
+            lb := label.new(bar_index + sdFwdS, isDem ? zBot : zTop,
+                 (isDem ? "DEMAND  ×" : "SUPPLY  ×") + str.tostring(bodySz / atrVal, "#.0") + " ATR",
+                 xloc = xloc.bar_index,
+                 style = isDem ? label.style_label_upper_left : label.style_label_lower_left,
+                 color = color.new(cz, 25), textcolor = color.white, size = size.tiny)
+        array.push(zones, Zone.new(top = zTop, bot = zBot, born = bar_index, demand = isDem,
+             touches = 0, broken = false, inside = false, power = bodySz / atrVal, bx = bx, lb = lb))
+        if isDem
+            sigNewDem := true
+        else
+            sigNewSup := true
+        int cntZ  = 0
+        int total = array.size(zones)
+        if total > 0
+            for k = total - 1 to 0
+                Zone zq = array.get(zones, k)
+                if zq.demand == isDem
+                    cntZ := cntZ + 1
+                    if cntZ > sdMaxZ
+                        box.delete(zq.bx)
+                        if not na(zq.lb)
+                            label.delete(zq.lb)
+                        array.remove(zones, k)
+
+if sdOn and barstate.islast
+    int nZ3 = array.size(zones)
+    if nZ3 > 0
+        for k = 0 to nZ3 - 1
+            Zone z = array.get(zones, k)
+            if not z.broken
+                box.set_right(z.bx, bar_index + sdFwdS)
+                if not na(z.lb)
+                    label.set_x(z.lb, bar_index + sdFwdS)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ③  ELLIOTT WAVE — drawing
+// ═══════════════════════════════════════════════════════════════════════════════
+if ewOn and barstate.islast
+    f_clearEW()
+    int m = array.size(zzP)
+    Cnt ct  = cBar
+    ewStart := ct.s
+    ewCount := ct.cnt
+    ewBull  := ct.bull
+    ewLoose := ct.loose
+    ewCorr  := ct.corr
+    ewEv    := ct.ev
+    ewWhy   := ct.why
+    ewGapSh := ct.gap
+    color cEW = ewBull ? ewColBull : ewColBear
+    if ewStart != -1
+        ewInvLv := f_invAny(ewStart, ewCount, ewCorr)
+    if ewZig and m >= 2
+        int zFrom = ewStart != -1 ? ewStart : math.max(0, m - 8)
+        if m - 2 >= zFrom
+            for k = zFrom to m - 2
+                array.push(ewLn, line.new(array.get(zzB, k), array.get(zzP, k),
+                     array.get(zzB, k + 1), array.get(zzP, k + 1), xloc = xloc.bar_index,
+                     color = ewColZig, width = 1))
+        int   lastD  = array.get(zzD, m - 1)
+        float livePx = lastD == 1 ? low : high
+        array.push(ewLn, line.new(array.get(zzB, m - 1), array.get(zzP, m - 1),
+             bar_index, livePx, xloc = xloc.bar_index,
+             color = color.new(ewColZig, 40), width = 1, style = line.style_dotted))
+    if ewStart != -1
+        for k = 0 to ewCount - 1
+            int   bx2  = array.get(zzB, ewStart + k)
+            float py   = array.get(zzP, ewStart + k)
+            bool  isHi = array.get(zzD, ewStart + k) == 1
+            array.push(ewLb, label.new(bx2, py, str.tostring(k), xloc = xloc.bar_index,
+                 style = isHi ? label.style_label_down : label.style_label_up,
+                 color = cEW, textcolor = color.white, size = size.small))
+        if ewCorr > 0
+            for k = 0 to ewCorr - 1
+                int   bx3   = array.get(zzB, ewStart + 6 + k)
+                float py2   = array.get(zzP, ewStart + 6 + k)
+                bool  isHi2 = array.get(zzD, ewStart + 6 + k) == 1
+                string t2   = k == 0 ? "A" : k == 1 ? "B" : "C"
+                array.push(ewLb, label.new(bx3, py2, t2, xloc = xloc.bar_index,
+                     style = isHi2 ? label.style_label_down : label.style_label_up,
+                     color = color.new(cEW, 35), textcolor = color.white, size = size.small))
+    // ══ WHERE PRICE GOES NEXT ════════════════════════════════════════════════
+    if ewStart != -1 and (ewTargets or ewProject)
+        Proj pr    = f_proj(ewStart, ewCount, ewBull, ewCorr, ewLoose or ewEv == 1)
+        int  xLast = array.get(zzB, ewStart + ewCount - 1)
+        ewNextP := pr.mid
+        ewNextL := pr.nm
+        int   tot = pr.dur + (ewLegs >= 2 ? pr.n2dur : 0) + (ewLegs >= 3 ? pr.n3dur : 0)
+        float sk  = tot > safeFwd ? float(safeFwd) / float(tot) : 1.0
+        int   d1s = math.max(int(pr.dur   * sk), 2)
+        int   d2s = math.max(int(pr.n2dur * sk), 2)
+        int   d3s = math.max(int(pr.n3dur * sk), 2)
+        if not na(pr.mid)
+            float budget = ewFeasK * nz(atrEW, close * 0.02) * math.sqrt(math.max(d1s, 1))
+            ewNeed := math.abs(pr.mid - close)
+            ewFeas := ewNeed <= budget
+        if clOn and not na(pr.lo) and not na(pr.hi)
+            Cluster cl = f_cluster(pr.lo, pr.hi, pr.dur)
+            ewCl     := cl.score
+            ewClRail := cl.rail
+            ewClZone := cl.zone
+            if cl.score >= clMin
+                float cT = f_clip(cl.hi)
+                float cB = f_clip(cl.lo)
+                if clBox and not na(cT) and not na(cB) and cT > cB
+                    array.push(ewBx, box.new(bar_index, cT, bar_index + d1s, cB,
+                         xloc = xloc.bar_index, border_color = color.new(clCol, 25),
+                         border_width = 2, bgcolor = color.new(clCol, 82)))
+                    array.push(ewLb, label.new(bar_index + d1s, cT,
+                         "★ " + tr("CLUSTER", "توافق") + " " + str.tostring(cl.score) + "/2  " +
+                         (cl.rail ? tr("rail", "قناة") : "") +
+                         (cl.rail and cl.zone ? " + " : "") +
+                         (cl.zone ? tr("zone", "منطقة") : ""),
+                         xloc = xloc.bar_index, style = label.style_label_lower_left,
+                         color = color.new(clCol, 15), textcolor = color.black, size = size.tiny))
+                if clAlert and barstate.isconfirmed and high >= cl.lo and low <= cl.hi
+                    alert("AC Auto-Structure · " + syminfo.ticker + " " + timeframe.period +
+                         " · price is INSIDE a confluence cluster at " +
+                         str.tostring(pr.mid, format.mintick), alert.freq_once_per_bar_close)
+        if ewTargets and not pr.dead
+            int xt = bar_index + math.min(40, safeFwd)
+            f_target(xLast, xt, pr.lo, pr.nm + "  " + str.tostring(pr.lo, format.mintick), cEW)
+            f_target(xLast, xt, pr.hi, pr.nm + "  " + str.tostring(pr.hi, format.mintick), cEW)
+        if ewProject and not na(pr.mid)
+            int   xA = bar_index
+            int   xB = xA + d1s
+            float zT = f_clip(math.max(nz(pr.lo, pr.mid), nz(pr.hi, pr.mid)))
+            float zB = f_clip(math.min(nz(pr.lo, pr.mid), nz(pr.hi, pr.mid)))
+            if not na(zT) and not na(zB) and zT > zB
+                array.push(ewBx, box.new(xA, zT, xB, zB, xloc = xloc.bar_index,
+                     border_color = color.new(ewColProj, 55), border_width = 1,
+                     bgcolor = color.new(ewColProj, 88)))
+            string mark = (ewEv == 1 ? "?" : "") + (ewFeas ? "" : " ⚠") +
+                 (ewGapSh > 0.25 ? " ◪" : "")
+            f_leg(xA, close, xB, pr.mid,
+                 pr.nm + mark + "  " + str.tostring(pr.mid, format.mintick), ewColProj)
+            int xC = xB
+            if ewLegs >= 2 and not na(pr.n2)
+                xC := xB + d2s
+                f_leg(xB, pr.mid, xC, pr.n2, pr.n2nm, color.new(ewColProj, 35))
+                if ewLegs >= 3 and not na(pr.n3)
+                    f_leg(xC, pr.n2, xC + d3s, pr.n3, pr.n3nm, color.new(ewColProj, 50))
+                    xC := xC + d3s
+            if ewInvLine and not na(ewInvLv) and f_ok(ewInvLv)
+                if math.abs(ewInvLv - close) / close * 100.0 <= invMaxD
+                    array.push(ewLn, line.new(xLast, ewInvLv, xC, ewInvLv, xloc = xloc.bar_index,
+                         color = color.new(ewColInv, 20), style = line.style_dashed, width = 1))
+                    array.push(ewLb, label.new(xC, ewInvLv,
+                         "✕ " + tr("count dies", "يبطل العدّ") + "  " +
+                         str.tostring(ewInvLv, format.mintick),
+                         xloc = xloc.bar_index, style = label.style_label_left,
+                         color = color.new(ewColInv, 20), textcolor = color.white, size = size.tiny))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⑤  WALK-FORWARD ACCURACY TEST — state
+// ═══════════════════════════════════════════════════════════════════════════════
+var array<Trade> btOpen = array.new<Trade>()
+var int    btN    = 0
+var int    btWin  = 0
+var int    btLos  = 0
+var int    btExp  = 0
+var float  btRsum = 0.0
+var int    btHeld = 0
+var string btLast = ""
+
+if btOn and ewOn and barstate.isconfirmed and bar_index > ewLen * 4
+    if array.size(btOpen) > 0
+        Trade t    = array.get(btOpen, 0)
+        bool  hitT = t.long ? high >= t.tgt  : low  <= t.tgt
+        bool  hitS = t.long ? low  <= t.stop : high >= t.stop
+        int   held = bar_index - t.bar
+        if hitS
+            btLos  += 1
+            btRsum -= 1.0
+            array.clear(btOpen)
+        else if hitT
+            btWin  += 1
+            btHeld += held
+            btRsum += math.abs(t.tgt - t.entry) / math.max(math.abs(t.entry - t.stop), syminfo.mintick)
+            array.clear(btOpen)
+        else if held >= btHoldEff
+            btExp += 1
+            array.clear(btOpen)
+    if array.size(btOpen) == 0 and cBar.s != -1
+        Cnt    c2 = cBar
+        Proj   p2 = f_proj(c2.s, c2.cnt, c2.bull, c2.corr, c2.loose or c2.ev == 1)
+        string id = str.tostring(array.get(zzB, c2.s)) + "|" + str.tostring(c2.cnt) +
+             "|" + (c2.bull ? "B" : "S") + "|" + str.tostring(c2.corr)
+        if id != btLast and not na(p2.mid) and not p2.dead
+            bool  lng    = p2.mid > close
+            float stpRaw = f_invAny(c2.s, c2.cnt, c2.corr)
+            if (lng and stpRaw >= close) or (not lng and stpRaw <= close)
+                stpRaw := array.get(zzP, c2.s + c2.cnt - 1 + c2.corr)
+            // the stop must be survivable: % cap or ATR cap, whichever is NEARER
+            float capD = math.min(close * btStopCap / 100.0, btStopATR * nz(atrVal, close * 0.02))
+            float stp  = lng ? math.max(stpRaw, close - capD) : math.min(stpRaw, close + capD)
+            bool  ok   = (lng and stp < close and p2.mid > close) or
+                 (not lng and stp > close and p2.mid < close)
+            // a target closer than one ATR is noise, not a signal
+            ok := ok and math.abs(p2.mid - close) >= nz(atrVal, close * 0.01)
+            float rr = ok ? math.abs(p2.mid - close) / math.max(math.abs(close - stp), syminfo.mintick) : 0.0
+            if ok and rr >= btMinRR
+                btLast := id
+                btN    += 1
+                array.push(btOpen, Trade.new(entry = close, tgt = p2.mid, stop = stp,
+                     long = lng, bar = bar_index))
+                if btMarks
+                    label.new(bar_index, lng ? low : high,
+                         (lng ? "▲" : "▼") + p2.nm, xloc = xloc.bar_index,
+                         style = lng ? label.style_label_up : label.style_label_down,
+                         color = color.new(lng ? sdColDem : sdColSup, 30),
+                         textcolor = color.white, size = size.tiny)
+
+// ── the honest arithmetic ────────────────────────────────────────────────────
+int    btClosed = btWin + btLos + btExp
+int    btDen    = btTOloss ? btClosed : (btWin + btLos)
+float  btHit    = btDen    > 0 ? btWin / float(btDen) * 100.0 : na
+float  btExpc   = btClosed > 0 ? btRsum / float(btClosed) : na
+bool   btEnough = btClosed >= btMinN
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ④  DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+var table dash = table.new(
+     dashPos == "Top right"    ? position.top_right    :
+     dashPos == "Top left"     ? position.top_left     :
+     dashPos == "Bottom right" ? position.bottom_right :
+     dashPos == "Bottom left"  ? position.bottom_left  : position.middle_right,
+     2, 13, border_width = 1, border_color = color.new(color.gray, 70),
+     frame_width = 1, frame_color = color.new(color.gray, 70))
+
+if dashOn and barstate.islast
+    string tsz = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+    color  bgH = color.new(#1e222d, 10)
+    color  bgC = color.new(#131722, 20)
+    table.cell(dash, 0, 0, "AC AUTO-STRUCTURE", text_color = color.white, bgcolor = bgH, text_size = tsz)
+    table.cell(dash, 1, 0, timeframe.period + (useLog ? "  ·log" : "  ·lin"),
+         text_color = color.white, bgcolor = bgH, text_size = tsz)
+    string chTxt = "—  " + chWhy
+    color  chCol = color.gray
+    if not na(chMidNow) and chWhy == ""
+        chCol := chRNow > 0 ? chColUp : chColDn
+        chTxt := (chRNow > 0 ? tr("Rising", "صاعدة") : tr("Falling", "هابطة")) +
+             "  " + str.tostring(chLenNow) + "B  R²=" + str.tostring(chRNow * chRNow, "#.00")
+    table.cell(dash, 0, 1, tr("Fib channel", "قناة فيبو"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 1, chTxt, text_color = chCol, bgcolor = bgC, text_size = tsz)
+    string posTxt = "—"
+    color  posCol = color.gray
+    if not na(chFib)
+        posTxt := str.tostring(chFib, "#.000") + "   " +
+             (chFib > 1.0   ? tr("past level 1", "تجاوز 1") :
+              chFib < 0.0   ? tr("past level 0", "تجاوز 0") :
+              chFib > 0.786 ? tr("far rail", "الحافة البعيدة") :
+              chFib >= 0.5  ? tr("golden zone", "المنطقة الذهبية") :
+              chFib < 0.236 ? tr("trend rail", "حافة الاتجاه") : tr("mid", "الوسط"))
+        posCol := chFib < 0.382 ? sdColDem : chFib > 0.786 ? sdColSup : color.new(color.white, 20)
+    table.cell(dash, 0, 2, tr("At level", "عند مستوى"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 2, posTxt, text_color = posCol, bgcolor = bgC, text_size = tsz)
+    float nD = na
+    float nS = na
+    int   nZD = array.size(zones)
+    if nZD > 0
+        for k = 0 to nZD - 1
+            Zone z = array.get(zones, k)
+            if not z.broken
+                if z.demand and z.top <= close
+                    nD := na(nD) ? z.top : math.max(nD, z.top)
+                if not z.demand and z.bot >= close
+                    nS := na(nS) ? z.bot : math.min(nS, z.bot)
+    table.cell(dash, 0, 3, tr("Demand ▲", "طلب ▲"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 3, na(nD) ? "—" : str.tostring(nD, format.mintick) + "   (" +
+         str.tostring((close - nD) / close * 100.0, "#.0") + "%)",
+         text_color = sdColDem, bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 0, 4, tr("Supply ▼", "عرض ▼"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 4, na(nS) ? "—" : str.tostring(nS, format.mintick) + "   (" +
+         str.tostring((nS - close) / close * 100.0, "#.0") + "%)",
+         text_color = sdColSup, bgcolor = bgC, text_size = tsz)
+    string ewTxt = ewWhy == 4 ? tr("wave has not started yet", "الموجة لم تبدأ بعد") :
+         ewWhy == 3 ? tr("last count was invalidated", "أُبطل آخر عدّ") :
+         ewWhy == 2 ? tr("wave 2 too deep", "تصحيح الموجة 2 عميق جداً") :
+         tr("no impulsive structure", "لا يوجد هيكل دافع")
+    color ewCol = color.gray
+    if ewStart != -1
+        ewCol := ewBull ? ewColBull : ewColBear
+        string dir = ewBull ? tr("Bullish", "صاعد") : tr("Bearish", "هابط")
+        string st  = ewCount == 3 ? tr("W2 done → W3 expected",  "انتهت 2 ← تُتوقع 3") :
+             ewCount == 4 ? tr("W3 done → W4 correction", "انتهت 3 ← تصحيح 4") :
+             ewCount == 5 ? tr("W4 done → W5 expected",   "انتهت 4 ← تُتوقع 5") :
+             ewCorr == 0  ? tr("W5 done → ABC ahead",     "انتهت 5 ← تصحيح ABC") :
+             ewCorr == 1  ? tr("Wave A done",             "انتهت A") :
+             ewCorr == 2  ? tr("Wave B done → C ahead",   "انتهت B ← تُتوقع C") :
+             tr("ABC done → new impulse?", "انتهى ABC ← دفعة جديدة؟")
+        ewTxt := dir + " · " + st + (ewEv == 1 ? "  ?" + tr("provisional", "مبدئي") : "") +
+             (ewLoose ? "  ⚠" + tr("loose", "مرن") : "")
+    table.cell(dash, 0, 5, tr("Elliott", "إليوت"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 5, ewTxt, text_color = ewCol, bgcolor = bgC, text_size = tsz)
+    string nxTxt = ewStart == -1 ? "—" : (na(ewNextP) ?
+         (ewNextL == "" ? "—" : "✕ " + ewNextL) : "")
+    if not na(ewNextP)
+        nxTxt := ewNextL + " → " + str.tostring(ewNextP, format.mintick) + "   (" +
+             str.tostring((ewNextP - close) / close * 100.0, "+#.0;-#.0") + "%)" +
+             (f_ok(ewNextP) ? "" : "  " + tr("off-scale", "خارج الشارت"))
+    table.cell(dash, 0, 6, tr("Target", "الهدف"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 6, nxTxt, text_color = na(ewNextP) ? color.gray : ewCol, bgcolor = bgC, text_size = tsz)
+    string ivTxt = "—"
+    color  ivCol = ewColInv
+    if not na(ewInvLv)
+        float ivD = math.abs(ewInvLv - close) / close * 100.0
+        float capEffP = math.min(btStopCap, btStopATR * nz(atrVal, close * 0.02) / close * 100.0)
+        ivTxt := str.tostring(ewInvLv, format.mintick) + "   (" +
+             str.tostring((ewInvLv - close) / close * 100.0, "+#.0;-#.0") + "%)"
+        if ivD > capEffP
+            ivTxt := ivTxt + "  ⚠" + tr("test stops at ", "الاختبار يقف عند ") +
+                 str.tostring(capEffP, "#.0") + "%"
+            ivCol := color.new(color.orange, 15)
+    table.cell(dash, 0, 7, tr("Invalid at", "يبطل عند"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 7, ivTxt, text_color = ivCol, bgcolor = bgC, text_size = tsz)
+    string fTxt = na(ewNextP) ? "—" :
+         (ewFeas ? tr("reachable", "قابل للتحقق") : "⚠ " + tr("needs an outsized move", "يتطلب حركة مبالغاً فيها"))
+    table.cell(dash, 0, 8, tr("Reality check", "اختبار الواقعية"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 8, fTxt,
+         text_color = na(ewNextP) ? color.gray : (ewFeas ? sdColDem : sdColSup),
+         bgcolor = bgC, text_size = tsz)
+    bool   projUp = na(ewNextP) ? ewBull : ewNextP > close
+    string hTxt   = "—"
+    color  hCol   = color.gray
+    if htfOn and not na(htfSlope)
+        bool hUp = htfSlope > 0
+        hTxt := htfTF + "  " + (hUp ? tr("rising", "صاعد") : tr("falling", "هابط")) +
+             (na(htfPos) ? "" : "  " + str.tostring(htfPos * 100.0, "#") + "%") +
+             "  ·" + str.tostring(htfN) + "B"
+        hCol := hUp ? chColUp : chColDn
+        if ewStart != -1 and not na(ewNextP) and projUp != hUp
+            hTxt := hTxt + "  ⚠" + tr("target fights it", "الهدف يخالفه")
+            hCol := sdColSup
+    table.cell(dash, 0, 9, tr("Higher TF", "الفاصل الأعلى"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 9, hTxt, text_color = hCol, bgcolor = bgC, text_size = tsz)
+    string clTxt = "—"
+    color  clC   = color.gray
+    if clOn and ewStart != -1 and not na(ewNextP)
+        clTxt := ewCl == 0 ? tr("target stands alone", "الهدف وحده") :
+             str.tostring(ewCl) + "/2  " + (ewClRail ? tr("channel rail", "حافة القناة") : "") +
+             (ewClRail and ewClZone ? " + " : "") + (ewClZone ? tr("S/D zone", "منطقة عرض/طلب") : "")
+        clC := ewCl >= clMin ? clCol : color.new(color.white, 40)
+    table.cell(dash, 0, 10, tr("Confluence", "التوافق"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 10, clTxt, text_color = clC, bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 0, 11, tr("Gap share", "نصيب الفجوة"), text_color = color.new(color.white, 30), bgcolor = bgC, text_size = tsz)
+    table.cell(dash, 1, 11, ewStart == -1 ? "—" :
+         str.tostring(ewGapSh * 100.0, "#.0") + "%" +
+         (ewGapSh > 0.25 ? "  ◪ " + tr("gap-driven", "مدفوعة بفجوة") : ""),
+         text_color = ewGapSh > 0.25 ? sdColSup : color.new(color.white, 20),
+         bgcolor = bgC, text_size = tsz)
+    int score = 0
+    if chRNow > 0.3
+        score += 1
+    if chRNow < -0.3
+        score -= 1
+    if not na(chFib)
+        if chFib < 0.33
+            score += 1
+        if chFib > 0.66
+            score -= 1
+    if ewStart != -1 and not na(ewNextP)
+        score += projUp ? 1 : -1
+    if htfOn and not na(htfSlope)
+        score += htfSlope > 0 ? 1 : -1
+    if clOn and ewStart != -1 and ewCl >= clMin and not na(ewNextP)
+        score += projUp ? 1 : -1
+    string bias = score >= 2 ? tr("LONG bias", "تحيّز شرائي") :
+         score <= -2 ? tr("SHORT bias", "تحيّز بيعي") : tr("Neutral", "محايد")
+    color bCol = score >= 2 ? sdColDem : score <= -2 ? sdColSup : color.new(color.white, 20)
+    if btOn and btVeto and btEnough and not na(btExpc) and btExpc < 0.0
+        bias := tr("NO-TRADE · negative expectancy", "لا تداول · توقّع سالب")
+        bCol := sdColSup
+    table.cell(dash, 0, 12, tr("Bias", "التحيّز"), text_color = color.new(color.white, 30), bgcolor = bgH, text_size = tsz)
+    table.cell(dash, 1, 12, bias + "  (" + str.tostring(score) + ")", text_color = bCol, bgcolor = bgH, text_size = tsz)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ⑤  WALK-FORWARD ACCURACY TEST — table
+// ═══════════════════════════════════════════════════════════════════════════════
+var table bt = table.new(
+     btPos == "Bottom left"  ? position.bottom_left  :
+     btPos == "Bottom right" ? position.bottom_right :
+     btPos == "Top left"     ? position.top_left     : position.middle_left,
+     2, 7, border_width = 1, border_color = color.new(color.gray, 70),
+     frame_width = 1, frame_color = color.new(color.gray, 70))
+
+if btOn and barstate.islast
+    string bsz  = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : size.small
+    color  bgH2 = color.new(#1e222d, 10)
+    color  bgC2 = color.new(#131722, 20)
+    string small = tr("n=" + str.tostring(btClosed) + " · too small",
+         "العيّنة " + str.tostring(btClosed) + " · صغيرة")
+    table.cell(bt, 0, 0, tr("ACCURACY TEST", "اختبار الدقة"), text_color = color.white, bgcolor = bgH2, text_size = bsz)
+    table.cell(bt, 1, 0, syminfo.ticker + " " + timeframe.period, text_color = color.white, bgcolor = bgH2, text_size = bsz)
+    table.cell(bt, 0, 1, tr("Signals", "الإشارات"), text_color = color.new(color.white, 30), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 1, 1, str.tostring(btN) + "   (" + tr("closed ", "مغلقة ") + str.tostring(btClosed) + ")",
+         text_color = color.new(color.white, 10), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 0, 2, tr("Target hit", "بلغ الهدف"), text_color = color.new(color.white, 30), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 1, 2, str.tostring(btWin) + (btEnough ? "   (" + str.tostring(btHit, "#.0") + "%)" : ""),
+         text_color = btEnough ? sdColDem : color.new(color.gray, 10), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 0, 3, tr("Invalidated", "أُبطل"), text_color = color.new(color.white, 30), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 1, 3, str.tostring(btLos) +
+         (btEnough and btDen > 0 ? "   (" + str.tostring(btLos / float(btDen) * 100.0, "#.0") + "%)" : ""),
+         text_color = btEnough ? sdColSup : color.new(color.gray, 10), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 0, 4, tr("Timed out", "انتهت المهلة"), text_color = color.new(color.white, 30), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 1, 4, str.tostring(btExp) + (btTOloss ? "  " + tr("· counted as miss", "· تُحتسب إخفاقاً") : ""),
+         text_color = color.new(color.white, 40), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 0, 5, tr("Avg bars to target", "متوسط الشموع للهدف"), text_color = color.new(color.white, 30), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 1, 5, btWin > 0 ? str.tostring(btHeld / float(btWin), "#.0") + " / " + str.tostring(btHoldEff) : "—",
+         text_color = color.new(color.white, 20), bgcolor = bgC2, text_size = bsz)
+    table.cell(bt, 0, 6, tr("Expectancy (R)", "التوقع (R)"), text_color = color.new(color.white, 30), bgcolor = bgH2, text_size = bsz)
+    table.cell(bt, 1, 6, not btEnough ? small : (na(btExpc) ? "—" : str.tostring(btExpc, "+#.00;-#.00")),
+         text_color = not btEnough ? color.new(color.orange, 15) :
+              (na(btExpc) ? color.gray : btExpc > 0 ? sdColDem : sdColSup),
+         bgcolor = bgH2, text_size = bsz)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(sigNewDem, "New Demand Zone",  "AC Auto-Structure · new DEMAND zone on {{ticker}} {{interval}}")
+alertcondition(sigNewSup, "New Supply Zone",  "AC Auto-Structure · new SUPPLY zone on {{ticker}} {{interval}}")
+alertcondition(sigTouch,  "Zone Tested",      "AC Auto-Structure · price is testing a zone on {{ticker}} {{interval}}")
+alertcondition(sigBreak,  "Zone Broken",      "AC Auto-Structure · a zone was broken on {{ticker}} {{interval}}")

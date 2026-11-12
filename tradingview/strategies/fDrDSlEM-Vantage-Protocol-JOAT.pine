@@ -1,0 +1,319 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("Vantage Protocol [JOAT]", overlay = true, margin_long = 0, margin_short = 0,
+     default_qty_type = strategy.percent_of_equity, default_qty_value = 2,
+     initial_capital = 100000, pyramiding = 0, max_labels_count = 50,
+     max_lines_count = 50, max_boxes_count = 20)
+
+// ─── Palette ────────────────────────────────────────────────────────────────
+var color VP_BULL        = color.rgb(0, 205, 150)          // #00cd96 — protocol green
+var color VP_BEAR        = color.rgb(225, 48, 88)          // #e13058 — protocol red
+var color VP_NEUTRAL     = color.rgb(85, 95, 118)          // #555f76 — pewter dusk
+var color VP_RANGING     = color.rgb(140, 120, 220)        // #8c78dc — indigo haze
+var color VP_BAND        = color.rgb(50, 60, 90)           // #323c5a — deep twilight
+var color VP_SL          = color.rgb(200, 60, 75)          // #c83c4b — stop scarlet
+var color VP_TP          = color.rgb(0, 180, 130)          // #00b482 — target jade
+
+// ─── Input Groups ───────────────────────────────────────────────────────────
+string GRP_REG  = "Regime Engine"
+string GRP_MOM  = "Momentum Core"
+string GRP_VOL  = "Volume Filter"
+string GRP_BAND = "Band Structure"
+string GRP_SESS = "Session Filter"
+string GRP_RISK = "Risk Management"
+string GRP_VIS  = "Visuals"
+
+// ── Regime Engine ───
+int    regEffLen  = input.int(30, "R² Length",         minval = 5, group = GRP_REG)
+float  regEffK    = input.float(0.8, "R² Threshold k", minval = 0.1, step = 0.1, group = GRP_REG)
+int    regChopLen = input.int(20, "Chop Length",       minval = 5, group = GRP_REG)
+float  regChopThr = input.float(0.55, "Chop Threshold", minval = 0.3, step = 0.05, group = GRP_REG)
+int    regHinfOrd = input.int(3, "H-Inf Order",       minval = 1, maxval = 6, group = GRP_REG)
+float  regHinfN   = input.float(0.5, "H-Inf Noise",   minval = 0.01, step = 0.05, group = GRP_REG)
+float  regHinfD   = input.float(1.0, "H-Inf Disturb", minval = 0.1, step = 0.1, group = GRP_REG)
+
+// ── Momentum Core ───
+float  momAlpha   = input.float(0.07, "Laguerre Alpha", minval = 0.02, maxval = 0.3, step = 0.01, group = GRP_MOM)
+int    momJmaPer  = input.int(8, "JMA Smooth Period",  minval = 2, group = GRP_MOM)
+float  momBullThr = input.float(62.0, "Bull Threshold", minval = 52, maxval = 85, group = GRP_MOM)
+float  momBearThr = input.float(38.0, "Bear Threshold", minval = 15, maxval = 48, group = GRP_MOM)
+
+// ── Volume Filter ───
+int    volCvdSmth = input.int(14, "CVD Smoothing",    minval = 1, group = GRP_VOL)
+float  volMinRat  = input.float(0.7, "Min Vol Ratio", minval = 0.1, step = 0.1, group = GRP_VOL,
+     tooltip = "Minimum volume relative to 50-bar average to allow entry")
+
+// ── Band Structure ───
+int    bandJmaPer = input.int(21, "JMA Period",       minval = 5, group = GRP_BAND)
+int    bandAtrLen = input.int(14, "ATR Length",        minval = 5, group = GRP_BAND)
+float  bandSlMult = input.float(1.8, "SL Multiplier", minval = 0.5, step = 0.1, group = GRP_BAND)
+float  bandTpMult = input.float(2.8, "TP Multiplier", minval = 1.0, step = 0.1, group = GRP_BAND)
+
+// ── Session Filter ───
+bool   useSess    = input.bool(true, "Session Filter", group = GRP_SESS)
+string sessActive = input.session("0200-1200", "Active Window", group = GRP_SESS)
+string sessTZ     = input.string("America/New_York", "Timezone", group = GRP_SESS)
+
+// ── Risk Management ───
+float  riskPct    = input.float(1.5, "Risk %", minval = 0.1, maxval = 10, step = 0.1, group = GRP_RISK)
+int    cooldown   = input.int(5, "Re-entry Cooldown", minval = 0, maxval = 50, group = GRP_RISK,
+     tooltip = "Minimum bars between exits and new entries")
+
+// ── Visuals ───
+bool   showBands  = input.bool(true, "Show Bands",     group = GRP_VIS)
+bool   showDash   = input.bool(true, "Dashboard",      group = GRP_VIS)
+bool   showBarCol = input.bool(true, "Bar Coloring",   group = GRP_VIS)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 1: REGIME ENGINE (from Cadence Veil)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// H-Infinity filter
+var float[] _hS = array.new_float(regHinfOrd, 0.0)
+var float[] _hE = array.new_float(regHinfOrd, 1.0)
+var bool _hInit = false
+
+float hinfOut = close
+if not _hInit
+    for i = 0 to regHinfOrd - 1
+        array.set(_hS, i, close)
+    _hInit := true
+for i = 0 to regHinfOrd - 1
+    float s = array.get(_hS, i)
+    float e = array.get(_hE, i) + regHinfN
+    float g = e / (e + regHinfD)
+    array.set(_hS, i, s + g * (close - s))
+    array.set(_hE, i, (1.0 - g) * e)
+hinfOut := array.get(_hS, 0)
+
+float hinfSlope = hinfOut - nz(hinfOut[1], hinfOut)
+
+// R² efficiency gate
+float r2Raw    = math.pow(ta.correlation(close, bar_index, regEffLen), 2)
+float r2Sm     = ta.sma(r2Raw, 10)
+float r2Thr    = ta.sma(r2Sm, regEffLen) + regEffK * ta.stdev(r2Sm, regEffLen)
+var bool effOK = false
+if not effOK and r2Sm > r2Thr
+    effOK := true
+if effOK and r2Sm < r2Thr * 0.82
+    effOK := false
+
+// Chop score
+float chopNet  = math.abs(close - close[regChopLen])
+float chopPath = math.sum(math.abs(close - close[1]), regChopLen)
+float chopScore = chopPath == 0.0 ? 1.0 : 1.0 - (chopNet / chopPath)
+bool isChoppy  = chopScore > regChopThr
+
+// Combined regime
+// true = trending/tradeable, false = ranging/avoid
+bool regimeTrend = effOK and not isChoppy
+int  regimeBias  = regimeTrend ? (hinfSlope >= 0 ? 1 : -1) : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 2: MOMENTUM CORE (from Spectra Inflection)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Laguerre RSI
+var float _mL0 = 0.0, var float _mL1 = 0.0, var float _mL2 = 0.0, var float _mL3 = 0.0
+float mGamma = 1.0 - momAlpha
+_mL0 := momAlpha * close + mGamma * nz(_mL0[1])
+_mL1 := -mGamma * _mL0 + nz(_mL0[1]) + mGamma * nz(_mL1[1])
+_mL2 := -mGamma * _mL1 + nz(_mL1[1]) + mGamma * nz(_mL2[1])
+_mL3 := -mGamma * _mL2 + nz(_mL2[1]) + mGamma * nz(_mL3[1])
+
+float mCU = (_mL0>_mL1 ? _mL0-_mL1 : 0) + (_mL1>_mL2 ? _mL1-_mL2 : 0) + (_mL2>_mL3 ? _mL2-_mL3 : 0)
+float mCD = (_mL0<_mL1 ? _mL1-_mL0 : 0) + (_mL1<_mL2 ? _mL2-_mL1 : 0) + (_mL2<_mL3 ? _mL3-_mL2 : 0)
+float mDen = mCU + mCD
+float lagRsi = mDen == 0.0 ? 50.0 : (mCU / mDen) * 100.0
+
+// JMA smoothing on Laguerre output
+jmaSmooth(_s, _p, _ph, _pw) =>
+    float pV = math.min(math.max((_ph * 0.01) + 1.5, 0.5), 2.5)
+    float bt = _pw * (_p - 1) / ((_pw * (_p - 1)) + 2)
+    float l1 = math.max((math.log(math.sqrt(0.5 * (_p - 1))) / math.log(2.0)) + 2.0, 0)
+    float p1 = math.max(l1 - 2.0, 0.5)
+    float al = math.pow(bt, 1.0 / p1)
+    float aS = al * al
+    float oA = 1.0 - al
+    float oS = oA * oA
+    var float _m = na, var float _d0 = na, var float _d1 = na, var float _j = na
+    _m  := na(_m) ? _s : _s + al * (_m - _s)
+    _d0 := na(_d0) ? 0.0 : (_s - _m) * (1.0 - bt) + bt * _d0
+    float _m2 = _m + pV * _d0
+    _d1 := na(_d1) ? 0.0 : (_m2 - nz(_j, _s)) * oS + aS * _d1
+    _j  := na(_j) ? _s : nz(_j, _s) + _d1
+    _j
+
+float momLine = jmaSmooth(lagRsi, momJmaPer, -50, 0.6)
+
+bool momBull = momLine > momBullThr
+bool momBear = momLine < momBearThr
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 3: VOLUME FILTER (from Liquidity Tessera)
+// ═══════════════════════════════════════════════════════════════════════════
+
+float barDelta = close > open ? volume : close < open ? -volume : 0.0
+var float cvdRaw = 0.0
+cvdRaw := nz(cvdRaw[1]) + barDelta
+float cvdEma = ta.ema(cvdRaw, volCvdSmth)
+float cvdSlope = cvdEma - nz(cvdEma[1], cvdEma)
+
+bool cvdBull = cvdSlope > 0
+bool cvdBear = cvdSlope < 0
+
+float volMA   = ta.sma(volume, 50)
+float volSafe = volMA == 0 ? 1.0 : volMA
+float volRat  = volume / volSafe
+bool  volOK   = volRat >= volMinRat
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 4: BAND STRUCTURE (from Meridian Scaffold)
+// ═══════════════════════════════════════════════════════════════════════════
+
+float baseLine = jmaSmooth(hlc3, bandJmaPer, 0, 0.45)
+float atrVal   = ta.atr(bandAtrLen)
+float atrZ1    = ta.ema(atrVal, 21)
+float atrZ2    = ta.ema(atrZ1, 21)
+float atrSmth  = atrZ1 + (atrZ1 - atrZ2)
+
+float slBand = atrSmth * bandSlMult
+float tpBand = atrSmth * bandTpMult
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 5: SESSION FILTER (from Killzone Cartograph)
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool sessOK = not useSess or not na(time(timeframe.period, sessActive, sessTZ))
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY & EXIT LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+
+var int lastExitBar = 0
+bool cooldownOK = bar_index - lastExitBar >= cooldown
+
+// ── Entry Conditions ───
+bool longSetup  = regimeBias == 1  and momBull and cvdBull and volOK and sessOK and cooldownOK
+bool shortSetup = regimeBias == -1 and momBear and cvdBear and volOK and sessOK and cooldownOK
+
+// ── Prevent re-entry in same direction immediately ───
+bool inLong  = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+bool flat    = strategy.position_size == 0
+
+// ── Execute Entries ───
+if longSetup and flat
+    float sl = close - slBand
+    float tp = close + tpBand
+    strategy.entry("VP_Long", strategy.long)
+    strategy.exit("VP_LX", "VP_Long", stop = sl, limit = tp)
+
+if shortSetup and flat
+    float sl = close + slBand
+    float tp = close - tpBand
+    strategy.entry("VP_Short", strategy.short)
+    strategy.exit("VP_SX", "VP_Short", stop = sl, limit = tp)
+
+// ── Regime Exit: Close if regime flips to ranging ───
+if inLong and (regimeBias <= 0 or momLine < 45)
+    strategy.close("VP_Long", comment = "Regime Exit")
+    lastExitBar := bar_index
+
+if inShort and (regimeBias >= 0 or momLine > 55)
+    strategy.close("VP_Short", comment = "Regime Exit")
+    lastExitBar := bar_index
+
+// Track exits from strategy fills
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    lastExitBar := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Baseline with glow ───
+color baseCol = regimeBias == 1 ? VP_BULL : regimeBias == -1 ? VP_BEAR : VP_RANGING
+plot(baseLine, "Baseline",  color = baseCol,                      linewidth = 2)
+plot(baseLine, "Base Glow", color = color.new(baseCol, 60),       linewidth = 5)
+
+// ── SL/TP Bands ───
+float slUp = baseLine + slBand
+float slDn = baseLine - slBand
+float tpUp = baseLine + tpBand
+float tpDn = baseLine - tpBand
+
+pSU = plot(showBands ? slUp : na, "SL Upper", color = color.new(VP_SL, 60), linewidth = 1)
+pSD = plot(showBands ? slDn : na, "SL Lower", color = color.new(VP_SL, 60), linewidth = 1)
+pTU = plot(showBands ? tpUp : na, "TP Upper", color = color.new(VP_TP, 70), linewidth = 1, style = plot.style_cross)
+pTD = plot(showBands ? tpDn : na, "TP Lower", color = color.new(VP_TP, 70), linewidth = 1, style = plot.style_cross)
+
+pBL = plot(showBands ? baseLine : na, "Base Fill Anchor", display = display.none)
+fill(pBL, pSU, color = color.new(VP_BAND, 92), title = "Upper SL Zone")
+fill(pBL, pSD, color = color.new(VP_BAND, 92), title = "Lower SL Zone")
+
+// ── Bar Coloring ───
+color bc = inLong ? VP_BULL : inShort ? VP_BEAR :
+     regimeBias == 0 ? color.new(VP_RANGING, 35) : color.new(VP_NEUTRAL, 40)
+barcolor(showBarCol ? bc : na)
+
+// ── Regime Background ───
+bgcolor(regimeBias == 0 ? color.new(VP_RANGING, 94) : na, title = "Ranging Zone")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════
+
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 9,
+         bgcolor = color.rgb(15, 17, 28, 5), border_color = color.rgb(40, 44, 62), border_width = 1)
+
+    table.cell(dash, 0, 0, "VANTAGE PROTOCOL [JOAT]", text_color = color.rgb(180, 185, 210),
+         text_size = size.normal)
+    table.cell_set_text_formatting(dash, 0, 0, text.format_bold)
+    table.merge_cells(dash, 0, 0, 1, 0)
+
+    // Regime
+    string regTxt = regimeBias == 1 ? "TREND BULL" : regimeBias == -1 ? "TREND BEAR" : "RANGING"
+    table.cell(dash, 0, 1, "Regime",     text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 1, regTxt,       text_color = baseCol, text_size = size.small)
+    table.cell_set_text_formatting(dash, 1, 1, text.format_bold)
+
+    // Momentum
+    table.cell(dash, 0, 2, "Momentum",   text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 2, str.tostring(momLine, "#.#"),
+         text_color = color.from_gradient(momLine, 30, 70, VP_BEAR, VP_BULL), text_size = size.small)
+
+    // CVD
+    table.cell(dash, 0, 3, "CVD Slope",  text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 3, cvdBull ? "INFLOW" : "OUTFLOW",
+         text_color = cvdBull ? VP_BULL : VP_BEAR, text_size = size.small)
+
+    // Volume
+    table.cell(dash, 0, 4, "Vol Ratio",  text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 4, str.tostring(volRat, "#.##") + "x",
+         text_color = volOK ? VP_BULL : VP_NEUTRAL, text_size = size.small)
+
+    // Session
+    table.cell(dash, 0, 5, "Session",    text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 5, sessOK ? "ACTIVE" : "CLOSED",
+         text_color = sessOK ? VP_BULL : VP_NEUTRAL, text_size = size.small)
+
+    // Position
+    string posTxt = inLong ? "LONG" : inShort ? "SHORT" : "FLAT"
+    color posCol  = inLong ? VP_BULL : inShort ? VP_BEAR : VP_NEUTRAL
+    table.cell(dash, 0, 6, "Position",   text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 6, posTxt,       text_color = posCol, text_size = size.small)
+    table.cell_set_text_formatting(dash, 1, 6, text.format_bold)
+
+    // ATR
+    table.cell(dash, 0, 7, "ATR (ZEMA)", text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 7, str.tostring(atrSmth, format.mintick),
+         text_color = VP_NEUTRAL, text_size = size.small)
+
+    // Cooldown
+    int cdRemain = math.max(0, cooldown - (bar_index - lastExitBar))
+    table.cell(dash, 0, 8, "Cooldown",   text_color = color.rgb(130, 135, 160), text_size = size.small)
+    table.cell(dash, 1, 8, cdRemain > 0 ? str.tostring(cdRemain) + " bars" : "READY",
+         text_color = cdRemain > 0 ? VP_RANGING : VP_BULL, text_size = size.small)

@@ -1,0 +1,301 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © asunder729
+
+//@version=6
+indicator("YM NQ Early Pullback Signals", overlay = true)
+
+// ─────────────────────────────────────────────
+// SETTINGS
+// ─────────────────────────────────────────────
+demaLength = input.int(9, "DEMA Length", minval = 1)
+biasTF1    = input.timeframe("30", "Bias Timeframe 1")
+biasTF2    = input.timeframe("180", "Bias Timeframe 2")
+
+useVWAP = input.bool(false, "Require VWAP Confirmation")
+
+atrLength       = input.int(14, "ATR Length", minval = 1)
+stopATR         = input.float(1.0, "Stop Distance — ATR", minval = 0.1, step = 0.1)
+rewardRisk      = input.float(1.5, "Take-Profit Risk/Reward", minval = 0.5, step = 0.1)
+maxDistanceATR  = input.float(0.6, "Maximum Entry Distance From DEMA", minval = 0.1, step = 0.1)
+cooldownBars    = input.int(10, "Bars Between Signals", minval = 1)
+
+showDEMA   = input.bool(true, "Show 9 DEMA")
+showVWAP   = input.bool(true, "Show VWAP")
+showLevels = input.bool(true, "Show Entry, Stop and Target")
+
+// ─────────────────────────────────────────────
+// CUSTOM DEMA
+// ─────────────────────────────────────────────
+demaCalc(source, length) =>
+    emaOne = ta.ema(source, length)
+    emaTwo = ta.ema(emaOne, length)
+    2.0 * emaOne - emaTwo
+
+// ─────────────────────────────────────────────
+// CURRENT CHART VALUES
+// ─────────────────────────────────────────────
+dema9     = demaCalc(close, demaLength)
+vwapValue = ta.vwap(hlc3)
+atrValue  = ta.atr(atrLength)
+
+// ─────────────────────────────────────────────
+// COMPLETED HIGHER-TIMEFRAME VALUES
+// ─────────────────────────────────────────────
+tf1Close = request.security(
+     syminfo.tickerid,
+     biasTF1,
+     close[1],
+     lookahead = barmerge.lookahead_on
+)
+
+tf1Dema = request.security(
+     syminfo.tickerid,
+     biasTF1,
+     demaCalc(close, demaLength)[1],
+     lookahead = barmerge.lookahead_on
+)
+
+tf2Close = request.security(
+     syminfo.tickerid,
+     biasTF2,
+     close[1],
+     lookahead = barmerge.lookahead_on
+)
+
+tf2Dema = request.security(
+     syminfo.tickerid,
+     biasTF2,
+     demaCalc(close, demaLength)[1],
+     lookahead = barmerge.lookahead_on
+)
+
+// ─────────────────────────────────────────────
+// HIGHER-TIMEFRAME BIAS
+// ─────────────────────────────────────────────
+tf1Long  = tf1Close > tf1Dema
+tf1Short = tf1Close < tf1Dema
+
+tf2Long  = tf2Close > tf2Dema
+tf2Short = tf2Close < tf2Dema
+
+longBias  = tf1Long and tf2Long
+shortBias = tf1Short and tf2Short
+
+// ─────────────────────────────────────────────
+// EARLY PULLBACK + REJECTION LOGIC
+//
+// BUY:
+// Both higher timeframes are long.
+// Price touches/pulls through DEMA.
+// Candle closes green back above DEMA.
+//
+// SELL:
+// Both higher timeframes are short.
+// Price touches/pulls through DEMA.
+// Candle closes red back below DEMA.
+// ─────────────────────────────────────────────
+bullishPullback =
+     low <= dema9 and
+     close > dema9 and
+     close > open
+
+bearishPullback =
+     high >= dema9 and
+     close < dema9 and
+     close < open
+
+vwapLongOkay  = not useVWAP or close > vwapValue
+vwapShortOkay = not useVWAP or close < vwapValue
+
+// Prevents signals after price has already moved too far.
+longDistanceOkay =
+     close >= dema9 and
+     close - dema9 <= atrValue * maxDistanceATR
+
+shortDistanceOkay =
+     close <= dema9 and
+     dema9 - close <= atrValue * maxDistanceATR
+
+buyRaw =
+     barstate.isconfirmed and
+     longBias and
+     bullishPullback and
+     vwapLongOkay and
+     longDistanceOkay
+
+sellRaw =
+     barstate.isconfirmed and
+     shortBias and
+     bearishPullback and
+     vwapShortOkay and
+     shortDistanceOkay
+
+// ─────────────────────────────────────────────
+// SIGNAL COOLDOWN
+// ─────────────────────────────────────────────
+var int lastSignalBar = na
+
+canSignal =
+     na(lastSignalBar) or
+     bar_index - lastSignalBar >= cooldownBars
+
+buySignal  = buyRaw and canSignal
+sellSignal = sellRaw and canSignal
+
+if buySignal or sellSignal
+    lastSignalBar := bar_index
+
+// ─────────────────────────────────────────────
+// ENTRY, STOP AND TARGET GUIDES
+// ─────────────────────────────────────────────
+var float entryPrice  = na
+var float stopPrice   = na
+var float targetPrice = na
+var int tradeSide     = 0
+var int entryBar      = na
+
+if buySignal
+    entryPrice  := close
+    stopPrice   := math.min(low, close - atrValue * stopATR)
+    targetPrice := close + (close - stopPrice) * rewardRisk
+    tradeSide   := 1
+    entryBar    := bar_index
+
+if sellSignal
+    entryPrice  := close
+    stopPrice   := math.max(high, close + atrValue * stopATR)
+    targetPrice := close - (stopPrice - close) * rewardRisk
+    tradeSide   := -1
+    entryBar    := bar_index
+
+longFinished =
+     tradeSide == 1 and
+     bar_index > entryBar and
+     (low <= stopPrice or high >= targetPrice)
+
+shortFinished =
+     tradeSide == -1 and
+     bar_index > entryBar and
+     (high >= stopPrice or low <= targetPrice)
+
+if longFinished or shortFinished
+    entryPrice  := na
+    stopPrice   := na
+    targetPrice := na
+    tradeSide   := 0
+    entryBar    := na
+
+// ─────────────────────────────────────────────
+// CHART DISPLAY
+// ─────────────────────────────────────────────
+plot(
+     showDEMA ? dema9 : na,
+     title = "9 DEMA",
+     color = color.yellow,
+     linewidth = 2
+)
+
+plot(
+     showVWAP ? vwapValue : na,
+     title = "Session VWAP",
+     color = color.blue,
+     linewidth = 2
+)
+
+plot(
+     showLevels and tradeSide != 0 ? entryPrice : na,
+     title = "Entry",
+     color = color.white,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showLevels and tradeSide != 0 ? stopPrice : na,
+     title = "Stop Loss",
+     color = color.red,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+plot(
+     showLevels and tradeSide != 0 ? targetPrice : na,
+     title = "Take Profit",
+     color = color.green,
+     linewidth = 2,
+     style = plot.style_linebr
+)
+
+// ─────────────────────────────────────────────
+// SIGNAL LABELS
+// ─────────────────────────────────────────────
+plotshape(
+     buySignal,
+     title = "BUY NOW",
+     text = "BUY NOW",
+     style = shape.labelup,
+     location = location.belowbar,
+     color = color.green,
+     textcolor = color.white,
+     size = size.small
+)
+
+plotshape(
+     sellSignal,
+     title = "SELL NOW",
+     text = "SELL NOW",
+     style = shape.labeldown,
+     location = location.abovebar,
+     color = color.red,
+     textcolor = color.white,
+     size = size.small
+)
+
+// ─────────────────────────────────────────────
+// STATUS BOX
+// ─────────────────────────────────────────────
+var table statusTable = table.new(
+     position.top_right,
+     1,
+     1,
+     border_width = 2
+)
+
+string statusText = "WAIT"
+color statusColor = color.orange
+
+if buySignal
+    statusText := "BUY NOW"
+    statusColor := color.green
+else if sellSignal
+    statusText := "SELL NOW"
+    statusColor := color.red
+else
+    statusText := "WAIT"
+    statusColor := color.orange
+
+if barstate.islast
+    table.cell(
+         statusTable,
+         0,
+         0,
+         statusText,
+         bgcolor = statusColor,
+         text_color = color.white,
+         text_size = size.large
+    )
+
+// ─────────────────────────────────────────────
+// ALERT CONDITIONS
+// ─────────────────────────────────────────────
+alertcondition(
+     buySignal,
+     title = "YM/NQ BUY NOW",
+     message = "BUY NOW on {{ticker}} at {{close}}"
+)
+
+alertcondition(
+     sellSignal,
+     title = "YM/NQ SELL NOW",
+     message = "SELL NOW on {{ticker}} at {{close}}"
+)

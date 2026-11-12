@@ -1,0 +1,291 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator(
+     "Equalhigh - Pettitt Structural Break Detector",
+     shorttitle = "Pettitt Break",
+     overlay = false,
+     precision = 1
+)
+
+// Non-parametric rolling change-point detector based on Pettitt (1979).
+// The script signals on the current detection bar. It never places a signal
+// retrospectively on the estimated historical change-point.
+
+// =============================================================================
+// 1. INPUTS
+// =============================================================================
+
+groupData = "1. Observations"
+source = input.source(close, "Price source", group = groupData)
+returnHorizon = input.int(5, "Log-return horizon", minval = 1, maxval = 20, group = groupData)
+windowLength = input.int(60, "Pettitt window", minval = 40, maxval = 120, group = groupData)
+minimumSegment = input.int(10, "Minimum segment size", minval = 5, maxval = 20, group = groupData)
+
+groupValidation = "2. Validation"
+alpha = input.float(0.05, "Confirmed p-value", minval = 0.01, maxval = 0.10, step = 0.01, group = groupValidation)
+warningAlpha = input.float(0.15, "Possible-break p-value", minval = 0.05, maxval = 0.30, step = 0.01, group = groupValidation)
+maximumBreakAge = input.int(10, "Maximum actionable break age", minval = 1, maxval = 30, group = groupValidation)
+minimumEffectSize = input.float(0.25, "Minimum median-shift effect", minval = 0.0, maxval = 2.0, step = 0.05, group = groupValidation)
+confirmAtClose = input.bool(true, "Confirm signals at bar close", group = groupValidation)
+
+groupDisplay = "3. Display"
+showBackground = input.bool(true, "Color the detected regime", group = groupDisplay)
+showSignals = input.bool(true, "Show structural-break labels", group = groupDisplay)
+showPossibleBreaks = input.bool(true, "Show possible-break markers", group = groupDisplay)
+showDashboard = input.bool(true, "Show statistical dashboard", group = groupDisplay)
+
+// =============================================================================
+// 2. STATISTICAL HELPERS
+// =============================================================================
+
+f_median(array<float> data) =>
+    array<float> sortedData = array.copy(data)
+    array.sort(sortedData, order.ascending)
+
+    int dataSize = array.size(sortedData)
+    int middle = int(math.floor(dataSize / 2.0))
+    float result = na
+
+    if dataSize > 0
+        result := dataSize % 2 == 1 ? array.get(sortedData, middle) : (array.get(sortedData, middle - 1) + array.get(sortedData, middle)) / 2.0
+
+    result
+
+// Returns:
+// [maximum statistic, chronological split index, approximate p-value,
+//  median before the split, median after the split]
+f_pettitt(float src, int length, int minSegment) =>
+    float maximumStatistic = na
+    int bestSplit = na
+    float approximatePValue = na
+    float medianBefore = na
+    float medianAfter = na
+
+    if not na(src[length - 1])
+        array<float> values = array.new<float>(length, na)
+        array<float> ranks = array.new<float>(length, na)
+        bool allValuesAvailable = true
+
+        // Store observations from oldest to newest.
+        for i = 0 to length - 1
+            float historicalValue = src[length - 1 - i]
+            array.set(values, i, historicalValue)
+            allValuesAvailable := allValuesAvailable and not na(historicalValue)
+
+        if allValuesAvailable
+            // Sorting indices reduces rank construction from O(n^2) pairwise
+            // comparisons to one sort. Equal values receive their average rank.
+            array<int> sortedIndices = array.sort_indices(values, order.ascending)
+            int sortedPosition = 0
+
+            while sortedPosition < length
+                int tieEnd = sortedPosition
+                int firstOriginalIndex = array.get(sortedIndices, sortedPosition)
+                float tiedValue = array.get(values, firstOriginalIndex)
+
+                while tieEnd + 1 < length and array.get(values, array.get(sortedIndices, tieEnd + 1)) == tiedValue
+                    tieEnd += 1
+
+                float averageRank = (float(sortedPosition + 1) + float(tieEnd + 1)) / 2.0
+
+                for rankPosition = sortedPosition to tieEnd
+                    int originalIndex = array.get(sortedIndices, rankPosition)
+                    array.set(ranks, originalIndex, averageRank)
+
+                sortedPosition := tieEnd + 1
+
+            float cumulativeRank = 0.0
+            float bestAbsoluteU = -1.0
+            float sampleSize = float(length)
+
+            // Pettitt's statistic can be calculated from cumulative rank sums:
+            // U(t) = 2 * sum(R[1:t]) - t * (n + 1).
+            for i = 0 to length - 1
+                cumulativeRank += array.get(ranks, i)
+                int splitCandidate = i + 1
+
+                if splitCandidate >= minSegment and splitCandidate <= length - minSegment
+                    float candidateU = 2.0 * cumulativeRank - float(splitCandidate) * (sampleSize + 1.0)
+                    float candidateAbsoluteU = math.abs(candidateU)
+
+                    if candidateAbsoluteU > bestAbsoluteU
+                        bestAbsoluteU := candidateAbsoluteU
+                        bestSplit := splitCandidate
+
+            if not na(bestSplit)
+                maximumStatistic := bestAbsoluteU
+
+                float probabilityDenominator = math.pow(sampleSize, 3.0) + math.pow(sampleSize, 2.0)
+                approximatePValue := math.min(1.0, 2.0 * math.exp(-6.0 * math.pow(maximumStatistic, 2.0) / probabilityDenominator))
+
+                array<float> beforeValues = array.new<float>(bestSplit, na)
+                array<float> afterValues = array.new<float>(length - bestSplit, na)
+
+                for i = 0 to bestSplit - 1
+                    array.set(beforeValues, i, array.get(values, i))
+
+                for i = bestSplit to length - 1
+                    array.set(afterValues, i - bestSplit, array.get(values, i))
+
+                medianBefore := f_median(beforeValues)
+                medianAfter := f_median(afterValues)
+
+    [maximumStatistic, bestSplit, approximatePValue, medianBefore, medianAfter]
+
+// =============================================================================
+// 3. ROLLING PETTITT TEST
+// =============================================================================
+
+observation = source > 0.0 and source[returnHorizon] > 0.0 ? 100.0 * math.log(source / source[returnHorizon]) : na
+
+[pettittStatistic, splitIndex, pValue, preBreakMedian, postBreakMedian] = f_pettitt(observation, windowLength, minimumSegment)
+
+medianShift = postBreakMedian - preBreakMedian
+observationDeviation = ta.stdev(observation, windowLength)
+effectSize = observationDeviation > 0.0 ? medianShift / observationDeviation : 0.0
+breakAge = not na(splitIndex) ? windowLength - splitIndex : na
+
+barConfirmed = not confirmAtClose or barstate.isconfirmed
+effectiveWarningAlpha = math.max(alpha, warningAlpha)
+
+validTest = not na(pValue) and not na(breakAge)
+recentBreak = validTest and breakAge <= maximumBreakAge
+effectIsMeaningful = math.abs(effectSize) >= minimumEffectSize
+
+confirmedBreak = recentBreak and pValue <= alpha and effectIsMeaningful
+possibleBreak = recentBreak and pValue > alpha and pValue <= effectiveWarningAlpha and math.abs(effectSize) >= minimumEffectSize * 0.5
+
+bullishBreakCondition = confirmedBreak and medianShift > 0.0
+bearishBreakCondition = confirmedBreak and medianShift < 0.0
+possibleBullishCondition = possibleBreak and medianShift > 0.0
+possibleBearishCondition = possibleBreak and medianShift < 0.0
+
+// A fresh event occurs when a condition first appears or when the estimated
+// break age resets to a more recent point while the condition remains active.
+newBullishBreak = barConfirmed and bullishBreakCondition and (not bullishBreakCondition[1] or breakAge < breakAge[1])
+newBearishBreak = barConfirmed and bearishBreakCondition and (not bearishBreakCondition[1] or breakAge < breakAge[1])
+newPossibleBullishBreak = barConfirmed and possibleBullishCondition and (not possibleBullishCondition[1] or breakAge < breakAge[1])
+newPossibleBearishBreak = barConfirmed and possibleBearishCondition and (not possibleBearishCondition[1] or breakAge < breakAge[1])
+
+// =============================================================================
+// 4. EASY MODE DISPLAY
+// =============================================================================
+
+confidence = validTest ? 100.0 * (1.0 - pValue) : na
+directionalConfidence = medianShift > 0.0 ? confidence : medianShift < 0.0 ? -confidence : 0.0
+
+confirmedConfidenceLevel = 100.0 * (1.0 - alpha)
+possibleConfidenceLevel = 100.0 * (1.0 - effectiveWarningAlpha)
+
+upperConfirmedLine = hline(confirmedConfidenceLevel, "Confirmed bullish boundary", color = color.new(color.green, 20), linestyle = hline.style_dashed)
+upperPossibleLine = hline(possibleConfidenceLevel, "Possible bullish boundary", color = color.new(color.orange, 35), linestyle = hline.style_dotted)
+zeroLine = hline(0.0, "No directional shift", color = color.new(color.gray, 55))
+lowerPossibleLine = hline(-possibleConfidenceLevel, "Possible bearish boundary", color = color.new(color.orange, 35), linestyle = hline.style_dotted)
+lowerConfirmedLine = hline(-confirmedConfidenceLevel, "Confirmed bearish boundary", color = color.new(color.red, 20), linestyle = hline.style_dashed)
+maximumLine = hline(100.0, "Maximum", color = color.new(color.white, 100), display = display.none)
+minimumLine = hline(-100.0, "Minimum", color = color.new(color.white, 100), display = display.none)
+
+fill(maximumLine, upperConfirmedLine, color = color.new(color.green, 91), title = "Confirmed bullish zone")
+fill(upperConfirmedLine, upperPossibleLine, color = color.new(color.orange, 93), title = "Possible bullish zone")
+fill(lowerPossibleLine, lowerConfirmedLine, color = color.new(color.orange, 93), title = "Possible bearish zone")
+fill(lowerConfirmedLine, minimumLine, color = color.new(color.red, 91), title = "Confirmed bearish zone")
+
+color detectorColor = bullishBreakCondition ? color.lime : bearishBreakCondition ? color.red : possibleBreak ? color.orange : color.gray
+plot(directionalConfidence, "Directional confidence", color = detectorColor, linewidth = 3)
+
+plotshape(
+     showSignals and newBullishBreak,
+     title = "Bullish structural break",
+     style = shape.labelup,
+     location = location.bottom,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "BULL"
+)
+
+plotshape(
+     showSignals and newBearishBreak,
+     title = "Bearish structural break",
+     style = shape.labeldown,
+     location = location.top,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "BEAR"
+)
+
+plotshape(
+     showPossibleBreaks and newPossibleBullishBreak,
+     title = "Possible bullish break",
+     style = shape.triangleup,
+     location = location.bottom,
+     color = color.orange,
+     size = size.tiny,
+     text = "?"
+)
+
+plotshape(
+     showPossibleBreaks and newPossibleBearishBreak,
+     title = "Possible bearish break",
+     style = shape.triangledown,
+     location = location.top,
+     color = color.orange,
+     size = size.tiny,
+     text = "?"
+)
+
+color stateBackground = bullishBreakCondition ? color.new(color.green, 92) : bearishBreakCondition ? color.new(color.red, 92) : possibleBreak ? color.new(color.orange, 93) : na
+bgcolor(showBackground ? stateBackground : na, title = "Structural-break state")
+
+// =============================================================================
+// 5. DASHBOARD AND DATA WINDOW
+// =============================================================================
+
+string stateText = bullishBreakCondition ? "BULL STRUCTURAL BREAK" : bearishBreakCondition ? "BEAR STRUCTURAL BREAK" : possibleBullishCondition ? "POSSIBLE BULL BREAK" : possibleBearishCondition ? "POSSIBLE BEAR BREAK" : validTest and pValue <= alpha and not recentBreak ? "OLD BREAK" : "STABLE REGIME"
+
+color stateColor = bullishBreakCondition ? color.green : bearishBreakCondition ? color.red : possibleBreak ? color.orange : color.gray
+string pValueText = not validTest ? "N/A" : pValue < 0.001 ? "<0.001" : str.tostring(pValue, "#.###")
+string breakAgeText = not validTest ? "N/A" : str.tostring(breakAge)
+string medianShiftText = not validTest ? "N/A" : str.tostring(medianShift, "#.###") + " pp"
+string effectSizeText = not validTest ? "N/A" : str.tostring(effectSize, "#.##") + " sigma"
+
+var table dashboard = table.new(
+     position.top_right,
+     2,
+     5,
+     border_width = 1,
+     border_color = color.new(color.gray, 50)
+)
+
+if barstate.islast and showDashboard
+    table.cell(dashboard, 0, 0, "PETTITT STATE", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 1, 0, stateText, bgcolor = stateColor, text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 0, 1, "P VALUE APPROX", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 1, 1, pValueText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 0, 2, "BREAK AGE", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 1, 2, breakAgeText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 0, 3, "MEDIAN SHIFT", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 1, 3, medianShiftText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 0, 4, "EFFECT SIZE", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.small)
+    table.cell(dashboard, 1, 4, effectSizeText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.small)
+
+stateCode = bullishBreakCondition ? 2 : bearishBreakCondition ? -2 : possibleBullishCondition ? 1 : possibleBearishCondition ? -1 : 0
+
+plot(stateCode, "State code", color = color.new(color.white, 100), display = display.data_window)
+plot(pValue, "Approximate p-value", color = color.new(color.white, 100), display = display.data_window)
+plot(breakAge, "Estimated break age", color = color.new(color.white, 100), display = display.data_window)
+plot(medianShift, "Median shift in percentage points", color = color.new(color.white, 100), display = display.data_window)
+plot(effectSize, "Median-shift effect size", color = color.new(color.white, 100), display = display.data_window)
+plot(pettittStatistic, "Pettitt K statistic", color = color.new(color.white, 100), display = display.data_window)
+
+// =============================================================================
+// 6. ALERTS
+// =============================================================================
+
+alertcondition(newPossibleBullishBreak, "Pettitt - Possible bullish break", "Possible positive structural break detected on {{ticker}} ({{interval}}). Statistical confirmation is incomplete.")
+alertcondition(newPossibleBearishBreak, "Pettitt - Possible bearish break", "Possible negative structural break detected on {{ticker}} ({{interval}}). Statistical confirmation is incomplete.")
+alertcondition(newBullishBreak, "Pettitt - Bullish structural break", "Confirmed positive structural break detected on {{ticker}} ({{interval}}).")
+alertcondition(newBearishBreak, "Pettitt - Bearish structural break", "Confirmed negative structural break detected on {{ticker}} ({{interval}}).")

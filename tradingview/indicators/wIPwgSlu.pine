@@ -1,0 +1,343 @@
+//@version=6
+// No se declara el parámetro `scale`: así el indicador hereda directamente
+// la escala principal del símbolo y sus niveles permanecen anclados al precio.
+indicator("Perfil de Volumen MTF Actual [15m | 1H | 4H | día anterior | 1W + anterior]", overlay = true, max_lines_count = 50, max_labels_count = 50, max_polylines_count = 30, calc_bars_count = 20000)
+
+// -----------------------------------------------------------------------------
+// Perfil de volumen aproximado de las velas EN FORMACIÓN de 15m, 1H, 4H y 1W,
+// más los perfiles cerrados del día anterior y la semana anterior.
+// Diseñado para utilizarse en temporalidades iguales o inferiores a 15 minutos.
+// El volumen de cada vela del gráfico se distribuye proporcionalmente entre
+// los niveles de precio recorridos. No representa volumen real bid/ask.
+// -----------------------------------------------------------------------------
+
+groupCalc = "Cálculo"
+rows       = input.int(100, "Filas por perfil", minval = 12, maxval = 1000, group = groupCalc)
+vaPercent  = input.float(70.0, "Área de valor (%)", minval = 50, maxval = 99, step = 1, group = groupCalc) / 100.0
+
+groupView  = "Visualización"
+rightSpace = input.int(8, "Separación desde la última vela", minval = 1, maxval = 50, group = groupView)
+maxWidth   = input.int(12, "Ancho máximo de cada perfil", minval = 4, maxval = 30, group = groupView)
+gap        = input.int(3, "Separación entre perfiles", minval = 1, maxval = 10, group = groupView)
+showVA     = input.bool(true, "Destacar área de valor", group = groupView)
+showLevels = input.bool(true, "Mostrar POC, VAH y VAL", group = groupView)
+showPrevW  = input.bool(true, "Mostrar semana anterior", group = groupView)
+buyCol     = input.color(color.new(color.aqua, 10), "Volumen comprador", group = groupView)
+sellCol    = input.color(color.new(color.red, 12), "Volumen vendedor", group = groupView)
+pocCol     = input.color(color.yellow, "POC", group = groupView)
+
+// Arrays de volumen por nivel.
+var array<float> bins15 = array.new_float(rows, 0.0)
+var array<float> bins1h = array.new_float(rows, 0.0)
+var array<float> bins4h = array.new_float(rows, 0.0)
+var array<float> bins1d = array.new_float(rows, 0.0)
+var array<float> binsPrevD = array.new_float(rows, 0.0)
+var array<float> bins1w = array.new_float(rows, 0.0)
+var array<float> binsPrevW = array.new_float(rows, 0.0)
+var array<float> buy15 = array.new_float(rows, 0.0)
+var array<float> sell15 = array.new_float(rows, 0.0)
+var array<float> buy1h = array.new_float(rows, 0.0)
+var array<float> sell1h = array.new_float(rows, 0.0)
+var array<float> buy4h = array.new_float(rows, 0.0)
+var array<float> sell4h = array.new_float(rows, 0.0)
+var array<float> buy1d = array.new_float(rows, 0.0)
+var array<float> sell1d = array.new_float(rows, 0.0)
+var array<float> buyPrevD = array.new_float(rows, 0.0)
+var array<float> sellPrevD = array.new_float(rows, 0.0)
+var array<float> buy1w = array.new_float(rows, 0.0)
+var array<float> sell1w = array.new_float(rows, 0.0)
+var array<float> buyPrevW = array.new_float(rows, 0.0)
+var array<float> sellPrevW = array.new_float(rows, 0.0)
+
+var float lo15 = na
+var float hi15 = na
+var float lo1h = na
+var float hi1h = na
+var float lo4h = na
+var float hi4h = na
+var float lo1d = na
+var float hi1d = na
+var float loPrevD = na
+var float hiPrevD = na
+var float lo1w = na
+var float hi1w = na
+var float loPrevW = na
+var float hiPrevW = na
+
+// Objetos visibles: se recrean solamente en la última vela.
+var array<polyline> profileShapes = array.new<polyline>()
+var array<line>  levelLines   = array.new_line()
+var array<label> titles       = array.new_label()
+
+f_clear_float(array<float> a) =>
+    for i = 0 to array.size(a) - 1
+        array.set(a, i, 0.0)
+
+// Amplía el rango del perfil y redistribuye los niveles anteriores por su centro.
+f_rebin(array<float> a, float oldLo, float oldHi, float newLo, float newHi) =>
+    if not na(oldLo) and oldHi > oldLo and (newLo < oldLo or newHi > oldHi)
+        array<float> tmp = array.new_float(rows, 0.0)
+        float oldStep = (oldHi - oldLo) / rows
+        float newStep = (newHi - newLo) / rows
+        for i = 0 to rows - 1
+            float v = array.get(a, i)
+            float mid = oldLo + (i + 0.5) * oldStep
+            int dst = math.max(0, math.min(rows - 1, int(math.floor((mid - newLo) / newStep))))
+            array.set(tmp, dst, array.get(tmp, dst) + v)
+        for i = 0 to rows - 1
+            array.set(a, i, array.get(tmp, i))
+
+// Incorpora una vela del gráfico al perfil activo.
+f_add_bar(array<float> a, float oldLo, float oldHi, float barLo, float barHi, float barClose, float barVol) =>
+    float newLo = na(oldLo) ? barLo : math.min(oldLo, barLo)
+    float newHi = na(oldHi) ? barHi : math.max(oldHi, barHi)
+    // Evita un rango cero en símbolos o instantes sin movimiento.
+    if newHi <= newLo
+        newHi := newLo + syminfo.mintick
+    f_rebin(a, oldLo, oldHi, newLo, newHi)
+    float step = (newHi - newLo) / rows
+    float candleRange = barHi - barLo
+    if candleRange <= 0
+        int idx = math.max(0, math.min(rows - 1, int(math.floor((barClose - newLo) / step))))
+        array.set(a, idx, array.get(a, idx) + nz(barVol))
+    else
+        int firstRow = math.max(0, math.min(rows - 1, int(math.floor((barLo - newLo) / step))))
+        int lastRow = math.max(0, math.min(rows - 1, int(math.floor((barHi - newLo) / step))))
+        for i = firstRow to lastRow
+            float rowLo = newLo + i * step
+            float rowHi = rowLo + step
+            float overlap = math.max(0.0, math.min(barHi, rowHi) - math.max(barLo, rowLo))
+            if overlap > 0
+                array.set(a, i, array.get(a, i) + nz(barVol) * overlap / candleRange)
+    [newLo, newHi]
+
+// Restablece cada perfil al comenzar una nueva vela de su temporalidad.
+if timeframe.change("15")
+    f_clear_float(bins15)
+    f_clear_float(buy15)
+    f_clear_float(sell15)
+    lo15 := na
+    hi15 := na
+if timeframe.change("60")
+    f_clear_float(bins1h)
+    f_clear_float(buy1h)
+    f_clear_float(sell1h)
+    lo1h := na
+    hi1h := na
+if timeframe.change("240")
+    f_clear_float(bins4h)
+    f_clear_float(buy4h)
+    f_clear_float(sell4h)
+    lo4h := na
+    hi4h := na
+if timeframe.change("1D")
+    // Congela el día que acaba de cerrar antes de iniciar el nuevo día.
+    if not na(lo1d) and not na(hi1d)
+        for i = 0 to rows - 1
+            array.set(binsPrevD, i, array.get(bins1d, i))
+            array.set(buyPrevD, i, array.get(buy1d, i))
+            array.set(sellPrevD, i, array.get(sell1d, i))
+        loPrevD := lo1d
+        hiPrevD := hi1d
+    f_clear_float(bins1d)
+    f_clear_float(buy1d)
+    f_clear_float(sell1d)
+    lo1d := na
+    hi1d := na
+if timeframe.change("1W")
+    // Congela el perfil que acaba de cerrar antes de iniciar la nueva semana.
+    if not na(lo1w) and not na(hi1w)
+        for i = 0 to rows - 1
+            array.set(binsPrevW, i, array.get(bins1w, i))
+            array.set(buyPrevW, i, array.get(buy1w, i))
+            array.set(sellPrevW, i, array.get(sell1w, i))
+        loPrevW := lo1w
+        hiPrevW := hi1w
+    f_clear_float(bins1w)
+    f_clear_float(buy1w)
+    f_clear_float(sell1w)
+    lo1w := na
+    hi1w := na
+
+[lo15New, hi15New] = f_add_bar(bins15, lo15, hi15, low, high, close, volume)
+[lo1hNew, hi1hNew] = f_add_bar(bins1h, lo1h, hi1h, low, high, close, volume)
+[lo4hNew, hi4hNew] = f_add_bar(bins4h, lo4h, hi4h, low, high, close, volume)
+[lo1dNew, hi1dNew] = f_add_bar(bins1d, lo1d, hi1d, low, high, close, volume)
+[lo1wNew, hi1wNew] = f_add_bar(bins1w, lo1w, hi1w, low, high, close, volume)
+// Aproximación compra/venta según la dirección de cada vela del gráfico.
+float buyVolume = close >= open ? volume : 0.0
+float sellVolume = close < open ? volume : 0.0
+[dummyLo15B, dummyHi15B] = f_add_bar(buy15, lo15, hi15, low, high, close, buyVolume)
+[dummyLo15S, dummyHi15S] = f_add_bar(sell15, lo15, hi15, low, high, close, sellVolume)
+[dummyLo1hB, dummyHi1hB] = f_add_bar(buy1h, lo1h, hi1h, low, high, close, buyVolume)
+[dummyLo1hS, dummyHi1hS] = f_add_bar(sell1h, lo1h, hi1h, low, high, close, sellVolume)
+[dummyLo4hB, dummyHi4hB] = f_add_bar(buy4h, lo4h, hi4h, low, high, close, buyVolume)
+[dummyLo4hS, dummyHi4hS] = f_add_bar(sell4h, lo4h, hi4h, low, high, close, sellVolume)
+[dummyLo1dB, dummyHi1dB] = f_add_bar(buy1d, lo1d, hi1d, low, high, close, buyVolume)
+[dummyLo1dS, dummyHi1dS] = f_add_bar(sell1d, lo1d, hi1d, low, high, close, sellVolume)
+[dummyLo1wB, dummyHi1wB] = f_add_bar(buy1w, lo1w, hi1w, low, high, close, buyVolume)
+[dummyLo1wS, dummyHi1wS] = f_add_bar(sell1w, lo1w, hi1w, low, high, close, sellVolume)
+lo15 := lo15New
+hi15 := hi15New
+lo1h := lo1hNew
+hi1h := hi1hNew
+lo4h := lo4hNew
+hi4h := hi4hNew
+lo1d := lo1dNew
+hi1d := hi1dNew
+lo1w := lo1wNew
+hi1w := hi1wNew
+
+f_delete_drawings() =>
+    if array.size(profileShapes) > 0
+        for p in profileShapes
+            polyline.delete(p)
+        array.clear(profileShapes)
+    if array.size(levelLines) > 0
+        for l in levelLines
+            line.delete(l)
+        array.clear(levelLines)
+    if array.size(titles) > 0
+        for t in titles
+            label.delete(t)
+        array.clear(titles)
+
+// Determina POC y área de valor expandiéndose desde el POC.
+f_value_area(array<float> a) =>
+    float total = array.sum(a)
+    float maxVol = array.max(a)
+    int poc = array.indexof(a, maxVol)
+    int val = poc
+    int vah = poc
+    float included = maxVol
+    float target = total * vaPercent
+    for n = 0 to rows - 2
+        if included < target
+            float below = val > 0 ? array.get(a, val - 1) : -1.0
+            float above = vah < rows - 1 ? array.get(a, vah + 1) : -1.0
+            if above >= below and vah < rows - 1
+                vah += 1
+                included += math.max(above, 0.0)
+            else if val > 0
+                val -= 1
+                included += math.max(below, 0.0)
+    [poc, val, vah, maxVol]
+
+f_draw_profile(array<float> a, array<float> buyers, array<float> sellers, float pLo, float pHi, int xBase, string title) =>
+    if not na(pLo) and not na(pHi) and pHi > pLo
+        [poc, val, vah, peak] = f_value_area(a)
+        float step = (pHi - pLo) / rows
+        array<chart.point> buyPoints = array.new<chart.point>()
+        array<chart.point> sellPoints = array.new<chart.point>()
+        array.push(buyPoints, chart.point.from_index(xBase, pLo))
+        // Borde exterior ascendente del volumen comprador.
+        for i = 0 to rows - 1
+            float v = array.get(a, i)
+            float bv = array.get(buyers, i)
+            float sv = array.get(sellers, i)
+            int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+            int sellWidth = peak > 0 ? int(math.round(maxWidth * sv / peak)) : 0
+            int totalWidth = buyWidth + sellWidth
+            if v > 0 and totalWidth == 0
+                buyWidth := bv >= sv ? 1 : 0
+                sellWidth := sv > bv ? 1 : 0
+            float y1 = pLo + i * step
+            float y2 = y1 + step
+            array.push(buyPoints, chart.point.from_index(xBase + buyWidth, y1))
+            array.push(buyPoints, chart.point.from_index(xBase + buyWidth, y2))
+        array.push(buyPoints, chart.point.from_index(xBase, pHi))
+        color buyBaseCol = showVA ? color.new(buyCol, int(math.min(95, color.t(buyCol) + 62))) : buyCol
+        array.push(profileShapes, polyline.new(buyPoints, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(buyBaseCol, 100), fill_color = buyBaseCol))
+
+        // Polígono vendedor: borde total hacia arriba y borde comprador de regreso.
+        for i = 0 to rows - 1
+            float bv = array.get(buyers, i)
+            float sv = array.get(sellers, i)
+            int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+            int sellWidth = peak > 0 ? int(math.round(maxWidth * sv / peak)) : 0
+            float y1 = pLo + i * step
+            float y2 = y1 + step
+            array.push(sellPoints, chart.point.from_index(xBase + buyWidth + sellWidth, y1))
+            array.push(sellPoints, chart.point.from_index(xBase + buyWidth + sellWidth, y2))
+        for i = rows - 1 to 0
+            float bv = array.get(buyers, i)
+            int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+            float y2 = pLo + (i + 1) * step
+            float y1 = pLo + i * step
+            array.push(sellPoints, chart.point.from_index(xBase + buyWidth, y2))
+            array.push(sellPoints, chart.point.from_index(xBase + buyWidth, y1))
+        color sellBaseCol = showVA ? color.new(sellCol, int(math.min(95, color.t(sellCol) + 62))) : sellCol
+        array.push(profileShapes, polyline.new(sellPoints, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(sellBaseCol, 100), fill_color = sellBaseCol))
+
+        // Superpone únicamente el área de valor con los colores intensos.
+        if showVA
+            array<chart.point> buyVaPoints = array.new<chart.point>()
+            array<chart.point> sellVaPoints = array.new<chart.point>()
+            float vaLoPrice = pLo + val * step
+            float vaHiPrice = pLo + (vah + 1) * step
+            array.push(buyVaPoints, chart.point.from_index(xBase, vaLoPrice))
+            for i = val to vah
+                float bv = array.get(buyers, i)
+                int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+                float y1 = pLo + i * step
+                float y2 = y1 + step
+                array.push(buyVaPoints, chart.point.from_index(xBase + buyWidth, y1))
+                array.push(buyVaPoints, chart.point.from_index(xBase + buyWidth, y2))
+            array.push(buyVaPoints, chart.point.from_index(xBase, vaHiPrice))
+            array.push(profileShapes, polyline.new(buyVaPoints, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(buyCol, 100), fill_color = buyCol))
+
+            for i = val to vah
+                float bv = array.get(buyers, i)
+                float sv = array.get(sellers, i)
+                int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+                int sellWidth = peak > 0 ? int(math.round(maxWidth * sv / peak)) : 0
+                float y1 = pLo + i * step
+                float y2 = y1 + step
+                array.push(sellVaPoints, chart.point.from_index(xBase + buyWidth + sellWidth, y1))
+                array.push(sellVaPoints, chart.point.from_index(xBase + buyWidth + sellWidth, y2))
+            for i = vah to val
+                float bv = array.get(buyers, i)
+                int buyWidth = peak > 0 ? int(math.round(maxWidth * bv / peak)) : 0
+                float y2 = pLo + (i + 1) * step
+                float y1 = pLo + i * step
+                array.push(sellVaPoints, chart.point.from_index(xBase + buyWidth, y2))
+                array.push(sellVaPoints, chart.point.from_index(xBase + buyWidth, y1))
+            array.push(profileShapes, polyline.new(sellVaPoints, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(sellCol, 100), fill_color = sellCol))
+        float pocPrice = pLo + (poc + 0.5) * step
+        float vahPrice = pLo + (vah + 1.0) * step
+        float valPrice = pLo + val * step
+        if showLevels
+            array.push(levelLines, line.new(xBase, pocPrice, xBase + maxWidth, pocPrice, xloc = xloc.bar_index, color = pocCol, width = 2))
+            array.push(levelLines, line.new(xBase, vahPrice, xBase + maxWidth, vahPrice, xloc = xloc.bar_index, color = buyCol, style = line.style_dotted))
+            array.push(levelLines, line.new(xBase, valPrice, xBase + maxWidth, valPrice, xloc = xloc.bar_index, color = buyCol, style = line.style_dotted))
+        string levelsText = title + "  VA" + str.tostring(vaPercent * 100, "#") + "\nPOC: " + str.tostring(pocPrice, format.mintick) + "\nVAH: " + str.tostring(vahPrice, format.mintick) + "\nVAL: " + str.tostring(valPrice, format.mintick)
+        label lab = label.new(xBase + int(math.floor(maxWidth / 2)), pHi + step, levelsText, xloc = xloc.bar_index, style = label.style_label_down, color = color.new(color.black, 45), textcolor = color.white, size = size.small)
+        array.push(titles, lab)
+
+if barstate.islast
+    f_delete_drawings()
+    int stride = maxWidth + gap
+    int x15 = bar_index + rightSpace
+    int x1h = x15 + stride
+    int x4h = x1h + stride
+    int x1d = x4h + stride
+    int x1w = x1d + stride
+    int xPrevW = x1w + stride
+    f_draw_profile(bins15, buy15, sell15, lo15, hi15, x15, "15m")
+    f_draw_profile(bins1h, buy1h, sell1h, lo1h, hi1h, x1h, "1H")
+    f_draw_profile(bins4h, buy4h, sell4h, lo4h, hi4h, x4h, "4H")
+    f_draw_profile(binsPrevD, buyPrevD, sellPrevD, loPrevD, hiPrevD, x1d, "1D ANT")
+    f_draw_profile(bins1w, buy1w, sell1w, lo1w, hi1w, x1w, "1W")
+    if showPrevW
+        f_draw_profile(binsPrevW, buyPrevW, sellPrevW, loPrevW, hiPrevW, xPrevW, "1W ANT")
+
+// Aviso discreto si se usa en una temporalidad superior a 15 minutos.
+var table warning = table.new(position.bottom_right, 1, 1)
+if barstate.islast
+    bool unsuitable = timeframe.in_seconds() > timeframe.in_seconds("15")
+    table.cell(warning, 0, 0, unsuitable ? "Usar en gráfico de 15 min o menor" : "", text_color = color.orange, bgcolor = color.new(color.black, 100), text_size = size.tiny)// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Consciencia_Billonaria
+
+//@version=6
+
+plot(close)

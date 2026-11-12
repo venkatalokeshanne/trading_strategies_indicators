@@ -1,0 +1,832 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}}
+strategy("User Trading Plan Strategy v1", overlay = true, pyramiding = 0, calc_on_order_fills = true, process_orders_on_close = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 200, margin_long = 100, margin_short = 100)
+
+const string STRATEGY_NAME = "User Trading Plan Strategy v1"
+
+// ============================================================================
+// IMPORTANT
+// ----------------------------------------------------------------------------
+// This strategy follows the user's extracted plan as closely as possible.
+// Where the plan is discretionary or undefined (OB formula, picaro, build up,
+// efficiency, exact session, exact market structure formulas, etc.), the code
+// uses adjustable inputs instead of inventing hidden rules.
+//
+// TradingView strategies cannot create usable alertcondition() strategy alerts.
+// They can use alert() calls and order-fill alerts. alertcondition() calls are
+// included below only because the user explicitly requested them.
+// ============================================================================
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+// ---- Market & symbol controls
+groupMarket = "1. Market & Symbol Controls"
+allowGold            = input.bool(true, "Allow XAUUSD / Gold", group = groupMarket)
+allowIndex           = input.bool(true, "Allow SP500 / ES / US500", group = groupMarket)
+manualNoTrade        = input.bool(false, "Manual no-trade override", group = groupMarket)
+manualMacroBlock     = input.bool(false, "Manual block: macro opposing OB/zone present", group = groupMarket)
+biasOverride         = input.string("Auto", "Bias override", options = ["Auto", "Bullish", "Bearish", "Lateral"], group = groupMarket)
+
+// ---- Session & time controls
+groupSession = "2. Session & Time Rules"
+sessionInput         = input.session("0845-1100", "Trading session", group = groupSession)
+sessionDaysInput     = input.string("12345", "Session days (1=Sun ... 7=Sat)", group = groupSession, tooltip = "Example: 12345 = Monday-Friday in TradingView session string format.")
+timezoneInput        = input.string("America/Mexico_City", "Session timezone", group = groupSession)
+useNewsBlock         = input.bool(false, "Enable manual news blackout", group = groupSession)
+newsSessionInput     = input.session("0830-0840", "News blackout session", group = groupSession)
+newsDaysInput        = input.string("12345", "News blackout days", group = groupSession)
+
+// ---- Timeframes & structure
+groupTF = "3. Timeframes, Structure & Liquidity"
+biasTfFast           = input.timeframe("15", "Fast higher timeframe", group = groupTF)
+biasTfSlow           = input.timeframe("60", "Slow higher timeframe", group = groupTF)
+pivotLen             = input.int(3, "Execution pivot length", minval = 1, group = groupTF)
+htfPivotLen          = input.int(3, "HTF pivot length", minval = 1, group = groupTF)
+sweepLookback        = input.int(10, "Liquidity sweep lookback", minval = 2, group = groupTF)
+zoneLookback         = input.int(12, "Opposite-candle zone lookback", minval = 2, group = groupTF)
+zoneExpiryBars       = input.int(120, "Zone expiry bars", minval = 5, group = groupTF)
+zoneBasis            = input.string("Full Candle", "Zone basis", options = ["Full Candle", "Body Only"], group = groupTF, tooltip = "Plan does not define the exact OB/zone formula. This input lets you choose the zone proxy.")
+bosBreakTicks        = input.int(0, "Extra BOS break ticks", minval = 0, group = groupTF)
+confirmWindowBars    = input.int(6, "Bars allowed between zone touch and confirmation", minval = 1, group = groupTF)
+externalZoneBars     = input.int(10, "Bars to classify zone as external after sweep/break", minval = 1, group = groupTF)
+
+// ---- Bias & moving-average confluence
+groupBias = "4. Bias & MA Confluence"
+biasMethod           = input.string("PD Levels + HTF Swings", "Bias method", options = ["PD Levels Only", "PD Levels + HTF Swings", "PD Levels + HTF EMA"], group = groupBias)
+breakoutPoints       = input.float(5.0, "Confirmed breakout points", minval = 0.0, step = 0.25, group = groupBias)
+pointSizeInPrice     = input.float(1.0, "Point size in price units", minval = 0.00001, step = 0.00001, group = groupBias, tooltip = "ES usually uses 1.0 point. Adjust for your XAUUSD feed if needed.")
+maTypeInput          = input.string("EMA", "MA type", options = ["EMA", "SMA"], group = groupBias)
+maLengthInput        = input.int(20, "MA length", minval = 1, group = groupBias)
+requireMAConfluence  = input.bool(false, "Require MA rejection confluence", group = groupBias)
+showFlatMAWarning    = input.bool(true, "Show flat MA warning", group = groupBias)
+flatMaLookback       = input.int(5, "Flat MA lookback", minval = 2, group = groupBias)
+flatMaThresholdTicks = input.int(2, "Flat MA threshold in ticks", minval = 1, group = groupBias)
+
+// ---- Entry model
+groupEntry = "5. Entry Model"
+enableAnticipated    = input.bool(true, "Allow anticipated entry", group = groupEntry)
+enableConfirmed      = input.bool(true, "Allow confirmed entry", group = groupEntry)
+allowAnticipatedInternal = input.bool(false, "Allow anticipated entry on internal zones", group = groupEntry)
+confirmedNeedsBOS    = input.bool(true, "Confirmed entry needs BOS/CHoCH", group = groupEntry)
+entrySourceInput     = input.string("Market Close", "Entry price source", options = ["Market Close", "Zone Midpoint", "Near Zone Edge", "Far Zone Edge"], group = groupEntry, tooltip = "Market Close is used by default because your plan doesn't define exact automation rules for limit order persistence, picaro, or dissipation.")
+minRRInput           = input.float(3.0, "Minimum RR", minval = 0.25, step = 0.25, group = groupEntry)
+defaultRRInput       = input.float(3.0, "Default RR (TP3)", minval = 0.5, step = 0.25, group = groupEntry)
+targetBufferTicks    = input.int(2, "Target buffer ticks before obstacle", minval = 0, group = groupEntry)
+useObstacleAdjust    = input.bool(true, "Adjust final target before nearest obstacle", group = groupEntry)
+
+// ---- No-trade filters
+groupNoTrade = "6. No-Trade Filters"
+useConfusedBiasBlock = input.bool(true, "Block when bias is unclear/lateral", group = groupNoTrade)
+useNoPullbackBlock   = input.bool(false, "Block strong trend with no pullback", group = groupNoTrade)
+noPullbackBars       = input.int(8, "No-pullback bars", minval = 2, group = groupNoTrade)
+useLateralBlock      = input.bool(false, "Block aggressive lateral market", group = groupNoTrade)
+lateralLookback      = input.int(20, "Lateral lookback", minval = 5, group = groupNoTrade)
+lateralAtrMult       = input.float(1.5, "Lateral range ATR multiplier", minval = 0.1, step = 0.1, group = groupNoTrade)
+useProgressionCancel = input.bool(true, "Use simple progression cancel proxy", group = groupNoTrade)
+progressionBars      = input.int(3, "Progression bars", minval = 2, group = groupNoTrade)
+
+// ---- Risk & money management
+groupRisk = "7. Risk & Money Management"
+accountSizeInput     = input.float(100000.0, "Manual account size", minval = 1.0, step = 100.0, group = groupRisk)
+riskPctInput         = input.float(0.5, "Risk per trade (%)", minval = 0.01, step = 0.01, group = groupRisk)
+qtyStepInput         = input.float(1.0, "Quantity step", minval = 0.0001, step = 0.0001, group = groupRisk, tooltip = "Use 1 for futures, 0.01 or broker minimum for CFDs if needed.")
+dailyLossLimitPoints = input.float(4.0, "Daily loss limit (points)", minval = 0.25, step = 0.25, group = groupRisk, tooltip = "Your files conflict between 3 and 4 points. Adjust manually.")
+maxTradesPerDay      = input.int(2, "Max trades per day", minval = 1, group = groupRisk)
+maxConsecLossesWeek  = input.int(3, "Stop after this many consecutive weekly losses", minval = 1, group = groupRisk)
+secondTradeCooldownM = input.int(5, "Second-trade cooldown minutes", minval = 0, group = groupRisk)
+manualSecondTradeApproval = input.bool(true, "Manual second-trade approval", group = groupRisk, tooltip = "Your plan requires emotional calm for the second trade. This is a manual gate because Pine cannot detect emotion.")
+maxStopPointsInput   = input.float(5.0, "Max stop size (points)", minval = 0.25, step = 0.25, group = groupRisk, tooltip = "Your files conflict between 3 and 5 points. Adjust manually.")
+obCoveragePct        = input.float(0.60, "Minimum stop coverage of OB/zone", minval = 0.05, maxval = 1.0, step = 0.05, group = groupRisk)
+stopBufferTicks      = input.int(2, "Stop buffer ticks", minval = 0, group = groupRisk)
+
+// ---- Management & assumptions dashboard
+groupMgmt = "8. Trade Management & Dashboard"
+trailAtFirstBreak    = input.bool(true, "Tighten stop by 2 ticks after first pivot break", group = groupMgmt)
+trailAt60Pct         = input.bool(true, "Move stop to BE+1 tick at 60% progress", group = groupMgmt)
+winRateAssumption    = input.float(40.0, "Win-rate assumption (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = groupMgmt)
+tradesPerWeekAssume  = input.int(3, "Trades-per-week assumption", minval = 1, maxval = 10, group = groupMgmt)
+showDashboard        = input.bool(true, "Show dashboard", group = groupMgmt)
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+f_round_to_step(_value, _step) =>
+    _step > 0 ? math.round(_value / _step) * _step : _value
+
+f_ma(_src, _len, _type) =>
+    _type == "SMA" ? ta.sma(_src, _len) : ta.ema(_src, _len)
+
+// ----------------------------------------------------------------------------
+// f_json — builds a JSON alert string incrementally to avoid
+// "end of line without line continuation" errors in Pine Script v6.
+// ----------------------------------------------------------------------------
+f_json(_event, _direction, _setupType, _reason, float _entry, float _sl, float _tp1, float _tp2, float _tp3, float _riskAmount, float _rr) =>
+    string _entryStr      = na(_entry)      ? "null" : str.tostring(_entry,      format.mintick)
+    string _slStr         = na(_sl)         ? "null" : str.tostring(_sl,         format.mintick)
+    string _tp1Str        = na(_tp1)        ? "null" : str.tostring(_tp1,        format.mintick)
+    string _tp2Str        = na(_tp2)        ? "null" : str.tostring(_tp2,        format.mintick)
+    string _tp3Str        = na(_tp3)        ? "null" : str.tostring(_tp3,        format.mintick)
+    string _riskStr       = na(_riskAmount) ? "null" : str.tostring(_riskAmount, "#.##")
+    string _rrStr         = na(_rr)         ? "null" : str.tostring(_rr,         "#.##")
+    string _closeStr      = str.tostring(close, format.mintick)
+    string _barTimeStr    = str.format_time(time, "yyyy-MM-dd HH:mm", timezoneInput)
+    string _out = "{"
+    _out := _out + "\"event\":\""          + _event        + "\","
+    _out := _out + "\"strategy_name\":\""  + STRATEGY_NAME + "\","
+    _out := _out + "\"ticker\":\""         + syminfo.ticker          + "\","
+    _out := _out + "\"timeframe\":\""      + timeframe.period        + "\","
+    _out := _out + "\"direction\":\""      + _direction    + "\","
+    _out := _out + "\"setup_type\":\""     + _setupType    + "\","
+    _out := _out + "\"entry_price\":\""    + _entryStr     + "\","
+    _out := _out + "\"stop_loss\":\""      + _slStr        + "\","
+    _out := _out + "\"take_profit_1\":\""  + _tp1Str       + "\","
+    _out := _out + "\"take_profit_2\":\""  + _tp2Str       + "\","
+    _out := _out + "\"take_profit_3\":\""  + _tp3Str       + "\","
+    _out := _out + "\"risk_amount\":\""    + _riskStr      + "\","
+    _out := _out + "\"risk_to_reward\":\"" + _rrStr        + "\","
+    _out := _out + "\"reason\":\""         + _reason       + "\","
+    _out := _out + "\"close\":\""          + _closeStr     + "\","
+    _out := _out + "\"bar_time\":\""       + _barTimeStr   + "\""
+    _out := _out + "}"
+    _out
+
+f_find_zone(_bullish, _lookback, _useBody) =>
+    float zTop = na
+    float zBot = na
+    int zBar = na
+    for i = 1 to _lookback
+        bool oppCandle = _bullish ? close[i] < open[i] : close[i] > open[i]
+        if oppCandle
+            zTop := _useBody ? math.max(open[i], close[i]) : high[i]
+            zBot := _useBody ? math.min(open[i], close[i]) : low[i]
+            zBar := bar_index - i
+            break
+    [zTop, zBot, zBar]
+
+f_zone_entry_price(_isLong, _top, _bot, _mode) =>
+    float zoneMid = (_top + _bot) * 0.5
+    _mode == "Zone Midpoint" ? zoneMid :
+     _mode == "Near Zone Edge" ? (_isLong ? _top : _bot) :
+     _mode == "Far Zone Edge" ? (_isLong ? _bot : _top) :
+     close
+
+f_first_positive_target(_isLong, _entry, _candidate1, _candidate2, _candidate3) =>
+    float result = na
+    if _isLong
+        if _candidate1 > _entry
+            result := _candidate1
+        if _candidate2 > _entry
+            result := na(result) ? _candidate2 : math.min(result, _candidate2)
+        if _candidate3 > _entry
+            result := na(result) ? _candidate3 : math.min(result, _candidate3)
+    else
+        if _candidate1 < _entry
+            result := _candidate1
+        if _candidate2 < _entry
+            result := na(result) ? _candidate2 : math.max(result, _candidate2)
+        if _candidate3 < _entry
+            result := na(result) ? _candidate3 : math.max(result, _candidate3)
+    result
+
+// ============================================================================
+// SYMBOL SUPPORT
+// ============================================================================
+
+string tickerUpper = str.upper(syminfo.ticker)
+string descUpper   = str.upper(syminfo.description)
+bool isGoldSymbol  = str.contains(tickerUpper, "XAU") or str.contains(descUpper, "GOLD")
+bool isIndexSymbol = str.contains(tickerUpper, "ES") or str.contains(tickerUpper, "MES") or str.contains(tickerUpper, "SP500") or str.contains(tickerUpper, "US500")
+bool supportedSymbol = (allowGold and isGoldSymbol) or (allowIndex and isIndexSymbol)
+
+// ============================================================================
+// SESSION FILTERS
+// ============================================================================
+
+string sessionString = sessionInput + ":" + sessionDaysInput
+string newsString    = newsSessionInput + ":" + newsDaysInput
+bool inTradingSession = not na(time(timeframe.period, sessionString, timezoneInput))
+bool inNewsBlock      = useNewsBlock and not na(time(timeframe.period, newsString, timezoneInput))
+
+// ============================================================================
+// PREVIOUS-DAY LEVELS
+// ============================================================================
+
+float pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off)
+float pdl = request.security(syminfo.tickerid, "D", low[1], lookahead = barmerge.lookahead_off)
+
+float breakoutDistance = breakoutPoints * pointSizeInPrice
+float breakBuffer = bosBreakTicks * syminfo.mintick
+
+bool pdhSweep = high > pdh and close < pdh
+bool pdlSweep = low < pdl and close > pdl
+bool pdhConfirmedBreak = close > pdh + breakoutDistance
+bool pdlConfirmedBreak = close < pdl - breakoutDistance
+
+float localPriorHigh = ta.highest(high[1], sweepLookback)
+float localPriorLow  = ta.lowest(low[1], sweepLookback)
+bool localHighSweep  = high > localPriorHigh and close < localPriorHigh
+bool localLowSweep   = low < localPriorLow and close > localPriorLow
+
+// ============================================================================
+// STRUCTURE ENGINE: BOS / CHoCH / MSS
+// ============================================================================
+
+float pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+float lastSwingHigh = ta.valuewhen(not na(pivotHigh), pivotHigh, 0)
+float lastSwingLow  = ta.valuewhen(not na(pivotLow), pivotLow, 0)
+float prevSwingHigh = ta.valuewhen(not na(pivotHigh), pivotHigh, 1)
+float prevSwingLow  = ta.valuewhen(not na(pivotLow), pivotLow, 1)
+
+bool bosUp   = not na(lastSwingHigh) and close > lastSwingHigh + breakBuffer and close[1] <= lastSwingHigh + breakBuffer
+bool bosDown = not na(lastSwingLow) and close < lastSwingLow - breakBuffer and close[1] >= lastSwingLow - breakBuffer
+
+var int internalTrend = 0
+bool chochUp = bosUp and internalTrend[1] == -1
+bool chochDown = bosDown and internalTrend[1] == 1
+
+if bosUp
+    internalTrend := 1
+else if bosDown
+    internalTrend := -1
+
+// ============================================================================
+// HIGHER-TIMEFRAME CONTEXT
+// ============================================================================
+
+float htfFastSwingHigh = request.security(syminfo.tickerid, biasTfFast, ta.valuewhen(not na(ta.pivothigh(high, htfPivotLen, htfPivotLen)), ta.pivothigh(high, htfPivotLen, htfPivotLen), 0), lookahead = barmerge.lookahead_off)
+float htfFastSwingLow  = request.security(syminfo.tickerid, biasTfFast, ta.valuewhen(not na(ta.pivotlow(low, htfPivotLen, htfPivotLen)), ta.pivotlow(low, htfPivotLen, htfPivotLen), 0), lookahead = barmerge.lookahead_off)
+float htfSlowSwingHigh = request.security(syminfo.tickerid, biasTfSlow, ta.valuewhen(not na(ta.pivothigh(high, htfPivotLen, htfPivotLen)), ta.pivothigh(high, htfPivotLen, htfPivotLen), 0), lookahead = barmerge.lookahead_off)
+float htfSlowSwingLow  = request.security(syminfo.tickerid, biasTfSlow, ta.valuewhen(not na(ta.pivotlow(low, htfPivotLen, htfPivotLen)), ta.pivotlow(low, htfPivotLen, htfPivotLen), 0), lookahead = barmerge.lookahead_off)
+float htfFastClose     = request.security(syminfo.tickerid, biasTfFast, close, lookahead = barmerge.lookahead_off)
+float htfSlowClose     = request.security(syminfo.tickerid, biasTfSlow, close, lookahead = barmerge.lookahead_off)
+float htfFastMa        = request.security(syminfo.tickerid, biasTfFast, f_ma(close, maLengthInput, maTypeInput), lookahead = barmerge.lookahead_off)
+float htfSlowMa        = request.security(syminfo.tickerid, biasTfSlow, f_ma(close, maLengthInput, maTypeInput), lookahead = barmerge.lookahead_off)
+
+bool htfSwingBull = not na(htfFastSwingHigh) and not na(htfSlowSwingHigh) and close > htfFastSwingHigh and close > htfSlowSwingHigh
+bool htfSwingBear = not na(htfFastSwingLow) and not na(htfSlowSwingLow) and close < htfFastSwingLow and close < htfSlowSwingLow
+bool htfEmaBull   = htfFastClose > htfFastMa and htfSlowClose > htfSlowMa
+bool htfEmaBear   = htfFastClose < htfFastMa and htfSlowClose < htfSlowMa
+
+int autoBias = 0
+if pdlSweep
+    autoBias := 1
+else if pdhSweep
+    autoBias := -1
+else if pdhConfirmedBreak
+    autoBias := 1
+else if pdlConfirmedBreak
+    autoBias := -1
+else
+    if biasMethod == "PD Levels + HTF Swings"
+        autoBias := htfSwingBull ? 1 : htfSwingBear ? -1 : 0
+    else if biasMethod == "PD Levels + HTF EMA"
+        autoBias := htfEmaBull ? 1 : htfEmaBear ? -1 : 0
+    else
+        autoBias := 0
+
+int biasState = biasOverride == "Bullish" ? 1 : biasOverride == "Bearish" ? -1 : biasOverride == "Lateral" ? 0 : autoBias
+bool bullishBias = biasState == 1
+bool bearishBias = biasState == -1
+bool lateralBias = biasState == 0
+
+// ============================================================================
+// MOVING-AVERAGE CONFLUENCE
+// ============================================================================
+
+float execMa = f_ma(close, maLengthInput, maTypeInput)
+bool longMaRejection  = low <= execMa and close > execMa
+bool shortMaRejection = high >= execMa and close < execMa
+bool flatMa = math.abs(execMa - execMa[flatMaLookback]) <= (flatMaThresholdTicks * syminfo.mintick)
+
+// ============================================================================
+// ZONE / OB PROXY ENGINE
+// ============================================================================
+
+bool useBodyOnly = zoneBasis == "Body Only"
+
+var float bullZoneTop = na
+var float bullZoneBot = na
+var int bullZoneBar = na
+var bool bullZoneExternal = false
+
+var float bearZoneTop = na
+var float bearZoneBot = na
+var int bearZoneBar = na
+var bool bearZoneExternal = false
+
+bool recentBullExternalEvent = ta.barssince(pdlSweep or pdhConfirmedBreak or localLowSweep) <= externalZoneBars
+bool recentBearExternalEvent = ta.barssince(pdhSweep or pdlConfirmedBreak or localHighSweep) <= externalZoneBars
+
+if bosUp or chochUp
+    [newBullTop, newBullBot, newBullBar] = f_find_zone(true, zoneLookback, useBodyOnly)
+    if not na(newBullTop) and not na(newBullBot)
+        bullZoneTop := math.max(newBullTop, newBullBot)
+        bullZoneBot := math.min(newBullTop, newBullBot)
+        bullZoneBar := newBullBar
+        bullZoneExternal := recentBullExternalEvent
+
+if bosDown or chochDown
+    [newBearTop, newBearBot, newBearBar] = f_find_zone(false, zoneLookback, useBodyOnly)
+    if not na(newBearTop) and not na(newBearBot)
+        bearZoneTop := math.max(newBearTop, newBearBot)
+        bearZoneBot := math.min(newBearTop, newBearBot)
+        bearZoneBar := newBearBar
+        bearZoneExternal := recentBearExternalEvent
+
+bool bullZoneExpired = not na(bullZoneBar) and bar_index - bullZoneBar > zoneExpiryBars
+bool bearZoneExpired = not na(bearZoneBar) and bar_index - bearZoneBar > zoneExpiryBars
+bool bullZoneBroken  = not na(bullZoneBot) and close < bullZoneBot - (stopBufferTicks * syminfo.mintick)
+bool bearZoneBroken  = not na(bearZoneTop) and close > bearZoneTop + (stopBufferTicks * syminfo.mintick)
+
+if bullZoneExpired or bullZoneBroken
+    bullZoneTop := na
+    bullZoneBot := na
+    bullZoneBar := na
+    bullZoneExternal := false
+
+if bearZoneExpired or bearZoneBroken
+    bearZoneTop := na
+    bearZoneBot := na
+    bearZoneBar := na
+    bearZoneExternal := false
+
+bool bullZoneActive = not na(bullZoneTop) and not na(bullZoneBot)
+bool bearZoneActive = not na(bearZoneTop) and not na(bearZoneBot)
+bool bullZoneTouch = bullZoneActive and low <= bullZoneTop and high >= bullZoneBot
+bool bearZoneTouch = bearZoneActive and high >= bearZoneBot and low <= bearZoneTop
+
+var int lastBullTouchBar = na
+var int lastBearTouchBar = na
+if bullZoneTouch
+    lastBullTouchBar := bar_index
+if bearZoneTouch
+    lastBearTouchBar := bar_index
+
+bool bullTouchWindow = not na(lastBullTouchBar) and bar_index - lastBullTouchBar <= confirmWindowBars
+bool bearTouchWindow = not na(lastBearTouchBar) and bar_index - lastBearTouchBar <= confirmWindowBars
+
+// ============================================================================
+// PROGRESSION-CANCEL PROXY
+// ============================================================================
+
+bool lowerCloseProgression = close < close[1] and close[1] < close[2] and progressionBars <= 3 ? true : ta.falling(close, progressionBars)
+bool higherCloseProgression = close > close[1] and close[1] > close[2] and progressionBars <= 3 ? true : ta.rising(close, progressionBars)
+bool cancelPendingLong = useProgressionCancel and bullTouchWindow and lowerCloseProgression and not (bosUp or chochUp)
+bool cancelPendingShort = useProgressionCancel and bearTouchWindow and higherCloseProgression and not (bosDown or chochDown)
+
+// ============================================================================
+// NO-TRADE ENGINE
+// ============================================================================
+
+float atrValue = ta.atr(14)
+float rangeWidth = ta.highest(high, lateralLookback) - ta.lowest(low, lateralLookback)
+bool aggressiveLateral = useLateralBlock and rangeWidth <= atrValue * lateralAtrMult
+bool strongTrendNoPullbackLong = useNoPullbackBlock and bullishBias and ta.lowest(low, noPullbackBars) > execMa
+bool strongTrendNoPullbackShort = useNoPullbackBlock and bearishBias and ta.highest(high, noPullbackBars) < execMa
+bool strongTrendNoPullback = strongTrendNoPullbackLong or strongTrendNoPullbackShort
+
+// Trade counters & lockouts
+bool newDay = ta.change(time("D")) != 0
+bool newWeek = ta.change(time("W")) != 0
+
+var int tradesToday = 0
+var float dailyLossPoints = 0.0
+var int consecutiveLosses = 0
+var int prevClosedTrades = 0
+var int lastEntryTimeMs = na
+
+if newDay
+    tradesToday := 0
+    dailyLossPoints := 0.0
+
+if newWeek
+    consecutiveLosses := 0
+
+if strategy.closedtrades > prevClosedTrades
+    for tradeNum = prevClosedTrades to strategy.closedtrades - 1
+        float closedProfit = strategy.closedtrades.profit(tradeNum)
+        float closedEntry = strategy.closedtrades.entry_price(tradeNum)
+        float closedExit = strategy.closedtrades.exit_price(tradeNum)
+        float closedPoints = math.abs(closedExit - closedEntry) / pointSizeInPrice
+        if closedProfit < 0
+            dailyLossPoints += closedPoints
+            consecutiveLosses += 1
+        else
+            consecutiveLosses := 0
+    prevClosedTrades := strategy.closedtrades
+
+bool dailyLossLocked = dailyLossPoints >= dailyLossLimitPoints
+bool maxTradesLocked = tradesToday >= maxTradesPerDay
+bool weeklyLossLocked = consecutiveLosses >= maxConsecLossesWeek
+bool cooldownLocked = tradesToday >= 1 and not na(lastEntryTimeMs) and (time - lastEntryTimeMs) < (secondTradeCooldownM * 60 * 1000)
+bool secondTradeBlocked = tradesToday >= 1 and (cooldownLocked or not manualSecondTradeApproval)
+bool unclearBiasBlocked = useConfusedBiasBlock and lateralBias
+
+string noTradeReason = ""
+if not supportedSymbol
+    noTradeReason := "unsupported_symbol"
+else if not inTradingSession
+    noTradeReason := "out_of_session"
+else if inNewsBlock
+    noTradeReason := "news_block"
+else if manualNoTrade
+    noTradeReason := "manual_no_trade"
+else if manualMacroBlock
+    noTradeReason := "macro_opposition"
+else if maxTradesLocked
+    noTradeReason := "max_trades_per_day"
+else if dailyLossLocked
+    noTradeReason := "daily_loss_limit"
+else if weeklyLossLocked
+    noTradeReason := "consecutive_losses_limit"
+else if secondTradeBlocked and tradesToday >= 1
+    noTradeReason := "second_trade_blocked"
+else if aggressiveLateral
+    noTradeReason := "aggressive_lateral"
+else if strongTrendNoPullback
+    noTradeReason := "strong_trend_no_pullback"
+else if unclearBiasBlocked
+    noTradeReason := "unclear_bias"
+else if cancelPendingLong or cancelPendingShort
+    noTradeReason := "progression_against_setup"
+
+bool noTrade = str.length(noTradeReason) > 0
+
+// ============================================================================
+// ENTRY SETUPS
+// ============================================================================
+
+bool longAnticipated = enableAnticipated and bullishBias and bullZoneTouch and (bullZoneExternal or allowAnticipatedInternal) and not cancelPendingLong
+bool shortAnticipated = enableAnticipated and bearishBias and bearZoneTouch and (bearZoneExternal or allowAnticipatedInternal) and not cancelPendingShort
+
+bool longConfirmedSignal = enableConfirmed and bullishBias and bullTouchWindow and (confirmedNeedsBOS ? (bosUp or chochUp) : true) and not cancelPendingLong
+bool shortConfirmedSignal = enableConfirmed and bearishBias and bearTouchWindow and (confirmedNeedsBOS ? (bosDown or chochDown) : true) and not cancelPendingShort
+
+bool maLongOk = not requireMAConfluence or longMaRejection
+bool maShortOk = not requireMAConfluence or shortMaRejection
+
+bool longSetup = (longAnticipated or longConfirmedSignal) and maLongOk
+bool shortSetup = (shortAnticipated or shortConfirmedSignal) and maShortOk
+
+string longSetupType = longAnticipated and not longConfirmedSignal ? "anticipated" : "confirmed"
+string shortSetupType = shortAnticipated and not shortConfirmedSignal ? "anticipated" : "confirmed"
+
+// ============================================================================
+// PRICE, STOP, TARGET AND RR CALCULATIONS
+// ============================================================================
+
+float tick = syminfo.mintick
+float targetBuffer = targetBufferTicks * tick
+float stopBuffer = stopBufferTicks * tick
+
+float longEntryRef = bullZoneActive ? f_zone_entry_price(true, bullZoneTop, bullZoneBot, entrySourceInput) : na
+float shortEntryRef = bearZoneActive ? f_zone_entry_price(false, bearZoneTop, bearZoneBot, entrySourceInput) : na
+bool longEntryInsideZone = bullZoneActive and not na(longEntryRef) and longEntryRef <= bullZoneTop and longEntryRef >= bullZoneBot
+bool shortEntryInsideZone = bearZoneActive and not na(shortEntryRef) and shortEntryRef <= bearZoneTop and shortEntryRef >= bearZoneBot
+
+float longZoneRange = bullZoneActive ? math.abs(bullZoneTop - bullZoneBot) : na
+float shortZoneRange = bearZoneActive ? math.abs(bearZoneTop - bearZoneBot) : na
+
+float longCoverageStop = bullZoneActive ? (longEntryRef - (longZoneRange * obCoveragePct)) : na
+float shortCoverageStop = bearZoneActive ? (shortEntryRef + (shortZoneRange * obCoveragePct)) : na
+float longStructuralStop = bullZoneActive ? (bullZoneBot - stopBuffer) : na
+float shortStructuralStop = bearZoneActive ? (bearZoneTop + stopBuffer) : na
+
+float longStopCandidate = bullZoneActive ? math.min(longStructuralStop, longCoverageStop) : na
+float shortStopCandidate = bearZoneActive ? math.max(shortStructuralStop, shortCoverageStop) : na
+
+float longRiskDist = bullZoneActive ? math.abs(longEntryRef - longStopCandidate) : na
+float shortRiskDist = bearZoneActive ? math.abs(shortEntryRef - shortStopCandidate) : na
+float longRiskPoints = bullZoneActive ? longRiskDist / pointSizeInPrice : na
+float shortRiskPoints = bearZoneActive ? shortRiskDist / pointSizeInPrice : na
+
+float longRRTarget = bullZoneActive ? (longEntryRef + longRiskDist * defaultRRInput) : na
+float shortRRTarget = bearZoneActive ? (shortEntryRef - shortRiskDist * defaultRRInput) : na
+
+float longObstacle = f_first_positive_target(true, longEntryRef, pdh - targetBuffer, lastSwingHigh - targetBuffer, bearZoneBot - targetBuffer)
+float shortObstacle = f_first_positive_target(false, shortEntryRef, pdl + targetBuffer, lastSwingLow + targetBuffer, bullZoneTop + targetBuffer)
+
+float longFinalTarget = bullZoneActive ? (useObstacleAdjust and not na(longObstacle) ? math.min(longRRTarget, longObstacle) : longRRTarget) : na
+float shortFinalTarget = bearZoneActive ? (useObstacleAdjust and not na(shortObstacle) ? math.max(shortRRTarget, shortObstacle) : shortRRTarget) : na
+
+float longTp1Candidate = bullZoneActive ? (longEntryRef + (longFinalTarget - longEntryRef) / 3.0) : na
+float longTp2Candidate = bullZoneActive ? (longEntryRef + (longFinalTarget - longEntryRef) * 2.0 / 3.0) : na
+float shortTp1Candidate = bearZoneActive ? (shortEntryRef - (shortEntryRef - shortFinalTarget) / 3.0) : na
+float shortTp2Candidate = bearZoneActive ? (shortEntryRef - (shortEntryRef - shortFinalTarget) * 2.0 / 3.0) : na
+
+float longRR = bullZoneActive and longRiskDist > 0 ? math.abs(longFinalTarget - longEntryRef) / longRiskDist : na
+float shortRR = bearZoneActive and shortRiskDist > 0 ? math.abs(shortEntryRef - shortFinalTarget) / shortRiskDist : na
+
+bool longStopOk = bullZoneActive and longRiskPoints <= maxStopPointsInput
+bool shortStopOk = bearZoneActive and shortRiskPoints <= maxStopPointsInput
+bool longRROk = bullZoneActive and longRR >= minRRInput
+bool shortRROk = bearZoneActive and shortRR >= minRRInput
+
+// Risk sizing
+float riskCash = accountSizeInput * (riskPctInput / 100.0)
+float longQtyRaw = longRiskDist > 0 ? riskCash / (longRiskDist * syminfo.pointvalue) : na
+float shortQtyRaw = shortRiskDist > 0 ? riskCash / (shortRiskDist * syminfo.pointvalue) : na
+float longQty = not na(longQtyRaw) ? math.max(syminfo.mincontract, f_round_to_step(longQtyRaw, qtyStepInput)) : na
+float shortQty = not na(shortQtyRaw) ? math.max(syminfo.mincontract, f_round_to_step(shortQtyRaw, qtyStepInput)) : na
+float longRiskAmount = not na(longQty) and not na(longRiskDist) ? longRiskDist * syminfo.pointvalue * longQty : na
+float shortRiskAmount = not na(shortQty) and not na(shortRiskDist) ? shortRiskDist * syminfo.pointvalue * shortQty : na
+bool longQtyOk = not na(longQty) and longQty > 0
+bool shortQtyOk = not na(shortQty) and shortQty > 0
+
+bool attemptedLong = bullishBias and (bullZoneTouch or bullTouchWindow)
+bool attemptedShort = bearishBias and (bearZoneTouch or bearTouchWindow)
+bool longSetupComplete = longSetup and bullZoneActive and longEntryInsideZone
+bool shortSetupComplete = shortSetup and bearZoneActive and shortEntryInsideZone
+
+if not noTrade
+    if (attemptedLong and not longEntryInsideZone) or (attemptedShort and not shortEntryInsideZone)
+        noTradeReason := "price_outside_entry_zone"
+        noTrade := true
+    else if (attemptedLong and not longRROk) or (attemptedShort and not shortRROk)
+        noTradeReason := "min_rr_not_met"
+        noTrade := true
+    else if (attemptedLong and not longSetupComplete) or (attemptedShort and not shortSetupComplete)
+        noTradeReason := "setup_incomplete"
+        noTrade := true
+
+bool longSetupReady = longSetupComplete and longStopOk and longRROk and longQtyOk and not noTrade
+bool shortSetupReady = shortSetupComplete and shortStopOk and shortRROk and shortQtyOk and not noTrade
+bool entryConflict = longSetupReady and shortSetupReady
+if entryConflict
+    noTradeReason := "conflicting_long_short_setup"
+    noTrade := true
+    longSetupReady := false
+    shortSetupReady := false
+    entryConflict := false
+
+// ============================================================================
+// ACTIVE TRADE STATE
+// ============================================================================
+
+var int activeSide = 0
+var float activeEntry = na
+var float activeStop = na
+var float activeTp1 = na
+var float activeTp2 = na
+var float activeTp3 = na
+var float activeRR = na
+var float activeRiskAmount = na
+var string activeSetupType = "none"
+var float activeFirstBreakLevel = na
+var bool firstBreakManaged = false
+var bool managedAt60Pct = false
+var bool tp1Alerted = false
+var bool tp2Alerted = false
+var bool tp3Alerted = false
+var bool slAlerted = false
+
+// ============================================================================
+// ORDER PLACEMENT
+// ============================================================================
+
+if longSetupReady and not entryConflict and strategy.position_size == 0
+    activeSide := 1
+    activeEntry := entrySourceInput == "Market Close" ? close : longEntryRef
+    activeStop := longStopCandidate
+    activeTp3 := longFinalTarget
+    activeTp1 := longTp1Candidate
+    activeTp2 := longTp2Candidate
+    activeRR := longRR
+    activeRiskAmount := longRiskAmount
+    activeSetupType := longSetupType
+    activeFirstBreakLevel := lastSwingHigh
+    firstBreakManaged := false
+    managedAt60Pct := false
+    tp1Alerted := false
+    tp2Alerted := false
+    tp3Alerted := false
+    slAlerted := false
+    tradesToday += 1
+    lastEntryTimeMs := time
+    string reasonLong = longSetupType + "_entry"
+    string longMsg = f_json("entry_triggered", "long", activeSetupType, reasonLong, activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR)
+    strategy.entry("Long", strategy.long, qty = longQty, alert_message = longMsg)
+    strategy.exit("L-TP1", "Long", stop = activeStop, limit = activeTp1, qty_percent = 33.0, alert_profit = f_json("tp1_hit", "long", activeSetupType, "tp1_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp1_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("L-TP2", "Long", stop = activeStop, limit = activeTp2, qty_percent = 33.0, alert_profit = f_json("tp2_hit", "long", activeSetupType, "tp2_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp2_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("L-TP3", "Long", stop = activeStop, limit = activeTp3, qty_percent = 34.0, alert_profit = f_json("tp3_hit", "long", activeSetupType, "tp3_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp3_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    alert(f_json("buy_setup", "long", activeSetupType, reasonLong, activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+
+if shortSetupReady and not entryConflict and strategy.position_size == 0
+    activeSide := -1
+    activeEntry := entrySourceInput == "Market Close" ? close : shortEntryRef
+    activeStop := shortStopCandidate
+    activeTp3 := shortFinalTarget
+    activeTp1 := shortTp1Candidate
+    activeTp2 := shortTp2Candidate
+    activeRR := shortRR
+    activeRiskAmount := shortRiskAmount
+    activeSetupType := shortSetupType
+    activeFirstBreakLevel := lastSwingLow
+    firstBreakManaged := false
+    managedAt60Pct := false
+    tp1Alerted := false
+    tp2Alerted := false
+    tp3Alerted := false
+    slAlerted := false
+    tradesToday += 1
+    lastEntryTimeMs := time
+    string reasonShort = shortSetupType + "_entry"
+    string shortMsg = f_json("entry_triggered", "short", activeSetupType, reasonShort, activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR)
+    strategy.entry("Short", strategy.short, qty = shortQty, alert_message = shortMsg)
+    strategy.exit("S-TP1", "Short", stop = activeStop, limit = activeTp1, qty_percent = 33.0, alert_profit = f_json("tp1_hit", "short", activeSetupType, "tp1_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp1_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("S-TP2", "Short", stop = activeStop, limit = activeTp2, qty_percent = 33.0, alert_profit = f_json("tp2_hit", "short", activeSetupType, "tp2_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp2_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("S-TP3", "Short", stop = activeStop, limit = activeTp3, qty_percent = 34.0, alert_profit = f_json("tp3_hit", "short", activeSetupType, "tp3_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp3_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    alert(f_json("sell_setup", "short", activeSetupType, reasonShort, activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+
+// ============================================================================
+// TRADE MANAGEMENT
+// ============================================================================
+
+bool inLong = strategy.position_size > 0
+bool inShort = strategy.position_size < 0
+bool inTrade = strategy.position_size != 0
+
+if inLong
+    if trailAtFirstBreak and not firstBreakManaged and not na(activeFirstBreakLevel) and high >= activeFirstBreakLevel
+        activeStop := math.max(activeStop, activeStop + 2.0 * tick)
+        firstBreakManaged := true
+    float longSixtyPctPrice = activeEntry + (activeTp3 - activeEntry) * 0.60
+    if trailAt60Pct and not managedAt60Pct and high >= longSixtyPctPrice
+        activeStop := math.max(activeStop, activeEntry + tick)
+        managedAt60Pct := true
+    strategy.exit("L-TP1", "Long", stop = activeStop, limit = activeTp1, qty_percent = 33.0, alert_profit = f_json("tp1_hit", "long", activeSetupType, "tp1_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp1_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("L-TP2", "Long", stop = activeStop, limit = activeTp2, qty_percent = 33.0, alert_profit = f_json("tp2_hit", "long", activeSetupType, "tp2_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp2_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("L-TP3", "Long", stop = activeStop, limit = activeTp3, qty_percent = 34.0, alert_profit = f_json("tp3_hit", "long", activeSetupType, "tp3_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "long", activeSetupType, "tp3_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+
+if inShort
+    if trailAtFirstBreak and not firstBreakManaged and not na(activeFirstBreakLevel) and low <= activeFirstBreakLevel
+        activeStop := math.min(activeStop, activeStop - 2.0 * tick)
+        firstBreakManaged := true
+    float shortSixtyPctPrice = activeEntry - (activeEntry - activeTp3) * 0.60
+    if trailAt60Pct and not managedAt60Pct and low <= shortSixtyPctPrice
+        activeStop := math.min(activeStop, activeEntry - tick)
+        managedAt60Pct := true
+    strategy.exit("S-TP1", "Short", stop = activeStop, limit = activeTp1, qty_percent = 33.0, alert_profit = f_json("tp1_hit", "short", activeSetupType, "tp1_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp1_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("S-TP2", "Short", stop = activeStop, limit = activeTp2, qty_percent = 33.0, alert_profit = f_json("tp2_hit", "short", activeSetupType, "tp2_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp2_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+    strategy.exit("S-TP3", "Short", stop = activeStop, limit = activeTp3, qty_percent = 34.0, alert_profit = f_json("tp3_hit", "short", activeSetupType, "tp3_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert_loss = f_json("stop_loss_hit", "short", activeSetupType, "tp3_stop_exit", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR))
+
+// ============================================================================
+// EVENT DETECTION FOR ALERT() NOTIFICATIONS
+// ============================================================================
+
+bool noTradeAlert = noTrade and not noTrade[1]
+
+bool longTp1Touch = inLong and not tp1Alerted and high >= activeTp1
+bool longTp2Touch = inLong and not tp2Alerted and high >= activeTp2
+bool longTp3Touch = inLong and not tp3Alerted and high >= activeTp3
+bool longSlTouch  = inLong and not slAlerted and low <= activeStop
+
+bool shortTp1Touch = inShort and not tp1Alerted and low <= activeTp1
+bool shortTp2Touch = inShort and not tp2Alerted and low <= activeTp2
+bool shortTp3Touch = inShort and not tp3Alerted and low <= activeTp3
+bool shortSlTouch  = inShort and not slAlerted and high >= activeStop
+
+if noTradeAlert
+    alert(f_json("no_trade_condition", "none", "none", noTradeReason, float(na), float(na), float(na), float(na), float(na), float(na), float(na)), alert.freq_once_per_bar_close)
+
+if longTp1Touch
+    tp1Alerted := true
+    alert(f_json("tp1_hit", "long", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if longTp2Touch
+    tp2Alerted := true
+    alert(f_json("tp2_hit", "long", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if longTp3Touch
+    tp3Alerted := true
+    alert(f_json("tp3_hit", "long", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if longSlTouch
+    slAlerted := true
+    alert(f_json("stop_loss_hit", "long", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+
+if shortTp1Touch
+    tp1Alerted := true
+    alert(f_json("tp1_hit", "short", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if shortTp2Touch
+    tp2Alerted := true
+    alert(f_json("tp2_hit", "short", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if shortTp3Touch
+    tp3Alerted := true
+    alert(f_json("tp3_hit", "short", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+if shortSlTouch
+    slAlerted := true
+    alert(f_json("stop_loss_hit", "short", activeSetupType, "touch", activeEntry, activeStop, activeTp1, activeTp2, activeTp3, activeRiskAmount, activeRR), alert.freq_once_per_bar_close)
+
+// Reset trade state after flat
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    activeSide := 0
+    activeEntry := na
+    activeStop := na
+    activeTp1 := na
+    activeTp2 := na
+    activeTp3 := na
+    activeRR := na
+    activeRiskAmount := na
+    activeSetupType := "none"
+    activeFirstBreakLevel := na
+    firstBreakManaged := false
+    managedAt60Pct := false
+    tp1Alerted := false
+    tp2Alerted := false
+    tp3Alerted := false
+    slAlerted := false
+
+// ============================================================================
+// PLOTS & VISUALS
+// ============================================================================
+
+plot(pdh, "PDH", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+plot(pdl, "PDL", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+
+plot(execMa, "Execution MA", color = color.new(color.orange, 0))
+
+plotshape(pdhSweep, title = "PDH Sweep", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.tiny, text = "PDH Sweep")
+plotshape(pdlSweep, title = "PDL Sweep", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny, text = "PDL Sweep")
+plotshape(localHighSweep, title = "Local High Sweep", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 35), size = size.tiny, text = "Sweep")
+plotshape(localLowSweep, title = "Local Low Sweep", style = shape.triangleup, location = location.belowbar, color = color.new(color.lime, 35), size = size.tiny, text = "Sweep")
+
+plotshape(bosUp, title = "BOS Up", style = shape.labelup, location = location.belowbar, color = color.new(color.green, 0), text = "BOS")
+plotshape(bosDown, title = "BOS Down", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), text = "BOS")
+plotshape(chochUp, title = "CHoCH Up", style = shape.labelup, location = location.belowbar, color = color.new(color.teal, 0), text = "CHoCH")
+plotshape(chochDown, title = "CHoCH Down", style = shape.labeldown, location = location.abovebar, color = color.new(color.maroon, 0), text = "CHoCH")
+
+plotshape(longSetupReady, title = "Buy Setup", style = shape.circle, location = location.belowbar, color = color.new(color.lime, 0), size = size.tiny, text = "Buy")
+plotshape(shortSetupReady, title = "Sell Setup", style = shape.circle, location = location.abovebar, color = color.new(color.red, 0), size = size.tiny, text = "Sell")
+
+plotshape(noTradeAlert, title = "No-Trade", style = shape.xcross, location = location.top, color = color.new(color.gray, 0), size = size.tiny, text = "NoTrade")
+plotshape(showFlatMAWarning and flatMa, title = "Flat MA", style = shape.diamond, location = location.top, color = color.new(color.orange, 0), size = size.tiny, text = "Flat MA")
+
+plotBullTop = plot(bullZoneActive ? bullZoneTop : na, "Bull Zone Top", color = color.new(color.green, 0), style = plot.style_linebr)
+plotBullBot = plot(bullZoneActive ? bullZoneBot : na, "Bull Zone Bottom", color = color.new(color.green, 0), style = plot.style_linebr)
+fill(plotBullTop, plotBullBot, color = color.new(color.green, 88), title = "Bull Entry Zone")
+
+plotBearTop = plot(bearZoneActive ? bearZoneTop : na, "Bear Zone Top", color = color.new(color.red, 0), style = plot.style_linebr)
+plotBearBot = plot(bearZoneActive ? bearZoneBot : na, "Bear Zone Bottom", color = color.new(color.red, 0), style = plot.style_linebr)
+fill(plotBearTop, plotBearBot, color = color.new(color.red, 88), title = "Bear Entry Zone")
+
+plot(inTrade ? activeStop : na, "Stop Loss", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(inTrade ? activeTp1 : na, "TP1", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+plot(inTrade ? activeTp2 : na, "TP2", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+plot(inTrade ? activeTp3 : na, "TP3", color = color.new(color.green, 0), linewidth = 2, style = plot.style_linebr)
+
+if longSetupReady
+    label.new(bar_index, low, "Buy " + longSetupType + "\nRR " + str.tostring(longRR, "#.##"), style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+if shortSetupReady
+    label.new(bar_index, high, "Sell " + shortSetupType + "\nRR " + str.tostring(shortRR, "#.##"), style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+
+// ============================================================================
+// DASHBOARD
+// ============================================================================
+
+if showDashboard and (barstate.islastconfirmedhistory or barstate.isrealtime)
+    var table dash = table.new(position.top_right, 2, 11, bgcolor = color.new(color.black, 0))
+    string biasText = bullishBias ? "Bullish" : bearishBias ? "Bearish" : "Lateral"
+    string zoneText = bullZoneActive ? "Demand" : bearZoneActive ? "Supply" : "None"
+    string lockText = noTrade ? noTradeReason : "none"
+    string rrText = inTrade ? str.tostring(activeRR, "#.##") : longSetupReady ? str.tostring(longRR, "#.##") : shortSetupReady ? str.tostring(shortRR, "#.##") : "na"
+    table.cell(dash, 0, 0, "Bias", text_color = color.white)
+    table.cell(dash, 1, 0, biasText, text_color = bullishBias ? color.lime : bearishBias ? color.red : color.orange)
+    table.cell(dash, 0, 1, "Zone", text_color = color.white)
+    table.cell(dash, 1, 1, zoneText, text_color = color.aqua)
+    table.cell(dash, 0, 2, "No trade", text_color = color.white)
+    table.cell(dash, 1, 2, lockText, text_color = noTrade ? color.red : color.lime)
+    table.cell(dash, 0, 3, "Trades today", text_color = color.white)
+    table.cell(dash, 1, 3, str.tostring(tradesToday) + "/" + str.tostring(maxTradesPerDay), text_color = color.white)
+    table.cell(dash, 0, 4, "Daily loss pts", text_color = color.white)
+    table.cell(dash, 1, 4, str.tostring(dailyLossPoints, "#.##") + "/" + str.tostring(dailyLossLimitPoints, "#.##"), text_color = color.white)
+    table.cell(dash, 0, 5, "Consec losses", text_color = color.white)
+    table.cell(dash, 1, 5, str.tostring(consecutiveLosses) + "/" + str.tostring(maxConsecLossesWeek), text_color = color.white)
+    table.cell(dash, 0, 6, "RR", text_color = color.white)
+    table.cell(dash, 1, 6, rrText, text_color = color.white)
+    table.cell(dash, 0, 7, "Risk %", text_color = color.white)
+    table.cell(dash, 1, 7, str.tostring(riskPctInput, "#.##"), text_color = color.white)
+    table.cell(dash, 0, 8, "Win rate", text_color = color.white)
+    table.cell(dash, 1, 8, str.tostring(winRateAssumption, "#") + "%", text_color = color.white)
+    table.cell(dash, 0, 9, "Trades/week", text_color = color.white)
+    table.cell(dash, 1, 9, "2-" + str.tostring(tradesPerWeekAssume), text_color = color.white)
+    table.cell(dash, 0, 10, "Session", text_color = color.white)
+    table.cell(dash, 1, 10, inTradingSession ? "Active" : "Off", text_color = inTradingSession ? color.lime : color.red)
+
+// ============================================================================
+// ALERTCONDITION() PLACEHOLDERS
+// ----------------------------------------------------------------------------
+// TradingView strategies do not generate usable strategy alerts from
+// alertcondition(). They are included only because the user explicitly required
+// them. Use alert() + order-fill alerts in production.
+// ============================================================================
+
+alertcondition(longSetupReady, title = "Buy setup", message = "Buy setup ready")
+alertcondition(shortSetupReady, title = "Sell setup", message = "Sell setup ready")
+alertcondition(longSetupReady or shortSetupReady, title = "Entry triggered", message = "Entry trigger condition met")
+alertcondition(longSlTouch or shortSlTouch, title = "Stop loss hit", message = "Stop loss touched")
+alertcondition(longTp1Touch or shortTp1Touch, title = "TP1 hit", message = "TP1 touched")
+alertcondition(longTp2Touch or shortTp2Touch, title = "TP2 hit", message = "TP2 touched")
+alertcondition(longTp3Touch or shortTp3Touch, title = "TP3 hit", message = "TP3 touched")
+alertcondition(noTradeAlert, title = "No-trade condition", message = "No-trade condition active")

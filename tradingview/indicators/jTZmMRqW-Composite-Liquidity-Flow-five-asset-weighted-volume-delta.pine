@@ -1,0 +1,375 @@
+//@version=6
+indicator("Composite Liquidity Flow", "CLF", format=format.volume, max_labels_count=50)
+
+// =============================================================================
+// 1. Configuration
+// =============================================================================
+grp_comp = "Composite assets"
+sym_1 = input.symbol("NQ1!", "Asset 1 (tech futures)", group=grp_comp)
+sym_2 = input.symbol("ES1!", "Asset 2 (S&P futures)", group=grp_comp)
+sym_3 = input.symbol("SPY",  "Asset 3 (S&P fund)", group=grp_comp)
+sym_4 = input.symbol("QQQ",  "Asset 4 (tech fund)", group=grp_comp)
+sym_5 = input.symbol("SQQQ", "Asset 5 (inverse hedge)", group=grp_comp)
+
+grp_weights = "Asset weighting"
+wt_nq = input.float(0.5, "NQ weight", minval=0, maxval=2, step=0.1, group=grp_weights, tooltip="Futures leg weight.")
+wt_es = input.float(0.5, "ES weight", minval=0, maxval=2, step=0.1, group=grp_weights)
+wt_spy = input.float(0.7, "SPY weight", minval=0, maxval=2, step=0.1, group=grp_weights, tooltip="Fund flow reads differently from futures, so it is weighted up by default.")
+wt_qqq = input.float(0.7, "QQQ weight", minval=0, maxval=2, step=0.1, group=grp_weights)
+wt_sqqq = input.float(0.4, "SQQQ weight", minval=0, maxval=2, step=0.1, group=grp_weights, tooltip="Inverse hedge, logic inverted.")
+
+grp_smooth = "Smoothing and normalization"
+ema_length = input.int(25, "Smoothing length", minval=1, maxval=100, group=grp_smooth, tooltip="25 is a reasonable starting point on a 5 minute chart.")
+use_normalization = input.bool(true, "Normalize values (z-score)", group=grp_smooth, tooltip="Compresses the scale so quiet and volatile sessions read the same way.")
+norm_length = input.int(50, "Normalization lookback", minval=10, maxval=200, group=grp_smooth)
+
+grp_rsi = "Relative strength filter"
+use_rsi_confluence = input.bool(true, "Require filter agreement for markers", group=grp_rsi, tooltip="When off, agreement markers print on composite flow alone.")
+rsi_length = input.int(14, "Filter length", minval=5, maxval=30, group=grp_rsi)
+rsi_ob = input.int(70, "Upper band", minval=60, maxval=90, group=grp_rsi)
+rsi_os = input.int(30, "Lower band", minval=10, maxval=40, group=grp_rsi)
+rsi_source_sym = input.symbol("ES1!", "Filter source symbol", group=grp_rsi, tooltip="Symbol the filter is computed from.")
+
+grp_div = "Divergence detection"
+show_divergences = input.bool(true, "Show divergences", group=grp_div)
+div_lookback = input.int(15, "Divergence lookback", minval=5, maxval=30, group=grp_div, tooltip="Longer means fewer and stricter signals.")
+div_threshold = input.float(0.9, "Divergence sensitivity", minval=0.5, maxval=1.0, step=0.05, group=grp_div, tooltip="0.9 is stricter and produces less noise.")
+require_rsi_for_div = input.bool(true, "Require filter confirmation", group=grp_div, tooltip="Only show a divergence when the filter also confirms.")
+
+grp_session = "Session filter"
+use_session_filter = input.bool(true, "Filter non-regular-hours data", group=grp_session, tooltip="Fund volume is unrepresentative overnight.")
+session_time = input.session("0930-1600", "Regular session", group=grp_session)
+hide_premarket_hist = input.bool(true, "Suppress pre-market histogram", group=grp_session, tooltip="Zeroes the histogram before the regular session.")
+
+grp_visual = "Visual settings"
+show_cloud = input.bool(false, "Show pressure cloud", group=grp_visual, tooltip="Off by default; the histogram is cleaner alone.")
+show_histogram = input.bool(true, "Show delta histogram", group=grp_visual)
+show_momentum = input.bool(true, "Show flow momentum", group=grp_visual)
+show_dashboard = input.bool(true, "Show dashboard", group=grp_visual)
+show_confluence_signals = input.bool(true, "Show agreement markers", group=grp_visual, tooltip="Arrows when flow and the filter align.")
+mom_length = input.int(5, "Momentum length", minval=1, maxval=20, group=grp_visual)
+
+// =============================================================================
+// 2. Session helpers
+// =============================================================================
+is_rth() =>
+    not na(time(timeframe.period, session_time, "America/New_York"))
+
+in_session = is_rth()
+
+// =============================================================================
+// 3. Filter calculation, from the specified symbol
+// Lookahead is explicitly off: this script never reads future data.
+// =============================================================================
+rsi_close = request.security(rsi_source_sym, timeframe.period, close, ignore_invalid_symbol=true, lookahead=barmerge.lookahead_off)
+rsi_val = ta.rsi(rsi_close, rsi_length)
+
+rsi_bullish = rsi_val < rsi_os or (rsi_val > rsi_val[1] and rsi_val[1] < rsi_os)
+rsi_bearish = rsi_val > rsi_ob or (rsi_val < rsi_val[1] and rsi_val[1] > rsi_ob)
+rsi_neutral_bull = rsi_val > 50 and rsi_val < rsi_ob
+rsi_neutral_bear = rsi_val < 50 and rsi_val > rsi_os
+
+// =============================================================================
+// 4. Pressure calculation
+// =============================================================================
+calc_pressure(string symbol_name, bool apply_session) =>
+    // "time" was requested in the original and never used. Dropped: it added a
+    // field to every security call for nothing.
+    [o, h, l, c, v] = request.security(symbol_name, timeframe.period, [open, high, low, close, volume], ignore_invalid_symbol=true, lookahead=barmerge.lookahead_off)
+
+    float buy_val = 0.0
+    float sell_val = 0.0
+
+    bool session_ok = apply_session ? is_rth() : true
+
+    if not na(v) and v > 0 and session_ok
+        float spread = h - l
+
+        if spread > 0
+            float upper_wick = c > o ? h - c : h - o
+            float lower_wick = c > o ? o - l : c - l
+            float body_len = math.abs(c - o)
+
+            float pct_upper = upper_wick / spread
+            float pct_lower = lower_wick / spread
+            float pct_body = body_len / spread
+
+            float buy_pct = 0.0
+            float sell_pct = 0.0
+
+            if c > o
+                buy_pct := pct_body + pct_lower
+                sell_pct := pct_upper
+            else if c < o
+                sell_pct := pct_body + pct_upper
+                buy_pct := pct_lower
+            else
+                buy_pct := pct_lower
+                sell_pct := pct_upper
+
+            float raw_buy_vol = buy_pct * v
+            float raw_sell_vol = sell_pct * v
+
+            buy_val := raw_buy_vol * c
+            sell_val := raw_sell_vol * c
+
+    [buy_val, sell_val]
+
+// =============================================================================
+// 5. Aggregate data from all assets
+// =============================================================================
+[b1, s1] = calc_pressure(sym_1, false)
+[b2, s2] = calc_pressure(sym_2, false)
+[b3, s3] = calc_pressure(sym_3, use_session_filter)
+[b4, s4] = calc_pressure(sym_4, use_session_filter)
+[b5, s5] = calc_pressure(sym_5, use_session_filter)
+
+float futures_buy = (b1 * wt_nq) + (b2 * wt_es)
+float futures_sell = (s1 * wt_nq) + (s2 * wt_es)
+
+float spot_buy = (b3 * wt_spy) + (b4 * wt_qqq)
+float spot_sell = (s3 * wt_spy) + (s4 * wt_qqq)
+
+float hedge_buy = s5 * wt_sqqq
+float hedge_sell = b5 * wt_sqqq
+
+float total_buy = futures_buy + spot_buy + hedge_buy
+float total_sell = futures_sell + spot_sell + hedge_sell
+
+// =============================================================================
+// 6. Smoothing and normalization
+// =============================================================================
+float smooth_buy = ta.ema(total_buy, ema_length)
+float smooth_sell = ta.ema(total_sell, ema_length)
+
+float raw_delta = smooth_buy - smooth_sell
+
+float delta_mean = ta.sma(raw_delta, norm_length)
+float delta_std = ta.stdev(raw_delta, norm_length)
+float norm_delta = delta_std != 0 ? (raw_delta - delta_mean) / delta_std : 0
+
+float delta = use_normalization ? norm_delta : raw_delta
+
+float display_delta = (hide_premarket_hist and not in_session) ? 0 : delta
+
+// Momentum is a plain difference, not ta.roc(). delta is a z-score that crosses
+// zero, and ta.roc divides by delta[n]: near zero that produces spikes in the
+// hundreds, and when delta[n] is negative the sign of the result inverts, so
+// improving flow scored as deteriorating. A difference is in the same units as
+// delta, plots on the same scale, and cannot divide by zero.
+float flow_momentum = delta - delta[mom_length]
+
+bool flow_bullish = delta > 0
+bool flow_bearish = delta < 0
+// Renamed: these are first differences, so they mean rising and falling.
+// Acceleration would be the second difference. The old names described
+// something the code never computed.
+bool flow_rising_now = delta > delta[1]
+bool flow_falling_now = delta < delta[1]
+
+// =============================================================================
+// 7. Divergence detection
+// =============================================================================
+float price_high = ta.highest(close, div_lookback)
+float price_low = ta.lowest(close, div_lookback)
+
+float flow_high = ta.highest(delta, div_lookback)
+float flow_low = ta.lowest(delta, div_lookback)
+
+// Position within the recent range, not a percentage of absolute price.
+// The original tested close >= price_high * 0.9, which on an index near 7500
+// allows 750 points of slack. A 15-bar intraday range is rarely that wide, so
+// the condition was true on almost every bar and the divergence filter
+// collapsed to "flow moved against price for three bars". Range position is
+// scale invariant: it behaves the same on an index, a fund and a 5-dollar name.
+float price_range = price_high - price_low
+float price_pos = price_range > 0 ? (close - price_low) / price_range : 0.5
+
+bool price_at_high = price_range > 0 and price_pos >= div_threshold
+bool price_at_low = price_range > 0 and price_pos <= (1 - div_threshold)
+
+bool flow_declining = delta < delta[1] and delta[1] < delta[2] and delta[2] < delta[3]
+bool flow_rising = delta > delta[1] and delta[1] > delta[2] and delta[2] > delta[3]
+
+// Retreat from the flow extreme, measured against the flow range rather than
+// by multiplying a signed value. delta is a z-score and can be negative; when
+// flow_high was negative, flow_high * 0.7 sat ABOVE flow_high, so the test
+// inverted in exactly the regime where a bearish divergence matters.
+float flow_range = flow_high - flow_low
+float retreat = 0.30
+
+bool flow_off_high = flow_range > 0 and (flow_high - delta) / flow_range >= retreat
+bool flow_off_low = flow_range > 0 and (delta - flow_low) / flow_range >= retreat
+
+bool raw_bearish_div = price_at_high and flow_declining and flow_off_high
+bool raw_bullish_div = price_at_low and flow_rising and flow_off_low
+
+bool bearish_div = require_rsi_for_div ? (raw_bearish_div and (rsi_bearish or rsi_val > 60)) : raw_bearish_div
+bool bullish_div = require_rsi_for_div ? (raw_bullish_div and (rsi_bullish or rsi_val < 40)) : raw_bullish_div
+
+var int last_bear_div_bar = 0
+var int last_bull_div_bar = 0
+
+bool show_bear_div = bearish_div and (bar_index - last_bear_div_bar > div_lookback * 2) and show_divergences and in_session
+bool show_bull_div = bullish_div and (bar_index - last_bull_div_bar > div_lookback * 2) and show_divergences and in_session
+
+if show_bear_div
+    last_bear_div_bar := bar_index
+if show_bull_div
+    last_bull_div_bar := bar_index
+
+// =============================================================================
+// 8. Agreement markers
+// =============================================================================
+// use_rsi_confluence was declared but never referenced: the filter was always
+// on and the toggle did nothing. It is now wired to the agreement markers.
+bool bull_filter_ok = use_rsi_confluence ? (rsi_bullish or rsi_neutral_bull) : true
+bool bear_filter_ok = use_rsi_confluence ? (rsi_bearish or rsi_neutral_bear) : true
+
+bool strong_bull_confluence = flow_bullish and flow_rising_now and bull_filter_ok and in_session
+bool strong_bear_confluence = flow_bearish and flow_falling_now and bear_filter_ok and in_session
+
+bool bull_cross = ta.crossover(delta, 0)
+bool bear_cross = ta.crossunder(delta, 0)
+
+bool confirmed_bull_cross = bull_cross and (rsi_val > 40 or rsi_bullish) and in_session
+bool confirmed_bear_cross = bear_cross and (rsi_val < 60 or rsi_bearish) and in_session
+
+var int last_bull_conf_bar = 0
+var int last_bear_conf_bar = 0
+
+bool show_bull_confluence = strong_bull_confluence and (bar_index - last_bull_conf_bar > 10) and show_confluence_signals
+bool show_bear_confluence = strong_bear_confluence and (bar_index - last_bear_conf_bar > 10) and show_confluence_signals
+
+if show_bull_confluence
+    last_bull_conf_bar := bar_index
+if show_bear_confluence
+    last_bear_conf_bar := bar_index
+
+// =============================================================================
+// 9. Signal quality scoring
+// Range is -3.0 to +3.0. The original comment said 0 to 5, which no combination
+// of the five terms below can produce. "var" is also dropped: the score is
+// recomputed from scratch every bar and never carried forward.
+// =============================================================================
+float signal_score = 0.0
+signal_score := signal_score + (flow_bullish ? 1 : -1)
+signal_score := signal_score + (flow_rising_now ? 0.5 : -0.5)
+signal_score := signal_score + (rsi_val > 50 ? 0.5 : -0.5)
+signal_score := signal_score + (rsi_val > rsi_val[1] ? 0.5 : -0.5)
+signal_score := signal_score + (flow_momentum > 0 ? 0.5 : -0.5)
+
+// =============================================================================
+// 10. Flow strength
+// =============================================================================
+float avg_delta = ta.sma(math.abs(delta), 20)
+float flow_strength = avg_delta != 0 ? math.abs(delta) / avg_delta : 0
+
+bool strong_bull_flow = delta > 0 and flow_strength > 1.5 and in_session
+bool strong_bear_flow = delta < 0 and flow_strength > 1.5 and in_session
+
+// =============================================================================
+// 11. Plotting
+// =============================================================================
+color col_buy = color.new(color.teal, 50)
+color col_sell = color.new(color.red, 50)
+color col_fill = smooth_buy > smooth_sell ? color.new(color.teal, 85) : color.new(color.red, 85)
+
+plot_buy = plot(show_cloud ? smooth_buy : na, "Buying pressure", color=col_buy, linewidth=1)
+plot_sell = plot(show_cloud ? smooth_sell : na, "Selling pressure", color=col_sell, linewidth=1)
+fill(plot_buy, plot_sell, color=show_cloud ? col_fill : na, title="Pressure cloud")
+
+color col_delta_pos_strong = color.new(#00E676, 20)
+color col_delta_pos_weak = color.new(#00E676, 60)
+color col_delta_neg_strong = color.new(#FF5252, 20)
+color col_delta_neg_weak = color.new(#FF5252, 60)
+color col_neutral = color.new(color.gray, 70)
+
+color hist_color = na
+if hide_premarket_hist and not in_session
+    hist_color := col_neutral
+else if delta > 0
+    hist_color := delta > delta[1] ? col_delta_pos_strong : col_delta_pos_weak
+else
+    hist_color := delta < delta[1] ? col_delta_neg_strong : col_delta_neg_weak
+
+plot(show_histogram ? display_delta : na, "Net flow delta", style=plot.style_columns, color=hist_color)
+
+hline(0, "Zero line", color=color.new(color.gray, 50), linestyle=hline.style_dashed)
+
+plot(show_momentum ? flow_momentum : na, "Flow momentum", color=color.new(color.yellow, 30), linewidth=2)
+
+plotshape(show_bear_div ? display_delta : na, "Bearish divergence", shape.triangledown, location.top, color.new(color.orange, 0), size=size.normal, text="Div", textcolor=color.orange)
+plotshape(show_bull_div ? display_delta : na, "Bullish divergence", shape.triangleup, location.bottom, color.new(color.lime, 0), size=size.normal, text="Div", textcolor=color.lime)
+
+plotshape(show_bull_confluence ? display_delta : na, "Bullish agreement", shape.arrowup, location.bottom, color.new(#00E676, 0), size=size.large)
+plotshape(show_bear_confluence ? display_delta : na, "Bearish agreement", shape.arrowdown, location.top, color.new(#FF5252, 0), size=size.large)
+
+plotshape(confirmed_bull_cross ? display_delta : na, "Confirmed bullish cross", shape.circle, location.absolute, color.new(color.teal, 0), size=size.tiny)
+plotshape(confirmed_bear_cross ? display_delta : na, "Confirmed bearish cross", shape.circle, location.absolute, color.new(color.red, 0), size=size.tiny)
+
+// =============================================================================
+// 12. Session background
+// =============================================================================
+bgcolor(not in_session ? color.new(color.gray, 95) : na, title="Outside regular session")
+
+// =============================================================================
+// 13. Dashboard
+// =============================================================================
+if show_dashboard and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8, bgcolor=color.new(#1a1a2e, 5), border_color=color.new(color.gray, 60), border_width=1)
+
+    table.cell(dash, 0, 0, "Flow", text_color=color.white, text_size=size.small, bgcolor=color.new(#16213e, 0))
+    table.cell(dash, 1, 0, in_session ? "Regular" : "Extended", text_color=in_session ? color.lime : color.gray, text_size=size.small, bgcolor=color.new(#16213e, 0))
+
+    bool bulls_winning = delta > 0
+    string status_text = bulls_winning ? "Bullish" : "Bearish"
+    color status_color = bulls_winning ? #00E676 : #FF5252
+    table.cell(dash, 0, 1, "Direction", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 1, status_text, text_color=status_color, text_size=size.small)
+
+    string strength_label = flow_strength > 2.0 ? "Extreme" : flow_strength > 1.5 ? "Strong" : flow_strength > 1.0 ? "Normal" : "Weak"
+    color strength_color = flow_strength > 1.5 ? status_color : color.gray
+    table.cell(dash, 0, 2, "Strength", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 2, strength_label, text_color=strength_color, text_size=size.tiny)
+
+    string mom_label = flow_momentum > 0 ? "Rising" : flow_momentum < 0 ? "Falling" : "Flat"
+    table.cell(dash, 0, 3, "Momentum", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 3, mom_label, text_color=flow_momentum > 0 ? #00E676 : #FF5252, text_size=size.tiny)
+
+    string rsi_label = str.tostring(rsi_val, "#.0")
+    color rsi_color = rsi_val > rsi_ob ? #FF5252 : rsi_val < rsi_os ? #00E676 : color.white
+    table.cell(dash, 0, 4, "Filter", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 4, rsi_label, text_color=rsi_color, text_size=size.tiny)
+
+    string score_label = str.tostring(signal_score, "+#.0;-#.0")
+    color score_color = signal_score > 1.5 ? #00E676 : signal_score < -1.5 ? #FF5252 : color.yellow
+    table.cell(dash, 0, 5, "Score", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 5, score_label, text_color=score_color, text_size=size.tiny)
+
+    string conf_status = "-"
+    color conf_color = color.gray
+    if show_bull_confluence or (strong_bull_confluence and bar_index - last_bull_conf_bar < 3)
+        conf_status := "Long"
+        conf_color := #00E676
+    else if show_bear_confluence or (strong_bear_confluence and bar_index - last_bear_conf_bar < 3)
+        conf_status := "Short"
+        conf_color := #FF5252
+
+    table.cell(dash, 0, 6, "Agreement", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 6, conf_status, text_color=conf_color, text_size=size.tiny)
+
+    table.cell(dash, 0, 7, "Delta", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 7, str.tostring(delta, "#.00"), text_color=delta > 0 ? #00E676 : #FF5252, text_size=size.tiny)
+
+// =============================================================================
+// 14. Alerts
+// =============================================================================
+alertcondition(confirmed_bull_cross, "Confirmed bullish cross", "Composite flow crossed above zero with filter confirmation")
+alertcondition(confirmed_bear_cross, "Confirmed bearish cross", "Composite flow crossed below zero with filter confirmation")
+alertcondition(show_bear_div, "Bearish divergence", "Price high with weakening composite flow and filter confirmation")
+alertcondition(show_bull_div, "Bullish divergence", "Price low with strengthening composite flow and filter confirmation")
+alertcondition(show_bull_confluence, "Bullish agreement", "Composite flow and filter aligned to the upside")
+alertcondition(show_bear_confluence, "Bearish agreement", "Composite flow and filter aligned to the downside")
+alertcondition(strong_bull_flow, "Strong bullish flow", "Composite flow showing strong buying pressure")
+alertcondition(strong_bear_flow, "Strong bearish flow", "Composite flow showing strong selling pressure")

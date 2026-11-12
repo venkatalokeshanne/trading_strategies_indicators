@@ -1,0 +1,543 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © PyraTime
+
+//@version=6
+indicator("Gann Reversal Confluence", overlay = true, max_lines_count = 500)
+
+// Automates Gann's two-bar reversal: a turn is flagged when price closes beyond
+// the recent swing high/low, on a key reversal bar, or on an outside bar.
+// A reversal bar alone isn't a trade signal, so this scores each raw pattern
+// against range, volume, momentum, trend, and (optional) planetary hour to show
+// how much is actually confirming it. Confirms on bar close only, no repainting.
+
+// --- Inputs: logic ---
+method   = input.string("Swing (HiLo)", "Reversal method", options = ["Swing (HiLo)", "Key reversal", "Outside bar"], group = "Logic")
+swingLen = input.int(8, "Swing length", minval = 1, maxval = 20, group = "Logic", tooltip = "Bars used for the swing high/low. Lower = more sensitive.")
+useClose = input.bool(true, "Confirm on close (vs wick)", group = "Logic", tooltip = "Applies to all three methods: Swing compares close vs the swing band, Key reversal/Outside bar require the close (not just the wick) to have reversed.")
+minBarsBetween = input.int(20, "Min bars between signals", minval = 0, maxval = 100, group = "Logic", tooltip = "Suppresses new signals for N bars after the last one, to cut noise on choppy/short swing settings. 0 = no filter.")
+
+// --- Inputs: confluence ---
+useATR    = input.bool(true,  "Range significance (ATR)", group = "Confluence", tooltip = "Reversal bar's range must be at least ATR × multiplier — filters out small, low-conviction bars.")
+atrLen    = input.int(14, "ATR length", minval = 1, group = "Confluence")
+atrMult   = input.float(1.2, "ATR multiplier", minval = 0.1, step = 0.1, group = "Confluence")
+useVol    = input.bool(true,  "Volume confirmation", group = "Confluence", tooltip = "Reversal bar's volume must exceed its average by the multiplier. Off automatically on symbols with no volume.")
+volLen    = input.int(20, "Volume avg length", minval = 1, group = "Confluence")
+volMult   = input.float(1.2, "Volume multiplier", minval = 0.1, step = 0.1, group = "Confluence")
+useRSI    = input.bool(true,  "Momentum extreme (RSI)", group = "Confluence", tooltip = "Bullish reversals need RSI at/below the oversold line, bearish need RSI at/above overbought.")
+rsiLen    = input.int(14, "RSI length", minval = 1, group = "Confluence")
+rsiOS     = input.int(30, "RSI oversold", minval = 1, maxval = 50, group = "Confluence")
+rsiOB     = input.int(70, "RSI overbought", minval = 50, maxval = 99, group = "Confluence")
+useTrend  = input.bool(true,  "Trend context (EMA)", group = "Confluence", tooltip = "Gates the signal against the higher-timeframe trend: a BUY only scores this point while price is above the EMA (uptrend), a SELL only while below (downtrend). Trading with the trend, not against it.")
+trendLen  = input.int(50, "Trend EMA length", minval = 1, group = "Confluence")
+minConfluenceStr = input.string("3", "Minimum confluence score to show signal", options = ["0", "1", "2", "3", "4", "5", "6"], group = "Confluence", tooltip = "0 = show every raw reversal pattern regardless of confluence. Raise to only see higher-conviction signals — e.g. 3 only shows signals where 3+ of your enabled factors agree. Capped automatically at however many factors you have enabled (see 'Min filter' in the status table) — if you pick a value higher than your enabled factor count, no signals will show.")
+minConfluence = int(str.tonumber(minConfluenceStr))
+
+// --- Inputs: astro (hour-ruler tone) ---
+gAstro    = "Astro (optional)"
+useRuler  = input.bool(false, "Hour-ruler tone (Chaldean)", group = gAstro, tooltip = "Descriptive traditional overlay, not a validated filter: tags a bullish reversal as aligned when the current planetary hour is ruled by Venus or Jupiter (classical benefics), and a bearish reversal as aligned when ruled by Mars or Saturn (classical malefics). Sun/Moon/Mercury-ruled hours are neutral and never contribute — kept narrow on purpose so it only lights up when something traditionally meaningful lines up, not on the majority of hours. Off by default — treat this as a curiosity/context factor alongside the technical ones, not evidence on its own.")
+useDayRuler = input.bool(false, "Day-ruler tone (Chaldean)", group = gAstro, tooltip = "Same benefic/malefic logic as the hour ruler, but for the PLANETARY DAY (the weekday's own ruling body — Sun=Sunday, Moon=Monday, Mars=Tuesday, Mercury=Wednesday, Jupiter=Thursday, Venus=Friday, Saturn=Saturday). A coarser, whole-day version of the hour-ruler tone — independent factor, can agree or disagree with the hour ruler.")
+locPreset = input.string("Null Island (0,0) — crypto", "Location preset", group = gAstro, options = ["Null Island (0,0) — crypto", "New York (NYSE)", "Chicago (CME)", "Los Angeles", "London (LSE)", "Frankfurt (XETRA)", "Tokyo (TSE)", "Hong Kong (HKEX)", "Sydney (ASX)"], tooltip = "Only used for the hour-ruler sunrise/sunset calc. 0,0 (Null Island) is a reasonable default for 24/7 crypto.")
+useManualLoc = input.bool(false, "Use manual lat/lon (override preset)", group = gAstro)
+man_lat   = input.float(0.0, "Manual latitude (+N/-S)",  minval = -90,  maxval = 90,  group = gAstro)
+man_lon   = input.float(0.0, "Manual longitude (+E/-W)", minval = -180, maxval = 180, group = gAstro)
+
+float presetLat = locPreset == "New York (NYSE)" ? 40.7128 : locPreset == "Chicago (CME)" ? 41.8781 : locPreset == "Los Angeles" ? 34.0522 : locPreset == "London (LSE)" ? 51.5074 : locPreset == "Frankfurt (XETRA)" ? 50.1109 : locPreset == "Tokyo (TSE)" ? 35.6762 : locPreset == "Hong Kong (HKEX)" ? 22.3193 : locPreset == "Sydney (ASX)" ? -33.8688 : 0.0
+float presetLon = locPreset == "New York (NYSE)" ? -74.0060 : locPreset == "Chicago (CME)" ? -87.6298 : locPreset == "Los Angeles" ? -118.2437 : locPreset == "London (LSE)" ? -0.1278 : locPreset == "Frankfurt (XETRA)" ? 8.6821 : locPreset == "Tokyo (TSE)" ? 139.6503 : locPreset == "Hong Kong (HKEX)" ? 114.1694 : locPreset == "Sydney (ASX)" ? 151.2093 : 0.0
+obs_lat = useManualLoc ? man_lat : presetLat
+obs_lon = useManualLoc ? man_lon : presetLon
+
+// --- Inputs: display ---
+showBand  = input.bool(false, "Show swing band", group = "Display")
+showLine  = input.bool(true,  "Draw level at each signal", group = "Display")
+showBg    = input.bool(false, "Highlight signal bar background", group = "Display")
+showScore = input.bool(true,  "Show confluence score on signal", group = "Display")
+showTable = input.bool(true,  "Show status table", group = "Display")
+tablePos  = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = "Display")
+tableSizeStr = input.string("Tiny", "Status table text size", options = ["Tiny", "Small", "Large"], group = "Display")
+tableSize = tableSizeStr == "Tiny" ? size.tiny : tableSizeStr == "Large" ? size.large : size.small
+anchor    = input.string("Midpoint", "Level anchor", options = ["Midpoint", "Low", "High"], group = "Display")
+lineLen   = input.int(6, "Level length (bars)", minval = 1, maxval = 60, group = "Display")
+lineWid   = input.int(1, "Level width", minval = 1, maxval = 4, group = "Display")
+lineSty   = input.string("Solid", "Level style", options = ["Solid", "Dashed", "Dotted"], group = "Display")
+bullCol   = input.color(color.lime, "Bull", inline = "col", group = "Display")
+bearCol   = input.color(color.red,  "Bear", inline = "col", group = "Display")
+
+// --- Inputs: backtest tools (for your own tuning — not a performance claim) ---
+// Kept last in the settings panel deliberately — this is a tuning aid, not part of
+// the indicator's actual output, so it shouldn't compete for attention with Logic/
+// Confluence/Astro/Display when someone opens the settings. Off by default.
+gBT     = "Backtest tools (off by default — for tuning your own settings)"
+btMode  = input.string("Both off", "Backtest display", options = ["Oscillator", "PnL test", "Both off"], group = gBT, tooltip = "Oscillator = score-bucket comparison table (0-6), always-in-market flip with no risk management — a tuning aid, not a trading system. PnL test = an actual risk-managed simulation with an ATR stop and target, reported in R-multiples. Only one renders at a time to avoid clutter.")
+pnlStopMult   = input.float(1.5, "PnL test: stop (x ATR)",   minval = 0.1, step = 0.1, group = gBT)
+pnlTargetMult = input.float(3.0, "PnL test: target (x ATR)", minval = 0.1, step = 0.1, group = gBT)
+pnlRiskPct    = input.float(1.0, "PnL test: risk % per trade (for equity estimate)", minval = 0.1, step = 0.1, group = gBT)
+minSampleSize = input.int(20, "Min trades to trust a threshold", minval = 1, group = gBT, tooltip = "Buckets with fewer trades than this are dimmed and marked with * in the breakdown table — a threshold with 8 trades can look great by luck. Also excluded from the 'best' row highlight.")
+showBreakdown = input.bool(false, "Show breakdown table", group = gBT, tooltip = "Independent of Backtest display mode above — turns the score-comparison table on/off without changing which mode (Oscillator/PnL test) is selected.")
+bdSizeStr = input.string("Tiny", "Breakdown table text size", options = ["Tiny", "Small", "Large"], group = gBT)
+bdSize = bdSizeStr == "Small" ? size.small : bdSizeStr == "Large" ? size.large : size.tiny
+showOsc = btMode == "Oscillator"
+showPnL = btMode == "PnL test"
+
+// --- Parse Line Style ---
+parsedStyle = switch lineSty
+    "Dashed" => line.style_dashed
+    "Dotted" => line.style_dotted
+    =>          line.style_solid
+
+// --- Swing reference (prior swing high / low) ---
+hiBand = ta.highest(high, swingLen)
+loBand = ta.lowest(low,  swingLen)
+
+// --- Reversal conditions ---
+upTrig = useClose ? close : high
+dnTrig = useClose ? close : low
+
+// Swing: price takes out the prior swing extreme
+swingUp = upTrig > hiBand[1]
+swingDn = dnTrig < loBand[1]
+
+// Key reversal: new low that closes up / new high that closes down
+keyUp = low  < low[1]  and (useClose ? close > close[1] and close > open : high > high[1])
+keyDn = high > high[1] and (useClose ? close < close[1] and close < open : low  < low[1])
+
+// Outside bar: engulfs the prior range and closes in the reversal direction
+outUp = high > high[1] and low < low[1] and (useClose ? close > open : upTrig > dnTrig)
+outDn = high > high[1] and low < low[1] and (useClose ? close < open : dnTrig < upTrig)
+
+rawUp = switch method
+    "Key reversal" => keyUp
+    "Outside bar"  => outUp
+    => swingUp
+
+rawDn = switch method
+    "Key reversal" => keyDn
+    "Outside bar"  => outDn
+    => swingDn
+
+// --- Chaldean hour-ruler (only computed if useRuler is on) ---
+f_rev(x) => x - math.floor(x / 360.0) * 360.0
+f_wrap180(x) =>
+    y = x - math.floor(x / 360.0) * 360.0
+    y > 180.0 ? y - 360.0 : y
+
+f_atan2(y, x) =>
+    r = 0.0
+    if x > 0
+        r := math.atan(y / x)
+    else if x < 0 and y >= 0
+        r := math.atan(y / x) + math.pi
+    else if x < 0 and y < 0
+        r := math.atan(y / x) - math.pi
+    else if x == 0 and y > 0
+        r := math.pi / 2.0
+    else if x == 0 and y < 0
+        r := -math.pi / 2.0
+    else
+        r := 0.0
+    r
+
+f_ecc(M_deg, e) =>
+    M = math.toradians(M_deg)
+    E = M + e * math.sin(M) * (1.0 + e * math.cos(M))
+    E := E - (E - e * math.sin(E) - M) / (1.0 - e * math.cos(E))
+    E := E - (E - e * math.sin(E) - M) / (1.0 - e * math.cos(E))
+    E := E - (E - e * math.sin(E) - M) / (1.0 - e * math.cos(E))
+    E
+
+var string[] rulerNames    = array.from("Sun", "Moon", "Mercury", "Venus", "Mars", "Jupiter", "Saturn")
+var int[]    startIdxByDow = array.from(3, 6, 2, 5, 1, 4, 0)   // Chaldean start index per UTC weekday
+var int[]    chaldeanBody  = array.from(6, 5, 4, 0, 3, 2, 1)   // Sat,Jup,Mars,Sun,Ven,Mer,Moon -> body idx
+
+int   ph_rulerBody = int(na)
+int   ph_hourNum   = int(na)
+bool  ph_isNight   = bool(na)
+float ph_remMin    = float(na)
+bool  rulerBenefic = false
+bool  rulerMalefic = false
+
+// day ruler is just the planet that names the weekday — no ephemeris needed
+int  dayRulerBody     = int(na)
+bool dayRulerBenefic  = false
+bool dayRulerMalefic  = false
+if useDayRuler
+    dayIdx        = array.get(startIdxByDow, dayofweek(time, "UTC") - 1)
+    dayRulerBody := array.get(chaldeanBody, dayIdx)
+    dayRulerBenefic := dayRulerBody == 3 or dayRulerBody == 5
+    dayRulerMalefic := dayRulerBody == 4 or dayRulerBody == 6
+
+if useRuler
+    jd  = time / 86400000.0 + 2440587.5
+    d   = jd - 2451543.5
+    ut  = (jd + 0.5 - math.floor(jd + 0.5)) * 24.0
+
+    ws  = 282.9404 + 4.70935e-5 * d
+    es  = 0.016709 - 1.151e-9 * d
+    Ms  = f_rev(356.0470 + 0.9856002585 * d)
+    Es  = f_ecc(Ms, es)
+    xvs = math.cos(Es) - es
+    yvs = math.sqrt(1.0 - es * es) * math.sin(Es)
+    vs  = f_atan2(yvs, xvs)
+    sunLon = f_rev(math.todegrees(vs) + ws)
+    Ls  = f_rev(Ms + ws)
+
+    ecl   = 23.4393 - 3.563e-7 * d
+    eclr  = math.toradians(ecl)
+    phir  = math.toradians(obs_lat)
+    sunLonR = math.toradians(sunLon)
+    decl    = math.asin(math.sin(eclr) * math.sin(sunLonR))
+    raDeg   = f_rev(math.todegrees(f_atan2(math.cos(eclr) * math.sin(sunLonR), math.cos(sunLonR))))
+    eotMin  = 4.0 * f_wrap180(Ls - raDeg)
+    noonMin = 720.0 - 4.0 * obs_lon - eotMin
+    cosH0   = (math.sin(math.toradians(-0.833)) - math.sin(phir) * math.sin(decl)) / (math.cos(phir) * math.cos(decl))
+    ph_polar = cosH0 > 1.0 or cosH0 < -1.0
+    H0deg   = ph_polar ? 90.0 : math.todegrees(math.acos(cosH0))
+    sunrise = ph_polar ? 360.0  : noonMin - 4.0 * H0deg
+    sunset  = ph_polar ? 1080.0 : noonMin + 4.0 * H0deg
+    tmin    = ut * 60.0
+    dayLen  = sunset - sunrise
+    nightHr = (1440.0 - dayLen) / 12.0
+    dayHr   = dayLen / 12.0
+
+    int   hIdx = 0
+    float hourStart = sunrise
+    int   gdow = dayofweek(time, "UTC")
+    if tmin >= sunrise and tmin < sunset
+        hIdx      := int(math.floor((tmin - sunrise) / dayHr))
+        hourStart := sunrise + hIdx * dayHr
+        gdow      := dayofweek(time, "UTC")
+    else if tmin >= sunset
+        hIdx      := 12 + int(math.floor((tmin - sunset) / nightHr))
+        hourStart := sunset + (hIdx - 12) * nightHr
+        gdow      := dayofweek(time, "UTC")
+    else
+        hIdx      := 12 + int(math.floor((tmin + 1440.0 - sunset) / nightHr))
+        hourStart := (sunset - 1440.0) + (hIdx - 12) * nightHr
+        gdow      := dayofweek(time - 86400000, "UTC")
+    hIdx := math.max(0, math.min(23, hIdx))
+
+    ph_isNight := hIdx >= 12
+    hourLen      = ph_isNight ? nightHr : dayHr
+    startIdx     = array.get(startIdxByDow, gdow - 1)
+    ph_rulerBody := array.get(chaldeanBody, (startIdx + hIdx) % 7)
+    ph_hourNum   := (hIdx % 12) + 1
+    ph_remMin    := math.max(0.0, hourLen - (tmin - hourStart))
+
+    // Strict classical dignity: Venus(3)/Jupiter(5) = benefic, Mars(4)/Saturn(6) = malefic.
+    // Sun/Moon/Mercury are neutral luminaries/mutable and contribute to neither — deliberately
+    // narrow so this only lights up ~2 of 7 hours per direction instead of diluting every signal
+    rulerBenefic := ph_rulerBody == 3 or ph_rulerBody == 5
+    rulerMalefic := ph_rulerBody == 4 or ph_rulerBody == 6
+
+// --- Confluence factors ---
+atrVal      = ta.atr(atrLen)
+rangeOk     = not useATR or (high - low) >= atrVal * atrMult
+
+hasVolume   = ta.cum(volume) > 0
+volAvg      = ta.sma(volume, volLen)
+volOk       = not useVol or not hasVolume or volume >= volAvg * volMult
+
+rsiVal      = ta.rsi(close, rsiLen)
+rsiOkUp     = not useRSI or rsiVal <= rsiOS
+rsiOkDn     = not useRSI or rsiVal >= rsiOB
+
+emaVal      = ta.ema(close, trendLen)
+trendUp     = close > emaVal
+// gates on the higher-timeframe trend: a BUY only scores this point when the EMA
+// says the broader trend is up, a SELL only when it's down (trade with the trend)
+trendOkUp   = not useTrend or trendUp
+trendOkDn   = not useTrend or not trendUp
+
+rulerOkUp   = not useRuler or rulerBenefic
+rulerOkDn   = not useRuler or rulerMalefic
+
+dayRulerOkUp = not useDayRuler or dayRulerBenefic
+dayRulerOkDn = not useDayRuler or dayRulerMalefic
+
+confluenceUp = (useATR ? (rangeOk ? 1 : 0) : 0) + (useVol ? (volOk ? 1 : 0) : 0) + (useRSI ? (rsiOkUp ? 1 : 0) : 0) + (useTrend ? 1 : 0) + (useRuler ? (rulerOkUp ? 1 : 0) : 0) + (useDayRuler ? (dayRulerOkUp ? 1 : 0) : 0)
+confluenceDn = (useATR ? (rangeOk ? 1 : 0) : 0) + (useVol ? (volOk ? 1 : 0) : 0) + (useRSI ? (rsiOkDn ? 1 : 0) : 0) + (useTrend ? 1 : 0) + (useRuler ? (rulerOkDn ? 1 : 0) : 0) + (useDayRuler ? (dayRulerOkDn ? 1 : 0) : 0)
+maxScore     = (useATR ? 1 : 0) + (useVol ? 1 : 0) + (useRSI ? 1 : 0) + (useTrend ? 1 : 0) + (useRuler ? 1 : 0) + (useDayRuler ? 1 : 0)
+
+// clamp so an unreachable threshold (e.g. 5 with Hour-ruler off, max 4) doesn't
+// silently suppress every signal — cap at whatever's actually achievable
+effMinConfluence = math.min(minConfluence, maxScore)
+qualifiedUp = rawUp and confluenceUp >= effMinConfluence
+qualifiedDn = rawDn and confluenceDn >= effMinConfluence
+
+// --- Swing state machine (commit on bar close only -> no repaint) ---
+var int dir = 0
+var int lastSignalBar = na
+var int lastScore = na
+buy  = false
+sell = false
+
+if barstate.isconfirmed
+    cooldownOk = na(lastSignalBar) or (bar_index - lastSignalBar) >= minBarsBetween
+    if qualifiedUp and dir <= 0 and cooldownOk
+        buy := true
+        dir := 1
+        lastSignalBar := bar_index
+        lastScore := confluenceUp
+    else if qualifiedDn and dir >= 0 and cooldownOk
+        sell := true
+        dir := -1
+        lastSignalBar := bar_index
+        lastScore := confluenceDn
+
+// --- Oscillator: always-in-market flip on each signal, no SL/TP/fees ---
+// Runs on the RAW signal universe (ignores the minConfluence display filter) so every
+// threshold can be compared at once — each closed trade is tagged with its entry score
+// and counted into every "score >= T" bucket it qualifies for.
+var int   btDir          = 0
+var int   btLastBar      = na
+var float btEntryPrice   = na
+var int   btPosDir       = 0
+var int   btEntryScore   = na
+var float[] btTrades     = array.new_float(7, 0.0)
+var float[] btWins       = array.new_float(7, 0.0)
+var float[] btCumPnl     = array.new_float(7, 0.0)
+var float[] btGrossWin   = array.new_float(7, 0.0)
+var float[] btGrossLoss  = array.new_float(7, 0.0)
+
+if showOsc and barstate.isconfirmed
+    btCooldownOk = na(btLastBar) or (bar_index - btLastBar) >= minBarsBetween
+    btRawBuy  = rawUp and btDir <= 0 and btCooldownOk
+    btRawSell = rawDn and btDir >= 0 and btCooldownOk
+    if btRawBuy or btRawSell
+        if btPosDir != 0
+            tradePnl = btPosDir == 1 ? (close - btEntryPrice) / btEntryPrice * 100.0 : (btEntryPrice - close) / btEntryPrice * 100.0
+            for t = 0 to btEntryScore
+                array.set(btTrades, t, array.get(btTrades, t) + 1)
+                array.set(btCumPnl, t, array.get(btCumPnl, t) + tradePnl)
+                if tradePnl > 0
+                    array.set(btWins, t, array.get(btWins, t) + 1)
+                    array.set(btGrossWin, t, array.get(btGrossWin, t) + tradePnl)
+                else
+                    array.set(btGrossLoss, t, array.get(btGrossLoss, t) + -tradePnl)
+        btEntryScore := btRawBuy ? confluenceUp : confluenceDn
+        btEntryPrice := close
+        btPosDir     := btRawBuy ? 1 : -1
+        btDir        := btPosDir
+        btLastBar    := bar_index
+
+// stats for whichever threshold the display filter is currently set to
+btIdx        = effMinConfluence
+btTradesAt   = array.get(btTrades, btIdx)
+btWinsAt     = array.get(btWins, btIdx)
+btCumPnlAt   = array.get(btCumPnl, btIdx)
+btGrossWinAt = array.get(btGrossWin, btIdx)
+btGrossLossAt = array.get(btGrossLoss, btIdx)
+btWinRate = btTradesAt > 0 ? btWinsAt / btTradesAt * 100.0 : na
+btAvgPnl  = btTradesAt > 0 ? btCumPnlAt / btTradesAt : na
+btPF      = btGrossLossAt > 0 ? btGrossWinAt / btGrossLossAt : na
+
+// --- PnL test: risk-managed simulation — ATR stop/target, real R-multiples ---
+// Same bucket-across-every-threshold design as the oscillator above, but each bucket
+// runs its OWN risk-managed position (independent stop/target/cooldown), so you can
+// compare "trade only score>=3 signals" against "score>=5" etc. side by side. Exits
+// on whichever comes first: stop, target, or a fresh opposite raw signal forcing a flip
+// at that threshold. No fees/slippage modeled.
+var int[]   pDir       = array.new_int(7, 0)
+var int[]   pLastBar   = array.new_int(7, na)
+var float[] pEntry     = array.new_float(7, na)
+var float[] pStop      = array.new_float(7, na)
+var float[] pTarget    = array.new_float(7, na)
+var int[]   pTrades    = array.new_int(7, 0)
+var int[]   pWins      = array.new_int(7, 0)
+var float[] pSumR      = array.new_float(7, 0.0)
+var float[] pGrossWin  = array.new_float(7, 0.0)
+var float[] pGrossLoss = array.new_float(7, 0.0)
+
+if showPnL and barstate.isconfirmed
+    for t = 0 to 6
+        dirT = array.get(pDir, t)
+        exitPxT = float(na)
+        if dirT == 1
+            if low <= array.get(pStop, t)
+                exitPxT := array.get(pStop, t)
+            else if high >= array.get(pTarget, t)
+                exitPxT := array.get(pTarget, t)
+        else if dirT == -1
+            if high >= array.get(pStop, t)
+                exitPxT := array.get(pStop, t)
+            else if low <= array.get(pTarget, t)
+                exitPxT := array.get(pTarget, t)
+        rawFlip = (dirT == 1 and rawDn) or (dirT == -1 and rawUp)
+        if na(exitPxT) and dirT != 0 and rawFlip
+            exitPxT := close
+
+        if not na(exitPxT) and dirT != 0
+            entryT = array.get(pEntry, t)
+            stopDistT = math.abs(entryT - array.get(pStop, t))
+            tradeRT = stopDistT > 0 ? (dirT == 1 ? (exitPxT - entryT) : (entryT - exitPxT)) / stopDistT : 0.0
+            array.set(pTrades, t, array.get(pTrades, t) + 1)
+            array.set(pSumR, t, array.get(pSumR, t) + tradeRT)
+            if tradeRT > 0
+                array.set(pWins, t, array.get(pWins, t) + 1)
+                array.set(pGrossWin, t, array.get(pGrossWin, t) + tradeRT)
+            else
+                array.set(pGrossLoss, t, array.get(pGrossLoss, t) + -tradeRT)
+            array.set(pDir, t, 0)
+            dirT := 0
+
+        cooldownOkT = na(array.get(pLastBar, t)) or (bar_index - array.get(pLastBar, t)) >= minBarsBetween
+        entryBuyT  = rawUp and dirT <= 0 and cooldownOkT and confluenceUp >= t
+        entrySellT = rawDn and dirT >= 0 and cooldownOkT and confluenceDn >= t
+        if dirT == 0 and (entryBuyT or entrySellT)
+            newDirT = entryBuyT ? 1 : -1
+            array.set(pDir, t, newDirT)
+            array.set(pEntry, t, close)
+            array.set(pStop, t,   newDirT == 1 ? close - atrVal * pnlStopMult   : close + atrVal * pnlStopMult)
+            array.set(pTarget, t, newDirT == 1 ? close + atrVal * pnlTargetMult : close - atrVal * pnlTargetMult)
+            array.set(pLastBar, t, bar_index)
+
+// stats at whichever threshold the display filter is currently set to
+pIdx        = effMinConfluence
+pnlTrades   = array.get(pTrades, pIdx)
+pnlWins     = array.get(pWins, pIdx)
+pnlSumR     = array.get(pSumR, pIdx)
+pnlGrossWinR  = array.get(pGrossWin, pIdx)
+pnlGrossLossR = array.get(pGrossLoss, pIdx)
+pnlWinRate  = pnlTrades > 0 ? pnlWins / pnlTrades * 100.0 : na
+pnlAvgR     = pnlTrades > 0 ? pnlSumR / pnlTrades : na
+pnlPF       = pnlGrossLossR > 0 ? pnlGrossWinR / pnlGrossLossR : na
+pnlEquityPct = pnlSumR * pnlRiskPct   // naive additive estimate, not compounded
+
+// --- Level line at each signal ---
+level = anchor == "Low" ? low : anchor == "High" ? high : math.avg(high, low)
+
+if showLine and buy
+    line.new(bar_index - lineLen, level, bar_index + lineLen, level, xloc = xloc.bar_index, color = bullCol, width = lineWid, style = parsedStyle)
+if showLine and sell
+    line.new(bar_index - lineLen, level, bar_index + lineLen, level, xloc = xloc.bar_index, color = bearCol, width = lineWid, style = parsedStyle)
+
+// --- Plots ---
+plot(showBand ? hiBand : na, "Swing high", color = color.new(bearCol, 55), style = plot.style_stepline)
+plot(showBand ? loBand : na, "Swing low",  color = color.new(bullCol, 55), style = plot.style_stepline)
+
+plotshape(buy,  "Buy",  shape.triangleup,   location.belowbar, bullCol, size = size.small, text = "BUY",  textcolor = bullCol)
+plotshape(sell, "Sell", shape.triangledown, location.abovebar, bearCol, size = size.small, text = "SELL", textcolor = bearCol)
+
+// offset well clear of the triangle (which sits right at low/high) so the score
+// label doesn't render on top of / hidden behind the shape
+scoreOffset = ta.atr(14) * 1.5
+if showScore and buy
+    label.new(bar_index, low - scoreOffset,  str.tostring(lastScore) + "/" + str.tostring(maxScore), style = label.style_none, color = color.new(bullCol, 100), textcolor = bullCol, size = size.tiny, yloc = yloc.price)
+if showScore and sell
+    label.new(bar_index, high + scoreOffset, str.tostring(lastScore) + "/" + str.tostring(maxScore), style = label.style_none, color = color.new(bearCol, 100), textcolor = bearCol, size = size.tiny, yloc = yloc.price)
+
+bgcolor(showBg ? (buy ? color.new(bullCol, 90) : sell ? color.new(bearCol, 90) : na) : na, title = "Signal highlight")
+
+// --- Status table ---
+tablePosVal = switch tablePos
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    => position.top_right
+var table statusTable = table.new(tablePosVal, 2, 13, border_width = 1)
+
+f_row(_r, _label, _value, _color) =>
+    table.cell(statusTable, 0, _r, _label, text_halign = text.align_left,  text_color = color.gray,  bgcolor = color.new(color.black, 85), text_size = tableSize)
+    table.cell(statusTable, 1, _r, _value, text_halign = text.align_right, text_color = _color,      bgcolor = color.new(color.black, 85), text_size = tableSize)
+
+if showTable and barstate.islast
+    trendLabel = trendUp ? "Up" : "Down"
+    barsAgo    = na(lastSignalBar) ? "—" : str.tostring(bar_index - lastSignalBar)
+    lastDir    = dir == 1 ? "BUY" : dir == -1 ? "SELL" : "—"
+    lastDirCol = dir == 1 ? bullCol : dir == -1 ? bearCol : color.gray
+
+    // running row counter — rows are conditional (ruler/backtest may or may not
+    // show), so indices are assigned as we go instead of hardcoded, and rows are
+    // consolidated (RSI+Trend, signal+bars-ago) to keep the default view compact
+    int r = 0
+    f_row(r, "Method",       method,                                                                 color.gray)
+    r += 1
+    f_row(r, "Last signal",  lastDir + (na(lastSignalBar) ? "" : "  (" + barsAgo + "b ago)"),         lastDirCol)
+    r += 1
+    f_row(r, "Confluence",   na(lastScore) ? "—" : str.tostring(lastScore) + "/" + str.tostring(maxScore), color.gray)
+    r += 1
+    f_row(r, "RSI / Trend",  str.tostring(rsiVal, "#.#") + "  /  " + trendLabel,                      trendUp ? bullCol : bearCol)
+    r += 1
+    if minConfluence > 0
+        minFilterCol = minConfluence > maxScore ? bearCol : color.gray
+        f_row(r, "Min filter", str.tostring(effMinConfluence) + "/" + str.tostring(maxScore) + (minConfluence > maxScore ? " (capped)" : ""), minFilterCol)
+        r += 1
+    if useRuler
+        rulerLbl = array.get(rulerNames, ph_rulerBody) + " " + (ph_isNight ? "N" : "D") + str.tostring(ph_hourNum)
+        rulerCol = rulerBenefic ? bullCol : rulerMalefic ? bearCol : color.gray
+        f_row(r, "Hour ruler", rulerLbl, rulerCol)
+        r += 1
+    if useDayRuler
+        dayRulerLbl = array.get(rulerNames, dayRulerBody)
+        dayRulerCol = dayRulerBenefic ? bullCol : dayRulerMalefic ? bearCol : color.gray
+        f_row(r, "Day ruler", dayRulerLbl, dayRulerCol)
+        r += 1
+    if showOsc
+        oscCol = btTradesAt == 0 ? color.gray : btCumPnlAt >= 0 ? bullCol : bearCol
+        f_row(r, "— OSCILLATOR —", "", color.orange)
+        r += 1
+        f_row(r, "Trades/Win% · PnL%", str.tostring(btTradesAt) + "/" + (na(btWinRate) ? "—" : str.tostring(btWinRate, "#.#") + "%") + "  ·  " + (btTradesAt == 0 ? "—" : str.tostring(btCumPnlAt, "#.##") + "%"), oscCol)
+        r += 1
+    if showPnL
+        pnlHdrCol = pnlTrades == 0 ? color.gray : pnlSumR >= 0 ? bullCol : bearCol
+        f_row(r, "— PNL TEST —", "", color.orange)
+        r += 1
+        f_row(r, "Trades/Win% · R/PF", str.tostring(pnlTrades) + "/" + (na(pnlWinRate) ? "—" : str.tostring(pnlWinRate, "#.#") + "%") + "  ·  " + (pnlTrades == 0 ? "—" : str.tostring(pnlSumR, "#.##")) + "/" + (na(pnlPF) ? "—" : str.tostring(pnlPF, "#.##")), pnlHdrCol)
+        r += 1
+
+// --- Score-bucket breakdown table (compares every threshold 0-6 at once) ---
+// One table, not two — TradingView only renders one table per screen corner, so two
+// separate table.new() calls both anchored bottom_right silently collide (whichever is
+// declared later wins the slot even with zero cells). This single table switches its
+// own headers/content based on which backtest mode is selected.
+var table breakdownTable = table.new(position.bottom_right, 6, 9, border_width = 1)
+
+if (showOsc or showPnL) and showBreakdown and barstate.islast
+    hdrBg = color.new(color.orange, 80)
+    table.cell(breakdownTable, 0, 0, "Score≥",  text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    table.cell(breakdownTable, 1, 0, "Trades",  text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    table.cell(breakdownTable, 2, 0, "Win%",    text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    table.cell(breakdownTable, 3, 0, "Avg",     text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    table.cell(breakdownTable, 4, 0, "PF",      text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    table.cell(breakdownTable, 5, 0, showOsc ? "Total PnL%" : "Total R", text_color = color.orange, text_size = bdSize, bgcolor = hdrBg)
+    bestT   = -1
+    bestVal = -1e9
+    for t = 0 to 6
+        trS  = showOsc ? array.get(btTrades, t) : array.get(pTrades, t)
+        valS = showOsc ? array.get(btCumPnl, t) : array.get(pSumR, t)
+        if trS >= minSampleSize and valS > bestVal
+            bestVal := valS
+            bestT   := t
+    for t = 0 to 6
+        tr  = showOsc ? array.get(btTrades, t)    : array.get(pTrades, t)
+        wn  = showOsc ? array.get(btWins, t)      : array.get(pWins, t)
+        val = showOsc ? array.get(btCumPnl, t)    : array.get(pSumR, t)
+        gw  = showOsc ? array.get(btGrossWin, t)  : array.get(pGrossWin, t)
+        gl  = showOsc ? array.get(btGrossLoss, t) : array.get(pGrossLoss, t)
+        wr  = tr > 0 ? wn / tr * 100.0 : na
+        avg = tr > 0 ? val / tr : na
+        pf  = gl > 0 ? gw / gl : na
+        lowSample = tr > 0 and tr < minSampleSize
+        isBest = t == bestT
+        rowBg  = isBest ? color.new(color.orange, 70) : color.new(color.black, 85)
+        dimGray = lowSample ? color.new(color.gray, 40) : color.gray
+        valCol = tr == 0 ? color.gray : lowSample ? dimGray : val >= 0 ? bullCol : bearCol
+        table.cell(breakdownTable, 0, t + 1, str.tostring(t),                            text_color = color.gray, text_size = bdSize, bgcolor = rowBg)
+        table.cell(breakdownTable, 1, t + 1, str.tostring(tr, "#") + (lowSample ? "*" : ""), text_color = lowSample ? dimGray : color.gray, text_size = bdSize, bgcolor = rowBg)
+        table.cell(breakdownTable, 2, t + 1, na(wr) ? "—" : str.tostring(wr, "#.#"),     text_color = dimGray,    text_size = bdSize, bgcolor = rowBg)
+        table.cell(breakdownTable, 3, t + 1, na(avg) ? "—" : str.tostring(avg, "#.##"),  text_color = dimGray,    text_size = bdSize, bgcolor = rowBg)
+        table.cell(breakdownTable, 4, t + 1, na(pf) ? "—" : str.tostring(pf, "#.##"),    text_color = dimGray,    text_size = bdSize, bgcolor = rowBg)
+        table.cell(breakdownTable, 5, t + 1, tr == 0 ? "—" : str.tostring(val, "#.##"),  text_color = valCol,     text_size = bdSize, bgcolor = rowBg)
+    table.cell(breakdownTable, 0, 8, "*<" + str.tostring(minSampleSize) + " trades = low sample", text_color = color.gray, text_size = bdSize, bgcolor = color.new(color.black, 85))
+    table.merge_cells(breakdownTable, 0, 8, 5, 8)
+
+// --- Alerts ---
+// alertcondition() for the static dropdown in TV's alert dialog, alert() below
+// for dynamic text with ticker/price/confluence baked in — kept both on purpose
+alertcondition(buy,         "Buy reversal",  "Gann Reversal Confluence: BUY")
+alertcondition(sell,        "Sell reversal", "Gann Reversal Confluence: SELL")
+alertcondition(buy or sell, "Any reversal",  "Gann Reversal Confluence: new signal")
+
+if buy
+    alert("Gann BUY Reversal on " + syminfo.ticker + " at " + str.tostring(close) + " (confluence " + str.tostring(lastScore) + "/" + str.tostring(maxScore) + ")", alert.freq_once_per_bar_close)
+if sell
+    alert("Gann SELL Reversal on " + syminfo.ticker + " at " + str.tostring(close) + " (confluence " + str.tostring(lastScore) + "/" + str.tostring(maxScore) + ")", alert.freq_once_per_bar_close)

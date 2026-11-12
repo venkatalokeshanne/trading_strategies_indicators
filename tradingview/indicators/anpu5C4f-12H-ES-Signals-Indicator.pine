@@ -1,0 +1,130 @@
+//@version=6
+indicator("12H ES Signals Indicator", overlay=true, max_labels_count=500)
+
+//#region Inputs
+grpLvl = "12H Levels"
+useFixed = input.bool(true, "Fixed 6am/6pm 12H sessions", group=grpLvl)
+showLvButton = input.bool(true, "Show Gray Levels", group=grpLvl)
+
+grpSig = "Signals"
+minProb = input.float(85.0, "Min hit-rate % to fire", minval=0, maxval=100, group=grpSig)
+showLong = input.bool(true, "Show BUY", group=grpSig)
+showShort = input.bool(true, "Show SELL", group=grpSig)
+minRng = input.float(10.0, "Min session range (pts) to allow signals", minval=0.0, group=grpSig)
+trail = input.bool(true, "Trailing target line", group=grpSig)
+
+grpProb = "Hit-Rate % (from backtest)"
+esB25 = input.float(91.1, "ES Bull +.25 → next level", group=grpProb)
+esB50 = input.float(89.6, "ES Bull +.50 → next level", group=grpProb)
+esB75 = input.float(87.7, "ES Bull +.75 → next level", group=grpProb)
+esB100 = input.float(86.0, "ES Bull +1.0 → next level", group=grpProb)
+esSEq = input.float(94.0, "ES Bear any → EQ reversion", group=grpProb)
+//#endregion
+
+//#region Session Levels
+// DETERMINISTIC session hi/lo — no `var` accumulation, no ticker.new session.
+// We accumulate the session's running high/low but RESET it at each session
+// boundary using the session-change condition. Because the reset is driven by
+// `ta.change(time(...))` (a deterministic bar property), this behaves identically
+// in live and replay — fixing the "zero signals in replay" bug.
+tz = "America/New_York"
+amSess = "0600-1800"
+pmSess = "1800-0600"
+
+inAm = not na(time("", amSess, tz))
+inPm = not na(time("", pmSess, tz))
+
+// Session boundary triggers (deterministic).
+isNewAm = inAm and not inAm[1]
+isNewPm = inPm and not inPm[1]
+
+var float sHi = na
+var float sLo = na
+if isNewAm or isNewPm
+    sHi := high
+    sLo := low
+else
+    sHi := na(sHi) ? high : math.max(sHi, high)
+    sLo := na(sLo) ? low  : math.min(sLo, low)
+
+hi = useFixed ? sHi : ta.highest(high, 720)
+lo = useFixed ? sLo : ta.lowest(low, 720)
+
+eq = (hi + lo) / 2
+rng = hi - lo
+
+u25 = eq + 0.25 * rng
+u50 = eq + 0.50 * rng
+u75 = eq + 0.75 * rng
+u100 = eq + 1.00 * rng
+d25 = eq - 0.25 * rng
+d50 = eq - 0.50 * rng
+d75 = eq - 0.75 * rng
+d100 = eq - 1.00 * rng
+
+plot(eq, "EQ", color=color.white, linewidth=2)
+plot(u25, ".25U", color=color.new(color.gray, 40), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(u50, ".50U", color=color.new(color.gray, 30), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(u75, ".75U", color=color.new(color.gray, 20), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(u100, "1.0U", color=color.new(color.gray, 10), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(d25, ".25D", color=color.new(color.gray, 40), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(d50, ".50D", color=color.new(color.gray, 30), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(d75, ".75D", color=color.new(color.gray, 20), linewidth=1, display=showLvButton ? display.all : display.none)
+plot(d100, "1.0D", color=color.new(color.gray, 10), linewidth=1, display=showLvButton ? display.all : display.none)
+
+//#endregion
+
+//#region Signal Logic
+h1c = request.security(syminfo.tickerid, "60", close)
+h1c1 = request.security(syminfo.tickerid, "60", close[1])
+
+var float snapU25 = na
+var float snapD25 = na
+var float snapEQ  = na
+var float snapRng = na
+isNewHour = ta.change(time("60", tz)) != 0
+if isNewHour and rng >= minRng
+    snapU25 := u25
+    snapD25 := d25
+    snapEQ  := eq
+    snapRng := rng
+
+inWin = not na(time("", "0600-1600", tz))
+
+bullBreak = inWin and not na(snapU25) and not na(h1c1) and h1c1 <= snapU25 and h1c > snapU25 and isNewHour
+bearBreak = inWin and not na(snapD25) and not na(h1c1) and h1c1 >= snapD25 and h1c < snapD25 and isNewHour
+
+var float brkLvl = na
+if bullBreak
+    brkLvl := h1c > snapEQ + 1.0 * snapRng ? 1.0 : h1c > snapEQ + 0.75 * snapRng ? 0.75 : h1c > snapEQ + 0.50 * snapRng ? 0.50 : 0.25
+if bearBreak
+    brkLvl := h1c < snapEQ - 1.0 * snapRng ? -1.0 : h1c < snapEQ - 0.75 * snapRng ? -0.75 : h1c < snapEQ - 0.50 * snapRng ? -0.50 : -0.25
+
+probLong = brkLvl == 1.0 ? esB100 : brkLvl == 0.75 ? esB75 : brkLvl == 0.50 ? esB50 : esB25
+probShort = esSEq
+
+fireLong = bullBreak and probLong >= minProb and showLong
+fireShort = bearBreak and probShort >= minProb and showShort
+
+var bool firedLong = false
+var bool firedShort = false
+if fireLong and not firedLong
+    label.new(bar_index, low, "BUY " + str.tostring(probLong, "#.#") + "%", style=label.style_label_up, color=color.lime, textcolor=color.black, size=size.small)
+    firedLong := true
+if fireShort and not firedShort
+    label.new(bar_index, high, "SELL " + str.tostring(probShort, "#.#") + "%", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+    firedShort := true
+if isNewHour
+    firedLong := false
+    firedShort := false
+
+var line tL = na
+var line tS = na
+if trail
+    if fireLong and not firedLong
+        line.delete(tL)
+        tL := line.new(bar_index, u50, bar_index + math.min(720, 500), u50, color=color.lime, width=2, style=line.style_dashed)
+    if fireShort and not firedShort
+        line.delete(tS)
+        tS := line.new(bar_index, d50, bar_index + math.min(720, 500), d50, color=color.red, width=2, style=line.style_dashed)
+//#endregion

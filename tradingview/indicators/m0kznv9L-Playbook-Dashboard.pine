@@ -1,0 +1,534 @@
+//@version=6
+indicator("Playbook Dashboard", overlay=true)
+
+// =============================================================================
+// Playbook Dashboard
+// Decision-support overlay only. Does NOT generate buy or sell signals.
+// Playbook mapping: 4H = bias context | 15M = structure / setup context
+//
+// Architecture notes:
+// 1) One request.security() per timeframe.
+// 2) Checklist scoring separate from display formatting.
+// 3) Critical gates (R1 / R7 FAIL) cap the score.
+// 4) Default live mode uses forming HTF/15M bars (lookahead_off).
+//    Optional confirmed mode uses last closed bar via series[1] + lookahead_on
+//    (TradingView non-repaint HTF pattern) so the dashboard does not flip intrabar.
+// 5) No var collections inside request.security() (RE10139).
+//
+// Playbook.md → checklist (Recommendation 3):
+//   R1 Respect HTF     OBJECTIVE — 4H bias clear; 15M must not oppose it
+//   R2 Never chase     OBJECTIVE — extension past break without retest = chase risk
+//   R3 Wait structure  OBJECTIVE — prefer confirmed retest / pullback over impulse
+//   R4 Invalidation    MANUAL    — requires trader-defined stop / idea
+//   R5 Risk/reward     MANUAL    — requires entry, stop, target
+//   R6 Evidence        MANUAL    — compliance is behavioral; context shows evidence
+//   R7 Bias vs timing  OBJECTIVE — HTF owns direction; 15M owns structure/timing
+//   R8 Challenge side  MANUAL    — requires trader's opposing case
+//   R9 Emotional check MANUAL    — not observable from price
+//   R10 Process review MANUAL    — post-trade discipline, not live market data
+// Score averages OBJECTIVE rules only. MANUAL rows never inflate the score.
+// Auditable reasons (Recommendation 5): each rule status has a one-line reason
+// derived from the same conditions — display only; does not change evaluation.
+// =============================================================================
+
+// ----- Inputs ----------------------------------------------------------------
+string GRP_EMA   = "EMAs"
+string GRP_MOM   = "Momentum"
+string GRP_TREND = "Trend"
+string GRP_VOL   = "Volatility"
+string GRP_STR   = "Structure"
+string GRP_TH    = "Thresholds"
+string GRP_PB    = "Playbook"
+string GRP_UI    = "Display"
+
+int emaFastLen    = input.int(20,  "EMA Fast",     minval=1, group=GRP_EMA)
+int emaMidLen     = input.int(50,  "EMA Mid",      minval=1, group=GRP_EMA)
+int emaSlowLen    = input.int(200, "EMA Slow",     minval=1, group=GRP_EMA)
+
+int rsiLen        = input.int(14, "RSI Length",  minval=1, group=GRP_MOM)
+int macdFast      = input.int(12, "MACD Fast",   minval=1, group=GRP_MOM)
+int macdSlow      = input.int(26, "MACD Slow",   minval=1, group=GRP_MOM)
+int macdSignalLen = input.int(9,  "MACD Signal", minval=1, group=GRP_MOM)
+
+int adxLen        = input.int(14, "ADX Length", minval=1, group=GRP_TREND)
+
+int atrLen        = input.int(14, "ATR Length",  minval=1, group=GRP_VOL)
+int atrAvgLen     = input.int(50, "ATR Average", minval=1, group=GRP_VOL)
+
+int pivotLeft     = input.int(3, "Pivot Left",  minval=1, group=GRP_STR)
+int pivotRight    = input.int(3, "Pivot Right", minval=1, group=GRP_STR)
+float retestAtrMult = input.float(0.25, "Retest ATR Tol", minval=0.05, step=0.05, group=GRP_STR)
+float pullbackAtrMult = input.float(1.0, "Pullback ATR Prox", minval=0.25, step=0.25, group=GRP_STR)
+float chaseAtrMult = input.float(1.5, "Chase ATR Dist", minval=0.5, step=0.25, group=GRP_PB)
+
+float adxStrong   = input.float(25.0, "ADX Strong >=",   minval=1.0, group=GRP_TH)
+float adxModerate = input.float(20.0, "ADX Moderate >=", minval=1.0, group=GRP_TH)
+
+bool showDashboard = input.bool(true, "Show Dashboard", group=GRP_UI)
+bool showAuditDetails = input.bool(false, "Show audit details", group=GRP_UI, tooltip="Off (default): compact decision panel only. On: full rule checklist, score, and extras.")
+bool useConfirmedBars = input.bool(false, "Use confirmed HTF/15M bars only", group=GRP_UI, tooltip="Off (default): live forming 4H/15M bars. On: evaluate last closed 4H and 15M bars only to reduce intrabar flips.")
+
+string STATUS_READY   = "READY"
+string STATUS_WAIT    = "WAIT"
+string STATUS_BLOCKED = "BLOCKED"
+
+// ----- Constants -------------------------------------------------------------
+string PASS    = "PASS"
+string WARNING = "WARNING"
+string FAIL    = "FAIL"
+string MANUAL  = "MANUAL"
+string BULL    = "Bullish"
+string BEAR    = "Bearish"
+string NEUT    = "Neutral"
+
+string TF_BIAS  = "240"
+string TF_SETUP = "15"
+
+string EVT_NONE = "None"
+string RT_NONE  = "None"
+string RT_PEND  = "Pending"
+string RT_CONF  = "Confirmed"
+string RT_FAIL  = "Failed"
+
+// =============================================================================
+// Pure helpers
+// =============================================================================
+
+f_ema_stack_bias(float price, float emaFast, float emaMid, float emaSlow) =>
+    bool bullStack = price > emaFast and emaFast > emaMid and emaMid > emaSlow
+    bool bearStack = price < emaFast and emaFast < emaMid and emaMid < emaSlow
+    bullStack ? BULL : bearStack ? BEAR : NEUT
+
+f_ema_alignment_label(float price, float emaFast, float emaMid, float emaSlow) =>
+    bool bullAligned = emaFast > emaMid and emaMid > emaSlow
+    bool bearAligned = emaFast < emaMid and emaMid < emaSlow
+    bool priceAgrees = (bullAligned and price > emaFast) or (bearAligned and price < emaFast)
+    bullAligned and priceAgrees ? "Aligned Bull" :
+      bearAligned and priceAgrees ? "Aligned Bear" :
+      bullAligned or bearAligned ? "Partial" : "Mixed"
+
+f_rsi_status(float rsi) =>
+    na(rsi) ? "n/a" :
+      rsi >= 70.0 ? "Overbought" :
+      rsi <= 30.0 ? "Oversold" :
+      rsi >= 55.0 ? "Bullish" :
+      rsi <= 45.0 ? "Bearish" : "Neutral"
+
+f_macd_status(float macdLine, float signalLine, float hist) =>
+    na(macdLine) or na(signalLine) or na(hist) ? "n/a" :
+      macdLine > signalLine and hist > 0.0 ? "Bullish" :
+      macdLine < signalLine and hist < 0.0 ? "Bearish" : "Flat"
+
+f_atr_state(float atr, float atrAvg) =>
+    na(atr) or na(atrAvg) or atrAvg == 0.0 ? "n/a" :
+      atr / atrAvg >= 1.35 ? "High" :
+      atr / atrAvg <= 0.75 ? "Low / Squeeze" : "Normal"
+
+f_adx_strength(float adx) =>
+    na(adx) ? "n/a" :
+      adx >= adxStrong ? "Strong" :
+      adx >= adxModerate ? "Moderate" : "Weak"
+
+f_result_score(string result) =>
+    result == PASS ? 1.0 : result == WARNING ? 0.5 : result == FAIL ? 0.0 : na
+
+f_result_color(string result) =>
+    result == PASS ? color.new(color.teal, 0) :
+      result == WARNING ? color.new(color.orange, 0) :
+      result == FAIL ? color.new(color.red, 0) :
+      color.new(color.aqua, 0)
+
+f_bias_color(string bias) =>
+    bias == BULL ? color.new(color.teal, 0) :
+      bias == BEAR ? color.new(color.red, 0) :
+      color.new(color.gray, 0)
+
+f_fmt1(float v) =>
+    na(v) ? "n/a" : str.tostring(v, "#.#")
+
+f_fmt2(float v) =>
+    na(v) ? "n/a" : str.tostring(v, "#.##")
+
+// -----------------------------------------------------------------------------
+// Swing structure (confirmed pivots → HH/HL/LH/LL → BOS/CHOCH → retest)
+// Returns: reportBias, swingPattern, lastEvent, retestState, swingLow, swingHigh, breakLevel
+// -----------------------------------------------------------------------------
+f_swing_structure(int leftBars, int rightBars, float atrLenSeries, float retestTolMult) =>
+    float ph = ta.pivothigh(high, leftBars, rightBars)
+    float pl = ta.pivotlow(low, leftBars, rightBars)
+
+    float sh0 = ta.valuewhen(not na(ph), ph, 0)
+    float sh1 = ta.valuewhen(not na(ph), ph, 1)
+    float sl0 = ta.valuewhen(not na(pl), pl, 0)
+    float sl1 = ta.valuewhen(not na(pl), pl, 1)
+
+    float tick = syminfo.mintick
+    bool swingsReady = not na(sh0) and not na(sh1) and not na(sl0) and not na(sl1)
+    bool eqH = swingsReady and math.abs(sh0 - sh1) <= tick
+    bool eqL = swingsReady and math.abs(sl0 - sl1) <= tick
+    bool isHH = swingsReady and sh0 > sh1 + tick
+    bool isLH = swingsReady and sh0 < sh1 - tick
+    bool isHL = swingsReady and sl0 > sl1 + tick
+    bool isLL = swingsReady and sl0 < sl1 - tick
+
+    string swingPattern =
+         not swingsReady ? "n/a" :
+         isHH and isHL ? "HH+HL" :
+         isLH and isLL ? "LH+LL" :
+         eqH and eqL ? "Range EH+EL" :
+         eqH or eqL ? "Range" : "Mixed"
+
+    var string storedBias = NEUT
+    bool newPivot = not na(ph) or not na(pl)
+    if newPivot and swingPattern == "HH+HL"
+        storedBias := BULL
+    else if newPivot and swingPattern == "LH+LL"
+        storedBias := BEAR
+
+    bool brokeHigh = not na(sh0) and close > sh0 and close[1] <= sh0
+    bool brokeLow  = not na(sl0) and close < sl0 and close[1] >= sl0
+
+    var string lastEvent = EVT_NONE
+    var float retestLvl = na
+    var int retestSide = 0
+    var string retestState = RT_NONE
+    var float breakLevel = na
+
+    if brokeHigh
+        lastEvent := storedBias == BEAR ? "CHOCH Bull" : "BOS Bull"
+        storedBias := BULL
+        retestLvl := sh0
+        breakLevel := sh0
+        retestSide := 1
+        retestState := RT_PEND
+    else if brokeLow
+        lastEvent := storedBias == BULL ? "CHOCH Bear" : "BOS Bear"
+        storedBias := BEAR
+        retestLvl := sl0
+        breakLevel := sl0
+        retestSide := -1
+        retestState := RT_PEND
+    else if retestState == RT_PEND and not na(retestLvl)
+        float tol = na(atrLenSeries) ? 0.0 : atrLenSeries * retestTolMult
+        bool touched = low <= retestLvl + tol and high >= retestLvl - tol
+        if retestSide == 1 and touched
+            retestState := close < retestLvl - tol ? RT_FAIL : RT_CONF
+        else if retestSide == -1 and touched
+            retestState := close > retestLvl + tol ? RT_FAIL : RT_CONF
+
+    string reportBias =
+         swingPattern == "HH+HL" ? BULL :
+         swingPattern == "LH+LL" ? BEAR : NEUT
+
+    [reportBias, swingPattern, lastEvent, retestState, sl0, sh0, breakLevel]
+
+// =============================================================================
+// Timeframe bundles
+// =============================================================================
+
+f_htf_bundle() =>
+    float eFast = ta.ema(close, emaFastLen)
+    float eMid  = ta.ema(close, emaMidLen)
+    float eSlow = ta.ema(close, emaSlowLen)
+    [plusDI, minusDI, adxV] = ta.dmi(adxLen, adxLen)
+    string bias = f_ema_stack_bias(close, eFast, eMid, eSlow)
+    [plusDI, minusDI, adxV, bias]
+
+f_setup_bundle() =>
+    float eFast = ta.ema(close, emaFastLen)
+    float eMid  = ta.ema(close, emaMidLen)
+    float eSlow = ta.ema(close, emaSlowLen)
+    float rsiV  = ta.rsi(close, rsiLen)
+    [macdLine, signalLine, hist] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+    // Pine v6 has no ta.adx — ADX is the 3rd value from ta.dmi().
+    [diPlusSetup, diMinusSetup, adxV] = ta.dmi(adxLen, adxLen)
+    float atrV = ta.atr(atrLen)
+    float atrAvgV = ta.sma(atrV, atrAvgLen)
+    string emaAlign = f_ema_alignment_label(close, eFast, eMid, eSlow)
+    string rsiStat = f_rsi_status(rsiV)
+    string macdStat = f_macd_status(macdLine, signalLine, hist)
+    string atrState = f_atr_state(atrV, atrAvgV)
+    string adxState = f_adx_strength(adxV)
+
+    [structBias, swingPattern, structEvent, retestState, swingSup, swingRes, breakLvl] =
+         f_swing_structure(pivotLeft, pivotRight, atrV, retestAtrMult)
+
+    [close, rsiV, adxV, atrV, emaAlign, structBias, swingPattern, structEvent, retestState, rsiStat, macdStat, atrState, adxState, swingSup, swingRes, breakLvl]
+
+// Export wrappers: confirmed mode returns previous closed TF bar snapshot only.
+// Pine CE10163: ternaries cannot return tuples — use if/else.
+f_htf_export() =>
+    [a, b, c, d] = f_htf_bundle()
+    if useConfirmedBars
+        [a[1], b[1], c[1], d[1]]
+    else
+        [a, b, c, d]
+
+f_setup_export() =>
+    [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15] = f_setup_bundle()
+    if useConfirmedBars
+        [v0[1], v1[1], v2[1], v3[1], v4[1], v5[1], v6[1], v7[1], v8[1], v9[1], v10[1], v11[1], v12[1], v13[1], v14[1], v15[1]]
+    else
+        [v0, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15]
+
+f_paint_row(table t, int row, string left, string right, color rightCol, bool header) =>
+    // Opaque dark fills so chart candles cannot show through the panel.
+    color bg = header ? color.new(#0b0f16, 0) : color.new(#121821, 0)
+    color lc = header ? color.new(#e8edf5, 0) : color.new(#c5ccd6, 0)
+    color safeRight = na(rightCol) ? color.new(#c5ccd6, 0) : rightCol
+    table.cell(t, 0, row, left,  text_color=lc,        bgcolor=bg, text_halign=text.align_left,  text_size=size.small)
+    table.cell(t, 1, row, right, text_color=safeRight, bgcolor=bg, text_halign=text.align_right, text_size=size.small)
+
+f_adx_color(float adx) =>
+    na(adx) ? color.gray :
+      adx >= adxStrong ? color.teal :
+      adx >= adxModerate ? color.orange : color.red
+
+f_ema_align_color(string align) =>
+    align == "Mixed" ? color.red :
+      align == "Partial" ? color.orange : color.teal
+
+f_event_color(string evt) =>
+    str.contains(evt, "Bull") ? color.teal :
+      str.contains(evt, "Bear") ? color.red : color.gray
+
+f_retest_color(string rt) =>
+    rt == RT_CONF ? color.teal :
+      rt == RT_PEND ? color.orange :
+      rt == RT_FAIL ? color.red : color.gray
+
+f_status_color(string st) =>
+    st == STATUS_READY ? color.new(color.teal, 0) :
+      st == STATUS_BLOCKED ? color.new(color.red, 0) :
+      color.new(color.orange, 0)
+
+// =============================================================================
+// Multi-timeframe data
+// Live (default): lookahead_off, current forming TF bar.
+// Confirmed: lookahead_on + [1] inside export = last closed TF bar only.
+// =============================================================================
+
+barmerge_lookahead = useConfirmedBars ? barmerge.lookahead_on : barmerge.lookahead_off
+
+[pdi4, mdi4, adx4, bias4] = request.security(
+     syminfo.tickerid, TF_BIAS, f_htf_export(),
+     gaps = barmerge.gaps_off, lookahead = barmerge_lookahead)
+
+[close15, rsi15, adx15, atr15, emaAlign15, struct15, swing15, event15, retest15, rsiStat15, macdStat15, atrState15, adxState15, sup15, res15, breakLvl15] = request.security(
+     syminfo.tickerid, TF_SETUP, f_setup_export(),
+     gaps = barmerge.gaps_off, lookahead = barmerge_lookahead)
+
+// =============================================================================
+// Playbook.md checklist — R1–R10
+// =============================================================================
+
+bool htfReady = not na(adx4) and not na(pdi4) and not na(mdi4)
+bool htfClear = bias4 == BULL or bias4 == BEAR
+bool htfDiConflict =
+     htfReady and (
+          (bias4 == BULL and mdi4 > pdi4 and adx4 >= adxStrong) or
+          (bias4 == BEAR and pdi4 > mdi4 and adx4 >= adxStrong))
+bool m15Clear = struct15 == BULL or struct15 == BEAR
+bool m15OpposesHtf = htfClear and m15Clear and struct15 != bias4
+bool m15AgreesHtf = bias4 == NEUT or struct15 == NEUT or struct15 == bias4
+
+bool haveSwings = not na(sup15) and not na(res15)
+bool clearSwing = swing15 == "HH+HL" or swing15 == "LH+LL"
+bool rangingSwing = str.startswith(swing15, "Range") or swing15 == "Mixed"
+bool hasBreakEvent = event15 != EVT_NONE
+bool nearBullPullback = struct15 == BULL and haveSwings and not na(atr15) and math.abs(close15 - sup15) <= atr15 * pullbackAtrMult
+bool nearBearPullback = struct15 == BEAR and haveSwings and not na(atr15) and math.abs(res15 - close15) <= atr15 * pullbackAtrMult
+bool nearPullback = nearBullPullback or nearBearPullback
+
+float distFromBreak = not na(breakLvl15) and not na(close15) ? math.abs(close15 - breakLvl15) : na
+bool extendedFromBreak = not na(distFromBreak) and not na(atr15) and atr15 > 0.0 and distFromBreak > atr15 * chaseAtrMult
+
+// R1 Respect HTF — objective
+string checkR1 =
+     not htfReady ? WARNING :
+     htfDiConflict or m15OpposesHtf ? FAIL :
+     htfClear and m15AgreesHtf ? PASS :
+     htfClear ? WARNING : WARNING
+
+string reasonR1 =
+     not htfReady ? "4H data not ready" :
+     htfDiConflict and m15OpposesHtf ? "4H DI conflict and 15M opposes 4H" :
+     htfDiConflict ? "4H EMA bias conflicts with strong DI" :
+     m15OpposesHtf ? "15M " + struct15 + " opposes 4H " + bias4 :
+     htfClear and m15AgreesHtf ? "4H " + bias4 + "; 15M does not oppose" :
+     htfClear ? "4H " + bias4 + "; 15M unclear" :
+     "4H bias neutral/unclear"
+
+// R2 Never chase — objective proxy (extension without retest)
+string checkR2 =
+     retest15 == RT_CONF ? PASS :
+     retest15 == RT_PEND ? WARNING :
+     hasBreakEvent and extendedFromBreak ? FAIL :
+     hasBreakEvent and retest15 == RT_FAIL ? WARNING : PASS
+
+string reasonR2 =
+     retest15 == RT_CONF ? "Retest confirmed; not chasing extension" :
+     retest15 == RT_PEND ? "Break done; wait for retest, do not chase" :
+     hasBreakEvent and extendedFromBreak ? "Extended >" + str.tostring(chaseAtrMult) + " ATR past break without retest" :
+     hasBreakEvent and retest15 == RT_FAIL ? "Retest failed; avoid chasing continuation blindly" :
+     "No chase setup; price not extended past a break"
+
+// R3 Wait for structure — objective (retest / pullback over impulse)
+string checkR3 =
+     retest15 == RT_CONF ? PASS :
+     retest15 == RT_PEND ? WARNING :
+     clearSwing and nearPullback ? PASS :
+     clearSwing ? WARNING :
+     hasBreakEvent and retest15 == RT_FAIL ? FAIL :
+     rangingSwing and haveSwings ? WARNING : FAIL
+
+string reasonR3 =
+     retest15 == RT_CONF ? "Break-and-retest confirmed" :
+     retest15 == RT_PEND ? "Retest pending after break" :
+     clearSwing and nearPullback ? "Clear " + swing15 + " with pullback to swing" :
+     clearSwing ? "Clear " + swing15 + "; wait for pullback/retest" :
+     hasBreakEvent and retest15 == RT_FAIL ? "Impulse break; retest failed" :
+     rangingSwing and haveSwings ? "Range/mixed swings; no clean structure yet" :
+     "No usable swing structure"
+
+// R4–R6, R8–R10 — not objectively knowable from price alone
+string checkR4  = MANUAL
+string checkR5  = MANUAL
+string checkR6  = MANUAL
+string checkR8  = MANUAL
+string checkR9  = MANUAL
+string checkR10 = MANUAL
+
+string reasonR4 =
+     struct15 == BULL and haveSwings ? "Needs your SL; structural hint below " + f_fmt2(sup15) :
+     struct15 == BEAR and haveSwings ? "Needs your SL; structural hint above " + f_fmt2(res15) :
+     "Needs your invalidation; no clear swing hint"
+
+string reasonR5 = "Needs entry, stop, and target to judge R:R"
+
+string reasonR6 =
+     retest15 == RT_CONF ? "Chart evidence: retest confirmed (you still decide)" :
+     clearSwing ? "Chart evidence: " + swing15 + " (you still decide)" :
+     rangingSwing ? "Chart evidence weak: range/mixed only" :
+     "Chart evidence weak; compliance is still your call"
+
+string reasonR8 = "State the other side's best case and what proves you wrong"
+string reasonR9 = "Confirm no FOMO, urgency, or revenge before entry"
+string reasonR10 = "After the trade, review process — outcome is secondary"
+
+// R7 Separate bias from timing — objective
+string checkR7 =
+     m15OpposesHtf ? FAIL :
+     htfClear ? PASS :
+     WARNING
+
+string reasonR7 =
+     m15OpposesHtf ? "15M direction used against 4H bias" :
+     htfClear ? "4H owns bias (" + bias4 + "); 15M is timing/structure" :
+     "4H bias not clear; cannot separate bias from timing yet"
+
+f_audit_cell(string status, string reason) =>
+    status + " — " + reason
+
+// Score: OBJECTIVE rules only (exclude MANUAL)
+float s1 = f_result_score(checkR1)
+float s2 = f_result_score(checkR2)
+float s3 = f_result_score(checkR3)
+float s7 = f_result_score(checkR7)
+float scoreSum = nz(s1) + nz(s2) + nz(s3) + nz(s7)
+int objectiveCount = 4
+int baseScore = int(math.round(100.0 * scoreSum / objectiveCount))
+
+bool criticalFail = checkR1 == FAIL or checkR7 == FAIL
+int playbookScore = criticalFail ? int(math.min(baseScore, 54)) : baseScore
+
+string scoreTone =
+     criticalFail ? FAIL :
+     playbookScore >= 80 ? PASS :
+     playbookScore >= 55 ? WARNING : FAIL
+
+string reasonScore =
+     criticalFail ? "Gate: R1 or R7 FAIL caps score at 54" :
+     "Avg of R1/R2/R3/R7 = " + str.tostring(playbookScore)
+
+string reasonGate =
+     criticalFail ?
+         (checkR1 == FAIL and checkR7 == FAIL ? "R1 and R7 failed" :
+          checkR1 == FAIL ? "R1 failed" : "R7 failed") :
+     "No critical rule failure"
+
+string alignNote = useConfirmedBars ? "Confirmed closed 4H/15M bars" : "Forming 4H/15M bars update live"
+string structDisplay = struct15 + " · " + swing15
+
+// Decision status — presentation only (same gates/bands as before).
+// Answers: Should I look? If not, why? What needs to change?
+string playbookStatus =
+     criticalFail ? STATUS_BLOCKED :
+     playbookScore >= 80 ? STATUS_READY : STATUS_WAIT
+
+string playbookStatusReason =
+     criticalFail ?
+         (checkR1 == FAIL and checkR7 == FAIL ? "No — fix HTF conflict: " + reasonR1 :
+          checkR1 == FAIL ? "No — " + reasonR1 :
+          "No — " + reasonR7) :
+     playbookScore >= 80 ?
+         "Yes — look for a setup; finish manual rules (R4–R10) before entry" :
+     checkR2 == FAIL ? "Not yet — " + reasonR2 :
+     checkR3 == FAIL ? "Not yet — " + reasonR3 :
+     checkR1 == WARNING ? "Not yet — " + reasonR1 :
+     checkR2 == WARNING ? "Not yet — " + reasonR2 :
+     checkR3 == WARNING ? "Not yet — " + reasonR3 :
+     checkR7 == WARNING ? "Not yet — " + reasonR7 :
+     "Not yet — wait for clearer 4H/15M alignment"
+
+// =============================================================================
+// Dashboard table (presentation only)
+// Main panel = quick decision. Audit details = full checklist (toggle).
+// =============================================================================
+
+int DASH_ROWS = 30
+var table board = table.new(
+     position.top_right, 2, DASH_ROWS,
+     bgcolor      = color.new(#0b0f16, 0),
+     border_width = 1,
+     frame_color  = color.new(#2a3344, 0),
+     border_color = color.new(#2a3344, 0),
+     frame_width  = 2)
+
+if showDashboard and barstate.islast
+    table.clear(board, 0, 0, 1, DASH_ROWS - 1)
+
+    // --- Main: should I look for a trade? ---
+    f_paint_row(board, 0, "PLAYBOOK STATUS", alignNote, color.new(color.aqua, 0), true)
+    f_paint_row(board, 1, "Status", playbookStatus, f_status_color(playbookStatus), false)
+    f_paint_row(board, 2, "Reason", playbookStatusReason, f_status_color(playbookStatus), false)
+    f_paint_row(board, 3, "4H Context", bias4, f_bias_color(bias4), false)
+    f_paint_row(board, 4, "15M Structure", structDisplay, f_bias_color(struct15), false)
+    f_paint_row(board, 5, "Market Event", event15, f_event_color(event15), false)
+    f_paint_row(board, 6, "Retest", retest15, f_retest_color(retest15), false)
+    f_paint_row(board, 7, "Swing Support", f_fmt2(sup15), color.new(color.teal, 0), false)
+    f_paint_row(board, 8, "Swing Resistance", f_fmt2(res15), color.new(color.red, 0), false)
+    f_paint_row(board, 9, "Audit details", showAuditDetails ? "Expanded below" : "Hidden — enable in settings", color.new(color.gray, 0), false)
+
+    // --- Audit details (collapsible via input) ---
+    if showAuditDetails
+        f_paint_row(board, 10, "— AUDIT DETAILS —", "status — reason", color.new(color.gray, 20), true)
+        f_paint_row(board, 11, "R1 Respect HTF",     f_audit_cell(checkR1, reasonR1),   f_result_color(checkR1), false)
+        f_paint_row(board, 12, "R2 Never Chase",     f_audit_cell(checkR2, reasonR2),   f_result_color(checkR2), false)
+        f_paint_row(board, 13, "R3 Wait Structure",  f_audit_cell(checkR3, reasonR3),   f_result_color(checkR3), false)
+        f_paint_row(board, 14, "R4 Invalidation",    f_audit_cell(checkR4, reasonR4),   f_result_color(checkR4), false)
+        f_paint_row(board, 15, "R5 Risk/Reward",     f_audit_cell(checkR5, reasonR5),   f_result_color(checkR5), false)
+        f_paint_row(board, 16, "R6 Evidence",        f_audit_cell(checkR6, reasonR6),   f_result_color(checkR6), false)
+        f_paint_row(board, 17, "R7 Bias vs Timing",  f_audit_cell(checkR7, reasonR7),   f_result_color(checkR7), false)
+        f_paint_row(board, 18, "R8 Challenge Side",  f_audit_cell(checkR8, reasonR8),   f_result_color(checkR8), false)
+        f_paint_row(board, 19, "R9 Emotional Check", f_audit_cell(checkR9, reasonR9),   f_result_color(checkR9), false)
+        f_paint_row(board, 20, "R10 Process Review", f_audit_cell(checkR10, reasonR10), f_result_color(checkR10), false)
+        f_paint_row(board, 21, "Playbook Score",     str.tostring(playbookScore) + " / 100 — " + reasonScore, f_result_color(scoreTone), false)
+        f_paint_row(board, 22, "Gate",               f_audit_cell(criticalFail ? FAIL : PASS, reasonGate), criticalFail ? color.red : color.teal, false)
+        f_paint_row(board, 23, "15M EMA Align",      emaAlign15, f_ema_align_color(emaAlign15), false)
+        f_paint_row(board, 24, "15M ADX",            f_fmt1(adx15) + " · " + adxState15, f_adx_color(adx15), false)
+        f_paint_row(board, 25, "15M RSI",            f_fmt1(rsi15) + " · " + rsiStat15, color.new(#c5ccd6, 0), false)
+        f_paint_row(board, 26, "15M MACD",           macdStat15, f_bias_color(macdStat15 == "Bullish" ? BULL : macdStat15 == "Bearish" ? BEAR : NEUT), false)
+        f_paint_row(board, 27, "ATR Volatility",     atrState15, atrState15 == "Normal" ? color.teal : color.orange, false)
+        f_paint_row(board, 28, "Chase Dist ATR",     f_fmt1(na(distFromBreak) or na(atr15) or atr15 == 0.0 ? na : distFromBreak / atr15), color.new(color.gray, 0), false)
+        f_paint_row(board, 29, "Break Level",        f_fmt2(breakLvl15), color.new(color.gray, 0), false)

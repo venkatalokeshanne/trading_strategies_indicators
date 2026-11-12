@@ -1,0 +1,360 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("Crucible Convergence Engine [JOAT]", shorttitle="CCE [JOAT]", overlay=true,
+     calc_on_every_tick=false, margin_long=0, margin_short=0,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     pyramiding=0, process_orders_on_close=true)
+
+// ──────────────────── INPUTS ────────────────────────────────────────────────
+// ── Regime Arbiter (Core) ──
+string GRP_REG   = "Regime Arbiter"
+int    regAtrLen  = input.int(14,  "Dispersion Epoch",      minval=5,  maxval=50,  group=GRP_REG, tooltip="ATR lookback for regime classification")
+int    regRankLen = input.int(50,  "Rank Horizon",          minval=20, maxval=200, group=GRP_REG, tooltip="Percentile rank window for ATR")
+float  regTrGate  = input.float(55, "Kinetic Threshold",    minval=30, maxval=80,  step=5, group=GRP_REG, tooltip="ATR percentile above which market is trending")
+float  regVolGate = input.float(70, "Turbulence Threshold", minval=50, maxval=95, step=5, group=GRP_REG, tooltip="ATR percentile above which market is volatile")
+bool   useRegime  = input.bool(true, "Regime Gate Active",  group=GRP_REG)
+
+// ── Directional Helix (Core) ──
+string GRP_TREND = "Directional Helix"
+int    trendFast  = input.int(8,   "Lead Filament",    minval=2,  maxval=30,  group=GRP_TREND, tooltip="Fast MA for trend direction")
+int    trendSlow  = input.int(34,  "Anchor Filament",  minval=10, maxval=100, group=GRP_TREND, tooltip="Slow MA for trend direction")
+string trendMA    = input.string("EMA", "Filament Type", options=["EMA", "SMA"], group=GRP_TREND)
+
+// ── Pressure Reactor (Core) ──
+string GRP_MOM   = "Pressure Reactor"
+int    momFast    = input.int(8,   "Ignition Cycle",    minval=2,  maxval=30,  group=GRP_MOM)
+int    momSlow    = input.int(21,  "Sustain Cycle",     minval=5,  maxval=50,  group=GRP_MOM)
+int    momVolPer  = input.int(14,  "Flux Epoch",        minval=5,  maxval=50,  group=GRP_MOM)
+float  momVolSens = input.float(1.5, "Flux Amplifier",  minval=0.1, maxval=5.0, step=0.1, group=GRP_MOM)
+
+// ── Deviation Lattice (Core) ──
+string GRP_BAND  = "Deviation Lattice"
+int    bandZLen   = input.int(100, "Lattice Depth",     minval=20,  maxval=300, group=GRP_BAND, tooltip="Lookback for mean and standard deviation")
+float  bandMult   = input.float(2.0, "Sigma Aperture",  minval=1.0, maxval=4.0, step=0.25, group=GRP_BAND)
+bool   useBandExit = input.bool(true, "Lattice Extreme Exit", group=GRP_BAND, tooltip="Close position when price reaches opposite band extreme")
+
+// ── Fortress Grid (Core) ──
+string GRP_LVL   = "Fortress Grid"
+int    lvlEmaLen  = input.int(21,    "Grid Anchor",       minval=5,   maxval=100,  group=GRP_LVL, tooltip="EMA period for level derivation")
+float  lvlRound   = input.float(500, "Grid Increment",    minval=10,  maxval=5000, step=50, group=GRP_LVL)
+float  lvlTolF    = input.float(0.15, "Proximity Radius", minval=0.05, maxval=0.5, step=0.05, group=GRP_LVL)
+bool   useLvlExit = input.bool(true,  "Rail Interaction Exit", group=GRP_LVL, tooltip="Close position when price touches opposing level")
+
+// ── Risk Architecture ──
+string GRP_RISK  = "Risk Architecture"
+float  atrStopM   = input.float(2.0, "Shield Multiple",     minval=0.5, maxval=5.0, step=0.25, group=GRP_RISK, tooltip="ATR multiple for initial stop loss")
+float  atrTPM     = input.float(3.0, "Objective Multiple",   minval=1.0, maxval=8.0, step=0.25, group=GRP_RISK, tooltip="ATR multiple for take profit")
+int    riskAtrLen = input.int(14,    "Risk Epoch",           minval=5,   maxval=50,  group=GRP_RISK)
+bool   useTrail   = input.bool(true, "Trailing Shield",      group=GRP_RISK, tooltip="Enable ATR-based trailing stop after entry")
+float  trailMult  = input.float(1.5, "Trail Multiple",       minval=0.5, maxval=4.0, step=0.25, group=GRP_RISK, tooltip="ATR multiple for trailing stop distance")
+
+// ── Volume Gate ──
+string GRP_VGATE = "Volume Gate"
+bool   useVolGate = input.bool(true,  "Require Volume Confirmation", group=GRP_VGATE, tooltip="Entry requires above-average volume")
+float  volGateMul = input.float(1.1,  "Volume Gate Threshold",       minval=0.8, maxval=3.0, step=0.1, group=GRP_VGATE)
+
+// ── Optics Layer ──
+string GRP_VIS   = "Optics Layer"
+bool   showDash   = input.bool(true, "Command Panel",       group=GRP_VIS)
+bool   showBands  = input.bool(true, "Deviation Lattice",   group=GRP_VIS)
+bool   showEmas   = input.bool(true, "Directional Helix",   group=GRP_VIS)
+bool   showLevels = input.bool(true, "Fortress Rails",      group=GRP_VIS)
+bool   showBg     = input.bool(true, "Regime Aura",         group=GRP_VIS)
+
+string GRP_COL   = "Chromatic Scheme"
+color  colBull    = input.color(#0affab, "Ascent",      group=GRP_COL)
+color  colBear    = input.color(#ff2e63, "Descent",     group=GRP_COL)
+color  colNeut    = input.color(#6c5ce7, "Equilibrium", group=GRP_COL)
+color  colVolat   = input.color(#ffa502, "Turbulence",  group=GRP_COL)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODULE 1 : REGIME ARBITER 
+// ══════════════════════════════════════════════════════════════════════════════
+float rAtr    = ta.atr(regAtrLen)
+float rAtrPct = ta.percentrank(rAtr, regRankLen)
+
+float upMv    = math.max(high - high[1], 0)
+float dnMv    = math.max(low[1] - low, 0)
+float sdmP    = ta.ema(upMv > dnMv ? upMv : 0.0, regAtrLen)
+float sdmM    = ta.ema(dnMv > upMv ? dnMv : 0.0, regAtrLen)
+float dirBias = sdmP + sdmM != 0 ? (sdmP - sdmM) / (sdmP + sdmM) : 0.0
+
+float eFastR  = ta.ema(close, 8)
+float eSlowR  = ta.ema(close, 34)
+float emaBias = rAtr != 0 ? (eFastR - eSlowR) / rAtr : 0.0
+
+bool isVolatile = rAtrPct > regVolGate
+bool isTrending = rAtrPct > regTrGate and not isVolatile
+bool isBullDir  = dirBias > 0.1 and emaBias > 0.5
+bool isBearDir  = dirBias < -0.1 and emaBias < -0.5
+
+var int rawReg = 0
+if isVolatile
+    rawReg := 2
+else if isTrending and isBullDir
+    rawReg := 1
+else if isTrending and isBearDir
+    rawReg := -1
+else
+    rawReg := 0
+
+// Two-bar confirmation
+var int regime       = 0
+var int pendReg      = 0
+var int pendRegCount = 0
+
+if rawReg == pendReg
+    pendRegCount += 1
+else
+    pendReg      := rawReg
+    pendRegCount := 1
+
+if pendRegCount >= 2
+    regime := pendReg
+
+color regCol = regime == 1 ? colBull : regime == -1 ? colBear : regime == 2 ? colVolat : colNeut
+bgcolor(showBg ? color.new(regCol, 93) : na, title="Regime Aura")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODULE 2 : DIRECTIONAL HELIX 
+// ══════════════════════════════════════════════════════════════════════════════
+float eFast = trendMA == "SMA" ? ta.sma(close, trendFast) : ta.ema(close, trendFast)
+float eSlow = trendMA == "SMA" ? ta.sma(close, trendSlow) : ta.ema(close, trendSlow)
+
+bool trendBull = eFast > eSlow
+bool trendBear = eFast < eSlow
+
+color emaCol = trendBull ? color.new(colBull, 40) : color.new(colBear, 40)
+plot(showEmas ? eFast : na, "Lead Filament",   color=emaCol, linewidth=2)
+plot(showEmas ? eSlow : na, "Anchor Filament", color=color.new(colNeut, 50), linewidth=1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODULE 3 : PRESSURE REACTOR 
+// ══════════════════════════════════════════════════════════════════════════════
+float vR   = ta.sma(volume, 3) / ta.sma(volume, momVolPer)
+float pChg = ta.change(close)
+float vwM  = pChg * math.log(1 + vR * momVolSens)
+float mF   = ta.ema(vwM, momFast)
+float mS   = ta.ema(vwM, momSlow)
+float mIdx = ta.ema(mF - mS, 5)
+float mSig = ta.ema(mIdx, 12)
+
+bool momBull = mIdx > mSig
+bool momBear = mIdx < mSig
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODULE 4 : DEVIATION LATTICE 
+// ══════════════════════════════════════════════════════════════════════════════
+float bMean = ta.sma(close, bandZLen)
+float bDev  = ta.stdev(close, bandZLen)
+float bUp   = bMean + bDev * bandMult
+float bDn   = bMean - bDev * bandMult
+float bZ    = bDev != 0 ? (close - bMean) / bDev : 0.0
+
+bool notOB = close < bUp
+bool notOS = close > bDn
+
+plot(showBands ? bUp : na,   "Lattice Ceiling", color=color.new(colBear, 65), linewidth=1)
+plot(showBands ? bDn : na,   "Lattice Floor",   color=color.new(colBull, 65), linewidth=1)
+plot(showBands ? bMean : na, "Lattice Spine",    color=color.new(colNeut, 65), linewidth=1, style=plot.style_cross)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MODULE 5 : FORTRESS GRID
+// ══════════════════════════════════════════════════════════════════════════════
+float lvlEma  = ta.ema(close, lvlEmaLen)
+float topLvl  = lvlRound * math.ceil(lvlEma / lvlRound)
+float botLvl  = lvlRound * math.floor(lvlEma / lvlRound)
+float lvlGap  = topLvl - botLvl
+float lvlTol  = lvlGap * lvlTolF
+
+withinLvl(float price, float lvl) => price >= lvl - lvlTol and price <= lvl + lvlTol
+
+plot(showLevels ? topLvl : na, "Ceiling Rail", color=color.new(colBear, 50), linewidth=1, style=plot.style_linebr)
+plot(showLevels ? botLvl : na, "Floor Rail",   color=color.new(colBull, 50), linewidth=1, style=plot.style_linebr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VOLUME GATE
+// ══════════════════════════════════════════════════════════════════════════════
+float vgNow  = ta.sma(volume, 3)
+float vgAvg  = ta.sma(volume, 14)
+float vgRatio = vgAvg != 0 ? vgNow / vgAvg : 1.0
+bool  volGateOK = useVolGate ? vgRatio >= volGateMul : true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONVERGENCE SCORING & ENTRY CONDITIONS
+// ══════════════════════════════════════════════════════════════════════════════
+// Convergence score (0-100): weighted sum of aligned modules
+float convScore = 0.0
+float convMax   = 0.0
+
+// Regime module (weight 25)
+convMax += 25
+if regime == 1 or regime == -1
+    convScore += 25
+else if not useRegime
+    convScore += 25
+
+// Trend module (weight 25)
+convMax += 25
+if trendBull or trendBear
+    convScore += 25
+
+// Momentum module (weight 25)
+convMax += 25
+if momBull or momBear
+    convScore += 25
+
+// Band module (weight 15)
+convMax += 15
+if notOB and notOS
+    convScore += 15
+
+// Volume gate (weight 10)
+convMax += 10
+if volGateOK
+    convScore += 10
+
+float convPct = convMax > 0 ? convScore / convMax * 100 : 0
+string convLabel = convPct >= 90 ? "FULL LOCK" : convPct >= 70 ? "STRONG" : convPct >= 50 ? "PARTIAL" : "WEAK"
+
+bool regimeOK  = useRegime ? (regime == 1 or regime == -1) : true
+bool longConv  = regimeOK and trendBull and momBull and notOB and volGateOK and (useRegime ? regime == 1 : true)
+bool shortConv = regimeOK and trendBear and momBear and notOS and volGateOK and (useRegime ? regime == -1 : true)
+
+// Edge detection — global scope, one entry per transition
+bool longEdge  = longConv  and not longConv[1]
+bool shortEdge = shortConv and not shortConv[1]
+
+// ══════════════════════════════════════════════════════════════════════════════
+// RISK ARCHITECTURE : ATR SHIELD & OBJECTIVE
+// ══════════════════════════════════════════════════════════════════════════════
+float atrNow  = ta.atr(riskAtrLen)
+float stopD   = atrNow * atrStopM
+float tpD     = atrNow * atrTPM
+float trailD  = atrNow * trailMult
+
+// Trailing stop state
+var float trailStop = na
+var int   tradeAge  = 0
+
+if strategy.position_size > 0
+    tradeAge += 1
+    float newTrail = close - trailD
+    if useTrail
+        trailStop := na(trailStop) ? newTrail : math.max(nz(trailStop), newTrail)
+else if strategy.position_size < 0
+    tradeAge += 1
+    float newTrail = close + trailD
+    if useTrail
+        trailStop := na(trailStop) ? newTrail : math.min(nz(trailStop), newTrail)
+else
+    trailStop := na
+    tradeAge  := 0
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRADE EXECUTION
+// ══════════════════════════════════════════════════════════════════════════════
+if longEdge
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long X", "Long", stop=close - stopD, limit=close + tpD)
+    trailStop := na
+    tradeAge  := 0
+
+if shortEdge
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short X", "Short", stop=close + stopD, limit=close - tpD)
+    trailStop := na
+    tradeAge  := 0
+
+// ── Trailing Shield Exit ──
+if useTrail and not na(trailStop)
+    if strategy.position_size > 0 and low <= trailStop
+        strategy.close("Long", comment="Trail Shield")
+    if strategy.position_size < 0 and high >= trailStop
+        strategy.close("Short", comment="Trail Shield")
+
+// ── Regime Arbiter Flip Exit ──
+if strategy.position_size > 0 and regime == -1
+    strategy.close("Long", comment="Regime Flip")
+if strategy.position_size < 0 and regime == 1
+    strategy.close("Short", comment="Regime Flip")
+
+// ── Lattice Extreme Exit ──
+if useBandExit
+    if strategy.position_size > 0 and close >= bUp
+        strategy.close("Long", comment="Lattice OB")
+    if strategy.position_size < 0 and close <= bDn
+        strategy.close("Short", comment="Lattice OS")
+
+// ── Rail Interaction Exit ──
+if useLvlExit
+    if strategy.position_size > 0 and withinLvl(high, topLvl)
+        strategy.close("Long", comment="Ceiling Rail")
+    if strategy.position_size < 0 and withinLvl(low, botLvl)
+        strategy.close("Short", comment="Floor Rail")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUAL : ENTRY MARKERS & TRAIL
+// ══════════════════════════════════════════════════════════════════════════════
+plotshape(longEdge,  "Long Signal",  shape.diamond, location.belowbar, color=color.new(colBull, 5), size=size.tiny)
+plotshape(shortEdge, "Short Signal", shape.diamond, location.abovebar, color=color.new(colBear, 5), size=size.tiny)
+plot(useTrail and not na(trailStop) and strategy.position_size != 0 ? trailStop : na, "Trail Shield", color=color.new(colVolat, 40), linewidth=1, style=plot.style_linebr)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMMAND PANEL (DASHBOARD)
+// ══════════════════════════════════════════════════════════════════════════════
+color dashBg   = color.rgb(8, 8, 22, 5)
+color dashBord = color.rgb(40, 40, 65)
+color dashLbl  = color.rgb(120, 125, 155)
+color dashDim  = color.rgb(75, 78, 100)
+
+var table cceDash = table.new(position.top_right, 2, 13, bgcolor=dashBg, border_color=dashBord, border_width=1, frame_width=1, frame_color=dashBord)
+
+if showDash and barstate.islast
+    string regText = regime == 1 ? "KINETIC ASCENT" : regime == -1 ? "KINETIC DESCENT" : regime == 2 ? "TURBULENCE" : "EQUILIBRIUM"
+    // Row 0 — Title
+    table.cell(cceDash, 0, 0, "CCE",           text_color=regCol, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 0, "CONVERGENCE",   text_color=regCol, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 1 — Convergence Score
+    color convCol = convPct >= 90 ? colBull : convPct >= 70 ? colBull : convPct >= 50 ? colVolat : colBear
+    table.cell(cceDash, 0, 1, "SCORE",         text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 1, convLabel + " " + str.tostring(convPct, "#") + "%", text_color=convCol, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 2 — Regime
+    table.cell(cceDash, 0, 2, "REGIME",        text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 2, regText,          text_color=regCol,  text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 3 — Helix
+    table.cell(cceDash, 0, 3, "HELIX",         text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 3, trendBull ? "ASCENT" : "DESCENT", text_color=trendBull ? colBull : colBear, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 4 — Pressure
+    table.cell(cceDash, 0, 4, "PRESSURE",      text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 4, momBull ? "ASCENT" : "DESCENT", text_color=momBull ? colBull : colBear, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 5 — Lattice
+    table.cell(cceDash, 0, 5, "LATTICE",       text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    string latState = notOB and notOS ? "CLEAR" : close >= bUp ? "CEILING HIT" : "FLOOR HIT"
+    color  latCol   = notOB and notOS ? colBull : colBear
+    table.cell(cceDash, 1, 5, latState,         text_color=latCol, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 6 — Z-Score
+    table.cell(cceDash, 0, 6, "Z-SCORE",       text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 6, str.tostring(bZ, "#.##"), text_color=bZ > 1 ? colBear : bZ < -1 ? colBull : colNeut, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 7 — Volume Gate
+    table.cell(cceDash, 0, 7, "VOL GATE",      text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 7, volGateOK ? "OPEN " + str.tostring(vgRatio, "#.##") + "x" : "CLOSED", text_color=volGateOK ? colBull : dashDim, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 8 — Position
+    table.cell(cceDash, 0, 8, "POSITION",      text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    string posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    color  posCol  = strategy.position_size > 0 ? colBull : strategy.position_size < 0 ? colBear : colNeut
+    table.cell(cceDash, 1, 8, posText,          text_color=posCol, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 9 — Trade Age
+    table.cell(cceDash, 0, 9, "AGE",           text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 9, strategy.position_size != 0 ? str.tostring(tradeAge) + " bars" : "-", text_color=dashDim, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 10 — Shield (Stop)
+    table.cell(cceDash, 0, 10, "SHIELD",       text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 10, str.tostring(stopD, "#.##"), text_color=dashDim, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 11 — Trail
+    table.cell(cceDash, 0, 11, "TRAIL",        text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 11, not na(trailStop) ? str.tostring(trailStop, "#.##") : "-", text_color=not na(trailStop) ? colVolat : dashDim, text_size=size.tiny, text_font_family=font.family_monospace)
+    // Row 12 — Directional Bias
+    table.cell(cceDash, 0, 12, "DIR BIAS",     text_color=dashLbl, text_size=size.tiny, text_font_family=font.family_monospace)
+    table.cell(cceDash, 1, 12, str.tostring(dirBias, "#.###"), text_color=dirBias > 0 ? colBull : colBear, text_size=size.tiny, text_font_family=font.family_monospace)
+// ══════════════════════════════════════════════════════════════════════════════

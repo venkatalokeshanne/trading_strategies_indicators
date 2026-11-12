@@ -1,0 +1,400 @@
+//@version=6
+indicator("Fibo Sequence Pro - Multi-TF", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// ============================================================
+// PARAMÈTRES - DÉTECTION
+// ============================================================
+minStreak      = input.int(3, "Nombre minimum de bougies dans l'enchaînement", minval=2, maxval=15, group="Détection")
+minMovePercent = input.float(3.0, "Amplitude minimum de l'enchaînement (%)", minval=0.0, step=0.1, group="Détection")
+entryLevel     = input.float(0.236, "Niveau Fibo d'entrée (déclencheur, non affiché)", step=0.001, minval=0.0, maxval=1.0, group="Détection")
+midLevel1      = input.float(0.382, "Bordure proche du rectangle", step=0.001, minval=0.0, maxval=1.0, group="Détection")
+tp1Level       = input.float(0.5,   "Niveau TP1 (ligne interne + sortie)", step=0.001, minval=0.0, maxval=1.0, group="Détection")
+tp2Level       = input.float(0.618, "Bordure opposée du rectangle (TP2)", step=0.001, minval=0.0, maxval=1.0, group="Détection")
+maxWaitBars    = input.int(15, "Bougies avant expiration si non déclenché", minval=1, group="Détection")
+enableShort    = input.bool(true, "Activer les signaux Short", group="Détection")
+enableLong     = input.bool(true, "Activer les signaux Long", group="Détection")
+
+// ============================================================
+// PARAMÈTRES - VISUEL
+// ============================================================
+showZones        = input.bool(true, "Afficher les rectangles", group="Visuel")
+showEntryLabels  = input.bool(false, "Afficher les labels Long/Short sur les bougies", group="Visuel")
+boxBorderColor   = input.color(color.white, "Couleur des contours", group="Visuel")
+boxFillColor     = input.color(color.gray,  "Couleur de remplissage", group="Visuel")
+fillTransparency = input.int(88, "Transparence du remplissage (0-99)", minval=0, maxval=99, group="Visuel")
+midLineColor     = input.color(color.new(color.orange, 25), "Couleur de la ligne TP1 (0.5)", group="Visuel")
+shortLabelColor  = input.color(#F23645, "Couleur du label Short", group="Visuel")
+longLabelColor   = input.color(#089981, "Couleur du label Long", group="Visuel")
+
+// ============================================================
+// PARAMÈTRES - APRÈS LE TP
+// ============================================================
+stopImmediate    = input.bool(true, "Disparition immédiate dès que TP1 (0.5) est touché", group="Après TP")
+extraBarsAfterTP = input.int(10, "Sinon : bougies supplémentaires après le TP avant disparition", minval=1, group="Après TP")
+
+// ============================================================
+// PARAMÈTRES - MULTI-TIMEFRAME
+// ============================================================
+showMTF = input.bool(true, "Afficher les setups des autres timeframes", group="Multi-Timeframe")
+show15  = input.bool(false, "15 minutes", group="Multi-Timeframe")
+show30  = input.bool(false, "30 minutes", group="Multi-Timeframe")
+show60  = input.bool(true,  "1 heure", group="Multi-Timeframe")
+show120 = input.bool(false, "2 heures", group="Multi-Timeframe")
+show180 = input.bool(false, "3 heures", group="Multi-Timeframe")
+show240 = input.bool(true,  "4 heures", group="Multi-Timeframe")
+show360 = input.bool(false, "6 heures", group="Multi-Timeframe")
+show720 = input.bool(false, "12 heures", group="Multi-Timeframe")
+showD   = input.bool(true,  "Daily", group="Multi-Timeframe")
+showW   = input.bool(true,  "Weekly", group="Multi-Timeframe")
+
+// ============================================================
+// DÉTECTION SUR LE GRAPHIQUE ACTUEL (validée à la clôture)
+// ============================================================
+isGreen = close > open
+isRed   = close < open
+
+var int greenStreak = 0
+var int redStreak   = 0
+
+greenStreak := isGreen ? greenStreak[1] + 1 : 0
+redStreak   := isRed   ? redStreak[1] + 1 : 0
+
+bearSetupTrigger = barstate.isconfirmed and greenStreak[1] >= minStreak and not isGreen and enableShort
+bullSetupTrigger = barstate.isconfirmed and redStreak[1]   >= minStreak and not isRed   and enableLong
+
+// ============================================================
+// STRUCTURES - GRAPHIQUE ACTUEL
+// ============================================================
+type Pending
+    float high
+    float low
+    int   startBar
+
+type Confirmed
+    float high
+    float low
+    box   zoneBox
+    line  midLine
+    bool  tpTouched
+    int   tpTouchedBar
+
+var array<Pending> shortPending = array.new<Pending>()
+var array<Pending> longPending  = array.new<Pending>()
+
+var array<Confirmed> shortConfirmed = array.new<Confirmed>()
+var array<Confirmed> longConfirmed  = array.new<Confirmed>()
+
+// ---- Création des setups en attente (invisible) ----
+if bearSetupTrigger
+    h = high[1]
+    l = low[greenStreak[1]]
+    movePercent = (h - l) / l * 100
+    if movePercent >= minMovePercent
+        array.push(shortPending, Pending.new(h, l, bar_index))
+
+if bullSetupTrigger
+    h = high[redStreak[1]]
+    l = low[1]
+    movePercent = (h - l) / l * 100
+    if movePercent >= minMovePercent
+        array.push(longPending, Pending.new(h, l, bar_index))
+
+// ---- Suivi des setups en attente : SHORT ----
+var bool shortTriggeredThisBar = false
+shortTriggeredThisBar := false
+
+if array.size(shortPending) > 0
+    for i = array.size(shortPending) - 1 to 0
+        p = array.get(shortPending, i)
+        age = bar_index - p.startBar
+        if age > maxWaitBars
+            array.remove(shortPending, i)
+        else
+            rng = p.high - p.low
+            pxEntry = p.high - rng * entryLevel
+            if barstate.isconfirmed and close < pxEntry
+                pxTop = p.high - rng * midLevel1   // 0.382
+                pxMid = p.high - rng * tp1Level    // 0.5
+                pxBot = p.high - rng * tp2Level     // 0.618
+
+                zBox = showZones ? box.new(bar_index - 1, pxTop, bar_index, pxBot, border_color=boxBorderColor, border_width=1, bgcolor=color.new(boxFillColor, fillTransparency), extend=extend.right) : na
+                mL   = showZones ? line.new(bar_index - 1, pxMid, bar_index, pxMid, color=midLineColor, style=line.style_dotted, width=1, extend=extend.right) : na
+
+                array.push(shortConfirmed, Confirmed.new(p.high, p.low, zBox, mL, false, na))
+                if showEntryLabels
+                    label.new(bar_index, high, "Short", style=label.style_label_down, color=shortLabelColor, textcolor=color.white, size=size.small)
+                shortTriggeredThisBar := true
+                array.remove(shortPending, i)
+
+// ---- Suivi des setups en attente : LONG ----
+var bool longTriggeredThisBar = false
+longTriggeredThisBar := false
+
+if array.size(longPending) > 0
+    for i = array.size(longPending) - 1 to 0
+        p = array.get(longPending, i)
+        age = bar_index - p.startBar
+        if age > maxWaitBars
+            array.remove(longPending, i)
+        else
+            rng = p.high - p.low
+            pxEntry = p.low + rng * entryLevel
+            if barstate.isconfirmed and close > pxEntry
+                pxBot = p.low + rng * midLevel1   // 0.382
+                pxMid = p.low + rng * tp1Level    // 0.5
+                pxTop = p.low + rng * tp2Level     // 0.618
+
+                zBox = showZones ? box.new(bar_index - 1, pxTop, bar_index, pxBot, border_color=boxBorderColor, border_width=1, bgcolor=color.new(boxFillColor, fillTransparency), extend=extend.right) : na
+                mL   = showZones ? line.new(bar_index - 1, pxMid, bar_index, pxMid, color=midLineColor, style=line.style_dotted, width=1, extend=extend.right) : na
+
+                array.push(longConfirmed, Confirmed.new(p.high, p.low, zBox, mL, false, na))
+                if showEntryLabels
+                    label.new(bar_index, low, "Long", style=label.style_label_up, color=longLabelColor, textcolor=color.white, size=size.small)
+                longTriggeredThisBar := true
+                array.remove(longPending, i)
+
+// ---- Suivi des rectangles confirmés : SHORT ----
+if array.size(shortConfirmed) > 0
+    for i = array.size(shortConfirmed) - 1 to 0
+        c = array.get(shortConfirmed, i)
+        rng = c.high - c.low
+        pxTp1 = c.high - rng * tp1Level
+        removed = false
+
+        if not c.tpTouched and low <= pxTp1
+            c.tpTouched := true
+            c.tpTouchedBar := bar_index
+            if stopImmediate
+                box.delete(c.zoneBox)
+                line.delete(c.midLine)
+                array.remove(shortConfirmed, i)
+                removed := true
+
+        if not removed and c.tpTouched and not stopImmediate and (bar_index - c.tpTouchedBar >= extraBarsAfterTP)
+            box.delete(c.zoneBox)
+            line.delete(c.midLine)
+            array.remove(shortConfirmed, i)
+
+// ---- Suivi des rectangles confirmés : LONG ----
+if array.size(longConfirmed) > 0
+    for i = array.size(longConfirmed) - 1 to 0
+        c = array.get(longConfirmed, i)
+        rng = c.high - c.low
+        pxTp1 = c.low + rng * tp1Level
+        removed = false
+
+        if not c.tpTouched and high >= pxTp1
+            c.tpTouched := true
+            c.tpTouchedBar := bar_index
+            if stopImmediate
+                box.delete(c.zoneBox)
+                line.delete(c.midLine)
+                array.remove(longConfirmed, i)
+                removed := true
+
+        if not removed and c.tpTouched and not stopImmediate and (bar_index - c.tpTouchedBar >= extraBarsAfterTP)
+            box.delete(c.zoneBox)
+            line.delete(c.midLine)
+            array.remove(longConfirmed, i)
+
+// ============================================================
+// ALERTES
+// ============================================================
+alertcondition(shortTriggeredThisBar, title="Signal SHORT", message="SHORT confirmé sur {{ticker}} en {{interval}}")
+alertcondition(longTriggeredThisBar,  title="Signal LONG",  message="LONG confirmé sur {{ticker}} en {{interval}}")
+alertcondition(shortTriggeredThisBar or longTriggeredThisBar, title="Signal LONG ou SHORT", message="Signal confirmé sur {{ticker}} en {{interval}} — vérifie le graphique.")
+
+// ============================================================
+// MULTI-TIMEFRAME (setup le plus récent actif par sens et par TF)
+// ============================================================
+f_detectSetup(msArg, mpArg, enArg, tp1Arg, stopArg, extraArg, enShortArg, enLongArg) =>
+    isG = close > open
+    isR = close < open
+    var int gS = 0
+    var int rS = 0
+    gS := isG ? gS[1] + 1 : 0
+    rS := isR ? rS[1] + 1 : 0
+
+    bTrig = barstate.isconfirmed and gS[1] >= msArg and not isG and enShortArg
+    lTrig = barstate.isconfirmed and rS[1] >= msArg and not isR and enLongArg
+
+    var float sHigh = na
+    var float sLow  = na
+    var bool  sPend = false
+    var bool  sConf = false
+    var int   sStart = na
+    var bool  sTpTouched = false
+    var int   sTpBar = na
+
+    var float lHigh = na
+    var float lLow  = na
+    var bool  lPend = false
+    var bool  lConf = false
+    var int   lStart = na
+    var bool  lTpTouched = false
+    var int   lTpBar = na
+
+    if bTrig
+        hh = high[1]
+        ll = low[gS[1]]
+        mv = (hh - ll) / ll * 100
+        if mv >= mpArg
+            sHigh := hh
+            sLow  := ll
+            sPend := true
+            sConf := false
+            sTpTouched := false
+
+    if lTrig
+        hh = high[rS[1]]
+        ll = low[1]
+        mv = (hh - ll) / ll * 100
+        if mv >= mpArg
+            lHigh := hh
+            lLow  := ll
+            lPend := true
+            lConf := false
+            lTpTouched := false
+
+    if sPend and not sConf
+        rngS = sHigh - sLow
+        pxE = sHigh - rngS * enArg
+        if barstate.isconfirmed and close < pxE
+            sConf := true
+            sPend := false
+            sStart := time
+
+    if lPend and not lConf
+        rngL = lHigh - lLow
+        pxE = lLow + rngL * enArg
+        if barstate.isconfirmed and close > pxE
+            lConf := true
+            lPend := false
+            lStart := time
+
+    if sConf
+        rngS = sHigh - sLow
+        pxTp1S = sHigh - rngS * tp1Arg
+        if not sTpTouched and low <= pxTp1S
+            sTpTouched := true
+            sTpBar := bar_index
+            if stopArg
+                sConf := false
+        if sTpTouched and not stopArg and (bar_index - sTpBar >= extraArg)
+            sConf := false
+
+    if lConf
+        rngL = lHigh - lLow
+        pxTp1L = lLow + rngL * tp1Arg
+        if not lTpTouched and high >= pxTp1L
+            lTpTouched := true
+            lTpBar := bar_index
+            if stopArg
+                lConf := false
+        if lTpTouched and not stopArg and (bar_index - lTpBar >= extraArg)
+            lConf := false
+
+    [sConf, sHigh, sLow, sStart, lConf, lHigh, lLow, lStart]
+
+type TFOverlay
+    box   bx
+    line  midLine
+    label tagLabel
+    int   lastStart
+
+f_updateOverlay(ov, active, pxTop, pxBottom, pxMid, startTime, tag, dirColor) =>
+    if active
+        isNew = na(ov.bx) or ov.lastStart != startTime
+        if isNew
+            if not na(ov.bx)
+                box.delete(ov.bx)
+            if not na(ov.midLine)
+                line.delete(ov.midLine)
+            if not na(ov.tagLabel)
+                label.delete(ov.tagLabel)
+            ov.bx := box.new(startTime - 60000, pxTop, startTime, pxBottom, xloc=xloc.bar_time, border_color=boxBorderColor, border_width=1, bgcolor=color.new(boxFillColor, fillTransparency), extend=extend.right)
+            ov.midLine := line.new(startTime - 60000, pxMid, startTime, pxMid, xloc=xloc.bar_time, color=midLineColor, style=line.style_dotted, width=1, extend=extend.right)
+            midX = int(math.round((startTime + time) / 2))
+            midY = (pxTop + pxBottom) / 2
+            ov.tagLabel := label.new(midX, midY, xloc=xloc.bar_time, text=tag, style=label.style_label_center, color=dirColor, textcolor=color.white, size=size.normal)
+            ov.lastStart := startTime
+        else
+            midX = int(math.round((ov.lastStart + time) / 2))
+            midY = (pxTop + pxBottom) / 2
+            label.set_xy(ov.tagLabel, midX, midY)
+    else
+        if not na(ov.bx)
+            box.delete(ov.bx)
+            ov.bx := na
+        if not na(ov.midLine)
+            line.delete(ov.midLine)
+            ov.midLine := na
+        if not na(ov.tagLabel)
+            label.delete(ov.tagLabel)
+            ov.tagLabel := na
+        ov.lastStart := na
+    ov
+
+[s15c, s15h, s15l, s15t, l15c, l15h, l15l, l15t]         = request.security(syminfo.tickerid, "15",  f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s30c, s30h, s30l, s30t, l30c, l30h, l30l, l30t]         = request.security(syminfo.tickerid, "30",  f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s60c, s60h, s60l, s60t, l60c, l60h, l60l, l60t]         = request.security(syminfo.tickerid, "60",  f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s120c, s120h, s120l, s120t, l120c, l120h, l120l, l120t] = request.security(syminfo.tickerid, "120", f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s180c, s180h, s180l, s180t, l180c, l180h, l180l, l180t] = request.security(syminfo.tickerid, "180", f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s240c, s240h, s240l, s240t, l240c, l240h, l240l, l240t] = request.security(syminfo.tickerid, "240", f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s360c, s360h, s360l, s360t, l360c, l360h, l360l, l360t] = request.security(syminfo.tickerid, "360", f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[s720c, s720h, s720l, s720t, l720c, l720h, l720l, l720t] = request.security(syminfo.tickerid, "720", f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[sDc, sDh, sDl, sDt, lDc, lDh, lDl, lDt]                 = request.security(syminfo.tickerid, "D",   f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+[sWc, sWh, sWl, sWt, lWc, lWh, lWl, lWt]                 = request.security(syminfo.tickerid, "W",   f_detectSetup(minStreak, minMovePercent, entryLevel, tp1Level, stopImmediate, extraBarsAfterTP, enableShort, enableLong), lookahead=barmerge.lookahead_off)
+
+var TFOverlay ov15s  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov15l  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov30s  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov30l  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov60s  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov60l  = TFOverlay.new(na, na, na, na)
+var TFOverlay ov120s = TFOverlay.new(na, na, na, na)
+var TFOverlay ov120l = TFOverlay.new(na, na, na, na)
+var TFOverlay ov180s = TFOverlay.new(na, na, na, na)
+var TFOverlay ov180l = TFOverlay.new(na, na, na, na)
+var TFOverlay ov240s = TFOverlay.new(na, na, na, na)
+var TFOverlay ov240l = TFOverlay.new(na, na, na, na)
+var TFOverlay ov360s = TFOverlay.new(na, na, na, na)
+var TFOverlay ov360l = TFOverlay.new(na, na, na, na)
+var TFOverlay ov720s = TFOverlay.new(na, na, na, na)
+var TFOverlay ov720l = TFOverlay.new(na, na, na, na)
+var TFOverlay ovDs   = TFOverlay.new(na, na, na, na)
+var TFOverlay ovDl   = TFOverlay.new(na, na, na, na)
+var TFOverlay ovWs   = TFOverlay.new(na, na, na, na)
+var TFOverlay ovWl   = TFOverlay.new(na, na, na, na)
+
+if showMTF
+    if show15 and timeframe.period != "15"
+        ov15s := f_updateOverlay(ov15s, s15c, s15h - (s15h - s15l) * midLevel1, s15h - (s15h - s15l) * tp2Level, s15h - (s15h - s15l) * tp1Level, s15t, "15m", shortLabelColor)
+        ov15l := f_updateOverlay(ov15l, l15c, l15l + (l15h - l15l) * tp2Level, l15l + (l15h - l15l) * midLevel1, l15l + (l15h - l15l) * tp1Level, l15t, "15m", longLabelColor)
+    if show30 and timeframe.period != "30"
+        ov30s := f_updateOverlay(ov30s, s30c, s30h - (s30h - s30l) * midLevel1, s30h - (s30h - s30l) * tp2Level, s30h - (s30h - s30l) * tp1Level, s30t, "30m", shortLabelColor)
+        ov30l := f_updateOverlay(ov30l, l30c, l30l + (l30h - l30l) * tp2Level, l30l + (l30h - l30l) * midLevel1, l30l + (l30h - l30l) * tp1Level, l30t, "30m", longLabelColor)
+    if show60 and timeframe.period != "60"
+        ov60s := f_updateOverlay(ov60s, s60c, s60h - (s60h - s60l) * midLevel1, s60h - (s60h - s60l) * tp2Level, s60h - (s60h - s60l) * tp1Level, s60t, "1H", shortLabelColor)
+        ov60l := f_updateOverlay(ov60l, l60c, l60l + (l60h - l60l) * tp2Level, l60l + (l60h - l60l) * midLevel1, l60l + (l60h - l60l) * tp1Level, l60t, "1H", longLabelColor)
+    if show120 and timeframe.period != "120"
+        ov120s := f_updateOverlay(ov120s, s120c, s120h - (s120h - s120l) * midLevel1, s120h - (s120h - s120l) * tp2Level, s120h - (s120h - s120l) * tp1Level, s120t, "2H", shortLabelColor)
+        ov120l := f_updateOverlay(ov120l, l120c, l120l + (l120h - l120l) * tp2Level, l120l + (l120h - l120l) * midLevel1, l120l + (l120h - l120l) * tp1Level, l120t, "2H", longLabelColor)
+    if show180 and timeframe.period != "180"
+        ov180s := f_updateOverlay(ov180s, s180c, s180h - (s180h - s180l) * midLevel1, s180h - (s180h - s180l) * tp2Level, s180h - (s180h - s180l) * tp1Level, s180t, "3H", shortLabelColor)
+        ov180l := f_updateOverlay(ov180l, l180c, l180l + (l180h - l180l) * tp2Level, l180l + (l180h - l180l) * midLevel1, l180l + (l180h - l180l) * tp1Level, l180t, "3H", longLabelColor)
+    if show240 and timeframe.period != "240"
+        ov240s := f_updateOverlay(ov240s, s240c, s240h - (s240h - s240l) * midLevel1, s240h - (s240h - s240l) * tp2Level, s240h - (s240h - s240l) * tp1Level, s240t, "4H", shortLabelColor)
+        ov240l := f_updateOverlay(ov240l, l240c, l240l + (l240h - l240l) * tp2Level, l240l + (l240h - l240l) * midLevel1, l240l + (l240h - l240l) * tp1Level, l240t, "4H", longLabelColor)
+    if show360 and timeframe.period != "360"
+        ov360s := f_updateOverlay(ov360s, s360c, s360h - (s360h - s360l) * midLevel1, s360h - (s360h - s360l) * tp2Level, s360h - (s360h - s360l) * tp1Level, s360t, "6H", shortLabelColor)
+        ov360l := f_updateOverlay(ov360l, l360c, l360l + (l360h - l360l) * tp2Level, l360l + (l360h - l360l) * midLevel1, l360l + (l360h - l360l) * tp1Level, l360t, "6H", longLabelColor)
+    if show720 and timeframe.period != "720"
+        ov720s := f_updateOverlay(ov720s, s720c, s720h - (s720h - s720l) * midLevel1, s720h - (s720h - s720l) * tp2Level, s720h - (s720h - s720l) * tp1Level, s720t, "12H", shortLabelColor)
+        ov720l := f_updateOverlay(ov720l, l720c, l720l + (l720h - l720l) * tp2Level, l720l + (l720h - l720l) * midLevel1, l720l + (l720h - l720l) * tp1Level, l720t, "12H", longLabelColor)
+    if showD and timeframe.period != "D"
+        ovDs := f_updateOverlay(ovDs, sDc, sDh - (sDh - sDl) * midLevel1, sDh - (sDh - sDl) * tp2Level, sDh - (sDh - sDl) * tp1Level, sDt, "D", shortLabelColor)
+        ovDl := f_updateOverlay(ovDl, lDc, lDl + (lDh - lDl) * tp2Level, lDl + (lDh - lDl) * midLevel1, lDl + (lDh - lDl) * tp1Level, lDt, "D", longLabelColor)
+    if showW and timeframe.period != "W"
+        ovWs := f_updateOverlay(ovWs, sWc, sWh - (sWh - sWl) * midLevel1, sWh - (sWh - sWl) * tp2Level, sWh - (sWh - sWl) * tp1Level, sWt, "W", shortLabelColor)
+        ovWl := f_updateOverlay(ovWl, lWc, lWl + (lWh - lWl) * tp2Level, lWl + (lWh - lWl) * midLevel1, lWl + (lWh - lWl) * tp1Level, lWt, "W", longLabelColor)

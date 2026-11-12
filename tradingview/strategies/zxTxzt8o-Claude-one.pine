@@ -1,0 +1,231 @@
+//@version=5
+strategy("XAUUSD RSI+EMA Confluence Scalper v1",
+     overlay=true,
+     initial_capital=1000,
+     currency=currency.USD,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     pyramiding=0,
+     commission_type=strategy.commission.cash_per_contract,
+     commission_value=0.07,       // ~$7 round-turn per 100 oz = $0.07/oz
+     slippage=2,
+     process_orders_on_close=true,
+     calc_on_every_tick=false)
+
+// ════════════════════════════════════════════════════════════
+// 1. INPUTS
+// ════════════════════════════════════════════════════════════
+grpRisk = "Risk Management"
+riskPerTradePct = input.float(1.0,  "Risk per trade %",            step=0.1, group=grpRisk)
+dailyLossPct    = input.float(3.0,  "Daily loss soft pause %",     step=0.5, group=grpRisk)
+dailyHardPct    = input.float(5.0,  "Daily loss hard stop %",      step=0.5, group=grpRisk)
+killSwitchPct   = input.float(10.0, "Total DD kill-switch %",      step=1.0, group=grpRisk)
+maxConsecLoss   = input.int  (3,    "Max consecutive losses",      group=grpRisk)
+
+grpEMA = "EMA Settings"
+emaFast    = input.int(50,  "Fast EMA (pullback level)",  group=grpEMA)
+emaTrend   = input.int(200, "Trend EMA (bias filter)",    group=grpEMA)
+pullbackATR= input.float(0.5, "Max distance to fast EMA (ATR mult)", step=0.1, group=grpEMA)
+
+grpRSI = "RSI Settings"
+rsiLen        = input.int  (14, "RSI length",                       group=grpRSI)
+rsiLongLevel  = input.int  (40, "RSI long trigger (cross above)",   group=grpRSI)
+rsiShortLevel = input.int  (60, "RSI short trigger (cross below)",  group=grpRSI)
+rsiOversold   = input.int  (35, "RSI oversold zone (must dip below first)", group=grpRSI)
+rsiOverbought = input.int  (65, "RSI overbought zone (must spike above first)", group=grpRSI)
+rsiLookback   = input.int  (5,  "Bars to look back for OS/OB dip",  group=grpRSI)
+
+grpFilter = "Filters"
+useSession   = input.bool(true,  "Trade only during London + NY",   group=grpFilter)
+useADX       = input.bool(true,  "Require ADX momentum",            group=grpFilter)
+adxMin       = input.float(20.0, "Minimum ADX",                     step=1, group=grpFilter)
+
+grpExit = "Exit / Trail"
+atrLen       = input.int  (14,  "ATR length for stop",          group=grpExit)
+atrMult      = input.float(1.5, "Initial SL ATR multiplier",    step=0.1, group=grpExit)
+ceLen        = input.int  (22,  "Chandelier period",            group=grpExit)
+ceMult       = input.float(2.5, "Chandelier ATR multiplier",    step=0.1, group=grpExit)
+useEmaExit   = input.bool(true, "Exit if RSI returns to neutral (50)", group=grpExit)
+forceCloseGMT= input.int  (21,  "Force flat hour (GMT)",        minval=0, maxval=23, group=grpExit)
+
+grpWH = "Webhook (PineConnector format)"
+pineconnector_id = input.string("YOUR_LICENSE_ID", "PineConnector licence ID", group=grpWH)
+symbolWH         = input.string("XAUUSD",          "Webhook symbol",           group=grpWH)
+
+// ════════════════════════════════════════════════════════════
+// 2. SESSION FILTER (London + NY only)
+// ════════════════════════════════════════════════════════════
+isLondonNY = time(timeframe.period, "0700-1600:12345", "GMT")
+sessionOK  = not useSession or isLondonNY
+
+// ════════════════════════════════════════════════════════════
+// 3. INDICATORS
+// ════════════════════════════════════════════════════════════
+emaF   = ta.ema(close, emaFast)
+emaT   = ta.ema(close, emaTrend)
+rsi    = ta.rsi(close, rsiLen)
+atr    = ta.atr(atrLen)
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
+
+// Chandelier Exit (monotonic — only ratchets in trade direction)
+ceAtr  = ta.atr(ceLen) * ceMult
+rawCEL = ta.highest(high, ceLen) - ceAtr
+rawCES = ta.lowest (low,  ceLen) + ceAtr
+var float ceLong  = na
+var float ceShort = na
+ceLong  := close[1] > nz(ceLong[1])  ? math.max(rawCEL, nz(ceLong[1]))  : rawCEL
+ceShort := close[1] < nz(ceShort[1]) ? math.min(rawCES, nz(ceShort[1])) : rawCES
+
+// ════════════════════════════════════════════════════════════
+// 4. RISK GUARDS
+// ════════════════════════════════════════════════════════════
+strategy.risk.max_drawdown(killSwitchPct, strategy.percent_of_equity)
+
+ddFromInit = (strategy.initial_capital - strategy.equity) / strategy.initial_capital * 100
+killHit    = ddFromInit >= killSwitchPct
+
+var float dayStartEq = strategy.equity
+isNewDay = ta.change(time("D")) != 0
+if isNewDay
+    dayStartEq := strategy.equity
+dailyPnLPct  = (strategy.equity - dayStartEq) / dayStartEq * 100
+dailyHalt    = dailyPnLPct <= -dailyHardPct
+dailySoft    = dailyPnLPct <= -dailyLossPct
+
+var int consecLoss = 0
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    lastPnL = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    consecLoss := lastPnL < 0 ? consecLoss + 1 : 0
+if isNewDay
+    consecLoss := 0
+consecHalt = consecLoss >= maxConsecLoss
+
+tradingAllowed = not killHit and not dailyHalt and not consecHalt and not dailySoft and sessionOK
+
+// ════════════════════════════════════════════════════════════
+// 5. POSITION SIZING (in ounces)
+// ════════════════════════════════════════════════════════════
+slDist    = atr * atrMult                           // $ per oz
+riskUSD   = strategy.equity * riskPerTradePct / 100
+qtyOz     = slDist > 0 ? math.floor(riskUSD / slDist) : 0
+qtyOz    := math.max(qtyOz, 1)                      // minimum 1 oz = 0.01 lots
+lotsOut   = qtyOz / 100.0                           // for webhook payload
+
+// ════════════════════════════════════════════════════════════
+// 6. RSI + EMA CONFLUENCE ENTRY LOGIC
+// ════════════════════════════════════════════════════════════
+// Trend bias
+uptrend   = close > emaT and emaF > emaT
+downtrend = close < emaT and emaF < emaT
+
+// Pullback to fast EMA — price within ATR distance of EMA50
+nearEmaLong  = math.abs(low  - emaF) <= atr * pullbackATR or low  <= emaF
+nearEmaShort = math.abs(high - emaF) <= atr * pullbackATR or high >= emaF
+
+// RSI must have dipped into oversold/overbought zone within lookback period
+rsiDippedOS = ta.lowest(rsi,  rsiLookback) <= rsiOversold
+rsiSpikedOB = ta.highest(rsi, rsiLookback) >= rsiOverbought
+
+// RSI cross trigger (the actual entry signal)
+rsiCrossUp   = ta.crossover (rsi, rsiLongLevel)
+rsiCrossDown = ta.crossunder(rsi, rsiShortLevel)
+
+// Candle confirmation
+bullCandle = close > open
+bearCandle = close < open
+
+// ADX filter
+adxOK = not useADX or adxVal >= adxMin
+
+// FINAL CONFLUENCE CONDITIONS
+longSignal  = uptrend   and nearEmaLong  and rsiDippedOS and rsiCrossUp   and bullCandle and adxOK
+shortSignal = downtrend and nearEmaShort and rsiSpikedOB and rsiCrossDown and bearCandle and adxOK
+
+goLong  = tradingAllowed and longSignal  and strategy.position_size == 0
+goShort = tradingAllowed and shortSignal and strategy.position_size == 0
+
+// ════════════════════════════════════════════════════════════
+// 7. ORDERS + WEBHOOK ALERTS
+// ════════════════════════════════════════════════════════════
+if goLong
+    strategy.entry("L", strategy.long, qty=qtyOz,
+         alert_message = pineconnector_id + ",buy," + symbolWH +
+                         ",risk=" + str.tostring(lotsOut, "#.##") +
+                         ",sl=" + str.tostring(slDist*100, "#") +
+                         ",comment=RSI_EMA_Long")
+
+if goShort
+    strategy.entry("S", strategy.short, qty=qtyOz,
+         alert_message = pineconnector_id + ",sell," + symbolWH +
+                         ",risk=" + str.tostring(lotsOut, "#.##") +
+                         ",sl=" + str.tostring(slDist*100, "#") +
+                         ",comment=RSI_EMA_Short")
+
+// Initial stop + Chandelier trail (whichever is tighter)
+hardLongSL  = strategy.position_avg_price - atr * atrMult
+hardShortSL = strategy.position_avg_price + atr * atrMult
+finalLongSL  = math.max(hardLongSL,  ceLong)
+finalShortSL = math.min(hardShortSL, ceShort)
+
+if strategy.position_size > 0
+    strategy.exit("xL", from_entry="L", stop=finalLongSL,
+         alert_message = pineconnector_id + ",closelong," + symbolWH)
+if strategy.position_size < 0
+    strategy.exit("xS", from_entry="S", stop=finalShortSL,
+         alert_message = pineconnector_id + ",closeshort," + symbolWH)
+
+// RSI neutral exit — exit when momentum dies (RSI returns through 50)
+if useEmaExit and strategy.position_size > 0 and ta.crossunder(rsi, 50)
+    strategy.close("L", comment="RSI_neutral",
+         alert_message = pineconnector_id + ",closelong," + symbolWH)
+if useEmaExit and strategy.position_size < 0 and ta.crossover(rsi, 50)
+    strategy.close("S", comment="RSI_neutral",
+         alert_message = pineconnector_id + ",closeshort," + symbolWH)
+
+// Force-flat at end of session
+hrGMT = hour(time, "GMT")
+if hrGMT >= forceCloseGMT and strategy.position_size != 0
+    strategy.close_all(comment="TimeStop",
+         alert_message = pineconnector_id + ",closeall," + symbolWH)
+
+// Flatten on any guard firing
+if not tradingAllowed and strategy.position_size != 0
+    strategy.close_all(comment="RISK_HALT",
+         alert_message = pineconnector_id + ",closeall," + symbolWH)
+
+// ════════════════════════════════════════════════════════════
+// 8. VISUALS + DASHBOARD
+// ════════════════════════════════════════════════════════════
+plot(emaT, "EMA200 (trend)", color=color.orange, linewidth=2)
+plot(emaF, "EMA50 (pullback)", color=color.aqua,  linewidth=1)
+plot(strategy.position_size > 0 ? finalLongSL  : na, "Long Trail",  color=color.red,   style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? finalShortSL : na, "Short Trail", color=color.green, style=plot.style_linebr, linewidth=2)
+
+// Signal markers
+plotshape(goLong,  "Long Entry",  shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(goShort, "Short Entry", shape.triangledown, location.abovebar, color.red,   size=size.small)
+
+bgcolor(isLondonNY ? color.new(color.blue, 95) : na)
+bgcolor(not tradingAllowed and isLondonNY ? color.new(color.red, 90) : na)
+
+// Dashboard
+var table dash = table.new(position.top_right, 2, 9, border_width=1)
+if barstate.islast
+    table.cell(dash,0,0,"Equity",        bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,0,"$" + str.tostring(strategy.equity,"#.##"))
+    table.cell(dash,0,1,"DD from init %",bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,1,str.tostring(ddFromInit,"#.##") + "%")
+    table.cell(dash,0,2,"Daily PnL %",   bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,2,str.tostring(dailyPnLPct,"#.##") + "%")
+    table.cell(dash,0,3,"Consec losses", bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,3,str.tostring(consecLoss))
+    table.cell(dash,0,4,"RSI",           bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,4,str.tostring(rsi,"#.#"))
+    table.cell(dash,0,5,"ADX",           bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,5,str.tostring(adxVal,"#.#"))
+    table.cell(dash,0,6,"ATR(14)",       bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,6,"$" + str.tostring(atr,"#.##"))
+    table.cell(dash,0,7,"Qty (oz)",      bgcolor=color.gray, text_color=color.white)
+    table.cell(dash,1,7,str.tostring(qtyOz))
+    table.cell(dash,0,8,"Status",        bgcolor=tradingAllowed?color.green:color.red, text_color=color.white)
+    table.cell(dash,1,8,tradingAllowed?"ACTIVE":"HALT")

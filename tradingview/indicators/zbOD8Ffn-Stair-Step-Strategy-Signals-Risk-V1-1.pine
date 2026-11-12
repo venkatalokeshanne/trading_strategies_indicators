@@ -1,0 +1,289 @@
+//@version=6
+indicator("TCG Stair Step Strategy - Signals & Risk", shorttitle = "Stair Step TCG", overlay = true, max_labels_count = 500)
+
+// Educational implementation of the Stair Step playbook described in the
+// supplied ChartGuys guide. This is an indicator, not an automated strategy.
+
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+string GROUP_SETUP = "1. Stair Step Setup"
+string direction = input.string("Both", "Signals", options = ["Both", "Long only", "Short only"], group = GROUP_SETUP)
+int minSteps = input.int(8, "Minimum consecutive steps", minval = 2, maxval = 30, tooltip = "Long: consecutive lower highs. Short: consecutive higher lows.", group = GROUP_SETUP)
+bool includeSignalBarExtreme = input.bool(true, "Include signal candle in move extreme", tooltip = "Uses the signal candle's low/high when calculating the initial stop.", group = GROUP_SETUP)
+int stopBufferTicks = input.int(1, "Stop wiggle room (ticks)", minval = 0, maxval = 1000, tooltip = "The stop is placed this many minimum ticks beyond the move's low/high.", group = GROUP_SETUP)
+
+string GROUP_FILTER = "2. Higher-Timeframe Filter"
+bool useHtfFilter = input.bool(false, "Require higher-timeframe alignment", tooltip = "Longs require confirmed HTF close above its EMA; shorts require confirmed HTF close below it.", group = GROUP_FILTER)
+string htf = input.timeframe("15", "Higher timeframe", group = GROUP_FILTER)
+int htfEmaLength = input.int(12, "HTF EMA length", minval = 1, maxval = 500, group = GROUP_FILTER)
+bool plotHtfEma = input.bool(true, "Plot confirmed HTF EMA", group = GROUP_FILTER)
+
+string GROUP_RISK = "3. Risk and Trade Management"
+bool useMaxRiskFilter = input.bool(false, "Skip overly wide setups", tooltip = "Rejects a setup when entry-to-stop risk exceeds the selected ATR multiple.", group = GROUP_RISK)
+int atrLength = input.int(14, "ATR length", minval = 1, maxval = 500, inline = "atr", group = GROUP_RISK)
+float maxRiskAtr = input.float(1.5, "Maximum risk (ATR)", minval = 0.1, step = 0.1, inline = "atr", group = GROUP_RISK)
+bool trackOneTrade = input.bool(true, "Track entry, stop, and targets", group = GROUP_RISK)
+bool moveStopToBreakeven = input.bool(true, "Move runner stop to entry after 1R", group = GROUP_RISK)
+string runnerExitMode = input.string("HTF EMA or Fixed R", "Runner exit", options = ["HTF EMA", "Fixed R", "HTF EMA or Fixed R"], group = GROUP_RISK)
+float fixedTargetR = input.float(3.0, "Fixed runner target (R)", minval = 1.0, step = 0.25, group = GROUP_RISK)
+
+string GROUP_DISPLAY = "4. Display"
+bool showSetupBars = input.bool(true, "Color staircase candles", group = GROUP_DISPLAY)
+bool showSkipped = input.bool(true, "Mark filtered/skipped breaks", group = GROUP_DISPLAY)
+bool showTradeLevels = input.bool(true, "Plot active trade levels", group = GROUP_DISPLAY)
+bool showDashboard = input.bool(true, "Show dashboard", group = GROUP_DISPLAY)
+
+// -----------------------------------------------------------------------------
+// Confirmed higher-timeframe context (offset + lookahead prevents HTF repainting)
+// -----------------------------------------------------------------------------
+bool htfIsValid = timeframe.in_seconds(htf) >= timeframe.in_seconds()
+float htfClose = request.security(syminfo.tickerid, htf, close[1], lookahead = barmerge.lookahead_on)
+float htfEma = request.security(syminfo.tickerid, htf, ta.ema(close, htfEmaLength)[1], lookahead = barmerge.lookahead_on)
+bool htfLongAligned = htfIsValid and not na(htfClose) and not na(htfEma) and htfClose > htfEma
+bool htfShortAligned = htfIsValid and not na(htfClose) and not na(htfEma) and htfClose < htfEma
+
+plot(plotHtfEma and htfIsValid ? htfEma : na, "Confirmed HTF EMA", color = color.new(color.orange, 15), linewidth = 2)
+
+// -----------------------------------------------------------------------------
+// Count completed stair steps and retain each move's extreme
+// -----------------------------------------------------------------------------
+var int lowerHighSteps = 0
+var int higherLowSteps = 0
+var float lowerHighMoveLow = na
+var float higherLowMoveHigh = na
+
+// These values describe the completed sequence immediately before this bar.
+int priorLowerHighSteps = lowerHighSteps
+int priorHigherLowSteps = higherLowSteps
+float priorLongMoveLow = lowerHighMoveLow
+float priorShortMoveHigh = higherLowMoveHigh
+
+float tick = syminfo.mintick
+float buffer = stopBufferTicks * tick
+float atr = ta.atr(atrLength)
+
+bool longBreakRaw = priorLowerHighSteps >= minSteps and high > high[1]
+bool shortBreakRaw = priorHigherLowSteps >= minSteps and low < low[1]
+
+float longMoveLow = includeSignalBarExtreme ? math.min(priorLongMoveLow, low) : priorLongMoveLow
+float shortMoveHigh = includeSignalBarExtreme ? math.max(priorShortMoveHigh, high) : priorShortMoveHigh
+float longEntryCandidate = high[1] + tick
+float shortEntryCandidate = low[1] - tick
+float longStopCandidate = longMoveLow - buffer
+float shortStopCandidate = shortMoveHigh + buffer
+float longRiskCandidate = longEntryCandidate - longStopCandidate
+float shortRiskCandidate = shortStopCandidate - shortEntryCandidate
+
+bool longRiskValid = not na(longRiskCandidate) and longRiskCandidate > 0
+bool shortRiskValid = not na(shortRiskCandidate) and shortRiskCandidate > 0
+bool longWidthAllowed = not useMaxRiskFilter or (not na(atr) and longRiskCandidate <= atr * maxRiskAtr)
+bool shortWidthAllowed = not useMaxRiskFilter or (not na(atr) and shortRiskCandidate <= atr * maxRiskAtr)
+bool longHtfAllowed = not useHtfFilter or htfLongAligned
+bool shortHtfAllowed = not useHtfFilter or htfShortAligned
+bool longDirectionAllowed = direction != "Short only"
+bool shortDirectionAllowed = direction != "Long only"
+
+bool longQualified = longBreakRaw and longRiskValid and longWidthAllowed and longHtfAllowed and longDirectionAllowed
+bool shortQualified = shortBreakRaw and shortRiskValid and shortWidthAllowed and shortHtfAllowed and shortDirectionAllowed
+bool ambiguousBreak = longQualified and shortQualified
+bool longSignal = longQualified and not ambiguousBreak
+bool shortSignal = shortQualified and not ambiguousBreak
+bool skippedLong = longBreakRaw and longDirectionAllowed and not longSignal
+bool skippedShort = shortBreakRaw and shortDirectionAllowed and not shortSignal
+
+// -----------------------------------------------------------------------------
+// Visual signals
+// -----------------------------------------------------------------------------
+plotshape(longSignal, "Long Stair Step", shape.triangleup, location.belowbar, color = color.lime, size = size.small, text = "LONG", textcolor = color.black)
+plotshape(shortSignal, "Short Stair Step", shape.triangledown, location.abovebar, color = color.red, size = size.small, text = "SHORT", textcolor = color.white)
+plotshape(showSkipped and skippedLong, "Skipped Long Break", shape.xcross, location.belowbar, color = color.orange, size = size.tiny, text = "SKIP")
+plotshape(showSkipped and skippedShort, "Skipped Short Break", shape.xcross, location.abovebar, color = color.orange, size = size.tiny, text = "SKIP")
+
+// -----------------------------------------------------------------------------
+// Optional one-trade-at-a-time level tracker
+// Stops are evaluated before targets on bars that touch both, a conservative
+// choice because OHLC history cannot reveal the intrabar order of those touches.
+// -----------------------------------------------------------------------------
+var int tradeDirection = 0  // 1 = long, -1 = short, 0 = flat
+var int entryBar = na
+var float activeEntry = na
+var float initialStop = na
+var float activeRisk = na
+var float oneRLevel = na
+var float fixedRunnerTarget = na
+var bool oneRReached = false
+
+bool oneRLongEvent = false
+bool oneRShortEvent = false
+bool stopLongEvent = false
+bool stopShortEvent = false
+bool breakevenLongEvent = false
+bool breakevenShortEvent = false
+bool runnerLongEvent = false
+bool runnerShortEvent = false
+
+float effectiveStopBeforeUpdate = tradeDirection != 0 ? (moveStopToBreakeven and oneRReached ? activeEntry : initialStop) : na
+bool emaTargetValidLong = tradeDirection == 1 and htfIsValid and not na(htfEma) and htfEma > activeEntry
+bool emaTargetValidShort = tradeDirection == -1 and htfIsValid and not na(htfEma) and htfEma < activeEntry
+bool useEmaTarget = runnerExitMode == "HTF EMA" or runnerExitMode == "HTF EMA or Fixed R"
+bool useFixedTarget = runnerExitMode == "Fixed R" or runnerExitMode == "HTF EMA or Fixed R"
+
+if trackOneTrade and tradeDirection == 1 and bar_index > entryBar
+    bool hitStop = low <= effectiveStopBeforeUpdate
+    bool hitEmaTarget = useEmaTarget and emaTargetValidLong and high >= htfEma
+    bool hitFixedTarget = useFixedTarget and high >= fixedRunnerTarget
+    if hitStop
+        if oneRReached and moveStopToBreakeven
+            breakevenLongEvent := true
+        else
+            stopLongEvent := true
+        tradeDirection := 0
+        entryBar := na
+        activeEntry := na
+        initialStop := na
+        activeRisk := na
+        oneRLevel := na
+        fixedRunnerTarget := na
+        oneRReached := false
+    else
+        if not oneRReached and high >= oneRLevel
+            oneRReached := true
+            oneRLongEvent := true
+        if hitEmaTarget or hitFixedTarget
+            runnerLongEvent := true
+            tradeDirection := 0
+            entryBar := na
+            activeEntry := na
+            initialStop := na
+            activeRisk := na
+            oneRLevel := na
+            fixedRunnerTarget := na
+            oneRReached := false
+
+if trackOneTrade and tradeDirection == -1 and bar_index > entryBar
+    bool hitStop = high >= effectiveStopBeforeUpdate
+    bool hitEmaTarget = useEmaTarget and emaTargetValidShort and low <= htfEma
+    bool hitFixedTarget = useFixedTarget and low <= fixedRunnerTarget
+    if hitStop
+        if oneRReached and moveStopToBreakeven
+            breakevenShortEvent := true
+        else
+            stopShortEvent := true
+        tradeDirection := 0
+        entryBar := na
+        activeEntry := na
+        initialStop := na
+        activeRisk := na
+        oneRLevel := na
+        fixedRunnerTarget := na
+        oneRReached := false
+    else
+        if not oneRReached and low <= oneRLevel
+            oneRReached := true
+            oneRShortEvent := true
+        if hitEmaTarget or hitFixedTarget
+            runnerShortEvent := true
+            tradeDirection := 0
+            entryBar := na
+            activeEntry := na
+            initialStop := na
+            activeRisk := na
+            oneRLevel := na
+            fixedRunnerTarget := na
+            oneRReached := false
+
+// Start tracking only when flat at the end of the bar's management pass.
+if trackOneTrade and tradeDirection == 0
+    if longSignal
+        tradeDirection := 1
+        entryBar := bar_index
+        activeEntry := longEntryCandidate
+        initialStop := longStopCandidate
+        activeRisk := longRiskCandidate
+        oneRLevel := activeEntry + activeRisk
+        fixedRunnerTarget := activeEntry + activeRisk * fixedTargetR
+        oneRReached := false
+    else if shortSignal
+        tradeDirection := -1
+        entryBar := bar_index
+        activeEntry := shortEntryCandidate
+        initialStop := shortStopCandidate
+        activeRisk := shortRiskCandidate
+        oneRLevel := activeEntry - activeRisk
+        fixedRunnerTarget := activeEntry - activeRisk * fixedTargetR
+        oneRReached := false
+
+float displayedStop = tradeDirection != 0 ? (moveStopToBreakeven and oneRReached ? activeEntry : initialStop) : na
+float displayedRunnerTarget = na
+if tradeDirection == 1
+    float longEmaTarget = emaTargetValidLong ? htfEma : na
+    displayedRunnerTarget := runnerExitMode == "HTF EMA" ? longEmaTarget : runnerExitMode == "Fixed R" ? fixedRunnerTarget : na(longEmaTarget) ? fixedRunnerTarget : math.min(longEmaTarget, fixedRunnerTarget)
+else if tradeDirection == -1
+    float shortEmaTarget = emaTargetValidShort ? htfEma : na
+    displayedRunnerTarget := runnerExitMode == "HTF EMA" ? shortEmaTarget : runnerExitMode == "Fixed R" ? fixedRunnerTarget : na(shortEmaTarget) ? fixedRunnerTarget : math.max(shortEmaTarget, fixedRunnerTarget)
+
+plot(showTradeLevels and tradeDirection != 0 ? activeEntry : na, "Active Entry", color = color.new(color.blue, 0), linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and tradeDirection != 0 ? displayedStop : na, "Active Stop", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(showTradeLevels and tradeDirection != 0 and not oneRReached ? oneRLevel : na, "Half Off at 1R", color = color.new(color.yellow, 0), linewidth = 1, style = plot.style_linebr)
+plot(showTradeLevels and tradeDirection != 0 ? displayedRunnerTarget : na, "Runner Target", color = color.new(color.green, 0), linewidth = 2, style = plot.style_linebr)
+
+// -----------------------------------------------------------------------------
+// Update sequence state after evaluating this bar's possible break.
+// -----------------------------------------------------------------------------
+if high < high[1]
+    lowerHighSteps += 1
+    lowerHighMoveLow := lowerHighSteps == 1 ? math.min(low, low[1]) : math.min(lowerHighMoveLow, low)
+else
+    lowerHighSteps := 0
+    lowerHighMoveLow := na
+
+if low > low[1]
+    higherLowSteps += 1
+    higherLowMoveHigh := higherLowSteps == 1 ? math.max(high, high[1]) : math.max(higherLowMoveHigh, high)
+else
+    higherLowSteps := 0
+    higherLowMoveHigh := na
+
+color setupColor = lowerHighSteps > 0 and higherLowSteps > 0 ? color.new(color.purple, 55) : lowerHighSteps > 0 ? color.new(color.red, 55) : higherLowSteps > 0 ? color.new(color.lime, 55) : na
+barcolor(showSetupBars ? setupColor : na, title = "Staircase candle color")
+
+// Data-window and alert helper plots.
+plot(lowerHighSteps, "Lower-high step count", display = display.data_window)
+plot(higherLowSteps, "Higher-low step count", display = display.data_window)
+plot(longSignal ? longEntryCandidate : na, "Long Entry Trigger", display = display.none)
+plot(longSignal ? longStopCandidate : na, "Long Initial Stop", display = display.none)
+plot(shortSignal ? shortEntryCandidate : na, "Short Entry Trigger", display = display.none)
+plot(shortSignal ? shortStopCandidate : na, "Short Initial Stop", display = display.none)
+
+// -----------------------------------------------------------------------------
+// Alerts
+// -----------------------------------------------------------------------------
+alertcondition(longSignal, "Long Stair Step Break", "TCG Stair Step LONG on {{ticker}} ({{interval}}). Entry: {{plot(\"Long Entry Trigger\")}}, initial stop: {{plot(\"Long Initial Stop\")}}.")
+alertcondition(shortSignal, "Short Stair Step Break", "TCG Stair Step SHORT on {{ticker}} ({{interval}}). Entry: {{plot(\"Short Entry Trigger\")}}, initial stop: {{plot(\"Short Initial Stop\")}}.")
+alertcondition(oneRLongEvent or oneRShortEvent, "1R Reached - Take Half", "TCG Stair Step on {{ticker}} reached 1R. Consider taking half and protecting the runner.")
+alertcondition(stopLongEvent or stopShortEvent, "Initial Stop Hit", "TCG Stair Step initial stop hit on {{ticker}} ({{interval}}).")
+alertcondition(breakevenLongEvent or breakevenShortEvent, "Runner Stopped at Breakeven", "TCG Stair Step runner stopped near breakeven on {{ticker}} ({{interval}}).")
+alertcondition(runnerLongEvent or runnerShortEvent, "Runner Target Hit", "TCG Stair Step runner target reached on {{ticker}} ({{interval}}).")
+
+// -----------------------------------------------------------------------------
+// Dashboard
+// -----------------------------------------------------------------------------
+var table dashboard = table.new(position.top_right, 2, 5, border_width = 1)
+if barstate.islast and showDashboard
+    string alignmentText = not htfIsValid ? "Choose same/higher TF" : htfLongAligned ? "Bullish" : htfShortAligned ? "Bearish" : "Neutral"
+    color alignmentColor = not htfIsValid ? color.orange : htfLongAligned ? color.lime : htfShortAligned ? color.red : color.silver
+    string tradeText = tradeDirection == 1 ? (oneRReached ? "LONG - risk free" : "LONG active") : tradeDirection == -1 ? (oneRReached ? "SHORT - risk free" : "SHORT active") : "Flat"
+    table.cell(dashboard, 0, 0, "TCG Stair Step", text_color = color.white, bgcolor = color.rgb(22, 31, 63))
+    table.cell(dashboard, 1, 0, syminfo.ticker, text_color = color.white, bgcolor = color.rgb(22, 31, 63))
+    table.cell(dashboard, 0, 1, "Lower-high steps")
+    table.cell(dashboard, 1, 1, str.tostring(lowerHighSteps), text_color = lowerHighSteps >= minSteps ? color.lime : color.white)
+    table.cell(dashboard, 0, 2, "Higher-low steps")
+    table.cell(dashboard, 1, 2, str.tostring(higherLowSteps), text_color = higherLowSteps >= minSteps ? color.lime : color.white)
+    table.cell(dashboard, 0, 3, "HTF alignment")
+    table.cell(dashboard, 1, 3, alignmentText, text_color = alignmentColor)
+    table.cell(dashboard, 0, 4, "Trade tracker")
+    table.cell(dashboard, 1, 4, trackOneTrade ? tradeText : "Off")
+else if barstate.islast and not showDashboard
+    table.clear(dashboard, 0, 0, 1, 4)
+

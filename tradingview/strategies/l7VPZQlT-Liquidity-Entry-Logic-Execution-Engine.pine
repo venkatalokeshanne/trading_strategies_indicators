@@ -1,0 +1,159 @@
+//@version=6
+strategy("Liquidity Entry Logic v14 – Execution Engine", overlay=true,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     max_labels_count=500,
+     max_boxes_count=300)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+fastLen = input.int(21)
+midLen  = input.int(321)
+slowLen = input.int(440)
+
+htf_tf = input.timeframe("240")
+
+atrLen = input.int(14)
+slATR  = input.float(1.5)
+tpATR  = input.float(3.0)
+
+minAplusScore = input.int(6, "A+ Threshold (0–8)")
+onlyAplus     = input.bool(true, "Only Take A+ Trades")
+
+asiaSession = input.session("1800-0000")
+nySession   = input.session("0930-1200")
+
+// ─────────────────────────────────────────────
+// STRUCTURE
+// ─────────────────────────────────────────────
+fastEMA = ta.ema(close, fastLen)
+midEMA  = ta.ema(close, midLen)
+slowEMA = ta.ema(close, slowLen)
+
+htfMid  = request.security(syminfo.tickerid, htf_tf, ta.ema(close, midLen))
+htfSlow = request.security(syminfo.tickerid, htf_tf, ta.ema(close, slowLen))
+
+bullHTF = htfMid > htfSlow
+bearHTF = htfMid < htfSlow
+
+// ─────────────────────────────────────────────
+// SESSION + LIQUIDITY
+// ─────────────────────────────────────────────
+inAsia = not na(time(timeframe.period, asiaSession))
+inNY   = not na(time(timeframe.period, nySession))
+
+var float asiaHigh = na
+var float asiaLow  = na
+
+if inAsia and not inAsia[1]
+    asiaHigh := high
+    asiaLow  := low
+
+if inAsia
+    asiaHigh := math.max(asiaHigh, high)
+    asiaLow  := math.min(asiaLow, low)
+
+// ─────────────────────────────────────────────
+// MARKET REGIME DETECTION (KEY UPGRADE)
+// ─────────────────────────────────────────────
+rangeSize = ta.sma(high - low, 20)
+trendSize = math.abs(close - close[10])
+
+isTrending = trendSize > rangeSize * 1.2
+isRanging  = not isTrending
+isChoppy   = ta.sma(rangeSize, 10) < ta.sma(rangeSize, 50)
+
+// ─────────────────────────────────────────────
+// LIQUIDITY SWEEP (2-STEP CONFIRMATION)
+// ─────────────────────────────────────────────
+wick = high - low
+upperW = high - math.max(open, close)
+lowerW = math.min(open, close) - low
+
+rawSweepHigh = high > asiaHigh and upperW > wick * 0.45
+rawSweepLow  = low < asiaLow and lowerW > wick * 0.45
+
+confirmedSweepHigh = rawSweepHigh and close < open
+confirmedSweepLow  = rawSweepLow and close > open
+
+// ─────────────────────────────────────────────
+// DISPLACEMENT CONFIRMATION
+// ─────────────────────────────────────────────
+avgRange = ta.sma(high - low, 10)
+
+bullImpulse = close > open and (high - low) > avgRange * 1.3
+bearImpulse = close < open and (high - low) > avgRange * 1.3
+
+// ─────────────────────────────────────────────
+// STRUCTURE ALIGNMENT
+// ─────────────────────────────────────────────
+trendBull = close > midEMA and midEMA > slowEMA
+trendBear = close < midEMA and midEMA < slowEMA
+
+// ─────────────────────────────────────────────
+// SCORE SYSTEM (A+ MODEL)
+// ─────────────────────────────────────────────
+bullScore = 0
+bullScore += confirmedSweepLow ? 2 : 0
+bullScore += bullImpulse ? 1 : 0
+bullScore += trendBull ? 1 : 0
+bullScore += bullHTF ? 1 : 0
+bullScore += inNY ? 1 : 0
+bullScore += isTrending ? 1 : 0
+bullScore += not isChoppy ? 1 : 0
+
+bearScore = 0
+bearScore += confirmedSweepHigh ? 2 : 0
+bearScore += bearImpulse ? 1 : 0
+bearScore += trendBear ? 1 : 0
+bearScore += bearHTF ? 1 : 0
+bearScore += inNY ? 1 : 0
+bearScore += isTrending ? 1 : 0
+bearScore += not isChoppy ? 1 : 0
+
+// ─────────────────────────────────────────────
+// FINAL FILTER
+// ─────────────────────────────────────────────
+longCondition  = bullScore >= minAplusScore
+shortCondition = bearScore >= minAplusScore
+
+// optional restriction
+longCondition  := onlyAplus ? longCondition : (bullScore >= 4)
+shortCondition := onlyAplus ? shortCondition : (bearScore >= 4)
+
+// ─────────────────────────────────────────────
+// EXECUTION
+// ─────────────────────────────────────────────
+atr = ta.atr(atrLen)
+
+longSL = close - atr * slATR
+longTP = close + atr * tpATR
+
+shortSL = close + atr * slATR
+shortTP = close - atr * tpATR
+
+if (longCondition and strategy.position_size <= 0)
+    strategy.entry("Long", strategy.long)
+
+if (shortCondition and strategy.position_size >= 0)
+    strategy.entry("Short", strategy.short)
+
+strategy.exit("L Exit", from_entry="Long", stop=longSL, limit=longTP)
+strategy.exit("S Exit", from_entry="Short", stop=shortSL, limit=shortTP)
+
+// ─────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────
+plot(fastEMA, color=color.red)
+plot(midEMA, color=color.white)
+plot(slowEMA, color=color.blue)
+
+plotshape(longCondition, location=location.belowbar, color=color.lime, style=shape.triangleup)
+plotshape(shortCondition, location=location.abovebar, color=color.red, style=shape.triangledown)
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+alertcondition(longCondition, "LONG A+", "Liquidity Entry Logic v14 LONG")
+alertcondition(shortCondition, "SHORT A+", "Liquidity Entry Logic v14 SHORT")

@@ -1,0 +1,472 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// at https://mozilla.org/MPL/2.0/
+//RichBvwy
+//@version=6
+indicator("ICT FVG Detector", overlay=true,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ═══════════════════════════════════════════════════════════════
+// === 1. INPUTS
+// ═══════════════════════════════════════════════════════════════
+grp_fvg   = "FVG Detection"
+grp_swing = "Swing / Displacement"
+grp_disp  = "Display"
+grp_mit   = "Mitigation"
+grp_htf   = "HTF Alignment"
+
+showBull = input.bool(true, "Show Bullish FVG (BISI)", group=grp_fvg)
+showBear = input.bool(true, "Show Bearish FVG (SIBI)", group=grp_fvg)
+
+swingLen = input.int(10, "Swing lookback (bars each side)", minval=1, group=grp_swing,
+     tooltip="Used to find the most recent confirmed swing high/low.\n\nA Displacement FVG is tagged when the MIDDLE candle of the 3-bar FVG pattern (the actual displacement candle) trades THROUGH that swing point, confirming structure break.")
+
+bullColor     = input.color(color.new(color.blue, 90), "Bullish FVG (BISI) fill color", group=grp_disp)
+bearColor     = input.color(color.new(color.red,  90), "Bearish FVG (SIBI) fill color", group=grp_disp)
+bullLineColor = input.color(color.new(color.blue, 50), "Bullish line color",            group=grp_disp)
+bearLineColor = input.color(color.new(color.red,  50), "Bearish line color",            group=grp_disp)
+
+drawStyle       = input.string("Lines + Fill", "Draw style", options=["Lines + Fill", "Lines Only", "Fill Only", "Boxes"], group=grp_disp,
+     tooltip="Lines + Fill: boundary lines + shaded zone.\nLines Only: boundary lines, no fill.\nFill Only: shaded zone, no lines.\nBoxes: solid bordered rectangle.")
+lineStyleStr    = input.string("Solid", "Line style", options=["Solid", "Dashed", "Dotted"], group=grp_disp)
+extendToCurrent = input.bool(false, "Extend to current bar", group=grp_disp,
+     tooltip="When on, zones extend right to track the current bar live. When off, they stop after a fixed number of bars.")
+extBars         = input.int(20, "Fixed extend (bars)", minval=1, maxval=500, group=grp_disp)
+showLabel       = input.bool(true, "Show tooltip label on gap midpoint", group=grp_disp,
+     tooltip="Places a hoverable label at the vertical centre of each FVG. Hover it to see the gap type and size.")
+
+removeMitigated = input.bool(false, "Delete FVG once fully mitigated", group=grp_mit)
+dimMitigated    = input.bool(true,  "Dim FVG once fully mitigated (if not deleted)", group=grp_mit)
+
+// ─── HTF Alignment Inputs ───────────────────────────────────────
+showHTF = input.bool(true, "Show HTF FVGs on this chart", group=grp_htf,
+     tooltip="Transposes FVGs from the next-higher relevant timeframe onto this chart as gray zones.\n\nValid pairs:\n  1m  ← 15m\n  5m  ← 1H\n  15m ← 4H\n  1H  ← Daily\n  4H  ← Weekly\n  Daily ← Monthly\n\nOn any other timeframe no HTF zones are drawn.")
+htfBullFillColor = input.color(color.new(color.gray, 90), "HTF Bullish FVG fill", group=grp_htf)
+htfBearFillColor = input.color(color.new(color.gray, 90), "HTF Bearish FVG fill", group=grp_htf)
+htfLineColor     = input.color(color.new(color.gray, 50), "HTF line / border color", group=grp_htf)
+removeHTFMit     = input.bool(false, "Delete HTF FVG once mitigated", group=grp_htf)
+dimHTFMit        = input.bool(true,  "Dim HTF FVG once mitigated",    group=grp_htf)
+
+// ═══════════════════════════════════════════════════════════════
+// === 2. HELPERS
+// ═══════════════════════════════════════════════════════════════
+lineStyleVal = lineStyleStr == "Dashed" ? line.style_dashed : lineStyleStr == "Dotted" ? line.style_dotted : line.style_solid
+extMode      = extendToCurrent ? extend.right : extend.none
+
+showLines = drawStyle == "Lines + Fill" or drawStyle == "Lines Only"
+showFill  = drawStyle == "Lines + Fill" or drawStyle == "Fill Only"
+useBox    = drawStyle == "Boxes"
+
+// ═══════════════════════════════════════════════════════════════
+// === 3. SWING POINTS  (for Displacement detection)
+// ═══════════════════════════════════════════════════════════════
+pivHigh = ta.pivothigh(swingLen, swingLen)
+pivLow  = ta.pivotlow(swingLen, swingLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(pivHigh)
+    lastSwingHigh := pivHigh
+if not na(pivLow)
+    lastSwingLow := pivLow
+
+// ═══════════════════════════════════════════════════════════════
+// === 4. FVG DETECTION
+//
+//  The three-bar FVG pattern (detected when bar[0] closes):
+//    bar[2] = first candle
+//    bar[1] = MIDDLE (displacement) candle
+//    bar[0] = third candle  →  gap between high[2] and low[0]
+//
+//  Displacement is TRUE when the MIDDLE candle (bar[1])
+//  — the actual displacement candle — trades THROUGH the most
+//  recent confirmed swing point, breaking market structure.
+//    Bullish: high[1] > lastSwingHigh  (middle candle breaks swing high)
+//    Bearish: low[1]  < lastSwingLow   (middle candle breaks swing low)
+// ═══════════════════════════════════════════════════════════════
+bullGap = showBull and high[2] < low[0]
+bearGap = showBear and low[2]  > high[0]
+
+bullDisp = bullGap and not na(lastSwingHigh) and high[1] > lastSwingHigh
+bearDisp = bearGap and not na(lastSwingLow)  and low[1]  < lastSwingLow
+
+// ═══════════════════════════════════════════════════════════════
+// === 5. OPEN-FVG TRACKING ARRAYS
+// ═══════════════════════════════════════════════════════════════
+var box[]   bullFillBox = array.new_box()
+var box[]   bullBrdBox  = array.new_box()
+var line[]  bullLine1   = array.new_line()
+var line[]  bullLine2   = array.new_line()
+var label[] bullLbl     = array.new_label()
+var float[] bullMitLv   = array.new_float()
+
+var box[]   bearFillBox = array.new_box()
+var box[]   bearBrdBox  = array.new_box()
+var line[]  bearLine1   = array.new_line()
+var line[]  bearLine2   = array.new_line()
+var label[] bearLbl     = array.new_label()
+var float[] bearMitLv   = array.new_float()
+
+// ═══════════════════════════════════════════════════════════════
+// === 6. CREATE NEW FVGS
+// ═══════════════════════════════════════════════════════════════
+rightX = bar_index + extBars
+
+if bullGap
+    fillCol  = bullColor
+    lineCol  = bullLineColor
+    lbl      = bullDisp ? "Displacement BISI" : "BISI"
+    midPrice = (low[0] + high[2]) / 2
+
+    if showFill
+        bx = box.new(bar_index - 2, low[0], rightX, high[2],
+             bgcolor=fillCol, border_color=color.new(color.black, 100), border_width=0)
+        array.push(bullFillBox, bx)
+    if showLines
+        l1 = line.new(bar_index,     low[0],  rightX, low[0],  extend=extMode, color=lineCol, width=1, style=lineStyleVal)
+        l2 = line.new(bar_index - 2, high[2], rightX, high[2], extend=extMode, color=lineCol, width=1, style=lineStyleVal)
+        array.push(bullLine1, l1)
+        array.push(bullLine2, l2)
+    if useBox
+        bb = box.new(bar_index - 2, low[0], rightX, high[2],
+             bgcolor=fillCol, border_color=lineCol, border_width=1, border_style=lineStyleVal)
+        array.push(bullBrdBox, bb)
+    if showLabel
+        lb = label.new(bar_index, midPrice, text="",
+             style=label.style_circle, yloc=yloc.price, size=size.normal,
+             color=color.new(color.black, 100), textcolor=color.new(color.black, 100),
+             tooltip=lbl)
+        array.push(bullLbl, lb)
+    array.push(bullMitLv, high[2])
+
+if bearGap
+    fillCol  = bearColor
+    lineCol  = bearLineColor
+    lbl      = bearDisp ? "Displacement SIBI" : "SIBI"
+    midPrice = (low[2] + high[0]) / 2
+
+    if showFill
+        bx = box.new(bar_index - 2, low[2], rightX, high[0],
+             bgcolor=fillCol, border_color=color.new(color.black, 100), border_width=0)
+        array.push(bearFillBox, bx)
+    if showLines
+        l1 = line.new(bar_index - 2, low[2],  rightX, low[2],  extend=extMode, color=lineCol, width=1, style=lineStyleVal)
+        l2 = line.new(bar_index,     high[0], rightX, high[0], extend=extMode, color=lineCol, width=1, style=lineStyleVal)
+        array.push(bearLine1, l1)
+        array.push(bearLine2, l2)
+    if useBox
+        bb = box.new(bar_index - 2, low[2], rightX, high[0],
+             bgcolor=fillCol, border_color=lineCol, border_width=1, border_style=lineStyleVal)
+        array.push(bearBrdBox, bb)
+    if showLabel
+        lb = label.new(bar_index, midPrice, text="",
+             style=label.style_circle, yloc=yloc.price, size=size.normal,
+             color=color.new(color.black, 100), textcolor=color.new(color.black, 100),
+             tooltip=lbl)
+        array.push(bearLbl, lb)
+    array.push(bearMitLv, low[2])
+
+// ═══════════════════════════════════════════════════════════════
+// === 7. MAINTAIN OPEN FVGS  (extend live boxes + check mitigation)
+// ═══════════════════════════════════════════════════════════════
+if array.size(bullMitLv) > 0
+    for i = array.size(bullMitLv) - 1 to 0
+        mitLv     = array.get(bullMitLv, i)
+        mitigated = low <= mitLv
+        if mitigated
+            if removeMitigated
+                if showFill
+                    box.delete(array.get(bullFillBox, i))
+                if useBox
+                    box.delete(array.get(bullBrdBox, i))
+                if showLines
+                    line.delete(array.get(bullLine1, i))
+                    line.delete(array.get(bullLine2, i))
+                if showLabel
+                    label.delete(array.get(bullLbl, i))
+            else if dimMitigated
+                if showFill
+                    box.set_bgcolor(array.get(bullFillBox, i), color.new(color.gray, 90))
+                if useBox
+                    box.set_bgcolor(array.get(bullBrdBox, i), color.new(color.gray, 90))
+                    box.set_border_color(array.get(bullBrdBox, i), color.new(color.gray, 60))
+                if showLines
+                    line.set_color(array.get(bullLine1, i), color.new(color.gray, 60))
+                    line.set_color(array.get(bullLine2, i), color.new(color.gray, 60))
+            if showFill
+                array.remove(bullFillBox, i)
+            if useBox
+                array.remove(bullBrdBox, i)
+            if showLines
+                array.remove(bullLine1, i)
+                array.remove(bullLine2, i)
+            if showLabel
+                array.remove(bullLbl, i)
+            array.remove(bullMitLv, i)
+        else if extendToCurrent
+            if showFill
+                box.set_right(array.get(bullFillBox, i), bar_index)
+            if useBox
+                box.set_right(array.get(bullBrdBox, i), bar_index)
+
+if array.size(bearMitLv) > 0
+    for i = array.size(bearMitLv) - 1 to 0
+        mitLv     = array.get(bearMitLv, i)
+        mitigated = high >= mitLv
+        if mitigated
+            if removeMitigated
+                if showFill
+                    box.delete(array.get(bearFillBox, i))
+                if useBox
+                    box.delete(array.get(bearBrdBox, i))
+                if showLines
+                    line.delete(array.get(bearLine1, i))
+                    line.delete(array.get(bearLine2, i))
+                if showLabel
+                    label.delete(array.get(bearLbl, i))
+            else if dimMitigated
+                if showFill
+                    box.set_bgcolor(array.get(bearFillBox, i), color.new(color.gray, 90))
+                if useBox
+                    box.set_bgcolor(array.get(bearBrdBox, i), color.new(color.gray, 90))
+                    box.set_border_color(array.get(bearBrdBox, i), color.new(color.gray, 60))
+                if showLines
+                    line.set_color(array.get(bearLine1, i), color.new(color.gray, 60))
+                    line.set_color(array.get(bearLine2, i), color.new(color.gray, 60))
+            if showFill
+                array.remove(bearFillBox, i)
+            if useBox
+                array.remove(bearBrdBox, i)
+            if showLines
+                array.remove(bearLine1, i)
+                array.remove(bearLine2, i)
+            if showLabel
+                array.remove(bearLbl, i)
+            array.remove(bearMitLv, i)
+        else if extendToCurrent
+            if showFill
+                box.set_right(array.get(bearFillBox, i), bar_index)
+            if useBox
+                box.set_right(array.get(bearBrdBox, i), bar_index)
+
+// ═══════════════════════════════════════════════════════════════
+// === 8. ALERTS
+// ═══════════════════════════════════════════════════════════════
+alertcondition(bullGap,  "New BISI (Bullish FVG)", "Bullish FVG (BISI) formed")
+alertcondition(bearGap,  "New SIBI (Bearish FVG)", "Bearish FVG (SIBI) formed")
+alertcondition(bullDisp, "New Displacement BISI",  "Bullish Displacement FVG: middle candle broke swing high")
+alertcondition(bearDisp, "New Displacement SIBI",  "Bearish Displacement FVG: middle candle broke swing low")
+
+// ═══════════════════════════════════════════════════════════════
+// === 9. HTF ALIGNMENT — TIMEFRAME RESOLUTION
+//
+//  timeframe.period returns:
+//    minutes → "1", "5", "15", "60", "240"
+//    daily   → "D"
+//    weekly  → "W"
+//    monthly → "M"
+//
+//  Valid lower → higher pairs:
+//    1m → 15m  |  5m → 60m  |  15m → 240m
+//    1H → D    |  4H → W    |  Daily → M
+//
+//  A safe fallback of "M" keeps request.security() syntax valid on
+//  unsupported timeframes; validHTF=false suppresses all drawing.
+// ═══════════════════════════════════════════════════════════════
+htfTF = timeframe.period == "1" ? "15" : timeframe.period == "5" ? "60" : timeframe.period == "15" ? "240" : timeframe.period == "60" ? "D" : timeframe.period == "240" ? "W" : timeframe.period == "D" ? "M" : "M"
+
+validHTF = showHTF and (timeframe.period == "1" or timeframe.period == "5" or timeframe.period == "15" or timeframe.period == "60" or timeframe.period == "240" or timeframe.period == "D")
+
+// ═══════════════════════════════════════════════════════════════
+// === 10. HTF OHLC REQUEST
+//
+//  Expressions evaluate on the HTF chart (lookahead_off = previous
+//  closed HTF bar). Na is returned when no FVG exists on that bar.
+// ═══════════════════════════════════════════════════════════════
+
+// Bullish HTF FVG: HTF high[2] < HTF low[0]  →  zone top = low[0], bot = high[2]
+htfBullTop = request.security(syminfo.tickerid, htfTF, showBull ? (high[2] < low[0] ? low[0] : na) : na, lookahead=barmerge.lookahead_off)
+htfBullBot = request.security(syminfo.tickerid, htfTF, showBull ? (high[2] < low[0] ? high[2] : na) : na, lookahead=barmerge.lookahead_off)
+
+// Bearish HTF FVG: HTF low[2] > HTF high[0]  →  zone top = low[2], bot = high[0]
+htfBearTop = request.security(syminfo.tickerid, htfTF, showBear ? (low[2] > high[0] ? low[2] : na) : na, lookahead=barmerge.lookahead_off)
+htfBearBot = request.security(syminfo.tickerid, htfTF, showBear ? (low[2] > high[0] ? high[0] : na) : na, lookahead=barmerge.lookahead_off)
+
+// Fire once per new HTF bar: track the HTF bar_index and watch for its change
+htfBarIdx    = request.security(syminfo.tickerid, htfTF, bar_index, lookahead=barmerge.lookahead_off)
+htfBarChange = ta.change(htfBarIdx)
+newHTFBar    = not na(htfBarChange) and htfBarChange > 0
+
+newHTFBull = validHTF and newHTFBar and not na(htfBullTop)
+newHTFBear = validHTF and newHTFBar and not na(htfBearTop)
+
+// ═══════════════════════════════════════════════════════════════
+// === 11. HTF OPEN-FVG TRACKING ARRAYS
+// ═══════════════════════════════════════════════════════════════
+var box[]   htfBullFillBox = array.new_box()
+var box[]   htfBullBrdBox  = array.new_box()
+var line[]  htfBullLine1   = array.new_line()
+var line[]  htfBullLine2   = array.new_line()
+var label[] htfBullLbl     = array.new_label()
+var float[] htfBullMitLv   = array.new_float()
+
+var box[]   htfBearFillBox = array.new_box()
+var box[]   htfBearBrdBox  = array.new_box()
+var line[]  htfBearLine1   = array.new_line()
+var line[]  htfBearLine2   = array.new_line()
+var label[] htfBearLbl     = array.new_label()
+var float[] htfBearMitLv   = array.new_float()
+
+// ═══════════════════════════════════════════════════════════════
+// === 12. CREATE NEW HTF FVGS
+// ═══════════════════════════════════════════════════════════════
+htfRightX = bar_index + extBars
+
+if newHTFBull
+    zTop     = htfBullTop
+    zBot     = htfBullBot
+    zMid     = (zTop + zBot) / 2
+    htfLbl   = "HTF BISI (" + htfTF + ")"
+
+    if showFill
+        bx = box.new(bar_index, zBot, htfRightX, zTop, bgcolor=htfBullFillColor, border_color=color.new(color.black, 100), border_width=0)
+        array.push(htfBullFillBox, bx)
+    if showLines
+        l1 = line.new(bar_index, zBot, htfRightX, zBot, extend=extMode, color=htfLineColor, width=1, style=lineStyleVal)
+        l2 = line.new(bar_index, zTop, htfRightX, zTop, extend=extMode, color=htfLineColor, width=1, style=lineStyleVal)
+        array.push(htfBullLine1, l1)
+        array.push(htfBullLine2, l2)
+    if useBox
+        bb = box.new(bar_index, zBot, htfRightX, zTop, bgcolor=htfBullFillColor, border_color=htfLineColor, border_width=1, border_style=lineStyleVal)
+        array.push(htfBullBrdBox, bb)
+    if showLabel
+        lb = label.new(bar_index, zMid, text="",
+             style=label.style_circle, yloc=yloc.price, size=size.normal,
+             color=color.new(color.black, 100), textcolor=color.new(color.black, 100),
+             tooltip=htfLbl)
+        array.push(htfBullLbl, lb)
+    array.push(htfBullMitLv, zBot)
+
+if newHTFBear
+    zTop     = htfBearTop
+    zBot     = htfBearBot
+    zMid     = (zTop + zBot) / 2
+    htfLbl   = "HTF SIBI (" + htfTF + ")"
+
+    if showFill
+        bx = box.new(bar_index, zBot, htfRightX, zTop, bgcolor=htfBearFillColor, border_color=color.new(color.black, 100), border_width=0)
+        array.push(htfBearFillBox, bx)
+    if showLines
+        l1 = line.new(bar_index, zBot, htfRightX, zBot, extend=extMode, color=htfLineColor, width=1, style=lineStyleVal)
+        l2 = line.new(bar_index, zTop, htfRightX, zTop, extend=extMode, color=htfLineColor, width=1, style=lineStyleVal)
+        array.push(htfBearLine1, l1)
+        array.push(htfBearLine2, l2)
+    if useBox
+        bb = box.new(bar_index, zBot, htfRightX, zTop, bgcolor=htfBearFillColor, border_color=htfLineColor, border_width=1, border_style=lineStyleVal)
+        array.push(htfBearBrdBox, bb)
+    if showLabel
+        lb = label.new(bar_index, zMid, text="",
+             style=label.style_circle, yloc=yloc.price, size=size.normal,
+             color=color.new(color.black, 100), textcolor=color.new(color.black, 100),
+             tooltip=htfLbl)
+        array.push(htfBearLbl, lb)
+    array.push(htfBearMitLv, zTop)
+
+// ═══════════════════════════════════════════════════════════════
+// === 13. MAINTAIN HTF FVGS  (extend live + check mitigation)
+// ═══════════════════════════════════════════════════════════════
+if array.size(htfBullMitLv) > 0
+    for i = array.size(htfBullMitLv) - 1 to 0
+        mitLv     = array.get(htfBullMitLv, i)
+        mitigated = low <= mitLv
+        if mitigated
+            if removeHTFMit
+                if showFill
+                    box.delete(array.get(htfBullFillBox, i))
+                if useBox
+                    box.delete(array.get(htfBullBrdBox, i))
+                if showLines
+                    line.delete(array.get(htfBullLine1, i))
+                    line.delete(array.get(htfBullLine2, i))
+                if showLabel
+                    label.delete(array.get(htfBullLbl, i))
+            else if dimHTFMit
+                if showFill
+                    box.set_bgcolor(array.get(htfBullFillBox, i), color.new(color.gray, 93))
+                if useBox
+                    box.set_bgcolor(array.get(htfBullBrdBox, i), color.new(color.gray, 93))
+                    box.set_border_color(array.get(htfBullBrdBox, i), color.new(color.gray, 75))
+                if showLines
+                    line.set_color(array.get(htfBullLine1, i), color.new(color.gray, 75))
+                    line.set_color(array.get(htfBullLine2, i), color.new(color.gray, 75))
+            if showFill
+                array.remove(htfBullFillBox, i)
+            if useBox
+                array.remove(htfBullBrdBox, i)
+            if showLines
+                array.remove(htfBullLine1, i)
+                array.remove(htfBullLine2, i)
+            if showLabel
+                array.remove(htfBullLbl, i)
+            array.remove(htfBullMitLv, i)
+        else if extendToCurrent
+            if showFill
+                box.set_right(array.get(htfBullFillBox, i), bar_index)
+            if useBox
+                box.set_right(array.get(htfBullBrdBox, i), bar_index)
+
+if array.size(htfBearMitLv) > 0
+    for i = array.size(htfBearMitLv) - 1 to 0
+        mitLv     = array.get(htfBearMitLv, i)
+        mitigated = high >= mitLv
+        if mitigated
+            if removeHTFMit
+                if showFill
+                    box.delete(array.get(htfBearFillBox, i))
+                if useBox
+                    box.delete(array.get(htfBearBrdBox, i))
+                if showLines
+                    line.delete(array.get(htfBearLine1, i))
+                    line.delete(array.get(htfBearLine2, i))
+                if showLabel
+                    label.delete(array.get(htfBearLbl, i))
+            else if dimHTFMit
+                if showFill
+                    box.set_bgcolor(array.get(htfBearFillBox, i), color.new(color.gray, 93))
+                if useBox
+                    box.set_bgcolor(array.get(htfBearBrdBox, i), color.new(color.gray, 93))
+                    box.set_border_color(array.get(htfBearBrdBox, i), color.new(color.gray, 75))
+                if showLines
+                    line.set_color(array.get(htfBearLine1, i), color.new(color.gray, 75))
+                    line.set_color(array.get(htfBearLine2, i), color.new(color.gray, 75))
+            if showFill
+                array.remove(htfBearFillBox, i)
+            if useBox
+                array.remove(htfBearBrdBox, i)
+            if showLines
+                array.remove(htfBearLine1, i)
+                array.remove(htfBearLine2, i)
+            if showLabel
+                array.remove(htfBearLbl, i)
+            array.remove(htfBearMitLv, i)
+        else if extendToCurrent
+            if showFill
+                box.set_right(array.get(htfBearFillBox, i), bar_index)
+            if useBox
+                box.set_right(array.get(htfBearBrdBox, i), bar_index)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Signature
+// ─────────────────────────────────────────────────────────────────────────────
+var table sigTable = table.new(
+     position.bottom_center, 1, 1,
+     bgcolor      = color.new(color.black, 100),
+     border_color = color.new(color.black, 100),
+     border_width = 0,
+     frame_color  = color.new(color.black, 100),
+     frame_width  = 0)
+table.cell(sigTable, 0, 0, "ᵣᵢCₕ BᵥWY",
+     text_color  = color.new(color.gray, 80),
+     text_size   = size.small,
+     text_halign = text.align_center,
+     text_valign = text.align_center)

@@ -1,0 +1,678 @@
+//@version=6
+strategy(
+     "Hybrid 3-Strategy Smart System v6.1",
+     overlay=true,
+     initial_capital=2000,
+     pyramiding=0,
+     calc_on_every_tick=true,
+     process_orders_on_close=true,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04
+)
+
+// =====================================================
+// MODE
+// =====================================================
+mode = input.string("Balanced", "Mode", options=["Balanced", "High Quality"])
+
+// =====================================================
+// STRATEGY TOGGLES
+// =====================================================
+enableFVG = input.bool(true, "Enable FVG Pullback")
+enableVOL = input.bool(true, "Enable Volume Exhaustion")
+enableTL  = input.bool(true, "Enable Trendline Break Retest")
+
+// =====================================================
+// INPUTS
+// =====================================================
+riskPercent         = input.float(1.0, "Risk % Per Trade", step=0.1, minval=0.1)
+
+emaLen              = input.int(50, "EMA Length", minval=20)
+atrLen              = input.int(14, "ATR Length", minval=5)
+adxLen              = input.int(14, "ADX Length", minval=5)
+rsiLen              = input.int(14, "RSI Length", minval=5)
+
+pivotLen            = input.int(4, "Pivot Length", minval=2)
+volLen              = input.int(20, "Volume MA Length", minval=5)
+
+useHTFFilter        = input.bool(true, "Use Higher Timeframe Filter")
+htfTf               = input.timeframe("60", "Higher Timeframe")
+
+useSessionFilter    = input.bool(false, "Use Session Filter")
+sessionInput        = input.session("0800-1700", "Trading Session")
+
+showLabels          = input.bool(true, "Show Labels")
+showPanel           = input.bool(true, "Show Status Panel")
+showBoxes           = input.bool(true, "Show Order Boxes")
+enableAlerts        = input.bool(true, "Enable Alerts")
+
+// =====================================================
+// MODE-BASED PARAMETERS
+// =====================================================
+adxMin            = mode == "Balanced" ? 18.0 : 24.0
+volMult           = mode == "Balanced" ? 1.4 : 1.8
+fvgMinAtr         = mode == "Balanced" ? 0.20 : 0.40
+fvgMaxAge         = mode == "Balanced" ? 20   : 14
+cooldownBars      = mode == "Balanced" ? 5    : 8
+maxEntryDistATR   = mode == "Balanced" ? 1.00 : 0.60
+validityBars      = mode == "Balanced" ? 4    : 3
+maxEmaDistanceATR = mode == "Balanced" ? 2.5  : 1.6
+scoreThreshold    = mode == "Balanced" ? 55   : 70
+emaSlopeBars      = mode == "Balanced" ? 3    : 5
+emaSlopeAtrMin    = mode == "Balanced" ? 0.10 : 0.18
+
+rrFVG             = mode == "Balanced" ? 2.0  : 2.2
+rrVOL             = mode == "Balanced" ? 2.2  : 2.5
+rrTL              = mode == "Balanced" ? 1.8  : 2.0
+
+// =====================================================
+// INDICATORS
+// =====================================================
+ema50 = ta.ema(close, emaLen)
+atr   = ta.atr(atrLen)
+rsi   = ta.rsi(close, rsiLen)
+volMA = ta.sma(volume, volLen)
+[plusDI, minusDI, adx] = ta.dmi(adxLen, adxLen)
+
+htfClose = request.security(syminfo.tickerid, htfTf, close)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, emaLen))
+
+inSession = not useSessionFilter or not na(time(timeframe.period, sessionInput))
+htfBull   = not useHTFFilter or (htfClose > htfEma)
+htfBear   = not useHTFFilter or (htfClose < htfEma)
+
+emaDistanceOk = math.abs(close - ema50) <= atr * maxEmaDistanceATR
+emaSlopeValue = math.abs(ema50 - ema50[emaSlopeBars])
+trendStrengthOk = emaSlopeValue >= atr * emaSlopeAtrMin
+marketTrending = adx > adxMin and trendStrengthOk
+
+bodySize  = math.abs(close - open)
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+
+bullReject = close > open and lowerWick >= bodySize * 0.4
+bearReject = close < open and upperWick >= bodySize * 0.4
+
+bullConfirm = close > open
+bearConfirm = close < open
+
+bullTrend = close > ema50 and ema50 > ema50[emaSlopeBars] and htfBull and inSession and emaDistanceOk
+bearTrend = close < ema50 and ema50 < ema50[emaSlopeBars] and htfBear and inSession and emaDistanceOk
+
+highVol = volume > volMA * volMult
+volRatio = volMA > 0 ? volume / volMA : 0.0
+
+// =====================================================
+// COOLDOWN
+// =====================================================
+var int lastTradeBar = na
+cooldownOk = na(lastTradeBar) or (bar_index - lastTradeBar > cooldownBars)
+
+// =====================================================
+// PIVOTS
+// =====================================================
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow  = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(pivotHigh)
+    lastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    lastSwingLow := pivotLow
+
+// =====================================================
+// FVG DETECTION
+// =====================================================
+newBullFVG = low > high[2]
+newBearFVG = high < low[2]
+
+bullFVGSize = newBullFVG ? (low - high[2]) : 0.0
+bearFVGSize = newBearFVG ? (low[2] - high) : 0.0
+
+validNewBullFVG = enableFVG and newBullFVG and bullFVGSize >= atr * fvgMinAtr and bullTrend and marketTrending
+validNewBearFVG = enableFVG and newBearFVG and bearFVGSize >= atr * fvgMinAtr and bearTrend and marketTrending
+
+var float bullFvgTop = na
+var float bullFvgBot = na
+var int bullFvgBar = na
+var bool bullFvgArmed = false
+
+var float bearFvgTop = na
+var float bearFvgBot = na
+var int bearFvgBar = na
+var bool bearFvgArmed = false
+
+if validNewBullFVG
+    bullFvgTop := low
+    bullFvgBot := high[2]
+    bullFvgBar := bar_index
+    bullFvgArmed := true
+
+if validNewBearFVG
+    bearFvgTop := low[2]
+    bearFvgBot := high
+    bearFvgBar := bar_index
+    bearFvgArmed := true
+
+if bullFvgArmed and bar_index - bullFvgBar > fvgMaxAge
+    bullFvgArmed := false
+    bullFvgTop := na
+    bullFvgBot := na
+    bullFvgBar := na
+
+if bearFvgArmed and bar_index - bearFvgBar > fvgMaxAge
+    bearFvgArmed := false
+    bearFvgTop := na
+    bearFvgBot := na
+    bearFvgBar := na
+
+bullFvgTouch = bullFvgArmed and bar_index > bullFvgBar and low <= bullFvgTop and high >= bullFvgBot
+bearFvgTouch = bearFvgArmed and bar_index > bearFvgBar and high >= bearFvgBot and low <= bearFvgTop
+
+fvgLongBase  = enableFVG and bullTrend and cooldownOk and bullFvgTouch and bullConfirm and close > bullFvgBot and barstate.isconfirmed
+fvgShortBase = enableFVG and bearTrend and cooldownOk and bearFvgTouch and bearConfirm and close < bearFvgTop and barstate.isconfirmed
+
+bullFvgScore = math.min(bullFVGSize / atr, 2.0) * 15.0
+bearFvgScore = math.min(bearFVGSize / atr, 2.0) * 15.0
+
+fvgLongScore =
+     (bullTrend ? 20 : 0) +
+     (htfBull ? 15 : 0) +
+     (marketTrending ? 15 : 0) +
+     (bullFvgTouch ? 15 : 0) +
+     (bullConfirm ? 10 : 0) +
+     (highVol ? 10 : 0) +
+     bullFvgScore
+
+fvgShortScore =
+     (bearTrend ? 20 : 0) +
+     (htfBear ? 15 : 0) +
+     (marketTrending ? 15 : 0) +
+     (bearFvgTouch ? 15 : 0) +
+     (bearConfirm ? 10 : 0) +
+     (highVol ? 10 : 0) +
+     bearFvgScore
+
+fvgLongSetup  = fvgLongBase and fvgLongScore >= scoreThreshold
+fvgShortSetup = fvgShortBase and fvgShortScore >= scoreThreshold
+
+if fvgLongSetup
+    bullFvgArmed := false
+
+if fvgShortSetup
+    bearFvgArmed := false
+
+// =====================================================
+// VOLUME EXHAUSTION
+// =====================================================
+bullExhaustBar = enableVOL and close < ema50 and highVol and rsi < 38 and close > open and lowerWick > bodySize * 0.6
+bearExhaustBar = enableVOL and close > ema50 and highVol and rsi > 62 and close < open and upperWick > bodySize * 0.6
+
+var bool volLongArmed = false
+var bool volShortArmed = false
+var float volLongTrigger = na
+var float volShortTrigger = na
+var int volLongBar = na
+var int volShortBar = na
+
+if bullExhaustBar
+    volLongArmed := true
+    volLongTrigger := high
+    volLongBar := bar_index
+
+if bearExhaustBar
+    volShortArmed := true
+    volShortTrigger := low
+    volShortBar := bar_index
+
+if volLongArmed and bar_index - volLongBar > 4
+    volLongArmed := false
+    volLongTrigger := na
+    volLongBar := na
+
+if volShortArmed and bar_index - volShortBar > 4
+    volShortArmed := false
+    volShortTrigger := na
+    volShortBar := na
+
+volLongBase  = enableVOL and cooldownOk and volLongArmed and bar_index > volLongBar and close > volLongTrigger and bullConfirm and barstate.isconfirmed
+volShortBase = enableVOL and cooldownOk and volShortArmed and bar_index > volShortBar and close < volShortTrigger and bearConfirm and barstate.isconfirmed
+
+volLongScore =
+     (close > ema50 ? 15 : 0) +
+     (rsi < 35 ? 20 : 10) +
+     (highVol ? 20 : 0) +
+     (lowerWick > bodySize ? 15 : 8) +
+     (close > volLongTrigger ? 15 : 0) +
+     (bullConfirm ? 10 : 0) +
+     math.min(volRatio, 2.0) * 5.0
+
+volShortScore =
+     (close < ema50 ? 15 : 0) +
+     (rsi > 65 ? 20 : 10) +
+     (highVol ? 20 : 0) +
+     (upperWick > bodySize ? 15 : 8) +
+     (close < volShortTrigger ? 15 : 0) +
+     (bearConfirm ? 10 : 0) +
+     math.min(volRatio, 2.0) * 5.0
+
+volLongSetup  = volLongBase and volLongScore >= scoreThreshold
+volShortSetup = volShortBase and volShortScore >= scoreThreshold
+
+if volLongSetup
+    volLongArmed := false
+
+if volShortSetup
+    volShortArmed := false
+
+// =====================================================
+// TREND BREAK + RETEST
+// =====================================================
+var bool tlLongArmed = false
+var bool tlShortArmed = false
+var float tlLongLevel = na
+var float tlShortLevel = na
+var int tlLongBar = na
+var int tlShortBar = na
+
+newBreakLong  = enableTL and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh and bullTrend and marketTrending
+newBreakShort = enableTL and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow and bearTrend and marketTrending
+
+if newBreakLong
+    tlLongArmed := true
+    tlLongLevel := lastSwingHigh
+    tlLongBar := bar_index
+
+if newBreakShort
+    tlShortArmed := true
+    tlShortLevel := lastSwingLow
+    tlShortBar := bar_index
+
+if tlLongArmed and bar_index - tlLongBar > 10
+    tlLongArmed := false
+    tlLongLevel := na
+    tlLongBar := na
+
+if tlShortArmed and bar_index - tlShortBar > 10
+    tlShortArmed := false
+    tlShortLevel := na
+    tlShortBar := na
+
+trendLongBase  = enableTL and tlLongArmed and cooldownOk and bar_index > tlLongBar and low <= tlLongLevel and close > tlLongLevel and bullConfirm and barstate.isconfirmed
+trendShortBase = enableTL and tlShortArmed and cooldownOk and bar_index > tlShortBar and high >= tlShortLevel and close < tlShortLevel and bearConfirm and barstate.isconfirmed
+
+trendLongScore =
+     (bullTrend ? 20 : 0) +
+     (marketTrending ? 20 : 0) +
+     (htfBull ? 15 : 0) +
+     (low <= tlLongLevel ? 15 : 0) +
+     (close > tlLongLevel ? 15 : 0) +
+     (bullConfirm ? 10 : 0) +
+     (highVol ? 5 : 0)
+
+trendShortScore =
+     (bearTrend ? 20 : 0) +
+     (marketTrending ? 20 : 0) +
+     (htfBear ? 15 : 0) +
+     (high >= tlShortLevel ? 15 : 0) +
+     (close < tlShortLevel ? 15 : 0) +
+     (bearConfirm ? 10 : 0) +
+     (highVol ? 5 : 0)
+
+trendLongSetup  = trendLongBase and trendLongScore >= scoreThreshold
+trendShortSetup = trendShortBase and trendShortScore >= scoreThreshold
+
+if trendLongSetup
+    tlLongArmed := false
+
+if trendShortSetup
+    tlShortArmed := false
+
+// =====================================================
+// PENDING SIGNAL WINDOW
+// =====================================================
+var bool pendingLong = false
+var bool pendingShort = false
+var string pendingType = ""
+var float pendingEntry = na
+var float pendingSL = na
+var float pendingTP = na
+var float pendingRR = na
+var float pendingScore = na
+var int pendingStartBar = na
+var int pendingExpireBar = na
+var int pendingStartTime = na
+
+// =====================================================
+// EXECUTED TRADE CACHE
+// =====================================================
+var string lastExecType = ""
+var float lastExecEntry = na
+var float lastExecSL = na
+var float lastExecTP = na
+var float lastExecRR = na
+var float lastExecQty = na
+var float lastExecScore = na
+var bool lastExecLong = false
+var bool lastExecShort = false
+
+lastExecType := ""
+lastExecEntry := na
+lastExecSL := na
+lastExecTP := na
+lastExecRR := na
+lastExecQty := na
+lastExecScore := na
+lastExecLong := false
+lastExecShort := false
+
+// =====================================================
+// BUILD PENDING SETUP
+// =====================================================
+if strategy.position_size == 0 and not pendingLong and not pendingShort
+    if fvgLongSetup
+        pendingLong := true
+        pendingShort := false
+        pendingType := "FVG Pullback"
+        pendingEntry := close
+        pendingSL := math.min(low, bullFvgBot) - atr * 0.7
+        pendingRR := rrFVG
+        pendingTP := pendingEntry + (pendingEntry - pendingSL) * pendingRR
+        pendingScore := fvgLongScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+    else if volLongSetup
+        pendingLong := true
+        pendingShort := false
+        pendingType := "Volume Exhaustion"
+        pendingEntry := close
+        pendingSL := low - atr * 0.9
+        pendingRR := rrVOL
+        pendingTP := pendingEntry + (pendingEntry - pendingSL) * pendingRR
+        pendingScore := volLongScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+    else if trendLongSetup
+        pendingLong := true
+        pendingShort := false
+        pendingType := "Trendline Break Retest"
+        pendingEntry := close
+        pendingSL := math.min(low, tlLongLevel) - atr * 0.7
+        pendingRR := rrTL
+        pendingTP := pendingEntry + (pendingEntry - pendingSL) * pendingRR
+        pendingScore := trendLongScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+    else if fvgShortSetup
+        pendingLong := false
+        pendingShort := true
+        pendingType := "FVG Pullback"
+        pendingEntry := close
+        pendingSL := math.max(high, bearFvgTop) + atr * 0.7
+        pendingRR := rrFVG
+        pendingTP := pendingEntry - (pendingSL - pendingEntry) * pendingRR
+        pendingScore := fvgShortScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+    else if volShortSetup
+        pendingLong := false
+        pendingShort := true
+        pendingType := "Volume Exhaustion"
+        pendingEntry := close
+        pendingSL := high + atr * 0.9
+        pendingRR := rrVOL
+        pendingTP := pendingEntry - (pendingSL - pendingEntry) * pendingRR
+        pendingScore := volShortScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+    else if trendShortSetup
+        pendingLong := false
+        pendingShort := true
+        pendingType := "Trendline Break Retest"
+        pendingEntry := close
+        pendingSL := math.max(high, tlShortLevel) + atr * 0.7
+        pendingRR := rrTL
+        pendingTP := pendingEntry - (pendingSL - pendingEntry) * pendingRR
+        pendingScore := trendShortScore
+        pendingStartBar := bar_index
+        pendingExpireBar := bar_index + validityBars
+        pendingStartTime := timenow
+
+signalExpired = (pendingLong or pendingShort) and not na(pendingExpireBar) and bar_index > pendingExpireBar
+
+longStillValid  = pendingLong and not signalExpired and math.abs(close - pendingEntry) <= atr * maxEntryDistATR and close >= ema50 * 0.994
+shortStillValid = pendingShort and not signalExpired and math.abs(close - pendingEntry) <= atr * maxEntryDistATR and close <= ema50 * 1.006
+
+signalStillValid = longStillValid or shortStillValid
+
+if signalExpired
+    pendingLong := false
+    pendingShort := false
+    pendingType := ""
+    pendingEntry := na
+    pendingSL := na
+    pendingTP := na
+    pendingRR := na
+    pendingScore := na
+    pendingStartBar := na
+    pendingExpireBar := na
+    pendingStartTime := na
+
+// =====================================================
+// POSITION SIZE
+// =====================================================
+riskAmount = strategy.equity * (riskPercent / 100.0)
+
+longRisk  = pendingLong  ? (pendingEntry - pendingSL) : na
+shortRisk = pendingShort ? (pendingSL - pendingEntry) : na
+
+longQty  = pendingLong  and not na(longRisk)  and longRisk  > syminfo.mintick ? riskAmount / longRisk  : na
+shortQty = pendingShort and not na(shortRisk) and shortRisk > syminfo.mintick ? riskAmount / shortRisk : na
+
+// =====================================================
+// EXECUTION
+// =====================================================
+enterLong  = strategy.position_size == 0 and pendingLong and signalStillValid and barstate.isconfirmed
+enterShort = strategy.position_size == 0 and pendingShort and signalStillValid and barstate.isconfirmed
+
+if enterLong and not na(longQty)
+    lastExecType := pendingType
+    lastExecEntry := pendingEntry
+    lastExecSL := pendingSL
+    lastExecTP := pendingTP
+    lastExecRR := pendingRR
+    lastExecQty := longQty
+    lastExecScore := pendingScore
+    lastExecLong := true
+    lastExecShort := false
+
+    strategy.entry("LONG", strategy.long, qty=longQty, comment=pendingType)
+    strategy.exit("LONG EXIT", "LONG", stop=pendingSL, limit=pendingTP)
+    lastTradeBar := bar_index
+
+    pendingLong := false
+    pendingShort := false
+    pendingType := ""
+    pendingEntry := na
+    pendingSL := na
+    pendingTP := na
+    pendingRR := na
+    pendingScore := na
+    pendingStartBar := na
+    pendingExpireBar := na
+    pendingStartTime := na
+
+if enterShort and not na(shortQty)
+    lastExecType := pendingType
+    lastExecEntry := pendingEntry
+    lastExecSL := pendingSL
+    lastExecTP := pendingTP
+    lastExecRR := pendingRR
+    lastExecQty := shortQty
+    lastExecScore := pendingScore
+    lastExecLong := false
+    lastExecShort := true
+
+    strategy.entry("SHORT", strategy.short, qty=shortQty, comment=pendingType)
+    strategy.exit("SHORT EXIT", "SHORT", stop=pendingSL, limit=pendingTP)
+    lastTradeBar := bar_index
+
+    pendingLong := false
+    pendingShort := false
+    pendingType := ""
+    pendingEntry := na
+    pendingSL := na
+    pendingTP := na
+    pendingRR := na
+    pendingScore := na
+    pendingStartBar := na
+    pendingExpireBar := na
+    pendingStartTime := na
+
+// =====================================================
+// VISUALS
+// =====================================================
+plot(ema50, color=color.orange, linewidth=2, title="EMA 50")
+
+plotshape(fvgLongSetup, title="FVG Long Setup", location=location.belowbar, style=shape.circle, size=size.tiny, color=color.new(color.green, 0), text="F")
+plotshape(fvgShortSetup, title="FVG Short Setup", location=location.abovebar, style=shape.circle, size=size.tiny, color=color.new(color.red, 0), text="F")
+
+plotshape(volLongSetup, title="VOL Long Setup", location=location.belowbar, style=shape.square, size=size.tiny, color=color.new(color.lime, 0), text="V")
+plotshape(volShortSetup, title="VOL Short Setup", location=location.abovebar, style=shape.square, size=size.tiny, color=color.new(color.maroon, 0), text="V")
+
+plotshape(trendLongSetup, title="TL Long Setup", location=location.belowbar, style=shape.triangleup, size=size.tiny, color=color.new(color.aqua, 0), text="T")
+plotshape(trendShortSetup, title="TL Short Setup", location=location.abovebar, style=shape.triangledown, size=size.tiny, color=color.new(color.fuchsia, 0), text="T")
+
+plotshape(lastExecLong, title="BUY", location=location.belowbar, style=shape.labelup, size=size.tiny, color=color.green, text="BUY")
+plotshape(lastExecShort, title="SELL", location=location.abovebar, style=shape.labeldown, size=size.tiny, color=color.red, text="SELL")
+
+// =====================================================
+// ORDER BOXES
+// =====================================================
+var box activeBox = na
+var line entryLine = na
+var line slLine = na
+var line tpLine = na
+
+if showBoxes and (lastExecLong or lastExecShort)
+    if not na(activeBox)
+        box.delete(activeBox)
+    if not na(entryLine)
+        line.delete(entryLine)
+    if not na(slLine)
+        line.delete(slLine)
+    if not na(tpLine)
+        line.delete(tpLine)
+
+    float topPrice = lastExecLong ? lastExecTP : lastExecSL
+    float bottomPrice = lastExecLong ? lastExecSL : lastExecTP
+    color boxColor = lastExecLong ? color.new(color.green, 85) : color.new(color.red, 85)
+
+    activeBox := box.new(left=bar_index, top=topPrice, right=bar_index + 8, bottom=bottomPrice, bgcolor=boxColor, border_color=color.new(color.white, 70))
+    entryLine := line.new(bar_index, lastExecEntry, bar_index + 8, lastExecEntry, color=color.white, width=1, style=line.style_dashed)
+    slLine := line.new(bar_index, lastExecSL, bar_index + 8, lastExecSL, color=color.red, width=1)
+    tpLine := line.new(bar_index, lastExecTP, bar_index + 8, lastExecTP, color=color.lime, width=1)
+
+// =====================================================
+// LABELS
+// =====================================================
+if showLabels and (lastExecLong or lastExecShort)
+    label.new(
+         bar_index,
+         lastExecLong ? low : high,
+         (lastExecLong ? "BUY" : "SELL") +
+         "\n" + lastExecType +
+         "\nE: " + str.tostring(lastExecEntry, format.mintick) +
+         " | S: " + str.tostring(lastExecSL, format.mintick) +
+         "\nT: " + str.tostring(lastExecTP, format.mintick) +
+         " | RR: 1:" + str.tostring(lastExecRR) +
+         "\nQ: " + str.tostring(lastExecQty, format.mintick) +
+         " | Sc: " + str.tostring(lastExecScore, "#"),
+         style=lastExecLong ? label.style_label_up : label.style_label_down,
+         textcolor=color.white,
+         color=lastExecLong ? color.new(color.green, 0) : color.new(color.red, 0),
+         size=size.tiny
+     )
+
+// =====================================================
+// STATUS PANEL
+// =====================================================
+var table statusTbl = table.new(position.top_right, 2, 10, border_width=1)
+
+barsLeft = (pendingLong or pendingShort) and not na(pendingExpireBar) ? math.max(pendingExpireBar - bar_index, 0) : na
+minsPassed = (pendingLong or pendingShort) and not na(pendingStartTime) ? math.floor((timenow - pendingStartTime) / 60000) : na
+pendingSide = pendingLong ? "LONG" : pendingShort ? "SHORT" : "-"
+statusText = (pendingLong or pendingShort) ? (signalStillValid ? "ACTIVE" : "INVALID") : "NONE"
+
+if showPanel and barstate.islast
+    table.cell(statusTbl, 0, 0, "Status", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 0, statusText, text_color=color.white, bgcolor=statusText == "ACTIVE" ? color.green : statusText == "INVALID" ? color.red : color.gray)
+
+    table.cell(statusTbl, 0, 1, "Side", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 1, pendingSide, text_color=color.white)
+
+    table.cell(statusTbl, 0, 2, "Type", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 2, pendingType == "" ? "-" : pendingType, text_color=color.white)
+
+    table.cell(statusTbl, 0, 3, "Entry", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 3, na(pendingEntry) ? "-" : str.tostring(pendingEntry, format.mintick), text_color=color.white)
+
+    table.cell(statusTbl, 0, 4, "SL", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 4, na(pendingSL) ? "-" : str.tostring(pendingSL, format.mintick), text_color=color.white)
+
+    table.cell(statusTbl, 0, 5, "TP", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 5, na(pendingTP) ? "-" : str.tostring(pendingTP, format.mintick), text_color=color.white)
+
+    table.cell(statusTbl, 0, 6, "RR", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 6, na(pendingRR) ? "-" : "1:" + str.tostring(pendingRR), text_color=color.white)
+
+    table.cell(statusTbl, 0, 7, "Score", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 7, na(pendingScore) ? "-" : str.tostring(pendingScore, "#"), text_color=color.white)
+
+    table.cell(statusTbl, 0, 8, "Bars Left", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 8, na(barsLeft) ? "-" : str.tostring(barsLeft), text_color=color.white)
+
+    table.cell(statusTbl, 0, 9, "Mins Passed", text_color=color.white, bgcolor=color.gray)
+    table.cell(statusTbl, 1, 9, na(minsPassed) ? "-" : str.tostring(minsPassed), text_color=color.white)
+
+// =====================================================
+// ALERTS
+// =====================================================
+if enableAlerts and (fvgLongSetup or volLongSetup or trendLongSetup)
+    alert("NEW LONG SETUP", alert.freq_once_per_bar_close)
+
+if enableAlerts and (fvgShortSetup or volShortSetup or trendShortSetup)
+    alert("NEW SHORT SETUP", alert.freq_once_per_bar_close)
+
+if enableAlerts and lastExecLong
+    alert(
+         "LONG ENTRY | Type: " + lastExecType +
+         " | Entry: " + str.tostring(lastExecEntry, format.mintick) +
+         " | SL: " + str.tostring(lastExecSL, format.mintick) +
+         " | TP: " + str.tostring(lastExecTP, format.mintick) +
+         " | Score: " + str.tostring(lastExecScore, "#"),
+         alert.freq_once_per_bar_close
+     )
+
+if enableAlerts and lastExecShort
+    alert(
+         "SHORT ENTRY | Type: " + lastExecType +
+         " | Entry: " + str.tostring(lastExecEntry, format.mintick) +
+         " | SL: " + str.tostring(lastExecSL, format.mintick) +
+         " | TP: " + str.tostring(lastExecTP, format.mintick) +
+         " | Score: " + str.tostring(lastExecScore, "#"),
+         alert.freq_once_per_bar_close
+     )

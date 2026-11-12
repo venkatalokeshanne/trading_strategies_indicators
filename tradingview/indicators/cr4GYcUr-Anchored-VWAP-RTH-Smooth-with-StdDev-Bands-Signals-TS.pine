@@ -1,0 +1,107 @@
+//@version=6
+indicator("Anchored VWAP (RTH, Smooth) with StdDev Bands + Signals", shorttitle="AVWAP-RTH-Smooth", overlay=true, max_bars_back=5000)
+
+// ============================= INPUTS =============================
+grpAnchor = "VWAP Settings"
+anchorInput = input.string("Session", "Anchor Period", options=["Session", "Week", "Month"], group=grpAnchor)
+srcInput    = input.source(hlc3, "VWAP Source", group=grpAnchor)
+
+grpRTH = "Regular Trading Hours (UK time)"
+useRTH       = input.bool(true, "Restrict VWAP to Regular Trading Hours", group=grpRTH)
+rthStartHour = input.int(14, "RTH Start Hour (UK)", minval=0, maxval=23, group=grpRTH)
+rthStartMin  = input.int(30, "RTH Start Minute (UK)", minval=0, maxval=59, group=grpRTH)
+rthEndHour   = input.int(22, "RTH End Hour (UK)", minval=0, maxval=23, group=grpRTH)
+rthEndMin    = input.int(0, "RTH End Minute (UK)", minval=0, maxval=59, group=grpRTH)
+
+grpBands = "Standard Deviation Bands"
+showBands = input.bool(true, "Show Bands", group=grpBands)
+band1Mult = input.float(1.0, "Inner Band Multiplier (StdDev)", minval=0.1, step=0.1, group=grpBands)
+band2Mult = input.float(2.0, "Outer Band Multiplier (StdDev)", minval=0.1, step=0.1, group=grpBands)
+
+grpSignal = "Signal Markers"
+markerIntervalTF = input.timeframe("15", "Marker Interval (higher TF, e.g. every 3rd 5m bar)", group=grpSignal)
+threshPctInput   = input.float(0.1, "Signal Threshold (%)", minval=0.0, step=0.01, group=grpSignal) / 100
+
+grpColor = "Colors"
+vwapColor  = input.color(color.new(color.blue, 0),  "VWAP Line",  group=grpColor)
+band1Color = input.color(color.new(color.blue, 60), "Inner Bands", group=grpColor)
+band2Color = input.color(color.new(color.blue, 80), "Outer Bands", group=grpColor)
+plusColor  = input.color(color.new(color.lime, 0),  "Above-VWAP Marker (+)", group=grpColor)
+minusColor = input.color(color.new(color.red, 0),   "Below-VWAP Marker (-)", group=grpColor)
+
+startMinutes = rthStartHour * 60 + rthStartMin
+endMinutes   = rthEndHour * 60 + rthEndMin
+
+// ============================= SMOOTH ANCHORED VWAP (computed natively on the chart's own timeframe, in UK time) =============================
+hh = hour(time, "Europe/London")
+mm = minute(time, "Europe/London")
+curMin = hh * 60 + mm
+inRTH = not useRTH or (curMin >= startMinutes and curMin < endMinutes)
+
+var bool prevInRTH = false
+dayReset = inRTH and not prevInRTH
+weekChanged = ta.change(time("W")) != 0
+monthChanged = ta.change(time("M")) != 0
+
+bool periodChanged = false
+if anchorInput == "Session"
+    periodChanged := dayReset
+else if anchorInput == "Week"
+    periodChanged := dayReset and weekChanged
+else
+    periodChanged := dayReset and monthChanged
+
+var float sumPV = na
+var float sumPPV = na
+var float sumV = na
+
+float vwapVal = na
+float stdevVal = na
+
+if inRTH
+    if periodChanged or na(sumPV)
+        sumPV := srcInput * volume
+        sumPPV := srcInput * srcInput * volume
+        sumV := volume
+    else
+        sumPV := sumPV + srcInput * volume
+        sumPPV := sumPPV + srcInput * srcInput * volume
+        sumV := sumV + volume
+    vwapVal := sumPV / sumV
+    variance = sumPPV / sumV - vwapVal * vwapVal
+    stdevVal := math.sqrt(math.max(variance, 0))
+
+prevInRTH := inRTH
+
+// ============================= BANDS (also smooth, recalculated every bar) =============================
+upperBand1 = showBands and inRTH ? vwapVal + stdevVal * band1Mult : na
+lowerBand1 = showBands and inRTH ? vwapVal - stdevVal * band1Mult : na
+upperBand2 = showBands and inRTH ? vwapVal + stdevVal * band2Mult : na
+lowerBand2 = showBands and inRTH ? vwapVal - stdevVal * band2Mult : na
+
+// ============================= PLOTS (style_linebr forces a hard break at na, no connecting line across sessions) =============================
+plot(inRTH ? vwapVal : na, "Anchored VWAP", color=vwapColor, linewidth=2, style=plot.style_linebr)
+
+u1 = plot(upperBand1, "Upper Band 1 (Inner)", color=band1Color, style=plot.style_linebr)
+l1 = plot(lowerBand1, "Lower Band 1 (Inner)", color=band1Color, style=plot.style_linebr)
+u2 = plot(upperBand2, "Upper Band 2 (Outer)", color=band2Color, style=plot.style_linebr)
+l2 = plot(lowerBand2, "Lower Band 2 (Outer)", color=band2Color, style=plot.style_linebr)
+
+fill(u1, l1, color=color.new(band1Color, 90))
+fill(u2, u1, color=color.new(band2Color, 92))
+fill(l1, l2, color=color.new(band2Color, 92))
+
+// ============================= SIGNAL MARKERS (still only every 3rd bar, e.g. 15m boundary on a 5m chart) =============================
+newMarkerBar = timeframe.change(markerIntervalTF)
+
+pctDiff = (close - vwapVal) / vwapVal
+
+aboveSignal = newMarkerBar and inRTH and not na(vwapVal) and pctDiff >= threshPctInput
+belowSignal = newMarkerBar and inRTH and not na(vwapVal) and pctDiff <= -threshPctInput
+
+plotchar(aboveSignal ? vwapVal : na, "Above VWAP (+)", "+", location.absolute, color=plusColor, size=size.small)
+plotchar(belowSignal ? vwapVal : na, "Below VWAP (-)", "-", location.absolute, color=minusColor, size=size.small)
+
+// ============================= ALERTS =============================
+alertcondition(aboveSignal, title="Price above VWAP", message="Price closed {{close}} which is more than the threshold above the anchored VWAP ({{interval}} chart)")
+alertcondition(belowSignal, title="Price below VWAP", message="Price closed {{close}} which is more than the threshold below the anchored VWAP ({{interval}} chart)")

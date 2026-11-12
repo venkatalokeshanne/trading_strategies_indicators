@@ -1,0 +1,257 @@
+//@version=6
+indicator("WB Market Alignment V3.1 Optimised", shorttitle="WB ALIGN V3.1", overlay=true, max_labels_count=50, max_lines_count=50)
+
+//=============================================================================
+// 1. INPUTS
+//=============================================================================
+string groupTrend = "1. Trend and Momentum"
+int fastEmaLength = input.int(21, "Pullback EMA", minval=1, group=groupTrend)
+int slowEmaLength = input.int(200, "Chart Trend EMA", minval=2, group=groupTrend)
+string htfTimeframe = input.timeframe("60", "Higher Timeframe", group=groupTrend, tooltip="Suggested: 60 minutes when using a 5-minute or 15-minute entry chart.")
+int htfEmaLength = input.int(50, "Higher-Timeframe EMA", minval=2, group=groupTrend)
+int rsiLength = input.int(14, "RSI Length", minval=2, group=groupTrend)
+float bullRsiLevel = input.float(55.0, "Minimum RSI for Long", minval=0.0, maxval=100.0, step=0.5, group=groupTrend)
+float bearRsiLevel = input.float(45.0, "Maximum RSI for Short", minval=0.0, maxval=100.0, step=0.5, group=groupTrend)
+bool useHtfFilter = input.bool(true, "Use Higher-Timeframe Confirmation", group=groupTrend)
+bool useVwapFilter = input.bool(true, "Use Session VWAP Filter", group=groupTrend)
+bool useRsiFilter = input.bool(true, "Use RSI Filter", group=groupTrend)
+
+string groupEntry = "2. Entry Logic"
+float pullbackAtrTolerance = input.float(0.20, "EMA Pullback Tolerance in ATR", minval=0.0, step=0.05, group=groupEntry)
+bool requireDirectionCandle = input.bool(true, "Require Directional Candle", group=groupEntry)
+bool requireEmaSlope = input.bool(true, "Require Pullback EMA Slope", group=groupEntry)
+int signalCooldownBars = input.int(10, "Bars Between Signals", minval=0, group=groupEntry)
+int minimumScore = input.int(7, "Minimum Setup Score", minval=1, maxval=8, group=groupEntry, tooltip="Score remains out of 8. A disabled filter is treated as a pass to preserve V3 behaviour.")
+
+string groupVolatility = "3. ATR and Volatility"
+int atrLength = input.int(14, "ATR Length", minval=1, group=groupVolatility)
+int atrBaselineLength = input.int(50, "ATR Baseline Length", minval=2, group=groupVolatility)
+float minimumAtrRatio = input.float(0.80, "Minimum ATR versus Baseline", minval=0.1, step=0.05, group=groupVolatility)
+float maximumAtrRatio = input.float(2.50, "Maximum ATR versus Baseline", minval=0.2, step=0.05, group=groupVolatility)
+bool useAtrFilter = input.bool(true, "Use ATR Volatility Filter", group=groupVolatility)
+
+string groupVolume = "4. Volume Confirmation"
+int volumeAverageLength = input.int(20, "Volume Average Length", minval=1, group=groupVolume)
+float minimumRelativeVolume = input.float(1.00, "Minimum Relative Volume", minval=0.0, step=0.05, group=groupVolume)
+bool useVolumeFilter = input.bool(true, "Use Relative-Volume Filter", group=groupVolume)
+
+string groupSession = "5. Session and News Control"
+bool useSessionFilter = input.bool(true, "Use Trading Session Filter", group=groupSession)
+string tradeSession = input.session("0930-1200", "Trading Session", group=groupSession)
+string sessionTimeZone = input.string("America/New_York", "Session Time Zone", options=["America/New_York", "Etc/UTC", "Africa/Windhoek"], group=groupSession)
+bool useManualNewsBlackout = input.bool(false, "Activate Manual News Blackout", group=groupSession)
+
+string groupRisk = "6. ATR Risk Projection"
+float stopAtrMultiplier = input.float(1.20, "Stop Distance in ATR", minval=0.1, step=0.1, group=groupRisk)
+float targetOneRiskReward = input.float(1.00, "Target 1 Risk Multiple", minval=0.1, step=0.25, group=groupRisk)
+float targetTwoRiskReward = input.float(2.00, "Target 2 Risk Multiple", minval=0.1, step=0.25, group=groupRisk)
+bool keepRiskLevelsUntilNextSignal = input.bool(true, "Keep Latest Risk Levels on Chart", group=groupRisk)
+
+string groupDisplay = "7. Display"
+bool showFastEma = input.bool(true, "Show Pullback EMA", group=groupDisplay)
+bool showSlowEma = input.bool(true, "Show Chart Trend EMA", group=groupDisplay)
+bool showHtfEma = input.bool(true, "Show Higher-Timeframe EMA", group=groupDisplay)
+bool showVwap = input.bool(true, "Show VWAP", group=groupDisplay)
+bool showBackground = input.bool(true, "Show Trend Background", group=groupDisplay)
+bool showDashboard = input.bool(true, "Show V3 Dashboard", group=groupDisplay)
+bool showRiskLevels = input.bool(true, "Show Entry, Stop and Targets", group=groupDisplay)
+string dashboardLocation = input.string("Top Right", "Dashboard Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=groupDisplay)
+string dashboardSize = input.string("Small", "Dashboard Text Size", options=["Tiny", "Small", "Normal"], group=groupDisplay)
+
+//=============================================================================
+// 2. CORE CALCULATIONS
+//=============================================================================
+float emaFast = ta.ema(close, fastEmaLength)
+float emaSlow = ta.ema(close, slowEmaLength)
+float rsiValue = ta.rsi(close, rsiLength)
+float vwapValue = ta.vwap(hlc3)
+float atrValue = ta.atr(atrLength)
+float atrBaseline = ta.sma(atrValue, atrBaselineLength)
+float averageVolume = ta.sma(volume, volumeAverageLength)
+
+float atrRatio = not na(atrBaseline) and atrBaseline > 0.0 ? atrValue / atrBaseline : na
+bool volumeDataAvailable = not na(volume) and not na(averageVolume) and averageVolume > 0.0
+float relativeVolume = volumeDataAvailable ? volume / averageVolume : na
+
+// One tuple request replaces two request.security() calls. [1] and lookahead_on
+// expose only the last completed higher-timeframe bar, avoiding HTF repainting.
+[htfConfirmedClose, htfConfirmedEma] = request.security(syminfo.tickerid, htfTimeframe, [close[1], ta.ema(close, htfEmaLength)[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+//=============================================================================
+// 3. FILTERS, TREND AND ENTRY CONDITIONS
+//=============================================================================
+bool inSelectedSession = not na(time(timeframe.period, tradeSession, sessionTimeZone))
+bool sessionPass = not useSessionFilter or inSelectedSession
+bool newsPass = not useManualNewsBlackout
+bool volumePass = not useVolumeFilter or not volumeDataAvailable or relativeVolume >= minimumRelativeVolume
+bool atrPass = not useAtrFilter or (not na(atrRatio) and atrRatio >= minimumAtrRatio and atrRatio <= maximumAtrRatio)
+
+bool chartBullTrend = close > emaSlow and emaFast > emaSlow
+bool chartBearTrend = close < emaSlow and emaFast < emaSlow
+bool htfBullTrend = not na(htfConfirmedClose) and not na(htfConfirmedEma) and htfConfirmedClose > htfConfirmedEma
+bool htfBearTrend = not na(htfConfirmedClose) and not na(htfConfirmedEma) and htfConfirmedClose < htfConfirmedEma
+bool htfLongPass = not useHtfFilter or htfBullTrend
+bool htfShortPass = not useHtfFilter or htfBearTrend
+bool vwapLongPass = not useVwapFilter or close > vwapValue
+bool vwapShortPass = not useVwapFilter or close < vwapValue
+bool rsiLongPass = not useRsiFilter or rsiValue >= bullRsiLevel
+bool rsiShortPass = not useRsiFilter or rsiValue <= bearRsiLevel
+bool emaLongSlopePass = not requireEmaSlope or emaFast > emaFast[1]
+bool emaShortSlopePass = not requireEmaSlope or emaFast < emaFast[1]
+
+float pullbackTolerance = atrValue * pullbackAtrTolerance
+bool touchedEmaZone = low <= emaFast + pullbackTolerance and high >= emaFast - pullbackTolerance
+bool reclaimedForLong = touchedEmaZone and close > emaFast
+bool rejectedForShort = touchedEmaZone and close < emaFast
+bool longCandlePass = not requireDirectionCandle or close > open
+bool shortCandlePass = not requireDirectionCandle or close < open
+
+//=============================================================================
+// 4. SCORE AND SIGNAL CONTROL
+//=============================================================================
+int longScore = (chartBullTrend ? 1 : 0) + (htfLongPass ? 1 : 0) + (vwapLongPass ? 1 : 0) + (rsiLongPass ? 1 : 0) + (reclaimedForLong ? 1 : 0) + (emaLongSlopePass ? 1 : 0) + (atrPass ? 1 : 0) + (volumePass ? 1 : 0)
+int shortScore = (chartBearTrend ? 1 : 0) + (htfShortPass ? 1 : 0) + (vwapShortPass ? 1 : 0) + (rsiShortPass ? 1 : 0) + (rejectedForShort ? 1 : 0) + (emaShortSlopePass ? 1 : 0) + (atrPass ? 1 : 0) + (volumePass ? 1 : 0)
+
+var int lastSignalBar = na
+bool cooldownPass = na(lastSignalBar) or bar_index - lastSignalBar >= signalCooldownBars
+bool commonSignalPass = barstate.isconfirmed and sessionPass and newsPass and cooldownPass
+bool rawLongSignal = commonSignalPass and longScore >= minimumScore and chartBullTrend and reclaimedForLong and longCandlePass
+bool rawShortSignal = commonSignalPass and shortScore >= minimumScore and chartBearTrend and rejectedForShort and shortCandlePass
+bool longSignal = rawLongSignal and not rawShortSignal
+bool shortSignal = rawShortSignal and not rawLongSignal
+
+if longSignal or shortSignal
+    lastSignalBar := bar_index
+
+bool longReady = longScore >= minimumScore and chartBullTrend and htfLongPass and vwapLongPass
+bool shortReady = shortScore >= minimumScore and chartBearTrend and htfShortPass and vwapShortPass
+
+//=============================================================================
+// 5. RISK LEVELS
+//=============================================================================
+var float activeEntry = na
+var float activeStop = na
+var float activeTargetOne = na
+var float activeTargetTwo = na
+
+if longSignal
+    float risk = atrValue * stopAtrMultiplier
+    activeEntry := close
+    activeStop := close - risk
+    activeTargetOne := close + risk * targetOneRiskReward
+    activeTargetTwo := close + risk * targetTwoRiskReward
+else if shortSignal
+    float risk = atrValue * stopAtrMultiplier
+    activeEntry := close
+    activeStop := close + risk
+    activeTargetOne := close - risk * targetOneRiskReward
+    activeTargetTwo := close - risk * targetTwoRiskReward
+else if not keepRiskLevelsUntilNextSignal
+    activeEntry := na
+    activeStop := na
+    activeTargetOne := na
+    activeTargetTwo := na
+
+//=============================================================================
+// 6. PLOTS
+//=============================================================================
+plot(showFastEma ? emaFast : na, "Pullback EMA", color.aqua, 2)
+plot(showSlowEma ? emaSlow : na, "Chart Trend EMA", color.red, 2)
+plot(showHtfEma ? htfConfirmedEma : na, "Confirmed HTF EMA", color.purple, 2, plot.style_stepline)
+plot(showVwap ? vwapValue : na, "Session VWAP", color.orange, 2)
+plotshape(longSignal, "WB Long Signal", shape.labelup, location.belowbar, color.lime, text="LONG", textcolor=color.black, size=size.small)
+plotshape(shortSignal, "WB Short Signal", shape.labeldown, location.abovebar, color.red, text="SHORT", textcolor=color.white, size=size.small)
+
+color backgroundColour = chartBullTrend and htfLongPass ? color.new(color.green, 92) : chartBearTrend and htfShortPass ? color.new(color.red, 92) : color.new(color.gray, 96)
+bgcolor(showBackground ? backgroundColour : na)
+
+plot(showRiskLevels ? activeEntry : na, "Active Entry", color.blue, 2, plot.style_linebr)
+plot(showRiskLevels ? activeStop : na, "Active Stop", color.red, 2, plot.style_linebr)
+plot(showRiskLevels ? activeTargetOne : na, "Target 1", color.new(color.green, 25), 1, plot.style_linebr)
+plot(showRiskLevels ? activeTargetTwo : na, "Target 2", color.green, 2, plot.style_linebr)
+
+//=============================================================================
+// 7. DASHBOARD
+//=============================================================================
+dashboardPosition = switch dashboardLocation
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+
+dashboardTextSize = switch dashboardSize
+    "Tiny" => size.tiny
+    "Normal" => size.normal
+    => size.small
+
+color headerBg = color.rgb(21, 83, 150)
+color labelBg = color.rgb(26, 31, 38)
+color valueBg = color.rgb(15, 18, 22)
+color statusBg = color.rgb(32, 38, 46)
+var table dashboard = table.new(dashboardPosition, 3, 12, border_width=1, frame_width=1, frame_color=color.new(color.silver, 20), border_color=color.new(color.gray, 45), bgcolor=valueBg)
+
+f_cell(int col, int row, string value, color txt, color bg) =>
+    table.cell(dashboard, col, row, value, text_color=txt, text_size=dashboardTextSize, bgcolor=bg)
+
+if barstate.islast
+    if showDashboard
+        string chartTrendText = chartBullTrend ? "BULLISH" : chartBearTrend ? "BEARISH" : "NEUTRAL"
+        color chartTrendColour = chartBullTrend ? color.lime : chartBearTrend ? color.red : color.silver
+        string htfTrendText = htfBullTrend ? "BULLISH" : htfBearTrend ? "BEARISH" : "NEUTRAL"
+        color htfTrendColour = htfBullTrend ? color.lime : htfBearTrend ? color.red : color.silver
+        string vwapText = close > vwapValue ? "ABOVE" : close < vwapValue ? "BELOW" : "AT VWAP"
+        color vwapColour = close > vwapValue ? color.lime : close < vwapValue ? color.red : color.silver
+        string rsiStrengthText = rsiValue >= bullRsiLevel ? "BULL" : rsiValue <= bearRsiLevel ? "BEAR" : "MID"
+        color rsiColour = rsiValue >= bullRsiLevel ? color.lime : rsiValue <= bearRsiLevel ? color.red : color.yellow
+        color volumeColour = not useVolumeFilter ? color.orange : volumePass ? color.lime : color.red
+        color atrColour = not useAtrFilter ? color.orange : atrPass ? color.lime : color.red
+        color sessionColour = not useSessionFilter ? color.orange : sessionPass ? color.lime : color.red
+        color newsColour = newsPass ? color.lime : color.red
+        string tradeState = longSignal ? "LONG SIGNAL" : shortSignal ? "SHORT SIGNAL" : longReady ? "LONG READY" : shortReady ? "SHORT READY" : "WAIT"
+        color tradeColour = longSignal or longReady ? color.lime : shortSignal or shortReady ? color.red : color.yellow
+
+        f_cell(0, 0, "WB ALIGN V3.1", color.white, headerBg)
+        f_cell(1, 0, syminfo.ticker, color.white, headerBg)
+        f_cell(2, 0, timeframe.period, color.white, headerBg)
+        f_cell(0, 1, "TREND", color.white, labelBg)
+        f_cell(1, 1, chartTrendText, chartTrendColour, valueBg)
+        f_cell(2, 1, chartBullTrend ? "UP" : chartBearTrend ? "DOWN" : "FLAT", chartTrendColour, statusBg)
+        f_cell(0, 2, "HTF TREND", color.white, labelBg)
+        f_cell(1, 2, htfTrendText, htfTrendColour, valueBg)
+        f_cell(2, 2, htfBullTrend ? "UP" : htfBearTrend ? "DOWN" : "FLAT", htfTrendColour, statusBg)
+        f_cell(0, 3, "VWAP", color.white, labelBg)
+        f_cell(1, 3, vwapText, vwapColour, valueBg)
+        f_cell(2, 3, close > vwapValue ? "BULL" : close < vwapValue ? "BEAR" : "FLAT", vwapColour, statusBg)
+        f_cell(0, 4, "RSI", color.white, labelBg)
+        f_cell(1, 4, str.tostring(rsiValue, "#.0"), rsiColour, valueBg)
+        f_cell(2, 4, rsiStrengthText, rsiColour, statusBg)
+        f_cell(0, 5, "REL VOL", color.white, labelBg)
+        f_cell(1, 5, volumeDataAvailable ? str.tostring(relativeVolume, "#.00") + "x" : "N/A", volumeColour, valueBg)
+        f_cell(2, 5, not useVolumeFilter ? "OFF" : not volumeDataAvailable ? "N/A" : volumePass ? "PASS" : "FAIL", volumeColour, statusBg)
+        f_cell(0, 6, "ATR STATE", color.white, labelBg)
+        f_cell(1, 6, not na(atrRatio) ? str.tostring(atrRatio, "#.00") + "x" : "N/A", atrColour, valueBg)
+        f_cell(2, 6, not useAtrFilter ? "OFF" : atrPass ? "PASS" : "FAIL", atrColour, statusBg)
+        f_cell(0, 7, "SESSION", color.white, labelBg)
+        f_cell(1, 7, not useSessionFilter ? "DISABLED" : inSelectedSession ? "ACTIVE" : "CLOSED", sessionColour, valueBg)
+        f_cell(2, 7, not useSessionFilter ? "OFF" : sessionPass ? "OPEN" : "BLOCK", sessionColour, statusBg)
+        f_cell(0, 8, "NEWS", color.white, labelBg)
+        f_cell(1, 8, useManualNewsBlackout ? "BLOCKED" : "CLEAR", newsColour, valueBg)
+        f_cell(2, 8, newsPass ? "OK" : "BLOCK", newsColour, statusBg)
+        f_cell(0, 9, "LONG SCORE", color.white, labelBg)
+        f_cell(1, 9, str.tostring(longScore) + "/8", longScore >= minimumScore ? color.lime : color.silver, valueBg)
+        f_cell(2, 9, longScore >= minimumScore ? "READY" : "WAIT", longScore >= minimumScore ? color.lime : color.yellow, statusBg)
+        f_cell(0, 10, "SHORT SCORE", color.white, labelBg)
+        f_cell(1, 10, str.tostring(shortScore) + "/8", shortScore >= minimumScore ? color.red : color.silver, valueBg)
+        f_cell(2, 10, shortScore >= minimumScore ? "READY" : "WAIT", shortScore >= minimumScore ? color.red : color.yellow, statusBg)
+        f_cell(0, 11, "STATUS", color.black, tradeColour)
+        f_cell(1, 11, tradeState, color.black, tradeColour)
+        f_cell(2, 11, longSignal or shortSignal ? "ENTER" : longReady or shortReady ? "WATCH" : "NO TRADE", color.black, tradeColour)
+    else
+        table.clear(dashboard, 0, 0, 2, 11)
+
+//=============================================================================
+// 8. ALERTS
+//=============================================================================
+alertcondition(longSignal, "WB V3.1 Long Signal", "WB ALIGN V3.1 LONG | {{ticker}} | {{interval}} | Close: {{close}}")
+alertcondition(shortSignal, "WB V3.1 Short Signal", "WB ALIGN V3.1 SHORT | {{ticker}} | {{interval}} | Close: {{close}}")
+alertcondition(longSignal or shortSignal, "WB V3.1 Any Signal", "WB ALIGN V3.1 TRADE SIGNAL | {{ticker}} | {{interval}} | Close: {{close}}")

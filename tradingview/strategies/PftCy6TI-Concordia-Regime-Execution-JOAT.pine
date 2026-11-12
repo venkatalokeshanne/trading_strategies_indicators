@@ -1,0 +1,374 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("Concordia Regime Execution [JOAT]", shorttitle="CE [JOAT]", overlay=true, initial_capital=100000, pyramiding=0, commission_type=strategy.commission.percent, commission_value=0.02, slippage=1, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+//------------------------------------------------------------------------------
+// Configuration Groups
+//------------------------------------------------------------------------------
+var string g_regime = "Regime Engine"
+var string g_trend = "Trend Filters"
+var string g_momentum = "Momentum"
+var string g_pressure = "Pressure"
+var string g_risk = "Risk"
+var string g_visual = "Visuals"
+var string g_dash = "Dashboard"
+
+//------------------------------------------------------------------------------
+// Inputs
+//------------------------------------------------------------------------------
+regimeAtrLen = input.int(14, "ATR Length", minval=2, group=g_regime, inline="r1")
+regimeAdxLen = input.int(14, "ADX Length", minval=3, group=g_regime, inline="r1")
+regimeAdxFloor = input.float(18.0, "ADX Floor", minval=5.0, step=0.5, group=g_regime, inline="r1")
+regimeChopLen = input.int(14, "Chop Length", minval=5, group=g_regime, inline="r2")
+regimeChopCeiling = input.float(60.0, "Chop Ceiling", minval=35.0, maxval=80.0, step=0.1, group=g_regime, inline="r2")
+compressionLookback = input.int(34, "Compression Lookback", minval=10, group=g_regime, inline="r3")
+compressionThreshold = input.float(0.80, "Compression Threshold", minval=0.2, maxval=2.0, step=0.01, group=g_regime, inline="r3")
+
+fastLen = input.int(8, "Fast Length", minval=2, group=g_trend, inline="t1")
+midLen = input.int(21, "Intermediate Length", minval=3, group=g_trend, inline="t1")
+slowLen = input.int(55, "Structural Length", minval=5, group=g_trend, inline="t1")
+trendSlopeLookback = input.int(5, "Slope Lookback", minval=1, group=g_trend, inline="t2")
+pivotLen = input.int(3, "Pivot Strength", minval=2, maxval=20, group=g_trend, inline="t2")
+useWeeklyVwap = input.bool(false, "Require Weekly VWAP Alignment", group=g_trend)
+
+ribbonBase = input.int(7, "Ribbon Base", minval=2, group=g_momentum, inline="m1")
+ribbonStep = input.int(3, "Ribbon Step", minval=1, group=g_momentum, inline="m1")
+ribbonSmooth = input.int(5, "Lag-Reduced Smoothing", minval=2, group=g_momentum, inline="m2")
+ribbonThreshold = input.float(0.6, "Spread Threshold", minval=0.1, step=0.1, group=g_momentum, inline="m2")
+
+pressureLength = input.int(34, "Pressure Length", minval=10, group=g_pressure, inline="p1")
+pressureNorm = input.int(55, "Normalization Length", minval=20, group=g_pressure, inline="p1")
+pressureThreshold = input.float(0.0, "Pressure Threshold", minval=0.0, step=0.05, group=g_pressure, inline="p2")
+riskCeiling = input.float(92.0, "Risk Ceiling", minval=20.0, maxval=95.0, step=1.0, group=g_pressure, inline="p2")
+
+stopAtrMult = input.float(1.4, "Stop ATR", minval=0.2, step=0.1, group=g_risk, inline="k1")
+targetAtrMult = input.float(2.2, "Target ATR", minval=0.5, step=0.1, group=g_risk, inline="k1")
+trailTriggerR = input.float(0.8, "Trail Trigger (R)", minval=0.5, step=0.1, group=g_risk, inline="k2")
+trailAtrMult = input.float(1.1, "Trail ATR", minval=0.2, step=0.1, group=g_risk, inline="k2")
+cooldownBars = input.int(0, "Cooldown Bars", minval=0, maxval=100, group=g_risk, inline="k3")
+failExitOnBiasFlip = input.bool(true, "Exit On Bias Failure", group=g_risk, inline="k3")
+
+showRibbon = input.bool(true, "Show Trend Ribbon", group=g_visual, inline="v1")
+showCloud = input.bool(true, "Show VWAP Cloud", group=g_visual, inline="v1")
+showBarColor = input.bool(false, "Bar Color", group=g_visual, inline="v1")
+showDashboard = input.bool(true, "Dashboard", group=g_dash, inline="d1")
+dashboardPosition = input.string("Top Right", "Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group=g_dash, inline="d1")
+
+//------------------------------------------------------------------------------
+// Theme
+//------------------------------------------------------------------------------
+bullColor = color.rgb(41, 194, 150)
+bearColor = color.rgb(255, 107, 107)
+neutralColor = color.rgb(138, 152, 173)
+accentColor = color.rgb(94, 176, 255)
+cautionColor = color.rgb(245, 158, 11)
+bgColor = color.rgb(10, 15, 24)
+
+//------------------------------------------------------------------------------
+// Helpers
+//------------------------------------------------------------------------------
+f_dash_pos(pos) =>
+    switch pos
+        "Top Left" => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left" => position.bottom_left
+        => position.top_right
+
+f_clamp(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_zscore(value, length) =>
+    mean = ta.sma(value, length)
+    dev = ta.stdev(value, length)
+    dev != 0 ? (value - mean) / dev : 0.0
+
+f_grade(score) =>
+    score >= 80 ? "A" : score >= 65 ? "B" : score >= 50 ? "C" : "D"
+
+f_lag_reduced(seriesValue, length) =>
+    lag = math.floor((length - 1) / 2)
+    ta.ema(seriesValue + (seriesValue - seriesValue[lag]), length)
+
+//------------------------------------------------------------------------------
+// Anchored VWAP framework
+//------------------------------------------------------------------------------
+var float cumPvSession = 0.0
+var float cumVolSession = 0.0
+newSession = timeframe.change("D")
+if newSession
+    cumPvSession := 0.0
+    cumVolSession := 0.0
+cumPvSession += hlc3 * volume
+cumVolSession += volume
+sessionVwap = cumVolSession > 0 ? cumPvSession / cumVolSession : hlc3
+
+var float cumPvWeek = 0.0
+var float cumVolWeek = 0.0
+newWeek = timeframe.change("W")
+if newWeek
+    cumPvWeek := 0.0
+    cumVolWeek := 0.0
+cumPvWeek += hlc3 * volume
+cumVolWeek += volume
+weekVwap = cumVolWeek > 0 ? cumPvWeek / cumVolWeek : hlc3
+
+//------------------------------------------------------------------------------
+// Regime engine
+//------------------------------------------------------------------------------
+atr = ta.atr(regimeAtrLen)
+[diPlus, diMinus, adxValue] = ta.dmi(regimeAdxLen, regimeAdxLen)
+trueRangeSum = math.sum(ta.tr(true), regimeChopLen)
+chopRange = ta.highest(high, regimeChopLen) - ta.lowest(low, regimeChopLen)
+chopValue = chopRange > 0 ? 100 * math.log10(trueRangeSum / chopRange) / math.log10(regimeChopLen) : 50.0
+
+compressionRange = ta.highest(high, compressionLookback) - ta.lowest(low, compressionLookback)
+compressionRatio = atr * compressionLookback > 0 ? compressionRange / (atr * compressionLookback) : 1.0
+isCompressed = compressionRatio < compressionThreshold
+isExpansionRegime = adxValue >= regimeAdxFloor and chopValue < regimeChopCeiling and not isCompressed
+
+//------------------------------------------------------------------------------
+// Trend bias filter
+//------------------------------------------------------------------------------
+fastEma = ta.ema(close, fastLen)
+midEma = ta.ema(close, midLen)
+slowEma = ta.ema(close, slowLen)
+trendBasis = (fastEma + midEma + slowEma) / 3.0
+
+fastSlope = fastEma - fastEma[trendSlopeLookback]
+midSlope = midEma - midEma[trendSlopeLookback]
+slowSlope = slowEma - slowEma[trendSlopeLookback]
+
+trendVote = 0
+trendVote += fastEma > midEma ? 1 : -1
+trendVote += midEma > slowEma ? 1 : -1
+trendVote += fastSlope > 0 ? 1 : -1
+trendVote += midSlope > 0 ? 1 : -1
+trendVote += close > sessionVwap ? 1 : -1
+trendVote += useWeeklyVwap ? (close > weekVwap ? 1 : -1) : 0
+
+trendBias = trendVote >= 3 ? 1 : trendVote <= -3 ? -1 : 0
+trendStrength = f_clamp(math.abs(trendVote) / (useWeeklyVwap ? 6.0 : 5.0) * 100.0, 0, 100)
+
+//------------------------------------------------------------------------------
+// Structure filter
+//------------------------------------------------------------------------------
+ph = ta.pivothigh(high, pivotLen, pivotLen)
+pl = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int structuralBias = 0
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+bullBos = barstate.isconfirmed and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+bearBos = barstate.isconfirmed and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+
+if bullBos
+    structuralBias := 1
+if bearBos
+    structuralBias := -1
+
+sellSideSweep = barstate.isconfirmed and not na(lastSwingLow) and low < lastSwingLow and close > lastSwingLow
+buySideSweep = barstate.isconfirmed and not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh
+
+//------------------------------------------------------------------------------
+// Momentum ribbon engine
+//------------------------------------------------------------------------------
+r1 = ta.rsi(close, ribbonBase + ribbonStep * 0)
+r2 = ta.rsi(close, ribbonBase + ribbonStep * 1)
+r3 = ta.rsi(close, ribbonBase + ribbonStep * 2)
+r4 = ta.rsi(close, ribbonBase + ribbonStep * 3)
+r5 = ta.rsi(close, ribbonBase + ribbonStep * 4)
+r6 = ta.rsi(close, ribbonBase + ribbonStep * 5)
+
+o1 = f_lag_reduced(r1, ribbonSmooth) - 50
+o2 = f_lag_reduced(r2, ribbonSmooth) - 50
+o3 = f_lag_reduced(r3, ribbonSmooth) - 50
+o4 = f_lag_reduced(r4, ribbonSmooth) - 50
+o5 = f_lag_reduced(r5, ribbonSmooth) - 50
+o6 = f_lag_reduced(r6, ribbonSmooth) - 50
+
+fastRibbon = (o1 + o2 + o3) / 3.0
+slowRibbon = (o4 + o5 + o6) / 3.0
+ribbonSpread = fastRibbon - slowRibbon
+ribbonSlope = fastRibbon - fastRibbon[1]
+
+momentumBias = ribbonSpread > ribbonThreshold ? 1 : ribbonSpread < -ribbonThreshold ? -1 : 0
+momentumState = math.abs(ribbonSpread) < ribbonThreshold ? "Twist" : momentumBias == 1 ? "Impulse Up" : "Impulse Down"
+
+//------------------------------------------------------------------------------
+// Pressure and risk engine
+//------------------------------------------------------------------------------
+volumeDeltaProxy = (close - open) / math.max(high - low, syminfo.mintick) * volume
+volumeDeltaZ = f_zscore(volumeDeltaProxy, pressureNorm)
+vwapDeviationZ = f_zscore(close - sessionVwap, pressureNorm)
+volatilityPressureZ = f_zscore(atr, pressureNorm)
+distanceFromBasisZ = f_zscore(close - trendBasis, pressureNorm)
+
+pressureComposite = 0.35 * volumeDeltaZ + 0.25 * vwapDeviationZ + 0.20 * distanceFromBasisZ - 0.20 * volatilityPressureZ
+crowdingComposite = 0.50 * f_zscore(ta.rsi(close, 14) - 50, pressureNorm) + 0.50 * f_zscore(close - weekVwap, pressureNorm)
+pressureBias = pressureComposite > pressureThreshold ? 1 : pressureComposite < -pressureThreshold ? -1 : 0
+
+liquidationRisk = 50.0
+liquidationRisk += math.abs(crowdingComposite) * 14.0
+liquidationRisk += math.max(volatilityPressureZ, 0) * 10.0
+liquidationRisk += buySideSweep or sellSideSweep ? 8.0 : 0.0
+liquidationRisk := f_clamp(liquidationRisk, 0, 100)
+riskAllowed = liquidationRisk < riskCeiling
+
+//------------------------------------------------------------------------------
+// Composite decision engine
+//------------------------------------------------------------------------------
+longScore = 0.0
+longScore += isExpansionRegime ? 18 : 0
+longScore += trendBias == 1 ? 22 : 0
+longScore += structuralBias == 1 ? 14 : 0
+longScore += bullBos ? 12 : 0
+longScore += sellSideSweep ? 8 : 0
+longScore += momentumBias == 1 ? 16 : 0
+longScore += pressureBias == 1 ? 10 : 0
+longScore += close > sessionVwap ? 8 : 0
+longScore += useWeeklyVwap ? (close > weekVwap ? 6 : 0) : 0
+longScore -= riskAllowed ? 0 : 30
+
+shortScore = 0.0
+shortScore += isExpansionRegime ? 18 : 0
+shortScore += trendBias == -1 ? 22 : 0
+shortScore += structuralBias == -1 ? 14 : 0
+shortScore += bearBos ? 12 : 0
+shortScore += buySideSweep ? 8 : 0
+shortScore += momentumBias == -1 ? 16 : 0
+shortScore += pressureBias == -1 ? 10 : 0
+shortScore += close < sessionVwap ? 8 : 0
+shortScore += useWeeklyVwap ? (close < weekVwap ? 6 : 0) : 0
+shortScore -= riskAllowed ? 0 : 30
+
+entryThreshold = 30.0
+longGrade = f_grade(longScore)
+shortGrade = f_grade(shortScore)
+
+var int lastEntryBar = na
+cooldownReady = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownBars
+
+softExpansion = isExpansionRegime or adxValue >= regimeAdxFloor * 0.60
+softRiskAllowed = liquidationRisk < 95.0
+longTrigger = bullBos or sellSideSweep or ta.crossover(fastRibbon, slowRibbon) or ta.crossover(close, fastEma)
+shortTrigger = bearBos or buySideSweep or ta.crossunder(fastRibbon, slowRibbon) or ta.crossunder(close, fastEma)
+
+longSetup = barstate.isconfirmed and cooldownReady and longScore >= entryThreshold and longScore >= shortScore - 8 and softExpansion and trendBias >= 0 and momentumBias >= 0 and pressureComposite > -0.50 and longTrigger and softRiskAllowed
+shortSetup = barstate.isconfirmed and cooldownReady and shortScore >= entryThreshold and shortScore >= longScore - 8 and softExpansion and trendBias <= 0 and momentumBias <= 0 and pressureComposite < 0.50 and shortTrigger and softRiskAllowed
+
+if longSetup and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long, comment="Long Entry")
+    lastEntryBar := bar_index
+
+if shortSetup and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short, comment="Short Entry")
+    lastEntryBar := bar_index
+
+//------------------------------------------------------------------------------
+// Risk and exit model
+//------------------------------------------------------------------------------
+longStop = strategy.position_avg_price - atr * stopAtrMult
+longTarget = strategy.position_avg_price + atr * targetAtrMult
+shortStop = strategy.position_avg_price + atr * stopAtrMult
+shortTarget = strategy.position_avg_price - atr * targetAtrMult
+
+longTrailActive = strategy.position_size > 0 and close >= strategy.position_avg_price + atr * stopAtrMult * trailTriggerR
+shortTrailActive = strategy.position_size < 0 and close <= strategy.position_avg_price - atr * stopAtrMult * trailTriggerR
+longTrailStop = ta.highest(high, 5) - atr * trailAtrMult
+shortTrailStop = ta.lowest(low, 5) + atr * trailAtrMult
+
+longStopEff = longTrailActive ? math.max(longStop, longTrailStop) : longStop
+shortStopEff = shortTrailActive ? math.min(shortStop, shortTrailStop) : shortStop
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop=longStopEff, limit=longTarget, comment="Risk Exit")
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop=shortStopEff, limit=shortTarget, comment="Risk Exit")
+
+biasFailureLong = failExitOnBiasFlip and strategy.position_size > 0 and barstate.isconfirmed and (trendBias != 1 or momentumBias == -1 or pressureBias == -1 or not riskAllowed)
+biasFailureShort = failExitOnBiasFlip and strategy.position_size < 0 and barstate.isconfirmed and (trendBias != -1 or momentumBias == 1 or pressureBias == 1 or not riskAllowed)
+
+if biasFailureLong
+    strategy.close("Long", comment="Bias Failure")
+
+if biasFailureShort
+    strategy.close("Short", comment="Bias Failure")
+
+//------------------------------------------------------------------------------
+// Visual outputs
+//------------------------------------------------------------------------------
+ribbonColor = trendBias == 1 ? color.new(bullColor, 84) : trendBias == -1 ? color.new(bearColor, 84) : color.new(neutralColor, 88)
+vwapCloudColor = close >= sessionVwap ? color.new(bullColor, 92) : color.new(bearColor, 92)
+
+fastPlot = plot(fastEma, "Fast Bias", color=color.new(bullColor, 12), linewidth=1)
+midPlot = plot(midEma, "Intermediate Bias", color=color.new(accentColor, 12), linewidth=1)
+slowPlot = plot(slowEma, "Structural Bias", color=color.new(bearColor, 20), linewidth=1)
+sessionPlot = plot(sessionVwap, "Session VWAP", color=color.new(neutralColor, 0), linewidth=2)
+weekPlot = plot(useWeeklyVwap ? weekVwap : na, "Week VWAP", color=color.new(accentColor, 0), linewidth=1, style=plot.style_linebr)
+
+fill(fastPlot, midPlot, color=showRibbon ? ribbonColor : na, title="Fast Ribbon")
+fill(midPlot, slowPlot, color=showRibbon ? color.new(ribbonColor, 0) : na, title="Structural Ribbon")
+fill(sessionPlot, weekPlot, color=showCloud and useWeeklyVwap ? vwapCloudColor : na, title="VWAP Cloud")
+
+barColorFinal = trendBias == 1 ? color.new(bullColor, 72) : trendBias == -1 ? color.new(bearColor, 72) : na
+barcolor(showBarColor ? barColorFinal : na)
+
+plotshape(barstate.isconfirmed and longSetup ? low : na, title="Long State", style=shape.circle, location=location.absolute, color=color.new(bullColor, 15), size=size.tiny, text="")
+plotshape(barstate.isconfirmed and shortSetup ? high : na, title="Short State", style=shape.circle, location=location.absolute, color=color.new(bearColor, 15), size=size.tiny, text="")
+
+//------------------------------------------------------------------------------
+// Dashboard
+//------------------------------------------------------------------------------
+var table dash = table.new(f_dash_pos(dashboardPosition), 2, 10, bgcolor=color.new(bgColor, 5), border_color=color.new(neutralColor, 75), border_width=1)
+if showDashboard and barstate.islast
+    directionText = trendBias == 1 ? "Bullish" : trendBias == -1 ? "Bearish" : "Balanced"
+    directionColor = trendBias == 1 ? bullColor : trendBias == -1 ? bearColor : neutralColor
+    structureText = structuralBias == 1 ? "Positive" : structuralBias == -1 ? "Negative" : "Neutral"
+    structureColor = structuralBias == 1 ? bullColor : structuralBias == -1 ? bearColor : neutralColor
+    positionText = strategy.position_size > 0 ? "Long" : strategy.position_size < 0 ? "Short" : "Flat"
+    positionColor = strategy.position_size > 0 ? bullColor : strategy.position_size < 0 ? bearColor : neutralColor
+    riskColor = liquidationRisk >= riskCeiling ? bearColor : liquidationRisk > riskCeiling * 0.75 ? cautionColor : bullColor
+
+    table.cell(dash, 0, 0, "Concordia Regime", text_color=color.white, text_size=size.small, bgcolor=color.new(accentColor, 75))
+    table.cell(dash, 1, 0, "Execution", text_color=color.white, text_size=size.small, bgcolor=color.new(accentColor, 75))
+
+    table.cell(dash, 0, 1, "Regime", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 1, isExpansionRegime ? "Expansion" : isCompressed ? "Compression" : "Transitional", text_color=isExpansionRegime ? directionColor : cautionColor, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Trend Bias", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 2, directionText + " | " + str.tostring(trendStrength, "#.0"), text_color=directionColor, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Structure", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 3, structureText, text_color=structureColor, text_size=size.small)
+
+    table.cell(dash, 0, 4, "Momentum", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 4, momentumState + " | " + str.tostring(ribbonSpread, "#.00"), text_color=momentumBias == 1 ? bullColor : momentumBias == -1 ? bearColor : neutralColor, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Pressure", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(pressureComposite, "#.00"), text_color=pressureBias == 1 ? bullColor : pressureBias == -1 ? bearColor : neutralColor, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Risk", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 6, str.tostring(liquidationRisk, "#.0"), text_color=riskColor, text_size=size.small)
+
+    table.cell(dash, 0, 7, "Setups", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 7, "L " + str.tostring(longScore, "#.0") + " / S " + str.tostring(shortScore, "#.0"), text_color=accentColor, text_size=size.small)
+
+    table.cell(dash, 0, 8, "Position", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 8, positionText, text_color=positionColor, text_size=size.small)
+
+    table.cell(dash, 0, 9, "Stops", text_color=neutralColor, text_size=size.small)
+    table.cell(dash, 1, 9, strategy.position_size > 0 ? str.tostring(longStopEff, format.mintick) + " / " + str.tostring(longTarget, format.mintick) : strategy.position_size < 0 ? str.tostring(shortStopEff, format.mintick) + " / " + str.tostring(shortTarget, format.mintick) : "Inactive", text_color=accentColor, text_size=size.small)
+
+//------------------------------------------------------------------------------
+// Alerts
+//------------------------------------------------------------------------------
+alertcondition(longSetup, "Concordia Long Setup", "Concordia Regime Execution [JOAT] has confirmed a long setup.")
+alertcondition(shortSetup, "Concordia Short Setup", "Concordia Regime Execution [JOAT] has confirmed a short setup.")
+alertcondition(biasFailureLong or biasFailureShort, "Concordia Bias Failure", "Concordia Regime Execution [JOAT] detected a bias failure exit.")

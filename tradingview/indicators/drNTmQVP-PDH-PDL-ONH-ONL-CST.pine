@@ -1,0 +1,207 @@
+//@version=6
+// PDH / PDL / ONH / ONL  —  Chicago (CST/CDT) time zone
+// PDH/PDL : previous day's RTH  (default 08:30–16:00 CT)
+// ONH/ONL : overnight range     (default 16:00 CT prev day – 08:25 CT today)
+indicator("PDH / PDL / ONH / ONL (CST)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ================= Inputs =================
+grpT = "Time settings"
+tz      = input.string("America/Chicago", "Time zone", options=["America/Chicago","America/New_York","America/Denver","America/Los_Angeles","UTC","Europe/London","Europe/Bucharest","Asia/Kolkata"], group=grpT)
+rthSess = input.session("0830-1600", "RTH session (PDH/PDL)", group=grpT, tooltip="Regular Trading Hours in the selected time zone.")
+onSess  = input.session("1600-0825", "Overnight session (ONH/ONL)", group=grpT, tooltip="Crosses midnight. Runs from the RTH close to the pre-market cutoff.")
+rthDays = input.string("1234567", "Session days (1=Sun ... 7=Sat)", group=grpT)
+
+grpS = "Style"
+showPD    = input.bool(true,  "Show PDH / PDL", group=grpS)
+showON    = input.bool(true,  "Show ONH / ONL", group=grpS)
+keepHist  = input.bool(false, "Keep previous days' lines", group=grpS)
+startFromWick = input.bool(true, "Start lines from the wick that made the high/low", group=grpS, tooltip="ON: the line begins at the candle whose wick set the extreme. OFF: the line begins at the session close.")
+showLbl   = input.bool(true,  "Show labels", group=grpS)
+lblSize   = input.string("large", "Label size", options=["tiny","small","normal","large"], group=grpS)
+lblOffset = input.int(3, "Label offset (bars)", minval=0, maxval=50, group=grpS)
+
+grpC = "Colors & lines"
+pdhCol = input.color(color.new(color.red,    0), "PDH", inline="pdh", group=grpC)
+pdhSty = input.string("Solid",  "", options=["Solid","Dashed","Dotted"], inline="pdh", group=grpC)
+pdhW   = input.int(2, "", minval=1, maxval=5, inline="pdh", group=grpC)
+
+pdlCol = input.color(color.new(color.green,  0), "PDL", inline="pdl", group=grpC)
+pdlSty = input.string("Solid",  "", options=["Solid","Dashed","Dotted"], inline="pdl", group=grpC)
+pdlW   = input.int(2, "", minval=1, maxval=5, inline="pdl", group=grpC)
+
+onhCol = input.color(color.new(color.orange, 0), "ONH", inline="onh", group=grpC)
+onhSty = input.string("Dashed", "", options=["Solid","Dashed","Dotted"], inline="onh", group=grpC)
+onhW   = input.int(1, "", minval=1, maxval=5, inline="onh", group=grpC)
+
+onlCol = input.color(color.new(color.blue,   0), "ONL", inline="onl", group=grpC)
+onlSty = input.string("Dashed", "", options=["Solid","Dashed","Dotted"], inline="onl", group=grpC)
+onlW   = input.int(1, "", minval=1, maxval=5, inline="onl", group=grpC)
+
+grpV = "Session dividers (vertical)"
+showVert = input.bool(true, "Show day start / day end vertical lines", group=grpV)
+vertDays = input.int(10, "Days of history to draw", minval=1, maxval=200, group=grpV)
+vLblOn   = input.bool(true, "Show time labels", group=grpV)
+
+vsCol = input.color(color.new(color.gray, 30), "Day start", inline="vs", group=grpV)
+vsSty = input.string("Dashed", "", options=["Solid","Dashed","Dotted"], inline="vs", group=grpV)
+vsW   = input.int(1, "", minval=1, maxval=5, inline="vs", group=grpV)
+
+veCol = input.color(color.new(color.gray, 30), "Day end", inline="ve", group=grpV)
+veSty = input.string("Dotted", "", options=["Solid","Dashed","Dotted"], inline="ve", group=grpV)
+veW   = input.int(1, "", minval=1, maxval=5, inline="ve", group=grpV)
+
+// ================= Helpers =================
+styleOf(s) => s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+sizeOf(s)  => s == "tiny" ? size.tiny : s == "normal" ? size.normal : s == "large" ? size.large : size.small
+
+// ================= Session detection =================
+rthIn = not na(time(timeframe.period, rthSess + ":" + rthDays, tz))
+onIn  = not na(time(timeframe.period, onSess  + ":" + rthDays, tz))
+
+var bool rthWas = false
+var bool onWas  = false
+
+// running extremes of the session currently in progress
+var float rthHi = na
+var float rthLo = na
+var float onHi  = na
+var float onLo  = na
+
+// bar_index of the candle whose wick made each extreme
+var int rthHiBar = na
+var int rthLoBar = na
+var int onHiBar  = na
+var int onLoBar  = na
+
+// finalized values
+var float pdh = na
+var float pdl = na
+var float onh = na
+var float onl = na
+
+// line/label handles
+var line  lPdh = na
+var line  lPdl = na
+var line  lOnh = na
+var line  lOnl = na
+var label bPdh = na
+var label bPdl = na
+var label bOnh = na
+var label bOnl = na
+
+// vertical divider storage (pruned to `vertDays`)
+var array<line>  vLines  = array.new<line>()
+var array<label> vLabels = array.new<label>()
+
+// ---- RTH accumulation ----
+if rthIn
+    bool fresh = not rthWas or na(rthHi)
+    if fresh or high > rthHi
+        rthHi := high
+        rthHiBar := bar_index
+    if fresh or low < rthLo
+        rthLo := low
+        rthLoBar := bar_index
+rthEnd = rthWas and not rthIn
+
+// ---- Overnight accumulation ----
+if onIn
+    bool freshOn = not onWas or na(onHi)
+    if freshOn or high > onHi
+        onHi := high
+        onHiBar := bar_index
+    if freshOn or low < onLo
+        onLo := low
+        onLoBar := bar_index
+onEnd = onWas and not onIn
+
+rthStart = rthIn and not rthWas
+
+// ---- Vertical session dividers ----
+addVert(col, sty, w, txt) =>
+    ln = line.new(time, low, time, high, xloc=xloc.bar_time, extend=extend.both, color=col, style=styleOf(sty), width=w)
+    array.push(vLines, ln)
+    if vLblOn
+        lb = label.new(time, high, txt, xloc=xloc.bar_time, yloc=yloc.abovebar, style=label.style_label_down, color=color.new(col, 85), textcolor=col, size=sizeOf(lblSize))
+        array.push(vLabels, lb)
+    // prune old drawings (2 lines per day: start + end)
+    while array.size(vLines) > vertDays * 2
+        line.delete(array.shift(vLines))
+    while array.size(vLabels) > vertDays * 2
+        label.delete(array.shift(vLabels))
+
+if showVert and rthStart
+    addVert(vsCol, vsSty, vsW, "Open")
+if showVert and rthEnd
+    addVert(veCol, veSty, veW, "Close")
+
+// ================= Draw / update =================
+drawLevel(oldLn, oldLbl, price, srcBar, txt, col, sty, w) =>
+    if not na(oldLn)
+        if keepHist
+            line.set_extend(oldLn, extend.none)
+            line.set_x2(oldLn, bar_index)
+        else
+            line.delete(oldLn)
+    if not na(oldLbl)
+        label.delete(oldLbl)
+    int x1 = startFromWick and not na(srcBar) ? srcBar : bar_index
+    ln  = line.new(x1, price, x1 + 1, price, xloc=xloc.bar_index, extend=extend.right, color=col, style=styleOf(sty), width=w)
+    lbl = showLbl ? label.new(bar_index + lblOffset, price, txt + "  " + str.tostring(price, format.mintick), xloc=xloc.bar_index, style=label.style_label_left, color=color.new(col, 85), textcolor=col, size=sizeOf(lblSize)) : na
+    [ln, lbl]
+
+if rthEnd and showPD
+    pdh := rthHi
+    pdl := rthLo
+    [a1, a2] = drawLevel(lPdh, bPdh, pdh, rthHiBar, "PDH", pdhCol, pdhSty, pdhW)
+    lPdh := a1
+    bPdh := a2
+    [b1, b2] = drawLevel(lPdl, bPdl, pdl, rthLoBar, "PDL", pdlCol, pdlSty, pdlW)
+    lPdl := b1
+    bPdl := b2
+    rthHi := na
+    rthLo := na
+
+if onEnd and showON
+    onh := onHi
+    onl := onLo
+    [c1, c2] = drawLevel(lOnh, bOnh, onh, onHiBar, "ONH", onhCol, onhSty, onhW)
+    lOnh := c1
+    bOnh := c2
+    [d1, d2] = drawLevel(lOnl, bOnl, onl, onLoBar, "ONL", onlCol, onlSty, onlW)
+    lOnl := d1
+    bOnl := d2
+    onHi := na
+    onLo := na
+
+// keep labels riding the right edge of the chart
+if barstate.islast and showLbl
+    if not na(bPdh)
+        label.set_x(bPdh, bar_index + lblOffset)
+    if not na(bPdl)
+        label.set_x(bPdl, bar_index + lblOffset)
+    if not na(bOnh)
+        label.set_x(bOnh, bar_index + lblOffset)
+    if not na(bOnl)
+        label.set_x(bOnl, bar_index + lblOffset)
+
+rthWas := rthIn
+onWas  := onIn
+
+// ================= Alerts =================
+// evaluated on every bar so results stay consistent
+xPdhUp = ta.crossover(close,  pdh)
+xPdlDn = ta.crossunder(close, pdl)
+xOnhUp = ta.crossover(close,  onh)
+xOnlDn = ta.crossunder(close, onl)
+
+alertcondition(showPD and xPdhUp, "Cross above PDH", "Price crossed above PDH")
+alertcondition(showPD and xPdlDn, "Cross below PDL", "Price crossed below PDL")
+alertcondition(showON and xOnhUp, "Cross above ONH", "Price crossed above ONH")
+alertcondition(showON and xOnlDn, "Cross below ONL", "Price crossed below ONL")
+
+// optional plots for data window / screener
+plot(showPD ? pdh : na, "PDH", color=color.new(pdhCol, 100), display=display.data_window)
+plot(showPD ? pdl : na, "PDL", color=color.new(pdlCol, 100), display=display.data_window)
+plot(showON ? onh : na, "ONH", color=color.new(onhCol, 100), display=display.data_window)
+plot(showON ? onl : na, "ONL", color=color.new(onlCol, 100), display=display.data_window)

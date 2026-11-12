@@ -1,0 +1,452 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © BOSWaves
+
+//@version=6
+indicator("High Volume Rejection Zones [BOSWaves]", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 100, calc_bars_count = 3000, max_bars_back = 5000)
+
+// ┌───────────────────────────── BOSWaves ─ Groups ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+const string G_PIVOT  = "Swing Detection"
+const string G_REJECT = "Rejection Validation"
+const string G_ZONE   = "Zones"
+const string G_VIS    = "Visuals"
+
+// ┌───────────────────────────── BOSWaves ─ Inputs ───────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+int swingLeft  = input.int(12, "Pivot Lookback Left", minval = 3, maxval = 50, group = G_PIVOT, tooltip = "Bars to the left required to define a swing high or swing low.")
+int swingRight = input.int(12, "Pivot Lookback Right", minval = 3, maxval = 50, group = G_PIVOT, tooltip = "Bars to the right required before the swing is confirmed.")
+
+int volLen       = input.int(20, "Volume Average Length", minval = 5, maxval = 100, group = G_REJECT, tooltip = "Lookback length for the volume moving average baseline. Higher = smoother baseline less sensitive to short-term volume spikes.")
+float rvolMin    = input.float(1.15, "Minimum Relative Volume", minval = 0.5, maxval = 5.0, step = 0.05, group = G_REJECT, tooltip = "Volume on the pivot candle must exceed its moving average by this multiple.")
+float minWick    = input.float(0.25, "Minimum Rejection Wick", minval = 0.05, maxval = 0.80, step = 0.05, group = G_REJECT, tooltip = "Minimum wick size as a fraction of the full pivot candle range.")
+float minAway    = input.float(0.50, "Minimum Close Rejection", minval = 0.30, maxval = 0.90, step = 0.05, group = G_REJECT, tooltip = "How far the pivot candle must close away from its extreme.")
+
+int atrLen       = input.int(200, "ATR Length", minval = 20, maxval = 500, group = G_ZONE, tooltip = "ATR lookback used to set the vertical depth of each rejection zone. Higher = smoother volatility measurement; lower = more reactive to recent range changes.")
+float zoneATR    = input.float(0.30, "Zone ATR Width", minval = 0.10, maxval = 1.00, step = 0.05, group = G_ZONE, tooltip = "Vertical depth of each rejection zone.")
+int maxZoneAge   = input.int(200, "Maximum Zone Age", minval = 50, maxval = 1000, group = G_ZONE, tooltip = "Maximum number of bars a zone remains active before fading out. Higher = zones persist longer; lower = older zones expire sooner.")
+int maxZones     = input.int(60, "Historical Zones", minval = 10, maxval = 100, group = G_ZONE, tooltip = "Maximum number of historical zone objects retained on the chart. Oldest zones are removed first when the limit is reached.")
+
+bool showVolume  = input.bool(true, "Show Relative Volume", group = G_VIS, tooltip = "Displays the relative volume multiple on each zone label, showing how significant the pivot candle's participation was relative to its average.")
+bool showSignals = input.bool(true, "Retest Signals", group = G_VIS, tooltip = "Plots a diamond marker when price retests an active rejection zone and either holds or flips it.")
+int levelWidth   = input.int(2, "Level Thickness", minval = 1, maxval = 4, group = G_VIS, tooltip = "Line thickness of the pivot price level line drawn through each rejection zone.")
+
+color bullColor = input.color(#00ff00, "Bullish", inline = "clr", group = G_VIS, tooltip = "Colors applied to bullish support zones and bearish resistance zones respectively.")
+color bearColor = input.color(#ff0000, "Bearish", inline = "clr", group = G_VIS)
+
+// ┌───────────────────────────── BOSWaves ─ Helpers ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+clamp01(float value) =>
+    math.max(0.0, math.min(1.0, value))
+
+// ┌───────────────────────────── BOSWaves ─ Measurements ─────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+float atr = ta.atr(atrLen)
+float avgVolume = ta.sma(volume, volLen)
+
+float pHigh = ta.pivothigh(high, swingLeft, swingRight)
+float pLow  = ta.pivotlow(low, swingLeft, swingRight)
+
+int pivotOffset = swingRight
+
+float pivotRange = math.max(high[pivotOffset] - low[pivotOffset], syminfo.mintick)
+
+float upperWick = high[pivotOffset] - math.max(open[pivotOffset], close[pivotOffset])
+float lowerWick = math.min(open[pivotOffset], close[pivotOffset]) - low[pivotOffset]
+
+float upperWickRatio = upperWick / pivotRange
+float lowerWickRatio = lowerWick / pivotRange
+
+float highCloseAway = (high[pivotOffset] - close[pivotOffset]) / pivotRange
+float lowCloseAway  = (close[pivotOffset] - low[pivotOffset]) / pivotRange
+
+float pivotRVOL = not na(avgVolume[pivotOffset]) and avgVolume[pivotOffset] > 0.0 ? volume[pivotOffset] / avgVolume[pivotOffset] : 0.0
+
+bool validHigh = not na(pHigh) and pivotRVOL >= rvolMin and upperWickRatio >= minWick and highCloseAway >= minAway
+bool validLow  = not na(pLow) and pivotRVOL >= rvolMin and lowerWickRatio >= minWick and lowCloseAway >= minAway
+
+// ┌───────────────────────────── BOSWaves ─ Historical Objects ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var box[] historicalOuter = array.new<box>()
+var box[] historicalInner = array.new<box>()
+var line[] historicalLevels = array.new<line>()
+
+// ┌───────────────────────────── BOSWaves ─ Resistance State ─────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var box resOuter = na
+var box resInner = na
+var line resLevel = na
+
+var float resPrice = na
+var float resTop = na
+var int resStartIndex = na
+var int resCreatedBar = na
+var int resBreakBar = na
+
+var bool resBroken = false
+var bool resHoldDone = false
+var bool resFlipDone = false
+
+// ┌───────────────────────────── BOSWaves ─ Support State ────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+var box supOuter = na
+var box supInner = na
+var line supLevel = na
+
+var float supPrice = na
+var float supBottom = na
+var int supStartIndex = na
+var int supCreatedBar = na
+var int supBreakBar = na
+
+var bool supBroken = false
+var bool supHoldDone = false
+var bool supFlipDone = false
+
+// ┌───────────────────────────── BOSWaves ─ Event State ──────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+bool bullHoldSignal = false
+bool bearHoldSignal = false
+bool bullFlipSignal = false
+bool bearFlipSignal = false
+
+// ┌───────────────────────────── BOSWaves ─ Resistance Creation ──────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+if validHigh
+    if not na(resOuter)
+        resOuter.set_right(bar_index)
+        resInner.set_right(bar_index)
+        resLevel.set_x2(bar_index)
+
+    resPrice := pHigh
+    resStartIndex := bar_index - pivotOffset
+    resCreatedBar := bar_index
+    resBreakBar := na
+
+    float width = atr[pivotOffset] * zoneATR
+
+    resTop := resPrice + width
+
+    float wickScore = clamp01(upperWickRatio / 0.60)
+    float closeScore = clamp01(highCloseAway / 0.80)
+    float rvolScore = clamp01((pivotRVOL - rvolMin) / math.max(2.50 - rvolMin, 0.01))
+
+    float rejectionQuality = wickScore * 0.40 + closeScore * 0.35 + rvolScore * 0.25
+    float coreDepth = 0.22 + rejectionQuality * 0.48
+
+    float innerTop = resPrice + width * coreDepth
+
+    string zoneText = showVolume ? str.tostring(pivotRVOL, "#.0") + "× VOL" : ""
+
+    resOuter := box.new(
+         left = resStartIndex,
+         top = resTop,
+         right = bar_index + 5,
+         bottom = resPrice,
+         border_color = color.new(bearColor, 25),
+         border_width = 1,
+         bgcolor = color.new(bearColor, 91),
+         text = zoneText,
+         text_color = color.new(bearColor, 5),
+         text_size = size.auto,
+         text_halign = text.align_right,
+         text_valign = text.align_center)
+
+    resInner := box.new(
+         left = resStartIndex,
+         top = innerTop,
+         right = bar_index + 5,
+         bottom = resPrice,
+         border_color = na,
+         bgcolor = color.new(bearColor, 78))
+
+    resLevel := line.new(
+         resStartIndex,
+         resPrice,
+         bar_index + 5,
+         resPrice,
+         color = color.new(bearColor, 5),
+         width = levelWidth)
+
+    historicalOuter.push(resOuter)
+    historicalInner.push(resInner)
+    historicalLevels.push(resLevel)
+
+    resBroken := false
+    resHoldDone := false
+    resFlipDone := false
+
+// ┌───────────────────────────── BOSWaves ─ Support Creation ─────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+if validLow
+    if not na(supOuter)
+        supOuter.set_right(bar_index)
+        supInner.set_right(bar_index)
+        supLevel.set_x2(bar_index)
+
+    supPrice := pLow
+    supStartIndex := bar_index - pivotOffset
+    supCreatedBar := bar_index
+    supBreakBar := na
+
+    float width = atr[pivotOffset] * zoneATR
+
+    supBottom := supPrice - width
+
+    float wickScore = clamp01(lowerWickRatio / 0.60)
+    float closeScore = clamp01(lowCloseAway / 0.80)
+    float rvolScore = clamp01((pivotRVOL - rvolMin) / math.max(2.50 - rvolMin, 0.01))
+
+    float rejectionQuality = wickScore * 0.40 + closeScore * 0.35 + rvolScore * 0.25
+    float coreDepth = 0.22 + rejectionQuality * 0.48
+
+    float innerBottom = supPrice - width * coreDepth
+
+    string zoneText = showVolume ? str.tostring(pivotRVOL, "#.0") + "× VOL" : ""
+
+    supOuter := box.new(
+         left = supStartIndex,
+         top = supPrice,
+         right = bar_index + 5,
+         bottom = supBottom,
+         border_color = color.new(bullColor, 25),
+         border_width = 1,
+         bgcolor = color.new(bullColor, 91),
+         text = zoneText,
+         text_color = color.new(bullColor, 5),
+         text_size = size.auto,
+         text_halign = text.align_right,
+         text_valign = text.align_center)
+
+    supInner := box.new(
+         left = supStartIndex,
+         top = supPrice,
+         right = bar_index + 5,
+         bottom = innerBottom,
+         border_color = na,
+         bgcolor = color.new(bullColor, 78))
+
+    supLevel := line.new(
+         supStartIndex,
+         supPrice,
+         bar_index + 5,
+         supPrice,
+         color = color.new(bullColor, 5),
+         width = levelWidth)
+
+    historicalOuter.push(supOuter)
+    historicalInner.push(supInner)
+    historicalLevels.push(supLevel)
+
+    supBroken := false
+    supHoldDone := false
+    supFlipDone := false
+
+// ┌───────────────────────────── BOSWaves ─ Resistance Management ────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+if not na(resOuter)
+    int age = bar_index - resStartIndex
+
+    if age <= maxZoneAge
+        resOuter.set_right(bar_index + 5)
+        resInner.set_right(bar_index + 5)
+        resLevel.set_x2(bar_index + 5)
+
+        float fade = math.min(float(age) / float(maxZoneAge), 1.0)
+        float fadeCurve = math.pow(fade, 3.0)
+
+        if not resBroken
+            int outerTransparency = int(91.0 + 7.0 * fadeCurve)
+            int innerTransparency = int(78.0 + 17.0 * fadeCurve)
+            int borderTransparency = int(25.0 + 60.0 * fadeCurve)
+            int levelTransparency = int(5.0 + 70.0 * fadeCurve)
+            int textTransparency = int(5.0 + 70.0 * fadeCurve)
+
+            resOuter.set_bgcolor(color.new(bearColor, outerTransparency))
+            resInner.set_bgcolor(color.new(bearColor, innerTransparency))
+            resOuter.set_border_color(color.new(bearColor, borderTransparency))
+            resOuter.set_text_color(color.new(bearColor, textTransparency))
+            resLevel.set_color(color.new(bearColor, levelTransparency))
+
+            if bar_index > resCreatedBar
+                bool retest = not resHoldDone and high >= resPrice and close < resPrice
+
+                if retest
+                    bearHoldSignal := true
+                    resHoldDone := true
+
+                    resOuter.set_border_color(color.new(bearColor, 0))
+                    resLevel.set_color(color.new(bearColor, 0))
+                    resLevel.set_width(math.min(levelWidth + 1, 4))
+
+            if close > resTop
+                resBroken := true
+                resBreakBar := bar_index
+
+                resOuter.set_bgcolor(color.new(bullColor, 94))
+                resInner.set_bgcolor(color.new(bullColor, 88))
+                resOuter.set_border_color(color.new(bullColor, 45))
+                resOuter.set_text_color(color.new(bullColor, 25))
+                resOuter.set_border_style(line.style_dotted)
+
+                resLevel.set_color(color.new(bullColor, 25))
+                resLevel.set_style(line.style_dotted)
+                resLevel.set_width(levelWidth)
+
+        else
+            resOuter.set_bgcolor(color.new(bullColor, 94))
+            resInner.set_bgcolor(color.new(bullColor, 88))
+            resOuter.set_border_color(color.new(bullColor, 45))
+            resOuter.set_text_color(color.new(bullColor, 25))
+            resOuter.set_border_style(line.style_dotted)
+
+            resLevel.set_color(color.new(bullColor, 25))
+            resLevel.set_style(line.style_dotted)
+
+            if not resFlipDone and bar_index > resBreakBar
+                bool flippedRetest = low <= resTop and close > resTop
+
+                if flippedRetest
+                    bullFlipSignal := true
+                    resFlipDone := true
+
+                    resOuter.set_border_color(color.new(bullColor, 0))
+                    resOuter.set_text_color(color.new(bullColor, 0))
+                    resLevel.set_color(color.new(bullColor, 0))
+                    resLevel.set_width(math.min(levelWidth + 1, 4))
+
+    else
+        resOuter.set_right(bar_index)
+        resInner.set_right(bar_index)
+        resLevel.set_x2(bar_index)
+
+        color expiredColor = resBroken ? bullColor : bearColor
+
+        resOuter.set_bgcolor(color.new(expiredColor, 98))
+        resInner.set_bgcolor(color.new(expiredColor, 96))
+        resOuter.set_border_color(color.new(expiredColor, 88))
+        resOuter.set_text_color(color.new(expiredColor, 82))
+        resLevel.set_color(color.new(expiredColor, 86))
+
+        resOuter := na
+        resInner := na
+        resLevel := na
+
+// ┌───────────────────────────── BOSWaves ─ Support Management ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+if not na(supOuter)
+    int age = bar_index - supStartIndex
+
+    if age <= maxZoneAge
+        supOuter.set_right(bar_index + 5)
+        supInner.set_right(bar_index + 5)
+        supLevel.set_x2(bar_index + 5)
+
+        float fade = math.min(float(age) / float(maxZoneAge), 1.0)
+        float fadeCurve = math.pow(fade, 3.0)
+
+        if not supBroken
+            int outerTransparency = int(91.0 + 7.0 * fadeCurve)
+            int innerTransparency = int(78.0 + 17.0 * fadeCurve)
+            int borderTransparency = int(25.0 + 60.0 * fadeCurve)
+            int levelTransparency = int(5.0 + 70.0 * fadeCurve)
+            int textTransparency = int(5.0 + 70.0 * fadeCurve)
+
+            supOuter.set_bgcolor(color.new(bullColor, outerTransparency))
+            supInner.set_bgcolor(color.new(bullColor, innerTransparency))
+            supOuter.set_border_color(color.new(bullColor, borderTransparency))
+            supOuter.set_text_color(color.new(bullColor, textTransparency))
+            supLevel.set_color(color.new(bullColor, levelTransparency))
+
+            if bar_index > supCreatedBar
+                bool retest = not supHoldDone and low <= supPrice and close > supPrice
+
+                if retest
+                    bullHoldSignal := true
+                    supHoldDone := true
+
+                    supOuter.set_border_color(color.new(bullColor, 0))
+                    supLevel.set_color(color.new(bullColor, 0))
+                    supLevel.set_width(math.min(levelWidth + 1, 4))
+
+            if close < supBottom
+                supBroken := true
+                supBreakBar := bar_index
+
+                supOuter.set_bgcolor(color.new(bearColor, 94))
+                supInner.set_bgcolor(color.new(bearColor, 88))
+                supOuter.set_border_color(color.new(bearColor, 45))
+                supOuter.set_text_color(color.new(bearColor, 25))
+                supOuter.set_border_style(line.style_dotted)
+
+                supLevel.set_color(color.new(bearColor, 25))
+                supLevel.set_style(line.style_dotted)
+                supLevel.set_width(levelWidth)
+
+        else
+            supOuter.set_bgcolor(color.new(bearColor, 94))
+            supInner.set_bgcolor(color.new(bearColor, 88))
+            supOuter.set_border_color(color.new(bearColor, 45))
+            supOuter.set_text_color(color.new(bearColor, 25))
+            supOuter.set_border_style(line.style_dotted)
+
+            supLevel.set_color(color.new(bearColor, 25))
+            supLevel.set_style(line.style_dotted)
+
+            if not supFlipDone and bar_index > supBreakBar
+                bool flippedRetest = high >= supBottom and close < supBottom
+
+                if flippedRetest
+                    bearFlipSignal := true
+                    supFlipDone := true
+
+                    supOuter.set_border_color(color.new(bearColor, 0))
+                    supOuter.set_text_color(color.new(bearColor, 0))
+                    supLevel.set_color(color.new(bearColor, 0))
+                    supLevel.set_width(math.min(levelWidth + 1, 4))
+
+    else
+        supOuter.set_right(bar_index)
+        supInner.set_right(bar_index)
+        supLevel.set_x2(bar_index)
+
+        color expiredColor = supBroken ? bearColor : bullColor
+
+        supOuter.set_bgcolor(color.new(expiredColor, 98))
+        supInner.set_bgcolor(color.new(expiredColor, 96))
+        supOuter.set_border_color(color.new(expiredColor, 88))
+        supOuter.set_text_color(color.new(expiredColor, 82))
+        supLevel.set_color(color.new(expiredColor, 86))
+
+        supOuter := na
+        supInner := na
+        supLevel := na
+
+// ┌───────────────────────────── BOSWaves ─ Historical Cleanup ───────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+while historicalOuter.size() > maxZones
+    box oldOuter = historicalOuter.shift()
+    box oldInner = historicalInner.shift()
+    line oldLevel = historicalLevels.shift()
+
+    box.delete(oldOuter)
+    box.delete(oldInner)
+    line.delete(oldLevel)
+
+// ┌───────────────────────────── BOSWaves ─ Signals ──────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+bool bullSignal = bullHoldSignal or bullFlipSignal
+bool bearSignal = bearHoldSignal or bearFlipSignal
+
+plotshape(showSignals and bullSignal, title = "Bullish Rejection Zone Retest", style = shape.diamond, location = location.belowbar, color = bullColor, size = size.tiny)
+plotshape(showSignals and bearSignal, title = "Bearish Rejection Zone Retest", style = shape.diamond, location = location.abovebar, color = bearColor, size = size.tiny)
+
+// ┌───────────────────────────── BOSWaves ─ Alerts ───────────────────────────────────┐
+// └──────────────────────────────────────────────────────────────────────────────────┘
+alertcondition(validLow, title = "Bullish High Volume Rejection", message = "{{ticker}} bullish high volume rejection zone formed")
+alertcondition(validHigh, title = "Bearish High Volume Rejection", message = "{{ticker}} bearish high volume rejection zone formed")
+
+alertcondition(bullHoldSignal, title = "Bullish Rejection Hold", message = "{{ticker}} bullish high volume rejection zone held")
+alertcondition(bearHoldSignal, title = "Bearish Rejection Hold", message = "{{ticker}} bearish high volume rejection zone held")
+
+alertcondition(bullFlipSignal, title = "Bullish Rejection Flip", message = "{{ticker}} bearish rejection zone flipped to support")
+alertcondition(bearFlipSignal, title = "Bearish Rejection Flip", message = "{{ticker}} bullish rejection zone flipped to resistance")

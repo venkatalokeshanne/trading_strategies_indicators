@@ -1,0 +1,502 @@
+//@version=6
+indicator("Trade With Plan - AMD All Timeframes", overlay=true, max_boxes_count=50, max_lines_count=100, max_labels_count=100)
+
+//====================================================
+// INPUTS
+//====================================================
+
+// General
+groupGeneral = "General Settings"
+showEMA       = input.bool(true, "Show EMA 5", group=groupGeneral)
+showZones     = input.bool(true, "Show Entry Zones", group=groupGeneral)
+showLiquidity = input.bool(true, "Show Liquidity Pools", group=groupGeneral)
+showSignals   = input.bool(true, "Show Buy/Sell Signals", group=groupGeneral)
+showRetest    = input.bool(true, "Show Retest Signals", group=groupGeneral)
+showTP        = input.bool(true, "Show TP Levels", group=groupGeneral)
+showSL        = input.bool(true, "Show Stop Loss", group=groupGeneral)
+
+// AMD settings
+groupAMD = "AMD Settings"
+accumulationBars = input.int(12, "Accumulation Lookback", minval=5, group=groupAMD)
+rangeATR         = input.float(1.5, "Maximum Accumulation Range ATR", minval=0.2, step=0.1, group=groupAMD)
+manipulationATR  = input.float(0.25, "Manipulation Sweep ATR", minval=0.05, step=0.05, group=groupAMD)
+retestBars       = input.int(8, "Retest Valid Bars", minval=1, group=groupAMD)
+retestTolerance  = input.float(0.30, "Retest ATR Tolerance", minval=0.05, step=0.05, group=groupAMD)
+
+// Risk
+groupRisk = "Risk / Targets"
+atrLength = input.int(14, "ATR Length", minval=1, group=groupRisk)
+slATR     = input.float(0.30, "SL Buffer ATR", minval=0.05, step=0.05, group=groupRisk)
+tp1RR     = input.float(1.0, "TP1 Risk/Reward", minval=0.25, step=0.25, group=groupRisk)
+tp2RR     = input.float(2.0, "TP2 Risk/Reward", minval=0.5, step=0.25, group=groupRisk)
+
+// Volume
+groupVolume = "Volume Confirmation"
+useVolume   = input.bool(true, "Use Volume Confirmation", group=groupVolume)
+volumeLen   = input.int(20, "Volume Average", minval=2, group=groupVolume)
+volumeMult  = input.float(1.0, "Minimum Volume / Average", minval=0.1, step=0.1, group=groupVolume)
+
+//====================================================
+// CORE CALCULATIONS
+//====================================================
+
+ema5 = ta.ema(close, 5)
+atr  = ta.atr(atrLength)
+
+avgVolume = ta.sma(volume, volumeLen)
+volumeOK  = not useVolume or volume >= avgVolume * volumeMult
+
+// Accumulation range
+rangeHigh = ta.highest(high, accumulationBars)
+rangeLow  = ta.lowest(low, accumulationBars)
+rangeSize = rangeHigh - rangeLow
+
+isAccumulation = rangeSize <= atr * rangeATR
+
+// Previous range
+prevHigh = rangeHigh[1]
+prevLow  = rangeLow[1]
+
+//====================================================
+// LIQUIDITY POOLS
+//====================================================
+
+// Swing liquidity
+pivotHigh = ta.pivothigh(high, 3, 3)
+pivotLow  = ta.pivotlow(low, 3, 3)
+
+var float liquidityHigh = na
+var float liquidityLow  = na
+
+if not na(pivotHigh)
+    liquidityHigh := pivotHigh
+
+if not na(pivotLow)
+    liquidityLow := pivotLow
+
+//====================================================
+// MANIPULATION / LIQUIDITY SWEEP
+//====================================================
+
+// Bullish manipulation:
+// Price moves below accumulation low and closes back above it.
+bullSweep = low < rangeLow[1] - atr * manipulationATR and close > rangeLow[1]
+
+// Bearish manipulation:
+// Price moves above accumulation high and closes back below it.
+bearSweep = high > rangeHigh[1] + atr * manipulationATR and close < rangeHigh[1]
+
+//====================================================
+// AMD STATE MACHINE
+//====================================================
+
+var int state = 0
+// 0 = neutral
+// 1 = accumulation
+// 2 = bullish manipulation
+// 3 = bearish manipulation
+// 4 = bullish breakout
+// 5 = bearish breakout
+// 6 = bullish retest
+// 7 = bearish retest
+
+var float amdHigh = na
+var float amdLow  = na
+var float entryLevel = na
+var float stopLevel = na
+var float tp1Level = na
+var float tp2Level = na
+
+// Start accumulation
+if isAccumulation
+    amdHigh := rangeHigh
+    amdLow  := rangeLow
+    state := 1
+
+// Bullish manipulation
+if state == 1 and bullSweep
+    state := 2
+    amdLow := low
+
+// Bearish manipulation
+if state == 1 and bearSweep
+    state := 3
+    amdHigh := high
+
+//====================================================
+// BREAKOUT CONDITIONS
+//====================================================
+
+bullBreakout = state == 2 and close > amdHigh and volumeOK
+bearBreakout = state == 3 and close < amdLow and volumeOK
+
+// If there was no sweep, allow direct accumulation breakout
+directBullBreak = state == 1 and close > amdHigh and volumeOK
+directBearBreak = state == 1 and close < amdLow and volumeOK
+
+bullSignal = bullBreakout or directBullBreak
+bearSignal = bearBreakout or directBearBreak
+
+if bullSignal
+    state := 4
+    entryLevel := close
+    stopLevel := amdLow - atr * slATR
+    risk = entryLevel - stopLevel
+    tp1Level := entryLevel + risk * tp1RR
+    tp2Level := entryLevel + risk * tp2RR
+
+if bearSignal
+    state := 5
+    entryLevel := close
+    stopLevel := amdHigh + atr * slATR
+    risk = stopLevel - entryLevel
+    tp1Level := entryLevel - risk * tp1RR
+    tp2Level := entryLevel - risk * tp2RR
+
+//====================================================
+// RETEST
+//====================================================
+
+bullRetest = state == 4 and
+     low <= entryLevel + atr * retestTolerance and
+     close > entryLevel and
+     close > open
+
+bearRetest = state == 5 and
+     high >= entryLevel - atr * retestTolerance and
+     close < entryLevel and
+     close < open
+
+if bullRetest
+    state := 6
+
+if bearRetest
+    state := 7
+
+//====================================================
+// SECOND RETEST
+//====================================================
+
+var int bullRetestCount = 0
+var int bearRetestCount = 0
+
+if bullRetest
+    bullRetestCount += 1
+
+if bearRetest
+    bearRetestCount += 1
+
+secondBullRetest = state == 6 and
+     bullRetestCount >= 1 and
+     low <= entryLevel + atr * retestTolerance and
+     close > entryLevel
+
+secondBearRetest = state == 7 and
+     bearRetestCount >= 1 and
+     high >= entryLevel - atr * retestTolerance and
+     close < entryLevel
+
+//====================================================
+// AMD R2 LP
+//====================================================
+
+bullR2LP = secondBullRetest and low < liquidityLow and close > liquidityLow
+bearR2LP = secondBearRetest and high > liquidityHigh and close < liquidityHigh
+
+//====================================================
+// EMA
+//====================================================
+
+plot(showEMA ? ema5 : na, "EMA 5", color=color.blue, linewidth=2)
+
+//====================================================
+// ENTRY ZONE
+//====================================================
+
+var box entryBox = na
+
+if showZones and bullSignal
+    entryBox := box.new(
+         left=bar_index,
+         top=amdHigh,
+         right=bar_index + 10,
+         bottom=amdLow,
+         border_color=color.green,
+         bgcolor=color.new(color.green, 90))
+
+if showZones and bearSignal
+    entryBox := box.new(
+         left=bar_index,
+         top=amdHigh,
+         right=bar_index + 10,
+         bottom=amdLow,
+         border_color=color.red,
+         bgcolor=color.new(color.red, 90))
+
+//====================================================
+// LIQUIDITY POOL LINES
+//====================================================
+
+var line highLiquidityLine = na
+var line lowLiquidityLine  = na
+
+if showLiquidity and not na(liquidityHigh)
+    line.delete(highLiquidityLine)
+    highLiquidityLine := line.new(
+         bar_index - 20,
+         liquidityHigh,
+         bar_index + 20,
+         liquidityHigh,
+         color=color.red,
+         style=line.style_dashed)
+
+if showLiquidity and not na(liquidityLow)
+    line.delete(lowLiquidityLine)
+    lowLiquidityLine := line.new(
+         bar_index - 20,
+         liquidityLow,
+         bar_index + 20,
+         liquidityLow,
+         color=color.green,
+         style=line.style_dashed)
+
+//====================================================
+// TP / SL LINES
+//====================================================
+
+var line slLine  = na
+var line tp1Line = na
+var line tp2Line = na
+
+if showSL and bullSignal
+    line.delete(slLine)
+    slLine := line.new(
+         bar_index,
+         stopLevel,
+         bar_index + 30,
+         stopLevel,
+         color=color.red,
+         style=line.style_dashed,
+         width=2)
+
+if showSL and bearSignal
+    line.delete(slLine)
+    slLine := line.new(
+         bar_index,
+         stopLevel,
+         bar_index + 30,
+         stopLevel,
+         color=color.red,
+         style=line.style_dashed,
+         width=2)
+
+if showTP and bullSignal
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+
+    tp1Line := line.new(
+         bar_index,
+         tp1Level,
+         bar_index + 30,
+         tp1Level,
+         color=color.green,
+         style=line.style_dashed)
+
+    tp2Line := line.new(
+         bar_index,
+         tp2Level,
+         bar_index + 30,
+         tp2Level,
+         color=color.green,
+         style=line.style_dashed)
+
+if showTP and bearSignal
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+
+    tp1Line := line.new(
+         bar_index,
+         tp1Level,
+         bar_index + 30,
+         tp1Level,
+         color=color.green,
+         style=line.style_dashed)
+
+    tp2Line := line.new(
+         bar_index,
+         tp2Level,
+         bar_index + 30,
+         tp2Level,
+         color=color.green,
+         style=line.style_dashed)
+
+//====================================================
+// SIGNALS
+//====================================================
+
+plotshape(
+     showSignals and bullSignal,
+     title="AMD BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.green,
+     text="AMD BUY",
+     textcolor=color.white,
+     size=size.small)
+
+plotshape(
+     showSignals and bearSignal,
+     title="AMD SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     text="AMD SELL",
+     textcolor=color.white,
+     size=size.small)
+
+// Retest
+plotshape(
+     showRetest and bullRetest,
+     title="BUY RETEST",
+     style=shape.triangleup,
+     location=location.belowbar,
+     color=color.lime,
+     text="RETEST",
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     showRetest and bearRetest,
+     title="SELL RETEST",
+     style=shape.triangledown,
+     location=location.abovebar,
+     color=color.red,
+     text="RETEST",
+     textcolor=color.white,
+     size=size.tiny)
+
+// Second Retest
+plotshape(
+     showRetest and secondBullRetest,
+     title="2ND BUY RETEST",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.teal,
+     text="2ND R",
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     showRetest and secondBearRetest,
+     title="2ND SELL RETEST",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.orange,
+     text="2ND R",
+     textcolor=color.white,
+     size=size.tiny)
+
+// R2 LP
+plotshape(
+     showSignals and bullR2LP,
+     title="AMD R2 LP BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.green,
+     text="R2 LP",
+     textcolor=color.white,
+     size=size.small)
+
+plotshape(
+     showSignals and bearR2LP,
+     title="AMD R2 LP SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     text="R2 LP",
+     textcolor=color.white,
+     size=size.small)
+
+//====================================================
+// TP HIT
+//====================================================
+
+bullTP1Hit = not na(tp1Level) and high >= tp1Level
+bullTP2Hit = not na(tp2Level) and high >= tp2Level
+
+bearTP1Hit = not na(tp1Level) and low <= tp1Level
+bearTP2Hit = not na(tp2Level) and low <= tp2Level
+
+plotshape(
+     showTP and bullTP1Hit,
+     title="Bull TP1",
+     style=shape.circle,
+     location=location.abovebar,
+     color=color.green,
+     text="TP1",
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     showTP and bullTP2Hit,
+     title="Bull TP2",
+     style=shape.circle,
+     location=location.abovebar,
+     color=color.green,
+     text="TP2",
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     showTP and bearTP1Hit,
+     title="Bear TP1",
+     style=shape.circle,
+     location=location.belowbar,
+     color=color.green,
+     text="TP1",
+     textcolor=color.white,
+     size=size.tiny)
+
+plotshape(
+     showTP and bearTP2Hit,
+     title="Bear TP2",
+     style=shape.circle,
+     location=location.belowbar,
+     color=color.green,
+     text="TP2",
+     textcolor=color.white,
+     size=size.tiny)
+
+//====================================================
+// ALERTS
+//====================================================
+
+alertcondition(
+     bullSignal,
+     title="AMD BUY",
+     message="AMD BUY signal detected")
+
+alertcondition(
+     bearSignal,
+     title="AMD SELL",
+     message="AMD SELL signal detected")
+
+alertcondition(
+     bullRetest,
+     title="AMD BUY RETEST",
+     message="AMD bullish retest detected")
+
+alertcondition(
+     bearRetest,
+     title="AMD SELL RETEST",
+     message="AMD bearish retest detected")
+
+alertcondition(
+     bullR2LP,
+     title="AMD R2 LP BUY",
+     message="AMD R2 LP bullish signal detected")
+
+alertcondition(
+     bearR2LP,
+     title="AMD R2 LP SELL",
+     message="AMD R2 LP bearish signal detected")

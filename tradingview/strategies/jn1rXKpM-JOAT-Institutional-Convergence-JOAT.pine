@@ -1,0 +1,404 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © officialjackofalltrades
+//@version=6
+strategy("JOAT Institutional Convergence [JOAT]",
+     shorttitle        = "JIC [JOAT]",
+     overlay           = true,
+     initial_capital   = 10000,
+     currency          = currency.USD,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.05,
+     slippage          = 2,
+     max_bars_back     = 5000)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUT CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════════════
+string GRP_STRUCT  = "Structure (VSE)"
+string GRP_RIBBON  = "Ribbon Filter (ASB)"
+string GRP_REGIME  = "Regime Filter"
+string GRP_SESSION = "Session Filter (ISP)"
+string GRP_FVG     = "Imbalance Filter (IZC)"
+string GRP_RISK    = "Risk Management"
+string GRP_VIZ     = "Visualization"
+
+// Structure
+int    i_sw_len    = input.int  (20,   "Swing Length",         minval = 5,  maxval = 100, group = GRP_STRUCT)
+
+// Ribbon
+int    i_h_len     = input.int  (20,   "Hann Base Length",     minval = 4,  maxval = 200, group = GRP_RIBBON)
+int    i_h_wide    = input.int  (3,    "Ribbon Spacing",       minval = 1,  maxval = 20,  group = GRP_RIBBON)
+
+// Regime
+int    i_adx_len   = input.int  (14,   "ADX Length",           minval = 5,  maxval = 100, group = GRP_REGIME)
+int    i_adx_min   = input.int  (8,    "Min ADX for Entry",    minval = 0,  maxval = 40,  group = GRP_REGIME,
+     tooltip = "Block entries when ADX is below this (dead / no-direction markets). Lower = more trades.")
+int    i_adx_max   = input.int  (60,   "Max ADX for Entry",    minval = 20, maxval = 80,  group = GRP_REGIME,
+     tooltip = "Block new entries when ADX is above this (avoid chasing over-extended moves). Higher = more trades.")
+
+// Session — disabled by default so the strategy trades all hours (crypto-friendly)
+bool   i_sess_filter = input.bool(false, "Enable Session Filter", group = GRP_SESSION,
+     tooltip = "ON = only trade during selected sessions. OFF = trade all hours (recommended for crypto & indices).")
+bool   i_sess_asia = input.bool (true,  "Trade Asia Session",   group = GRP_SESSION)
+bool   i_sess_lon  = input.bool (true,  "Trade London Session", group = GRP_SESSION)
+bool   i_sess_ny   = input.bool (true,  "Trade NY Session",     group = GRP_SESSION)
+
+// FVG filter
+bool   i_use_fvg   = input.bool (false, "Require Near FVG Zone", group = GRP_FVG,
+     tooltip = "Entry must be within proximity of an active FVG. Disable for maximum trade count.")
+float  i_fvg_prox  = input.float(1.5,   "FVG Proximity (×ATR)", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_FVG)
+
+// Risk Management
+float  i_risk_pct  = input.float(1.0,   "Risk Per Trade (%)",   minval = 0.1, maxval = 5.0, step = 0.1, group = GRP_RISK)
+float  i_rr        = input.float(2.0,   "Reward:Risk Ratio",    minval = 1.0, maxval = 10.0, step = 0.1, group = GRP_RISK)
+float  i_sl_mult   = input.float(1.2,   "SL Buffer (×ATR)",     minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Stop-loss placed beyond last 20-bar fractal extreme + this multiplier × ATR.")
+bool   i_trail     = input.bool (true,  "Use Trailing Stop",    group = GRP_RISK)
+float  i_trail_mult = input.float(1.5,  "Trail Offset (×ATR)",  minval = 0.5, maxval = 8.0, step = 0.1, group = GRP_RISK,
+     tooltip = "Trailing stop trails highest/lowest price by this × ATR (in ticks). Activates immediately from entry.")
+
+// Visualization
+color  i_bull_col  = input.color(color.rgb(  0, 210, 145), "Bullish",  inline = "c", group = GRP_VIZ)
+color  i_bear_col  = input.color(color.rgb(255,  65,  75), "Bearish",  inline = "c", group = GRP_VIZ)
+bool   i_clr_bars  = input.bool (true,  "Color Candles by Regime", group = GRP_VIZ)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── ATR ──────────────────────────────────────────────────────────────────
+float atr_14 = ta.atr(14)
+
+// ─── Hann Window FIR Filter ───────────────────────────────────────────────
+hannFilter(src, length) =>
+    float filt = 0.0
+    float coef = 0.0
+    for i = 1 to length
+        float w = 1.0 - math.cos(2.0 * math.pi * i / (length + 1))
+        filt += src[i - 1] * w
+        coef += w
+    coef != 0.0 ? filt / coef : na
+
+float h0 = hannFilter(close, i_h_len)
+float h1 = hannFilter(close, i_h_len + i_h_wide)
+float h2 = hannFilter(close, i_h_len + i_h_wide * 2)
+
+bool rib_bull = h0 > h1 and h1 > h2
+bool rib_bear = h0 < h1 and h1 < h2
+
+// Ribbon crossovers — primary entry trigger (generates many more signals than BOS alone)
+bool cross_bull = ta.crossover (h0, h1)
+bool cross_bear = ta.crossunder(h0, h1)
+
+// ─── Volatility Regime ────────────────────────────────────────────────────
+[_, _, adx] = ta.dmi(i_adx_len, i_adx_len)
+bool regime_ok = adx >= i_adx_min and adx <= i_adx_max
+
+// ─── Market Structure (VSE Logic) ────────────────────────────────────────
+float H = ta.highest(high, i_sw_len)
+float L = ta.lowest (low,  i_sw_len)
+
+bool new_sh = high[1] == H[1] and high < H
+bool new_sl = low[1]  == L[1] and low  > L
+
+var float last_sh      = na
+var int   last_sh_bar  = na
+var float last_sl      = na
+var int   last_sl_bar  = na
+var int   struct_trend = 0    // 1 = bull | -1 = bear | 0 = undefined
+
+var float run_buy  = 0.0
+var float run_sell = 0.0
+
+if new_sh or new_sl
+    run_buy  := 0.0
+    run_sell := 0.0
+
+if close >= open
+    run_buy  += volume
+else
+    run_sell += volume
+
+if new_sh
+    if not na(last_sh) and high[1] > last_sh
+        struct_trend := 1
+    last_sh     := high[1]
+    last_sh_bar := bar_index[1]
+
+if new_sl
+    if not na(last_sl) and low[1] < last_sl
+        struct_trend := -1
+    last_sl     := low[1]
+    last_sl_bar := bar_index[1]
+
+// BOS signals (confirmed on bar close)
+var float bos_bull_track = na
+var float bos_bear_track = na
+bool bos_bull_sig = barstate.isconfirmed and not na(last_sh) and close > last_sh and last_sh != bos_bull_track
+bool bos_bear_sig = barstate.isconfirmed and not na(last_sl) and close < last_sl and last_sl != bos_bear_track
+
+if bos_bull_sig
+    bos_bull_track := last_sh
+    struct_trend   := 1
+if bos_bear_sig
+    bos_bear_track := last_sl
+    struct_trend   := -1
+
+// ─── Session Detection (ISP Logic) ────────────────────────────────────────
+int  utc_h   = hour(time, "GMT")
+int  dow     = dayofweek(time, "GMT")
+bool weekday = dow != dayofweek.saturday and dow != dayofweek.sunday
+bool in_asia = weekday and utc_h >= 1  and utc_h < 9
+bool in_lon  = weekday and utc_h >= 7  and utc_h < 16
+bool in_ny   = weekday and utc_h >= 13 and utc_h < 22
+
+// If session filter is disabled, allow all hours (important for 24h markets)
+bool session_ok = not i_sess_filter
+               or (i_sess_asia and in_asia)
+               or (i_sess_lon  and in_lon)
+               or (i_sess_ny   and in_ny)
+
+// ─── FVG Detection (IZC Logic) ────────────────────────────────────────────
+bool fvg_bull_near = false
+bool fvg_bear_near = false
+
+bool cur_fvg_bull = close[1] > open[1] and high[2] < low  and bar_index > 50
+bool cur_fvg_bear = close[1] < open[1] and low[2]  > high and bar_index > 50
+
+var float last_bull_fvg_bot = na
+var float last_bull_fvg_top = na
+var float last_bear_fvg_top = na
+var float last_bear_fvg_bot = na
+
+if cur_fvg_bull
+    last_bull_fvg_bot := high[2]
+    last_bull_fvg_top := low
+if cur_fvg_bear
+    last_bear_fvg_top := low[2]
+    last_bear_fvg_bot := high
+
+if not na(last_bull_fvg_bot)
+    fvg_bull_near := close > last_bull_fvg_bot - atr_14 * i_fvg_prox
+                  and close < last_bull_fvg_top + atr_14 * i_fvg_prox
+if not na(last_bear_fvg_top)
+    fvg_bear_near := close < last_bear_fvg_top + atr_14 * i_fvg_prox
+                  and close > last_bear_fvg_bot - atr_14 * i_fvg_prox
+
+// ─── Fractal S/R for SL/TP (FLM Logic) ───────────────────────────────────
+float frac_high_ref = ta.highest(high, 20)
+float frac_low_ref  = ta.lowest (low,  20)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+// Primary signal: Hann ribbon crossover — fires frequently on all assets/TFs.
+// Structural filter: not trading against a confirmed trend.
+// Both crossover AND BOS can trigger entries for maximum opportunity coverage.
+
+// cross_bull alone (not requiring full rib_bull stack) so it fires at the crossover bar itself.
+// At crossover h0 just crossed h1 — requiring h1>h2 too would miss most signals.
+bool long_entry_sig  = cross_bull or (bos_bull_sig and h0 > h2)
+bool short_entry_sig = cross_bear or (bos_bear_sig and h0 < h2)
+
+bool long_cond  = barstate.isconfirmed
+               and long_entry_sig
+               and struct_trend >= 0          // not in a confirmed downtrend
+               and regime_ok
+               and session_ok
+               and (not i_use_fvg or fvg_bull_near)
+               and strategy.position_size == 0
+
+bool short_cond = barstate.isconfirmed
+               and short_entry_sig
+               and struct_trend <= 0          // not in a confirmed uptrend
+               and regime_ok
+               and session_ok
+               and (not i_use_fvg or fvg_bear_near)
+               and strategy.position_size == 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POSITION SIZING (% Risk per trade → contracts)
+// Uses strategy.fixed qty type. qty = (equity × risk%) / sl_distance
+// This correctly sizes in contracts regardless of asset price/ATR scale.
+// ═══════════════════════════════════════════════════════════════════════════
+float long_sl_dist  = math.max(close - (frac_low_ref  - atr_14 * i_sl_mult), atr_14 * 0.5)
+float short_sl_dist = math.max((frac_high_ref + atr_14 * i_sl_mult) - close, atr_14 * 0.5)
+
+float equity    = strategy.equity
+float long_qty  = math.max((equity * i_risk_pct / 100.0) / long_sl_dist,  0.001)
+float short_qty = math.max((equity * i_risk_pct / 100.0) / short_sl_dist, 0.001)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY & EXIT EXECUTION
+// Trail is built into strategy.exit using trail_offset (ticks from peak/trough).
+// No manual trailing stop variables needed — cleaner and more reliable.
+// ═══════════════════════════════════════════════════════════════════════════
+float trail_ticks = math.round(atr_14 * i_trail_mult / syminfo.mintick)
+
+if long_cond
+    float sl_price = close - long_sl_dist
+    float tp_price = close + long_sl_dist * i_rr
+    strategy.entry("Long", strategy.long, qty = long_qty)
+    strategy.exit("Long Exit", "Long",
+         stop         = sl_price,
+         limit        = tp_price,
+         trail_offset = i_trail ? trail_ticks : na,
+         comment      = "L-Exit")
+
+if short_cond
+    float sl_price = close + short_sl_dist
+    float tp_price = close - short_sl_dist * i_rr
+    strategy.entry("Short", strategy.short, qty = short_qty)
+    strategy.exit("Short Exit", "Short",
+         stop         = sl_price,
+         limit        = tp_price,
+         trail_offset = i_trail ? trail_ticks : na,
+         comment      = "S-Exit")
+
+// ─── Structure Exit (opposite BOS closes the trade immediately) ───────────
+if strategy.position_size > 0 and bos_bear_sig
+    strategy.close("Long", comment = "BOS Exit")
+if strategy.position_size < 0 and bos_bull_sig
+    strategy.close("Short", comment = "BOS Exit")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Ribbon plots (3-layer gradient)
+color rib_col = rib_bull ? i_bull_col : rib_bear ? i_bear_col : color.rgb(100, 110, 130)
+p_h0 = plot(h0, "Hann Fast",   color = color.new(rib_col, 0),  linewidth = 2)
+p_h1 = plot(h1, "Hann Mid",    color = color.new(rib_col, 40), linewidth = 1)
+p_h2 = plot(h2, "Hann Slow",   color = color.new(rib_col, 70), linewidth = 1)
+fill(p_h0, p_h1, color.new(rib_col, 70))
+fill(p_h1, p_h2, color.new(rib_col, 82))
+
+// Structure cloud between last swing high / low
+p_sh = plot(last_sh, "Struct High", color = na, editable = false)
+p_sl = plot(last_sl, "Struct Low",  color = na, editable = false)
+fill(p_sh, p_sl, last_sh, last_sl,
+     color.new(rib_col, 92), color.new(rib_col, 96))
+
+// Entry price reference while in trade
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na, "Entry Long",
+     color = color.new(i_bull_col, 20), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size < 0 ? strategy.position_avg_price : na, "Entry Short",
+     color = color.new(i_bear_col, 20), linewidth = 1, style = plot.style_linebr)
+
+// Entry / exit markers
+plotshape(long_cond,  "Long Entry",  shape.triangleup,   location.belowbar,
+     color.new(i_bull_col, 0), size = size.small)
+plotshape(short_cond, "Short Entry", shape.triangledown,  location.abovebar,
+     color.new(i_bear_col, 0), size = size.small)
+
+// Candle color by regime
+color regime_c = not regime_ok ? color.rgb(80, 80, 100) : rib_bull ? i_bull_col : i_bear_col
+barcolor(i_clr_bars ? color.new(regime_c, 40) : na)
+
+// BOS / crossover signal backgrounds
+bgcolor(bos_bull_sig ? color.new(i_bull_col, 92) : na, title = "BOS Bull BG")
+bgcolor(bos_bear_sig ? color.new(i_bear_col, 92) : na, title = "BOS Bear BG")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRATEGY DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════
+if barstate.islast
+    color C_BG  = color.rgb(16, 18, 24)
+    color C_BDR = color.rgb(40, 46, 58)
+    color C_TX  = color.rgb(190, 200, 218)
+    color C_MUT = color.rgb(88, 98, 115)
+
+    var table dash = table.new(position.bottom_right, 2, 13,
+         bgcolor      = C_BG,
+         border_color = C_BDR,
+         border_width = 1,
+         frame_color  = C_BDR,
+         frame_width  = 2)
+
+    table.cell(dash, 0, 0, "JIC",
+         text_color = color.rgb(0, 210, 145), text_size = size.normal, text_halign = text.align_left)
+    table.cell(dash, 1, 0, "jackofalltrades",
+         text_color = C_MUT, text_size = size.tiny, text_halign = text.align_right)
+
+    string t_txt = struct_trend == 1 ? "▲ BULL" : struct_trend == -1 ? "▼ BEAR" : "— NEUT"
+    color  t_col = struct_trend == 1 ? i_bull_col : struct_trend == -1 ? i_bear_col : C_MUT
+    table.cell(dash, 0, 1, "Structure", text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 1, t_txt,       text_color = t_col, text_size = size.small, text_halign = text.align_right)
+
+    string r_txt = rib_bull ? "▲ BULL" : rib_bear ? "▼ BEAR" : "—"
+    color  r_col = rib_bull ? i_bull_col : rib_bear ? i_bear_col : C_MUT
+    table.cell(dash, 0, 2, "Ribbon",    text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 2, r_txt,       text_color = r_col, text_size = size.small, text_halign = text.align_right)
+
+    string reg_txt = not regime_ok ? "BLOCKED" : "ACTIVE"
+    color  reg_col = not regime_ok ? color.rgb(255, 200, 50) : color.rgb(0, 210, 145)
+    table.cell(dash, 0, 3, "Regime",    text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 3, reg_txt + "  ADX:" + str.tostring(math.round(adx, 0)),
+         text_color = reg_col, text_size = size.small, text_halign = text.align_right)
+
+    string sess_txt = not i_sess_filter ? "ALL HRS" : in_lon and in_ny ? "LON+NY" : in_ny ? "NY" : in_lon ? "LON" : in_asia ? "ASIA" : "CLOSED"
+    color  sess_col = session_ok ? color.rgb(0, 210, 145) : C_MUT
+    table.cell(dash, 0, 4, "Session",   text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 4, sess_txt,    text_color = sess_col, text_size = size.small, text_halign = text.align_right)
+
+    string fvg_txt = fvg_bull_near ? "BULL FVG" : fvg_bear_near ? "BEAR FVG" : i_use_fvg ? "NONE" : "OFF"
+    color  fvg_col = fvg_bull_near ? i_bull_col : fvg_bear_near ? i_bear_col : C_MUT
+    table.cell(dash, 0, 5, "FVG",       text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 5, fvg_txt,     text_color = fvg_col, text_size = size.small, text_halign = text.align_right)
+
+    string sig_txt = cross_bull ? "▲ CROSS" : cross_bear ? "▼ CROSS" : bos_bull_sig ? "▲ BOS" : bos_bear_sig ? "▼ BOS" : "—"
+    color  sig_col = (cross_bull or bos_bull_sig) ? i_bull_col : (cross_bear or bos_bear_sig) ? i_bear_col : C_MUT
+    table.cell(dash, 0, 6, "Signal",    text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 6, sig_txt,     text_color = sig_col, text_size = size.small, text_halign = text.align_right)
+
+    string pos_txt = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    color  pos_col = strategy.position_size > 0 ? i_bull_col : strategy.position_size < 0 ? i_bear_col : C_MUT
+    table.cell(dash, 0, 7, "Position",  text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 7, pos_txt,     text_color = pos_col, text_size = size.small, text_halign = text.align_right)
+
+    float open_pnl = strategy.openprofit
+    color pnl_col  = open_pnl >= 0 ? color.rgb(0, 210, 145) : color.rgb(255, 65, 75)
+    table.cell(dash, 0, 8, "Open P&L",  text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 8, str.tostring(math.round(open_pnl, 2)) + " " + syminfo.currency,
+         text_color = pnl_col, text_size = size.small, text_halign = text.align_right)
+
+    float net     = strategy.netprofit
+    color net_col = net >= 0 ? color.rgb(0, 210, 145) : color.rgb(255, 65, 75)
+    table.cell(dash, 0, 9,  "Net Profit",  text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 9,  str.tostring(math.round(net, 2)) + " " + syminfo.currency,
+         text_color = net_col, text_size = size.small, text_halign = text.align_right)
+
+    int   tot_t = strategy.closedtrades
+    float wr    = tot_t > 0 ? strategy.wintrades / tot_t * 100 : 0.0
+    color wr_c  = wr > 55 ? color.rgb(0, 210, 145) : wr > 40 ? color.rgb(255, 200, 50) : color.rgb(255, 65, 75)
+    table.cell(dash, 0, 10, "Win Rate",    text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 10, str.tostring(math.round(wr, 1)) + "% (" + str.tostring(tot_t) + " trades)",
+         text_color = wr_c, text_size = size.small, text_halign = text.align_right)
+
+    float pf    = strategy.grossloss != 0 ? math.abs(strategy.grossprofit / strategy.grossloss) : 0.0
+    color pf_c  = pf > 1.5 ? color.rgb(0, 210, 145) : pf > 1.0 ? color.rgb(255, 200, 50) : color.rgb(255, 65, 75)
+    table.cell(dash, 0, 11, "Prof Factor", text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 11, str.tostring(math.round(pf, 2)),
+         text_color = pf_c, text_size = size.small, text_halign = text.align_right)
+
+    table.cell(dash, 0, 12, "Max DD",      text_color = C_TX, text_size = size.small, text_halign = text.align_left)
+    table.cell(dash, 1, 12, str.tostring(math.round(strategy.max_drawdown, 2)) + " " + syminfo.currency,
+         text_color = color.rgb(255, 65, 75), text_size = size.small, text_halign = text.align_right)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+alertcondition(long_cond,    "JIC — Long Entry [JOAT]",
+     "JIC: Long entry on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(short_cond,   "JIC — Short Entry [JOAT]",
+     "JIC: Short entry on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(bos_bull_sig, "JIC — BOS Bull [JOAT]",
+     "JIC: Bullish BOS on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(bos_bear_sig, "JIC — BOS Bear [JOAT]",
+     "JIC: Bearish BOS on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(cross_bull,   "JIC — Ribbon Cross Bull [JOAT]",
+     "JIC: Bullish ribbon crossover on {{ticker}} ({{interval}}) @ {{close}}")
+alertcondition(cross_bear,   "JIC — Ribbon Cross Bear [JOAT]",
+     "JIC: Bearish ribbon crossover on {{ticker}} ({{interval}}) @ {{close}}")

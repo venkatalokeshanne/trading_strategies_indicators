@@ -1,0 +1,288 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/ MPL-2.0
+//@version=6
+indicator("Fractal Regime S/R Matrix", "FRSR Matrix", overlay = true, max_labels_count = 500, max_boxes_count = 50, calc_bars_count = 3000)
+
+// --- Constants ---
+string GROUP_STRUCTURE = "Structure & Zones"
+string GROUP_REGIME = "Volatility Regime Filter"
+string GROUP_STYLE = "Style"
+color BULL_COLOR = #089981
+color BEAR_COLOR = #f23645
+color NEUTRAL_COLOR = #5b9cf6
+color TEXT_COLOR = chart.fg_color
+
+// --- Inputs ---
+int pivotLengthInput = input.int(5, "Pivot confirmation length", minval = 2, maxval = 20, group = GROUP_STRUCTURE, tooltip = "Bars required on each side to confirm a market-structure pivot.")
+int zoneAtrLengthInput = input.int(14, "Zone ATR length", minval = 2, group = GROUP_STRUCTURE, tooltip = "ATR length used to size support and resistance zones.")
+float zoneAtrWidthInput = input.float(0.65, "Zone ATR width", minval = 0.1, maxval = 3.0, step = 0.05, group = GROUP_STRUCTURE, tooltip = "Thickness of each zone as a multiple of ATR.")
+int maxZoneAgeInput = input.int(250, "Maximum zone age", minval = 20, maxval = 2000, group = GROUP_STRUCTURE, tooltip = "Bars after which an old zone is hidden until a new pivot creates one.")
+bool showStructureInput = input.bool(true, "Show HH / HL / LH / LL", group = GROUP_STRUCTURE, tooltip = "Print confirmed swing classifications on the chart.")
+bool showBreaksInput = input.bool(true, "Show BOS / CHOCH", group = GROUP_STRUCTURE, tooltip = "Mark breaks of confirmed swing levels and distinguish continuation from change of character.")
+bool showZonesInput = input.bool(true, "Show support / resistance zones", group = GROUP_STRUCTURE, tooltip = "Display the most recent ATR-sized support and resistance areas.")
+bool showSignalsInput = input.bool(true, "Show zone signals", group = GROUP_STRUCTURE, tooltip = "Show buy and sell markers only when structure and the volatility regime agree.")
+bool showFvgInput = input.bool(true, "Show fair value gaps", group = GROUP_STRUCTURE, tooltip = "Display active bullish and bearish three-candle imbalance zones.")
+int maxFvgCountInput = input.int(12, "Maximum active FVGs", minval = 1, maxval = 40, group = GROUP_STRUCTURE, tooltip = "Maximum number of bullish and bearish fair value gaps retained on the chart.")
+int maxFvgAgeInput = input.int(150, "Maximum FVG age", minval = 10, maxval = 1000, group = GROUP_STRUCTURE, tooltip = "Hide and remove fair value gaps after this many bars if they remain unfilled.")
+float minimumFvgAtrInput = input.float(0.05, "Minimum FVG size in ATR", minval = 0.0, maxval = 2.0, step = 0.01, group = GROUP_STRUCTURE, tooltip = "Filters out insignificant gaps by requiring their size to exceed this ATR fraction.")
+
+int adxLengthInput = input.int(14, "ADX length", minval = 2, group = GROUP_REGIME, tooltip = "Directional strength length used to reject weak trends.")
+int adxSmoothingInput = input.int(14, "ADX smoothing", minval = 2, group = GROUP_REGIME, tooltip = "Smoothing applied to the directional movement index.")
+int efficiencyLengthInput = input.int(20, "Efficiency ratio length", minval = 5, group = GROUP_REGIME, tooltip = "Kaufman-style net movement divided by total movement; low values identify chop.")
+int slopeLengthInput = input.int(30, "Regression slope length", minval = 5, group = GROUP_REGIME, tooltip = "Linear-regression window used to measure directional displacement relative to ATR.")
+int volatilityLengthInput = input.int(50, "Volatility baseline length", minval = 5, group = GROUP_REGIME, tooltip = "Baseline used to compare current ATR with recent volatility.")
+float minimumAdxInput = input.float(18.0, "Minimum ADX", minval = 5.0, maxval = 50.0, step = 0.5, group = GROUP_REGIME, tooltip = "Minimum directional strength required for a valid trend regime.")
+float minimumEfficiencyInput = input.float(0.28, "Minimum efficiency ratio", minval = 0.05, maxval = 0.95, step = 0.01, group = GROUP_REGIME, tooltip = "Minimum net-to-total movement ratio required to avoid ranging conditions.")
+float minimumVolatilityRatioInput = input.float(0.85, "Minimum ATR ratio", minval = 0.25, maxval = 2.0, step = 0.05, group = GROUP_REGIME, tooltip = "Requires current ATR to be above this fraction of its baseline.")
+float regimeScoreInput = input.float(0.46, "Minimum regime score", minval = 0.1, maxval = 0.95, step = 0.01, group = GROUP_REGIME, tooltip = "Composite threshold combining ADX, efficiency and normalized regression slope.")
+
+bool showDashboardInput = input.bool(true, "Show volatility dashboard", group = GROUP_STYLE, tooltip = "Display the live trend, volatility and regime diagnostics.")
+bool showRegimeBackgroundInput = input.bool(true, "Shade market regime", group = GROUP_STYLE, tooltip = "Use a subtle background tint for trending versus ranging conditions.")
+string signalSizeInput = input.string("Large", "Signal triangle size", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = GROUP_STYLE, tooltip = "Controls the size of the BUY and SELL triangles.")
+color buySignalColorInput = input.color(BULL_COLOR, "Buy signal color", group = GROUP_STYLE, tooltip = "Color of bullish BUY triangles.")
+color sellSignalColorInput = input.color(BEAR_COLOR, "Sell signal color", group = GROUP_STYLE, tooltip = "Color of bearish SELL triangles.")
+color bullishFvgColorInput = input.color(#00bfa5, "Bullish FVG color", group = GROUP_STYLE, tooltip = "Color for unfilled bullish fair value gap zones.")
+color bearishFvgColorInput = input.color(#ff7043, "Bearish FVG color", group = GROUP_STYLE, tooltip = "Color for unfilled bearish fair value gap zones.")
+color supportColorInput = input.color(BULL_COLOR, "Support zone color", group = GROUP_STYLE, tooltip = "Color for support zones and bullish structure.")
+color resistanceColorInput = input.color(BEAR_COLOR, "Resistance zone color", group = GROUP_STYLE, tooltip = "Color for resistance zones and bearish structure.")
+
+// --- User-defined functions ---
+f_efficiencyRatio(series float source, int length) =>
+    float netChange = math.abs(source - source[length])
+    float totalChange = 0.0
+    for i = 0 to length - 1
+        totalChange += math.abs(source[i] - source[i + 1])
+    not na(netChange) and totalChange > 0.0 ? netChange / totalChange : 0.0
+
+f_regimeText(bool isTrending, int direction) =>
+    isTrending ? direction > 0 ? "TREND / BULL" : direction < 0 ? "TREND / BEAR" : "TREND / NEUTRAL" : "RANGING / BLOCKED"
+
+f_regimeColor(bool isTrending, int direction) =>
+    isTrending ? direction > 0 ? BULL_COLOR : direction < 0 ? BEAR_COLOR : NEUTRAL_COLOR : color.gray
+
+// --- Volatility and regime mathematics ---
+float atrValue = ta.atr(zoneAtrLengthInput)
+float atrPercent = close != 0.0 ? atrValue / close * 100.0 : 0.0
+float atrBaseline = ta.sma(atrValue, volatilityLengthInput)
+float volatilityRatio = not na(atrBaseline) and atrBaseline != 0.0 ? atrValue / atrBaseline : 0.0
+float efficiencyRatio = f_efficiencyRatio(close, efficiencyLengthInput)
+float regressionNow = ta.linreg(close, slopeLengthInput, 0)
+float regressionPrevious = ta.linreg(close, slopeLengthInput, 1)
+float regressionSlope = regressionNow - regressionPrevious
+float normalizedSlope = atrValue != 0.0 ? regressionSlope / atrValue : 0.0
+[diPlus, diMinus, adxValue] = ta.dmi(adxLengthInput, adxSmoothingInput)
+
+float adxComponent = math.min(adxValue / 50.0, 1.0)
+float slopeComponent = math.min(math.abs(normalizedSlope) / 0.8, 1.0)
+float regimeScore = adxComponent * 0.45 + efficiencyRatio * 0.35 + slopeComponent * 0.20
+bool directionalBiasBull = diPlus >= diMinus and normalizedSlope >= 0.0
+bool directionalBiasBear = diMinus > diPlus and normalizedSlope < 0.0
+bool volatilityPass = volatilityRatio >= minimumVolatilityRatioInput
+bool regimeReady = adxValue >= minimumAdxInput and efficiencyRatio >= minimumEfficiencyInput and volatilityPass and regimeScore >= regimeScoreInput
+
+// --- Confirmed market structure ---
+float pivotHigh = ta.pivothigh(high, pivotLengthInput, pivotLengthInput)
+float pivotLow = ta.pivotlow(low, pivotLengthInput, pivotLengthInput)
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var int lastPivotHighBar = na
+var int lastPivotLowBar = na
+var bool highAlreadyBroken = false
+var bool lowAlreadyBroken = false
+var int structureDirection = 0
+var string lastStructureEvent = "Waiting for structure"
+
+var box supportBox = na
+var box resistanceBox = na
+var float supportTop = na
+var float supportBottom = na
+var float resistanceTop = na
+var float resistanceBottom = na
+var int supportCreatedBar = na
+var int resistanceCreatedBar = na
+
+var array<box> bullishFvgBoxes = array.new<box>()
+var array<float> bullishFvgBottoms = array.new<float>()
+var array<int> bullishFvgBornBars = array.new<int>()
+var array<box> bearishFvgBoxes = array.new<box>()
+var array<float> bearishFvgTops = array.new<float>()
+var array<int> bearishFvgBornBars = array.new<int>()
+
+if not na(pivotHigh)
+    int pivotBar = bar_index - pivotLengthInput
+    string highType = na(lastPivotHigh) ? "SH" : pivotHigh > lastPivotHigh ? "HH" : "LH"
+    if showStructureInput
+        label.new(pivotBar, pivotHigh, highType, style = label.style_label_down, color = color.new(resistanceColorInput, 15), textcolor = TEXT_COLOR, size = size.tiny, tooltip = "Confirmed swing high")
+    lastPivotHigh := pivotHigh
+    lastPivotHighBar := pivotBar
+    highAlreadyBroken := false
+    float pivotAtr = nz(atrValue[pivotLengthInput], atrValue)
+    resistanceTop := pivotHigh + pivotAtr * zoneAtrWidthInput * 0.5
+    resistanceBottom := pivotHigh - pivotAtr * zoneAtrWidthInput * 0.5
+    resistanceCreatedBar := bar_index
+    if not na(resistanceBox)
+        box.delete(resistanceBox)
+    resistanceBox := box.new(left = pivotBar, top = resistanceTop, right = bar_index, bottom = resistanceBottom, border_color = color.new(resistanceColorInput, 25), border_width = 1, bgcolor = color.new(resistanceColorInput, 88))
+
+if not na(pivotLow)
+    int pivotBar = bar_index - pivotLengthInput
+    string lowType = na(lastPivotLow) ? "SL" : pivotLow > lastPivotLow ? "HL" : "LL"
+    if showStructureInput
+        label.new(pivotBar, pivotLow, lowType, style = label.style_label_up, color = color.new(supportColorInput, 15), textcolor = TEXT_COLOR, size = size.tiny, tooltip = "Confirmed swing low")
+    lastPivotLow := pivotLow
+    lastPivotLowBar := pivotBar
+    lowAlreadyBroken := false
+    float pivotAtr = nz(atrValue[pivotLengthInput], atrValue)
+    supportTop := pivotLow + pivotAtr * zoneAtrWidthInput * 0.5
+    supportBottom := pivotLow - pivotAtr * zoneAtrWidthInput * 0.5
+    supportCreatedBar := bar_index
+    if not na(supportBox)
+        box.delete(supportBox)
+    supportBox := box.new(left = pivotBar, top = supportTop, right = bar_index, bottom = supportBottom, border_color = color.new(supportColorInput, 25), border_width = 1, bgcolor = color.new(supportColorInput, 88))
+
+if not na(supportBox)
+    box.set_right(supportBox, bar_index)
+    box.set_bgcolor(supportBox, showZonesInput and not na(supportCreatedBar) and bar_index - supportCreatedBar <= maxZoneAgeInput ? color.new(supportColorInput, 88) : color.new(supportColorInput, 100))
+if not na(resistanceBox)
+    box.set_right(resistanceBox, bar_index)
+    box.set_bgcolor(resistanceBox, showZonesInput and not na(resistanceCreatedBar) and bar_index - resistanceCreatedBar <= maxZoneAgeInput ? color.new(resistanceColorInput, 88) : color.new(resistanceColorInput, 100))
+
+// --- Fair value gap engine ---
+bool bullishFvg = bar_index >= 2 and low > high[2] and low - high[2] >= atrValue * minimumFvgAtrInput
+bool bearishFvg = bar_index >= 2 and high < low[2] and low[2] - high >= atrValue * minimumFvgAtrInput
+
+if bullishFvg and showFvgInput
+    box newBullishFvg = box.new(left = bar_index - 2, top = low, right = bar_index, bottom = high[2], border_color = color.new(bullishFvgColorInput, 35), border_width = 1, bgcolor = color.new(bullishFvgColorInput, 84))
+    array.push(bullishFvgBoxes, newBullishFvg)
+    array.push(bullishFvgBottoms, high[2])
+    array.push(bullishFvgBornBars, bar_index)
+    if array.size(bullishFvgBoxes) > maxFvgCountInput
+        box oldestBullishFvg = array.get(bullishFvgBoxes, 0)
+        box.delete(oldestBullishFvg)
+        array.remove(bullishFvgBoxes, 0)
+        array.remove(bullishFvgBottoms, 0)
+        array.remove(bullishFvgBornBars, 0)
+
+if bearishFvg and showFvgInput
+    box newBearishFvg = box.new(left = bar_index - 2, top = low[2], right = bar_index, bottom = high, border_color = color.new(bearishFvgColorInput, 35), border_width = 1, bgcolor = color.new(bearishFvgColorInput, 84))
+    array.push(bearishFvgBoxes, newBearishFvg)
+    array.push(bearishFvgTops, low[2])
+    array.push(bearishFvgBornBars, bar_index)
+    if array.size(bearishFvgBoxes) > maxFvgCountInput
+        box oldestBearishFvg = array.get(bearishFvgBoxes, 0)
+        box.delete(oldestBearishFvg)
+        array.remove(bearishFvgBoxes, 0)
+        array.remove(bearishFvgTops, 0)
+        array.remove(bearishFvgBornBars, 0)
+
+int bullishFvgIndex = array.size(bullishFvgBoxes) - 1
+while bullishFvgIndex >= 0
+    box activeBullishFvg = array.get(bullishFvgBoxes, bullishFvgIndex)
+    float bullishFvgBottom = array.get(bullishFvgBottoms, bullishFvgIndex)
+    int bullishFvgBorn = array.get(bullishFvgBornBars, bullishFvgIndex)
+    bool bullishFvgFilled = low <= bullishFvgBottom
+    bool bullishFvgStale = bar_index - bullishFvgBorn > maxFvgAgeInput
+    if bullishFvgFilled or bullishFvgStale
+        box.delete(activeBullishFvg)
+        array.remove(bullishFvgBoxes, bullishFvgIndex)
+        array.remove(bullishFvgBottoms, bullishFvgIndex)
+        array.remove(bullishFvgBornBars, bullishFvgIndex)
+    else
+        box.set_right(activeBullishFvg, bar_index)
+        box.set_bgcolor(activeBullishFvg, showFvgInput ? color.new(bullishFvgColorInput, 84) : color.new(bullishFvgColorInput, 100))
+        box.set_border_color(activeBullishFvg, showFvgInput ? color.new(bullishFvgColorInput, 35) : color.new(bullishFvgColorInput, 100))
+    bullishFvgIndex -= 1
+
+int bearishFvgIndex = array.size(bearishFvgBoxes) - 1
+while bearishFvgIndex >= 0
+    box activeBearishFvg = array.get(bearishFvgBoxes, bearishFvgIndex)
+    float bearishFvgTop = array.get(bearishFvgTops, bearishFvgIndex)
+    int bearishFvgBorn = array.get(bearishFvgBornBars, bearishFvgIndex)
+    bool bearishFvgFilled = high >= bearishFvgTop
+    bool bearishFvgStale = bar_index - bearishFvgBorn > maxFvgAgeInput
+    if bearishFvgFilled or bearishFvgStale
+        box.delete(activeBearishFvg)
+        array.remove(bearishFvgBoxes, bearishFvgIndex)
+        array.remove(bearishFvgTops, bearishFvgIndex)
+        array.remove(bearishFvgBornBars, bearishFvgIndex)
+    else
+        box.set_right(activeBearishFvg, bar_index)
+        box.set_bgcolor(activeBearishFvg, showFvgInput ? color.new(bearishFvgColorInput, 84) : color.new(bearishFvgColorInput, 100))
+        box.set_border_color(activeBearishFvg, showFvgInput ? color.new(bearishFvgColorInput, 35) : color.new(bearishFvgColorInput, 100))
+    bearishFvgIndex -= 1
+
+bool bullishBreak = not na(lastPivotHigh) and not highAlreadyBroken and close > lastPivotHigh and close[1] <= lastPivotHigh
+bool bearishBreak = not na(lastPivotLow) and not lowAlreadyBroken and close < lastPivotLow and close[1] >= lastPivotLow
+bool bullishChoch = bullishBreak and structureDirection < 0
+bool bearishChoch = bearishBreak and structureDirection > 0
+bool bullishBos = bullishBreak and not bullishChoch
+bool bearishBos = bearishBreak and not bearishChoch
+
+if bullishBreak
+    highAlreadyBroken := true
+    structureDirection := 1
+    lastStructureEvent := bullishChoch ? "Bullish CHOCH" : "Bullish BOS"
+    if showBreaksInput
+        label.new(bar_index, low, bullishChoch ? "CHOCH ↑" : "BOS ↑", style = label.style_label_up, color = color.new(supportColorInput, 5), textcolor = TEXT_COLOR, size = size.small, tooltip = bullishChoch ? "Change of character: bearish structure broken" : "Break of structure to the upside")
+if bearishBreak
+    lowAlreadyBroken := true
+    structureDirection := -1
+    lastStructureEvent := bearishChoch ? "Bearish CHOCH" : "Bearish BOS"
+    if showBreaksInput
+        label.new(bar_index, high, bearishChoch ? "CHOCH ↓" : "BOS ↓", style = label.style_label_down, color = color.new(resistanceColorInput, 5), textcolor = TEXT_COLOR, size = size.small, tooltip = bearishChoch ? "Change of character: bullish structure broken" : "Break of structure to the downside")
+
+// --- Regime-gated zone reactions ---
+bool supportActive = not na(supportTop) and not na(supportCreatedBar) and bar_index - supportCreatedBar <= maxZoneAgeInput
+bool resistanceActive = not na(resistanceBottom) and not na(resistanceCreatedBar) and bar_index - resistanceCreatedBar <= maxZoneAgeInput
+bool buySignal = showSignalsInput and regimeReady and structureDirection == 1 and supportActive and low <= supportTop and close > supportTop and close > open
+bool sellSignal = showSignalsInput and regimeReady and structureDirection == -1 and resistanceActive and high >= resistanceBottom and close < resistanceBottom and close < open
+
+plot(showZonesInput ? supportTop : na, "Support ceiling", color = color.new(supportColorInput, 35), style = plot.style_linebr)
+plot(showZonesInput ? supportBottom : na, "Support floor", color = color.new(supportColorInput, 65), style = plot.style_linebr)
+plot(showZonesInput ? resistanceTop : na, "Resistance ceiling", color = color.new(resistanceColorInput, 65), style = plot.style_linebr)
+plot(showZonesInput ? resistanceBottom : na, "Resistance floor", color = color.new(resistanceColorInput, 35), style = plot.style_linebr)
+plotshape(buySignal and signalSizeInput == "Tiny", "Buy signal tiny", shape.triangleup, location.belowbar, buySignalColorInput, size = size.tiny, text = "BUY", textcolor = TEXT_COLOR)
+plotshape(buySignal and signalSizeInput == "Small", "Buy signal small", shape.triangleup, location.belowbar, buySignalColorInput, size = size.small, text = "BUY", textcolor = TEXT_COLOR)
+plotshape(buySignal and signalSizeInput == "Normal", "Buy signal normal", shape.triangleup, location.belowbar, buySignalColorInput, size = size.normal, text = "BUY", textcolor = TEXT_COLOR)
+plotshape(buySignal and signalSizeInput == "Large", "Buy signal large", shape.triangleup, location.belowbar, buySignalColorInput, size = size.large, text = "BUY", textcolor = TEXT_COLOR)
+plotshape(buySignal and signalSizeInput == "Huge", "Buy signal huge", shape.triangleup, location.belowbar, buySignalColorInput, size = size.huge, text = "BUY", textcolor = TEXT_COLOR)
+plotshape(sellSignal and signalSizeInput == "Tiny", "Sell signal tiny", shape.triangledown, location.abovebar, sellSignalColorInput, size = size.tiny, text = "SELL", textcolor = TEXT_COLOR)
+plotshape(sellSignal and signalSizeInput == "Small", "Sell signal small", shape.triangledown, location.abovebar, sellSignalColorInput, size = size.small, text = "SELL", textcolor = TEXT_COLOR)
+plotshape(sellSignal and signalSizeInput == "Normal", "Sell signal normal", shape.triangledown, location.abovebar, sellSignalColorInput, size = size.normal, text = "SELL", textcolor = TEXT_COLOR)
+plotshape(sellSignal and signalSizeInput == "Large", "Sell signal large", shape.triangledown, location.abovebar, sellSignalColorInput, size = size.large, text = "SELL", textcolor = TEXT_COLOR)
+plotshape(sellSignal and signalSizeInput == "Huge", "Sell signal huge", shape.triangledown, location.abovebar, sellSignalColorInput, size = size.huge, text = "SELL", textcolor = TEXT_COLOR)
+
+color regimeBackground = regimeReady ? directionalBiasBull ? color.new(supportColorInput, 93) : directionalBiasBear ? color.new(resistanceColorInput, 93) : color.new(NEUTRAL_COLOR, 95) : color.new(color.gray, 95)
+bgcolor(showRegimeBackgroundInput ? regimeBackground : na, title = "Regime background")
+
+// --- Dashboard ---
+var table dashboard = table.new(position.top_right, 2, 8, border_width = 1, border_color = color.new(TEXT_COLOR, 75), frame_width = 1, frame_color = color.new(TEXT_COLOR, 75))
+if barstate.islast and showDashboardInput
+    color regimeColor = f_regimeColor(regimeReady, structureDirection)
+    string volatilityState = volatilityRatio >= 1.10 ? "EXPANDING" : volatilityRatio <= 0.85 ? "COMPRESSED" : "NORMAL"
+    string directionText = directionalBiasBull ? "BULLISH" : directionalBiasBear ? "BEARISH" : "MIXED"
+    table.cell(dashboard, 0, 0, "FRACTAL REGIME", text_color = TEXT_COLOR, bgcolor = color.new(NEUTRAL_COLOR, 75), text_size = size.small)
+    table.cell(dashboard, 1, 0, "LIVE", text_color = TEXT_COLOR, bgcolor = color.new(NEUTRAL_COLOR, 75), text_size = size.small)
+    table.cell(dashboard, 0, 1, "Market state", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 1, f_regimeText(regimeReady, structureDirection), text_color = regimeColor, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 2, "ADX / Efficiency", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 2, str.tostring(adxValue, "#.0") + " / " + str.tostring(efficiencyRatio, "#.00"), text_color = adxValue >= minimumAdxInput and efficiencyRatio >= minimumEfficiencyInput ? BULL_COLOR : color.gray, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 3, "ATR / baseline", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 3, str.tostring(atrPercent, "#.00") + "% / " + str.tostring(volatilityRatio, "#.00"), text_color = volatilityPass ? NEUTRAL_COLOR : BEAR_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 4, "Volatility", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 4, volatilityState, text_color = volatilityRatio >= 1.10 ? BULL_COLOR : volatilityRatio <= 0.85 ? BEAR_COLOR : TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 5, "Regime score", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 5, str.tostring(regimeScore, "#.00") + " / " + str.tostring(regimeScoreInput, "#.00"), text_color = regimeReady ? BULL_COLOR : color.gray, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 6, "Bias / slope", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 6, directionText + " / " + str.tostring(normalizedSlope, "#.00"), text_color = directionalBiasBull ? BULL_COLOR : directionalBiasBear ? BEAR_COLOR : TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 0, 7, "Last event", text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+    table.cell(dashboard, 1, 7, lastStructureEvent, text_color = TEXT_COLOR, bgcolor = color.new(chart.bg_color, 0), text_size = size.tiny)
+
+// --- Alerts ---
+alertcondition(buySignal, "Buy zone reaction", "FRSR Matrix: bullish structure and trend-filtered reaction from support.")
+alertcondition(sellSignal, "Sell zone reaction", "FRSR Matrix: bearish structure and trend-filtered reaction from resistance.")
+alertcondition(bullishBos, "Bullish BOS", "FRSR Matrix: bullish break of structure.")
+alertcondition(bearishBos, "Bearish BOS", "FRSR Matrix: bearish break of structure.")
+alertcondition(bullishChoch, "Bullish CHOCH", "FRSR Matrix: bullish change of character.")
+alertcondition(bearishChoch, "Bearish CHOCH", "FRSR Matrix: bearish change of character.")
+alertcondition(bullishFvg, "Bullish FVG formed", "FRSR Matrix: bullish fair value gap formed.")
+alertcondition(bearishFvg, "Bearish FVG formed", "FRSR Matrix: bearish fair value gap formed.")

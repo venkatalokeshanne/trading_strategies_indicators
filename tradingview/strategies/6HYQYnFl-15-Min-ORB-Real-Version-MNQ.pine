@@ -1,0 +1,338 @@
+// ============================================================
+// MODEL 4 — OPENING RANGE BREAKOUT (REAL VERSION)
+// Instrument : MNQ (Micro NQ Futures)
+// Timeframe  : 1m (plots ORB, entries on breakout)
+// Edge       : First 30min range defines institutional reference.
+//              Real version requires volume surge + close outside
+//              range + no gap-and-go fade trap.
+// Risk       : $500/day max, funded account safe
+// Author     : BoothPay Labs Quant Desk
+// ============================================================
+
+//@version=5
+strategy(title="[M4] ORB Real Version – MNQ",
+         shorttitle="ORB-Real",
+         overlay=true,
+         initial_capital=25000,
+         default_qty_type=strategy.fixed,
+         default_qty_value=1,
+         commission_type=strategy.commission.cash_per_contract,
+         commission_value=0.62,
+         slippage=1)
+
+// ─────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────
+grp_orb  = "Opening Range"
+orbStart = input.int(9,    "ORB Start Hour (ET)",        group=grp_orb)
+orbStartM= input.int(30,   "ORB Start Minute",           group=grp_orb)
+orbEnd   = input.int(10,   "ORB End Hour (ET)",          group=grp_orb)
+orbEndM  = input.int(0,    "ORB End Minute",             group=grp_orb,
+           tooltip="Default: 9:30-10:00 = 30 min ORB. Institutional standard.")
+
+grp_bo   = "Breakout Confirmation"
+volLen   = input.int(20,   "Volume MA Length",           group=grp_bo)
+volMin   = input.float(1.5,"Min Volume Multiplier",      group=grp_bo, step=0.1,
+           tooltip="Breakout bar must have at least this x avg volume")
+reqClose = input.bool(true, "Require Close Outside Range",group=grp_bo,
+           tooltip="Bar must CLOSE beyond ORB level, not just wick through it")
+minRangeAtr = input.float(0.5,"Min ORB Range (ATR mult)",group=grp_bo, step=0.1,
+           tooltip="Skip if ORB is too tight — chop day, not worth it")
+maxRangeAtr = input.float(4.0,"Max ORB Range (ATR mult)",group=grp_bo, step=0.1,
+           tooltip="Skip if ORB is too wide — news gap day, risk too high")
+
+grp_flt  = "False Breakout Filter"
+retestOK = input.bool(true, "Allow Retest Entry",        group=grp_flt,
+           tooltip="If first bar breaks out but retraces to ORB level, enter on retest hold")
+maxRetest= input.int(5,    "Max Bars for Retest",        group=grp_flt)
+
+grp_risk = "Risk Management"
+atrLen   = input.int(14,   "ATR Length",                 group=grp_risk)
+stopMode = input.string("ORB Edge", "Stop Mode",         group=grp_risk,
+           options=["ORB Edge", "ATR"],
+           tooltip="ORB Edge: stop at opposite side of range. ATR: stop by ATR multiplier")
+stopMult = input.float(0.5,"ATR Stop Mult (if ATR mode)",group=grp_risk, step=0.1)
+tp1Pct   = input.float(40, "TP1 % of ORB Range",        group=grp_risk, step=10,
+           tooltip="TP1 = 1x ORB range extension from breakout level")
+tp2Pct   = input.float(50,"TP2 % of ORB Range",        group=grp_risk, step=10,
+           tooltip="TP2 = 2x ORB range extension")
+maxLoss  = input.float(500,"Max Daily Loss ($)",         group=grp_risk)
+contracts= input.int(2,    "Contracts",                  group=grp_risk, minval=1)
+
+grp_eod  = "EOD"
+eodHour  = input.int(15,   "EOD Hour (ET)",              group=grp_eod)
+eodMin   = input.int(50,   "EOD Minute",                 group=grp_eod)
+
+// ─────────────────────────────────────────────
+// TIME
+// ─────────────────────────────────────────────
+etHour   = hour(time,   "America/New_York")
+etMin    = minute(time, "America/New_York")
+etTime   = etHour * 60 + etMin
+orbStartT= orbStart * 60 + orbStartM
+orbEndT  = orbEnd   * 60 + orbEndM
+eodT     = eodHour  * 60 + eodMin
+
+inORBWindow   = etTime >= orbStartT and etTime < orbEndT
+afterORB      = etTime >= orbEndT
+isEOD         = etTime >= eodT
+isNewDay      = ta.change(time("D")) != 0
+
+// ─────────────────────────────────────────────
+// DAILY LIMITS
+// ─────────────────────────────────────────────
+var float dailyPnL   = 0.0
+var float lastEquity = strategy.initial_capital
+
+if isNewDay
+    dailyPnL   := 0.0
+    lastEquity := strategy.equity
+
+dailyPnL     := strategy.equity - lastEquity
+dailyLimitOK  = dailyPnL > -maxLoss
+
+// ─────────────────────────────────────────────
+// ORB RANGE BUILDING
+// ─────────────────────────────────────────────
+var float orbHigh    = na
+var float orbLow     = na
+var bool  orbLocked  = false
+var bool  longFired  = false
+var bool  shortFired = false
+
+// Reset daily
+if isNewDay
+    orbHigh   := na
+    orbLow    := na
+    orbLocked := false
+    longFired := false
+    shortFired:= false
+
+// Build ORB during window
+if inORBWindow
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+// Lock ORB at end of window
+if afterORB and not orbLocked and not na(orbHigh)
+    orbLocked := true
+
+// ─────────────────────────────────────────────
+// ORB QUALITY FILTER
+// ─────────────────────────────────────────────
+atr      = ta.atr(atrLen)
+volMA    = ta.sma(volume, volLen)
+orbRange = na(orbHigh) or na(orbLow) ? na : orbHigh - orbLow
+
+orbValid = orbLocked
+           and not na(orbRange)
+           and orbRange >= atr * minRangeAtr   // not too tight
+           and orbRange <= atr * maxRangeAtr   // not too wide (gap day)
+
+// ─────────────────────────────────────────────
+// BREAKOUT DETECTION
+// ─────────────────────────────────────────────
+orbRangeH = orbHigh
+orbRangeL = orbLow
+
+// Long breakout: close above ORB high with volume
+longBO = orbValid and afterORB and not isEOD
+         and (reqClose ? close > orbRangeH : high > orbRangeH)
+         and volume > volMA * volMin
+         and not longFired
+         and dailyLimitOK
+         and strategy.position_size == 0
+
+// Short breakout: close below ORB low with volume
+shortBO = orbValid and afterORB and not isEOD
+          and (reqClose ? close < orbRangeL : low < orbRangeL)
+          and volume > volMA * volMin
+          and not shortFired
+          and dailyLimitOK
+          and strategy.position_size == 0
+
+// ─────────────────────────────────────────────
+// RETEST ENTRY (secondary entry after initial breakout)
+// ─────────────────────────────────────────────
+var bool  awaitingRetest = false
+var bool  retestIsLong   = false
+var int   retestBar      = na
+
+// Mark retest opportunity if breakout bar closes back inside range
+if longBO
+    awaitingRetest := true
+    retestIsLong   := true
+    retestBar      := bar_index
+
+if shortBO
+    awaitingRetest := true
+    retestIsLong   := false
+    retestBar      := bar_index
+
+// Retest condition: price returns to ORB edge and holds
+retestLong  = retestOK and awaitingRetest and retestIsLong
+              and bar_index - retestBar <= maxRetest
+              and close > orbRangeH               // holds above ORB
+              and low <= orbRangeH * 1.002        // touched the level
+
+retestShort = retestOK and awaitingRetest and not retestIsLong
+              and bar_index - retestBar <= maxRetest
+              and close < orbRangeL
+              and high >= orbRangeL * 0.998
+
+// ─────────────────────────────────────────────
+// STOP & TP LEVELS
+// ─────────────────────────────────────────────
+longStop  = stopMode == "ORB Edge" ? orbRangeL : close - atr * stopMult
+shortStop = stopMode == "ORB Edge" ? orbRangeH : close + atr * stopMult
+longTP1   = orbRangeH + orbRange * (tp1Pct  / 100)
+longTP2   = orbRangeH + orbRange * (tp2Pct  / 100)
+shortTP1  = orbRangeL - orbRange * (tp1Pct  / 100)
+shortTP2  = orbRangeL - orbRange * (tp2Pct  / 100)
+
+// ─────────────────────────────────────────────
+// ENTRIES
+// ─────────────────────────────────────────────
+var float entryStop = na
+var float entryTP1  = na
+var float entryTP2  = na
+var bool  tp1Hit    = false
+
+if longBO
+    strategy.entry("Long-BO", strategy.long, qty=contracts)
+    entryStop := longStop
+    entryTP1  := longTP1
+    entryTP2  := longTP2
+    tp1Hit    := false
+    longFired := true
+    awaitingRetest := false
+
+if shortBO
+    strategy.entry("Short-BO", strategy.short, qty=contracts)
+    entryStop := shortStop
+    entryTP1  := shortTP1
+    entryTP2  := shortTP2
+    tp1Hit    := false
+    shortFired:= true
+    awaitingRetest := false
+
+if retestLong and strategy.position_size == 0
+    strategy.entry("Long-RT", strategy.long, qty=contracts)
+    entryStop := longStop
+    entryTP1  := longTP1
+    entryTP2  := longTP2
+    tp1Hit    := false
+    awaitingRetest := false
+
+if retestShort and strategy.position_size == 0
+    strategy.entry("Short-RT", strategy.short, qty=contracts)
+    entryStop := shortStop
+    entryTP1  := shortTP1
+    entryTP2  := shortTP2
+    tp1Hit    := false
+    awaitingRetest := false
+
+// ─────────────────────────────────────────────
+// EXITS
+// ─────────────────────────────────────────────
+if strategy.position_size > 0 and not tp1Hit and high >= entryTP1
+    strategy.exit("TP1-L", "Long-BO",  qty_percent=50, limit=entryTP1, stop=entryStop)
+    strategy.exit("TP1-LR","Long-RT",  qty_percent=50, limit=entryTP1, stop=entryStop)
+    tp1Hit := true
+
+if strategy.position_size < 0 and not tp1Hit and low <= entryTP1
+    strategy.exit("TP1-S", "Short-BO", qty_percent=50, limit=entryTP1, stop=entryStop)
+    strategy.exit("TP1-SR","Short-RT", qty_percent=50, limit=entryTP1, stop=entryStop)
+    tp1Hit := true
+
+if strategy.position_size > 0 and tp1Hit
+    strategy.exit("TP2-L", "Long-BO",  limit=entryTP2, stop=entryStop)
+    strategy.exit("TP2-LR","Long-RT",  limit=entryTP2, stop=entryStop)
+
+if strategy.position_size < 0 and tp1Hit
+    strategy.exit("TP2-S", "Short-BO", limit=entryTP2, stop=entryStop)
+    strategy.exit("TP2-SR","Short-RT", limit=entryTP2, stop=entryStop)
+
+if strategy.position_size > 0 and not tp1Hit
+    strategy.exit("SL-L", "Long-BO",  stop=entryStop)
+    strategy.exit("SL-LR","Long-RT",  stop=entryStop)
+
+if strategy.position_size < 0 and not tp1Hit
+    strategy.exit("SL-S", "Short-BO", stop=entryStop)
+    strategy.exit("SL-SR","Short-RT", stop=entryStop)
+
+if isEOD and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flat")
+
+if not dailyLimitOK and strategy.position_size != 0
+    strategy.close_all(comment="Daily Limit")
+
+// ─────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────
+// ORB Range Box
+orbHighPlot = plot(orbLocked ? orbHigh : na, "ORB High",
+     color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+orbLowPlot  = plot(orbLocked ? orbLow  : na, "ORB Low",
+     color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+fill(orbHighPlot, orbLowPlot,
+     color=color.new(color.orange, 90), title="ORB Zone")
+
+// ORB building phase highlight
+bgcolor(inORBWindow ? color.new(color.blue, 92) : na, title="ORB Build Window")
+
+// TP extension lines
+plot(orbLocked and orbValid ? longTP1  : na, "Long TP1",
+     color=color.new(color.green, 50), linewidth=1, style=plot.style_linebr)
+plot(orbLocked and orbValid ? longTP2  : na, "Long TP2",
+     color=color.new(color.green, 20), linewidth=1, style=plot.style_linebr)
+plot(orbLocked and orbValid ? shortTP1 : na, "Short TP1",
+     color=color.new(color.red,   50), linewidth=1, style=plot.style_linebr)
+plot(orbLocked and orbValid ? shortTP2 : na, "Short TP2",
+     color=color.new(color.red,   20), linewidth=1, style=plot.style_linebr)
+
+// Entry signals
+plotshape(longBO,   title="ORB Long BO",  location=location.belowbar,
+          style=shape.triangleup,   color=color.lime,   size=size.large, text="ORB↑")
+plotshape(shortBO,  title="ORB Short BO", location=location.abovebar,
+          style=shape.triangledown, color=color.red,    size=size.large, text="ORB↓")
+plotshape(retestLong,  title="Retest Long",  location=location.belowbar,
+          style=shape.triangleup,   color=color.aqua,   size=size.normal, text="RT↑")
+plotshape(retestShort, title="Retest Short", location=location.abovebar,
+          style=shape.triangledown, color=color.orange, size=size.normal, text="RT↓")
+
+// Active trade levels
+plot(strategy.position_size != 0 ? entryStop : na, "Stop",
+     color=color.red,    style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size != 0 ? entryTP1  : na, "TP1",
+     color=color.yellow, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size != 0 ? entryTP2  : na, "TP2",
+     color=color.green,  style=plot.style_linebr, linewidth=1)
+
+// Dashboard
+var table dash = table.new(position.top_right, 2, 4, border_width=1)
+table.cell(dash, 0, 0, "ORB Range",   text_color=color.white, bgcolor=color.gray)
+table.cell(dash, 1, 0, orbLocked and not na(orbRange) ?
+           str.tostring(math.round(orbRange, 2)) + " pts" : "Building...",
+           text_color=color.white, bgcolor=color.black)
+table.cell(dash, 0, 1, "ORB Valid",   text_color=color.white, bgcolor=color.gray)
+table.cell(dash, 1, 1, orbValid ? "YES" : "NO",
+           text_color=orbValid?color.lime:color.red, bgcolor=color.black)
+table.cell(dash, 0, 2, "Daily P&L",   text_color=color.white, bgcolor=color.gray)
+table.cell(dash, 1, 2, "$" + str.tostring(math.round(dailyPnL,2)),
+           text_color=dailyPnL>=0?color.lime:color.red, bgcolor=color.black)
+table.cell(dash, 0, 3, "Limit OK",    text_color=color.white, bgcolor=color.gray)
+table.cell(dash, 1, 3, dailyLimitOK?"YES":"NO",
+           text_color=dailyLimitOK?color.lime:color.red, bgcolor=color.black)
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+alertcondition(longBO,     title="ORB Long Breakout",
+               message="[M4] MNQ ORB — LONG Breakout | Volume confirmed close above ORB High")
+alertcondition(shortBO,    title="ORB Short Breakout",
+               message="[M4] MNQ ORB — SHORT Breakout | Volume confirmed close below ORB Low")
+alertcondition(retestLong, title="ORB Retest Long",
+               message="[M4] MNQ ORB — LONG Retest | Price holding above ORB High")
+alertcondition(retestShort,title="ORB Retest Short",
+               message="[M4] MNQ ORB — SHORT Retest | Price holding below ORB Low")

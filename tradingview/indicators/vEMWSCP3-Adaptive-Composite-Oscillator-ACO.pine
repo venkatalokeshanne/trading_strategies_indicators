@@ -1,0 +1,148 @@
+//@version=6
+indicator("Adaptive Composite Oscillator (ACO)", overlay = false)
+
+// =============================================================================
+
+
+// ------------------------------- Inputs -------------------------------------
+grpCore = "Core"
+baseLen      = input.int(14, "Base Momentum Length", minval = 2, group = grpCore)
+volLen       = input.int(20, "Volatility Lookback (for adaptive length)", minval = 2, group = grpCore)
+zLen         = input.int(100, "Z-Score Normalization Window", minval = 10, group = grpCore)
+
+grpRegime = "Regime Filter"
+adxLen       = input.int(14, "ADX Length", minval = 2, group = grpRegime)
+adxTrendThr  = input.float(25.0, "ADX Trend Threshold", group = grpRegime)
+
+grpVol = "Volume Confirmation"
+volMaLen     = input.int(20, "Volume MA Length", minval = 2, group = grpVol)
+volMult      = input.float(1.0, "Min Volume vs Avg (x)", minval = 0.1, step = 0.1, group = grpVol)
+
+grpDiv = "Divergence"
+pivotLeft    = input.int(5, "Pivot Left Bars", minval = 1, group = grpDiv)
+pivotRight   = input.int(5, "Pivot Right Bars", minval = 1, group = grpDiv)
+showDiv      = input.bool(true, "Show Divergence Signals", group = grpDiv)
+divLineWidth = input.int(2, "Divergence Line Width", minval = 1, group = grpDiv)
+
+grpSmooth = "Adaptive Smoothing (KAMA-style)"
+kamaFast     = input.int(2, "Fast EMA constant", minval = 1, group = grpSmooth)
+kamaSlow     = input.int(30, "Slow EMA constant", minval = 1, group = grpSmooth)
+
+// ------------------------- 1. Adaptive lookback ------------------------------
+atrNow   = ta.atr(volLen)
+atrAvg   = ta.sma(atrNow, volLen)
+volRatio = atrAvg == 0 ? 1.0 : atrNow / atrAvg
+adaptiveLen = math.max(3.0, math.min(baseLen * 3.0, baseLen / math.max(volRatio, 0.25)))
+
+// ------------------------- 2. Base momentum layer (manual adaptive RSI) ------
+priceChange = close - close[1]
+gain = priceChange > 0 ? priceChange : 0.0
+loss = priceChange < 0 ? -priceChange : 0.0
+
+rsiAlpha = 2.0 / (adaptiveLen + 1.0)
+
+var float avgGain = na
+var float avgLoss = na
+avgGain := na(avgGain[1]) ? gain : avgGain[1] + rsiAlpha * (gain - avgGain[1])
+avgLoss := na(avgLoss[1]) ? loss : avgLoss[1] + rsiAlpha * (loss - avgLoss[1])
+
+rs = avgLoss == 0 ? 0.0 : avgGain / avgLoss
+rawRsi = avgLoss == 0 ? 100.0 : 100.0 - (100.0 / (1.0 + rs))
+
+// ------------------------- 6. Adaptive smoothing (KAMA on the RSI) -----------
+change   = math.abs(rawRsi - rawRsi[baseLen])
+volatilitySum = 0.0
+for i = 0 to baseLen - 1
+    volatilitySum += math.abs(rawRsi[i] - rawRsi[i + 1])
+efficiencyRatio = volatilitySum == 0 ? 0.0 : change / volatilitySum
+fastSC = 2.0 / (kamaFast + 1)
+slowSC = 2.0 / (kamaSlow + 1)
+sc = math.pow(efficiencyRatio * (fastSC - slowSC) + slowSC, 2)
+
+var float kama = na
+kama := na(kama[1]) ? rawRsi : kama[1] + sc * (rawRsi - kama[1])
+
+// ------------------------- 3. Normalization layer (z-score) ------------------
+zMean = ta.sma(kama, zLen)
+zStd  = ta.stdev(kama, zLen)
+zScore = zStd == 0 ? 0.0 : (kama - zMean) / zStd
+
+// ------------------------- 4. Regime filter (ADX) -----------------------------
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+strongTrend = adxVal > adxTrendThr
+
+// ------------------------- 5. Volume confirmation -----------------------------
+volAvg = ta.sma(volume, volMaLen)
+volConfirmed = volume >= volAvg * volMult
+
+// ------------------------- Signal logic ---------------------------------------
+overboughtZ = 2.0
+oversoldZ   = -2.0
+
+rangeLong  = not strongTrend and ta.crossover(zScore, oversoldZ) and volConfirmed
+rangeShort = not strongTrend and ta.crossunder(zScore, overboughtZ) and volConfirmed
+
+trendLongCont  = strongTrend and diPlus > diMinus and ta.crossover(zScore, 0) and volConfirmed
+trendShortCont = strongTrend and diMinus > diPlus and ta.crossunder(zScore, 0) and volConfirmed
+
+longSignal  = rangeLong or trendLongCont
+shortSignal = rangeShort or trendShortCont
+
+// ------------------------- Divergence detection (algorithmic + lines) --------
+pivHighPrice = ta.pivothigh(high, pivotLeft, pivotRight)
+pivLowPrice  = ta.pivotlow(low, pivotLeft, pivotRight)
+pivHighOsc   = ta.pivothigh(zScore, pivotLeft, pivotRight)
+pivLowOsc    = ta.pivotlow(zScore, pivotLeft, pivotRight)
+
+var float lastPivHighPrice = na
+var float lastPivHighOsc   = na
+var int   lastPivHighBar   = na
+var float lastPivLowPrice  = na
+var float lastPivLowOsc    = na
+var int   lastPivLowBar    = na
+
+bearDiv = false
+bullDiv = false
+
+if not na(pivHighPrice)
+    curPivHighBar = bar_index - pivotRight
+    if not na(lastPivHighPrice) and pivHighPrice > lastPivHighPrice and pivHighOsc < lastPivHighOsc
+        bearDiv := true
+        if showDiv
+            // price-pane line (forced onto main chart even though overlay=false)
+            line.new(lastPivHighBar, lastPivHighPrice, curPivHighBar, pivHighPrice, xloc = xloc.bar_index, color = color.new(color.fuchsia, 0), width = divLineWidth, force_overlay = true)
+            // oscillator-pane line
+            line.new(lastPivHighBar, lastPivHighOsc, curPivHighBar, pivHighOsc, xloc = xloc.bar_index, color = color.new(color.fuchsia, 0), width = divLineWidth)
+    lastPivHighPrice := pivHighPrice
+    lastPivHighOsc   := pivHighOsc
+    lastPivHighBar   := curPivHighBar
+
+if not na(pivLowPrice)
+    curPivLowBar = bar_index - pivotRight
+    if not na(lastPivLowPrice) and pivLowPrice < lastPivLowPrice and pivLowOsc > lastPivLowOsc
+        bullDiv := true
+        if showDiv
+            line.new(lastPivLowBar, lastPivLowPrice, curPivLowBar, pivLowPrice, xloc = xloc.bar_index, color = color.new(color.lime, 0), width = divLineWidth, force_overlay = true)
+            line.new(lastPivLowBar, lastPivLowOsc, curPivLowBar, pivLowOsc, xloc = xloc.bar_index, color = color.new(color.lime, 0), width = divLineWidth)
+    lastPivLowPrice := pivLowPrice
+    lastPivLowOsc   := pivLowOsc
+    lastPivLowBar   := curPivLowBar
+
+// ------------------------------- Plotting -------------------------------------
+oscColor = strongTrend ? (diPlus > diMinus ? color.new(color.blue, 0) : color.new(color.orange, 0)) : color.new(color.gray, 0)
+
+plot(zScore, "ACO", color = oscColor, linewidth = 2)
+hline(overboughtZ, "Overbought (2.0 sd)", color = color.new(color.red, 60), linestyle = hline.style_dashed)
+hline(oversoldZ, "Oversold (-2.0 sd)", color = color.new(color.green, 60), linestyle = hline.style_dashed)
+hline(0, "Zero", color = color.new(color.gray, 70))
+
+bgcolor(strongTrend ? color.new(color.yellow, 92) : na, title = "Strong Trend Regime")
+
+plotshape(longSignal, "Long Signal", shape.triangleup, location.bottom, color.new(color.green, 0), size = size.small)
+plotshape(shortSignal, "Short Signal", shape.triangledown, location.top, color.new(color.red, 0), size = size.small)
+
+// ------------------------------- Alerts ----------------------------------------
+alertcondition(longSignal, "ACO Long Signal", "Adaptive Composite Oscillator: long signal (volume-confirmed)")
+alertcondition(shortSignal, "ACO Short Signal", "Adaptive Composite Oscillator: short signal (volume-confirmed)")
+alertcondition(bullDiv, "ACO Bullish Divergence", "Price made a lower low while ACO made a higher low")
+alertcondition(bearDiv, "ACO Bearish Divergence", "Price made a higher high while ACO made a lower high")

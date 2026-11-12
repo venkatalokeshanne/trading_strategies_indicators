@@ -1,0 +1,487 @@
+//@version=6
+// Author: Yulien
+// License: MIT (open source)
+// Version: 3.5.4
+// Modified: 2026-08-14
+indicator("SPX/ES/SPY Converter", shorttitle="SPX/ES/SPY", overlay=true, dynamic_requests=true, max_lines_count=1)
+const int milisegundos_por_minuto = 60000
+const int inicio_rth_ny_minuto = 570
+const int fin_rth_ny_minuto = 960
+string grupo_simbolos = "Symbols"
+string selector_principal = input.string("Current chart", "Main ticker", options=["Current chart", "SPY", "SPX", "ES"], tooltip="Current chart detects the main ticker automatically. An explicit selection must match the active chart.", group=grupo_simbolos)
+string simbolo_es = input.symbol("CME_MINI:ES1!", "ES contract", tooltip="For day trading, select the exact active CME ES contract and current expiration. Do not rely on ES1! around rollover; the continuous contract is only a convenience option.", group=grupo_simbolos)
+string simbolo_spy = input.symbol("AMEX:SPY", "ETF SPY", group=grupo_simbolos)
+string simbolo_spx = input.symbol("CBOE:SPX", "SPX Index", tooltip="CBOE:SPX is the required default. Use a Cboe real-time, non-delayed SPX feed; delayed or unavailable SPX data will make ratios, basis, and cash-anchor conversions unreliable or unavailable.", group=grupo_simbolos)
+string grupo_calidad_datos = "Day-Trading Data Quality"
+int antiguedad_maxima_seg = input.int(120, "Maximum data age (seconds)", minval=60, maxval=600, step=15, tooltip="During New York regular trading hours, any market data older than this limit is considered stale.", group=grupo_calidad_datos)
+int desfase_maximo_seg = input.int(60, "Maximum market skew (seconds)", minval=0, maxval=300, step=15, tooltip="Maximum timestamp difference allowed among SPY, SPX, and ES during regular trading hours.", group=grupo_calidad_datos)
+bool bloquear_datos_no_sincronizados = input.bool(true, "Block conversions when RTH data is unhealthy", tooltip="When enabled, live ratios and converted levels are hidden during regular trading hours if any of the three markets is missing, stale, or desynchronized.", group=grupo_calidad_datos)
+int antiguedad_maxima_ms = antiguedad_maxima_seg * 1000
+int desfase_maximo_ms = desfase_maximo_seg * 1000
+string grupo_conversion = "Conversion Model"
+string modelo_conversion = input.string("SPX Cash Anchor", "Level conversion", options=["SPX Cash Anchor", "Direct Live Ratio"], tooltip="SPX Cash Anchor uses SPX/SPY scaling and adds or subtracts the live ES-SPX basis. Direct Live Ratio multiplies the selected level by Reference/Main.", group=grupo_conversion)
+string grupo_visual = "Display"
+string posicion_input = input.string("Top right", "Table position", options=["Top right", "Top left", "Bottom right", "Bottom left"], group=grupo_visual)
+bool mostrar_precio_principal = input.bool(true, "Show Main Price", group=grupo_visual)
+bool mostrar_atr_principal = input.bool(true, "Show Main ATR", group=grupo_visual)
+bool mostrar_precio_ref_1 = input.bool(true, "Show Reference 1 Price", group=grupo_visual)
+bool mostrar_precio_ref_2 = input.bool(true, "Show Reference 2 Price", group=grupo_visual)
+bool mostrar_ratio_vivo_1 = input.bool(true, "Show Reference 1 Live Ratio", group=grupo_visual)
+bool mostrar_ratio_vivo_2 = input.bool(true, "Show Reference 2 Live Ratio", group=grupo_visual)
+bool mostrar_basis_es_spx = input.bool(true, "Show ES-SPX Basis", group=grupo_visual)
+bool mostrar_cambio_basis = input.bool(true, "Show ES-SPX Basis Change", group=grupo_visual)
+bool mostrar_equivalente_ref_1 = input.bool(true, "Show Reference 1 Equivalent", group=grupo_visual)
+bool mostrar_equivalente_ref_2 = input.bool(true, "Show Reference 2 Equivalent", group=grupo_visual)
+bool mostrar_estado_datos = input.bool(true, "Show Market/Data Status", group=grupo_visual)
+string grupo_atr = "Main-Chart ATR"
+int longitud_atr = input.int(9, "ATR length", minval=1, tooltip="ATR is calculated directly from the active chart ticker and timeframe.", group=grupo_atr)
+int decimales_atr = input.int(2, "ATR decimals", minval=1, maxval=4, group=grupo_atr)
+float multiplicador_stop_atr = input.float(1.2, "Stop multiplier", minval=0.1, step=0.1, tooltip="Displays a volatility-based distance equal to ATR multiplied by this value. It is not a trading signal.", group=grupo_atr)
+int longitud_base_regimen_atr = input.int(20, "ATR regime baseline length", minval=2, maxval=200, tooltip="Number of completed chart bars used to calculate the prior average ATR baseline.", group=grupo_atr)
+float umbral_regimen_atr_pct = input.float(25.0, "ATR regime threshold (%)", minval=1.0, maxval=100.0, step=1.0, tooltip="Expansion is detected above the prior average ATR plus this percentage; contraction is detected below that average by the same percentage.", group=grupo_atr)
+string grupo_nivel_referencia = "Interactive Reference Level"
+float nivel_referencia_principal = input.price(0.0, "Reference level (main chart)", tooltip="Select or drag a price on the active main-ticker chart. The same level is converted into both reference markets.", group=grupo_nivel_referencia, confirm=true)
+bool mostrar_linea_referencia = input.bool(true, "Show reference-level line", group=grupo_nivel_referencia)
+color color_linea_referencia = input.color(color.orange, "Line color", group=grupo_nivel_referencia)
+int grosor_linea_referencia = input.int(2, "Line width", minval=1, maxval=5, group=grupo_nivel_referencia)
+string estilo_linea_input = input.string("Dashed", "Line style", options=["Solid", "Dashed", "Dotted"], group=grupo_nivel_referencia)
+estilo_linea_referencia = line.style_solid
+if estilo_linea_input == "Dashed"
+    estilo_linea_referencia := line.style_dashed
+else if estilo_linea_input == "Dotted"
+    estilo_linea_referencia := line.style_dotted
+posicion_tabla = position.top_right
+if posicion_input == "Top left"
+    posicion_tabla := position.top_left
+else if posicion_input == "Bottom right"
+    posicion_tabla := position.bottom_right
+else if posicion_input == "Bottom left"
+    posicion_tabla := position.bottom_left
+float valor_atr = ta.atr(longitud_atr)
+float distancia_stop_atr = valor_atr * multiplicador_stop_atr
+float factor_banda_atr = umbral_regimen_atr_pct / 100.0
+float promedio_atr_previo = ta.sma(valor_atr, longitud_base_regimen_atr)[1]
+float banda_superior_atr = promedio_atr_previo * (1 + factor_banda_atr)
+float banda_inferior_atr = promedio_atr_previo * (1 - factor_banda_atr)
+string texto_timeframe_atr = timeframe.period
+if timeframe.isseconds
+    texto_timeframe_atr := str.tostring(timeframe.multiplier) + "s"
+else if timeframe.isminutes
+    texto_timeframe_atr := str.tostring(timeframe.multiplier) + "m"
+else if timeframe.isdaily
+    texto_timeframe_atr := str.tostring(timeframe.multiplier) + "D"
+else if timeframe.isweekly
+    texto_timeframe_atr := str.tostring(timeframe.multiplier) + "W"
+else if timeframe.ismonthly
+    texto_timeframe_atr := str.tostring(timeframe.multiplier) + "M"
+int estado_volatilidad_atr = 0
+if not na(valor_atr) and not na(banda_superior_atr) and valor_atr > banda_superior_atr
+    estado_volatilidad_atr := 1
+else if not na(valor_atr) and not na(banda_inferior_atr) and valor_atr < banda_inferior_atr
+    estado_volatilidad_atr := -1
+string icono_volatilidad_atr = "—"
+color color_volatilidad_atr = color.gray
+if estado_volatilidad_atr == 1
+    icono_volatilidad_atr := "▲"
+    color_volatilidad_atr := color.rgb(70, 210, 120)
+else if estado_volatilidad_atr == -1
+    icono_volatilidad_atr := "▼"
+    color_volatilidad_atr := color.rgb(230, 80, 80)
+if not chart.is_standard
+    runtime.error("This indicator requires a standard time-based price chart. Heikin Ashi, Renko, Range, Kagi, Line Break, and Point & Figure charts are not supported.")
+string nombre_principal = ""
+if syminfo.ticker == "SPY"
+    nombre_principal := "SPY"
+else if syminfo.ticker == "SPX"
+    nombre_principal := "SPX"
+else if syminfo.root == "ES"
+    nombre_principal := "ES"
+bool grafica_soportada = nombre_principal != ""
+if not grafica_soportada
+    runtime.error("This indicator can only be used on SPY, SPX, or ES charts.")
+bool seleccion_automatica = selector_principal == "Current chart"
+bool seleccion_coincide = selector_principal == nombre_principal
+if grafica_soportada and not seleccion_automatica and not seleccion_coincide
+    runtime.error("Main ticker must match the active chart. Select " + nombre_principal + " or Current chart in Settings.")
+string nombre_ref_1 = "ES"
+string nombre_ref_2 = "SPX"
+if nombre_principal == "SPX"
+    nombre_ref_1 := "ES"
+    nombre_ref_2 := "SPY"
+else if nombre_principal == "ES"
+    nombre_ref_1 := "SPY"
+    nombre_ref_2 := "SPX"
+string simbolo_spy_datos = simbolo_spy
+string simbolo_spx_datos = simbolo_spx
+string simbolo_es_datos = simbolo_es
+if nombre_principal == "SPY"
+    simbolo_spy_datos := syminfo.tickerid
+else if nombre_principal == "SPX"
+    simbolo_spx_datos := syminfo.tickerid
+else if nombre_principal == "ES"
+    simbolo_es_datos := syminfo.tickerid
+string nombre_ratio_1 = nombre_ref_1 + "/" + nombre_principal
+string nombre_ratio_2 = nombre_ref_2 + "/" + nombre_principal
+redondear_al_tick(float precio, float tick_destino) =>
+    float precio_redondeado = na
+    if not na(precio) and not na(tick_destino) and tick_destino > 0
+        precio_redondeado := math.round(precio / tick_destino) * tick_destino
+    precio_redondeado
+convertir_ratio_directo(float precio_principal, float ratio_conversion, float tick_destino) =>
+    float precio_referencia = na
+    if precio_principal > 0 and not na(ratio_conversion) and ratio_conversion > 0
+        precio_referencia := redondear_al_tick(precio_principal * ratio_conversion, tick_destino)
+    precio_referencia
+convertir_con_ancla_spx(float precio_principal, string mercado_principal, string mercado_destino, float precio_spy, float precio_spx, float precio_es, float tick_destino) =>
+    float precio_referencia = na
+    bool datos_validos = precio_principal > 0 and not na(precio_spy) and precio_spy > 0 and not na(precio_spx) and precio_spx > 0 and not na(precio_es) and precio_es > 0
+    if datos_validos
+        float ratio_spx_spy = precio_spx / precio_spy
+        float basis_es_spx_conversion = precio_es - precio_spx
+        float nivel_spx = na
+        if mercado_principal == "SPY"
+            nivel_spx := precio_principal * ratio_spx_spy
+        else if mercado_principal == "SPX"
+            nivel_spx := precio_principal
+        else if mercado_principal == "ES"
+            nivel_spx := precio_principal - basis_es_spx_conversion
+        if not na(nivel_spx)
+            if mercado_destino == "SPY"
+                precio_referencia := nivel_spx / ratio_spx_spy
+            else if mercado_destino == "SPX"
+                precio_referencia := nivel_spx
+            else if mercado_destino == "ES"
+                precio_referencia := nivel_spx + basis_es_spx_conversion
+        precio_referencia := redondear_al_tick(precio_referencia, tick_destino)
+    precio_referencia
+formatear_edad(int edad_ms) =>
+    string texto_edad = "—"
+    if not na(edad_ms)
+        int edad_seg = int(math.round(edad_ms / 1000.0))
+        texto_edad := str.tostring(edad_seg) + "s"
+    texto_edad
+obtener_cierre_efectivo(int tiempo_apertura, int tiempo_cierre) =>
+    int cierre_efectivo = tiempo_cierre
+    if na(cierre_efectivo) and not na(tiempo_apertura)
+        cierre_efectivo := tiempo_apertura + milisegundos_por_minuto
+    cierre_efectivo
+calcular_edad_ms(int tiempo_apertura, int tiempo_cierre) =>
+    int edad_ms = na
+    int cierre_efectivo = obtener_cierre_efectivo(tiempo_apertura, tiempo_cierre)
+    if barstate.isrealtime and not na(cierre_efectivo)
+        edad_ms := timenow - cierre_efectivo
+        if edad_ms < 0
+            edad_ms := 0
+    edad_ms
+var line linea_referencia = na
+if barstate.isfirst and mostrar_linea_referencia and nivel_referencia_principal > 0
+    linea_referencia := line.new(bar_index, nivel_referencia_principal, bar_index + 1, nivel_referencia_principal, xloc=xloc.bar_index, extend=extend.both, color=color_linea_referencia, style=estilo_linea_referencia, width=grosor_linea_referencia)
+var table tabla_conversion = table.new(posicion_tabla, 2, 11, border_width=1, border_color=color.new(color.gray, 50))
+var int fila_precio_principal = na
+var int fila_atr_principal = na
+var int fila_precio_ref_1 = na
+var int fila_precio_ref_2 = na
+var int fila_ratio_1 = na
+var int fila_ratio_2 = na
+var int fila_basis_es_spx = na
+var int fila_cambio_basis = na
+var int fila_equivalente_ref_1 = na
+var int fila_equivalente_ref_2 = na
+var int fila_estado_datos = na
+if barstate.isfirst
+    color fondo_etiqueta = color.rgb(25, 25, 25)
+    color fondo_valor = color.rgb(45, 45, 45)
+    color fondo_principal = color.rgb(35, 95, 165)
+    color fondo_principal_valor = color.rgb(20, 60, 115)
+    int fila_actual = 0
+    if mostrar_precio_principal
+        fila_precio_principal := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_principal + " Price", text_color=color.white, bgcolor=fondo_principal, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.white, bgcolor=fondo_principal_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_atr_principal
+        fila_atr_principal := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_principal + " ATR(" + str.tostring(longitud_atr) + ") " + texto_timeframe_atr + " —", text_color=color.gray, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.rgb(255, 205, 90), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_precio_ref_1
+        fila_precio_ref_1 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ref_1 + " Ref. Price", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.white, bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_precio_ref_2
+        fila_precio_ref_2 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ref_2 + " Ref. Price", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.white, bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_ratio_vivo_1
+        fila_ratio_1 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ratio_1 + " Ratio", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.rgb(255, 205, 90), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_ratio_vivo_2
+        fila_ratio_2 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ratio_2 + " Ratio", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.rgb(90, 205, 255), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_basis_es_spx
+        fila_basis_es_spx := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, "ES-SPX Basis", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.rgb(205, 205, 205), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_cambio_basis
+        fila_cambio_basis := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, "Basis Change", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.rgb(145, 200, 255), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_equivalente_ref_1
+        fila_equivalente_ref_1 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ref_1 + " <- " + nombre_principal + " Ref.", text_color=color.white, bgcolor=color.rgb(90, 55, 0), text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "Set Ref. Level", text_color=color.rgb(255, 205, 90), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_equivalente_ref_2
+        fila_equivalente_ref_2 := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, nombre_ref_2 + " <- " + nombre_principal + " Ref.", text_color=color.white, bgcolor=color.rgb(0, 65, 90), text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "Set Ref. Level", text_color=color.rgb(90, 205, 255), bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+    if mostrar_estado_datos
+        fila_estado_datos := fila_actual
+        table.cell(tabla_conversion, 0, fila_actual, "Market / Data", text_color=color.white, bgcolor=fondo_etiqueta, text_size=size.small)
+        table.cell(tabla_conversion, 1, fila_actual, "—", text_color=color.gray, bgcolor=fondo_valor, text_size=size.small)
+        fila_actual += 1
+if barstate.islast and mostrar_atr_principal
+    string formato_atr = "0." + str.repeat("0", decimales_atr)
+    string etiqueta_atr = nombre_principal + " ATR(" + str.tostring(longitud_atr) + ") " + texto_timeframe_atr + " " + icono_volatilidad_atr
+    string texto_atr = "—"
+    if not na(valor_atr) and not na(distancia_stop_atr)
+        texto_atr := str.tostring(valor_atr, formato_atr) + " | SL Dist. " + str.tostring(distancia_stop_atr, formato_atr)
+    table.cell_set_text(tabla_conversion, 0, fila_atr_principal, etiqueta_atr)
+    table.cell_set_text_color(tabla_conversion, 0, fila_atr_principal, color_volatilidad_atr)
+    table.cell_set_text(tabla_conversion, 1, fila_atr_principal, texto_atr)
+const string marco_temporal_datos = "1"
+const int barras_historial = 16
+solicitar_spy_1m(string simbolo) =>
+    request.security(simbolo, marco_temporal_datos, [close, time, time_close, syminfo.mintick, session.ismarket], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=1)
+solicitar_basis_1m(string simbolo) =>
+    request.security(simbolo, marco_temporal_datos, [close, time, time_close, syminfo.mintick, close[5], time[5], close[15], time[15]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, calc_bars_count=barras_historial)
+if barstate.islast
+    [ultimo_spy, tiempo_spy, tiempo_cierre_spy, tick_spy, sesion_mercado_spy] = solicitar_spy_1m(simbolo_spy_datos)
+    [ultimo_spx, tiempo_spx, tiempo_cierre_spx, tick_spx, precio_spx_5m, tiempo_spx_5m, precio_spx_15m, tiempo_spx_15m] = solicitar_basis_1m(simbolo_spx_datos)
+    [ultimo_es, tiempo_es, tiempo_cierre_es, tick_es, precio_es_5m, tiempo_es_5m, precio_es_15m, tiempo_es_15m] = solicitar_basis_1m(simbolo_es_datos)
+    float ultimo_principal = ultimo_spy
+    float ultimo_ref_1 = ultimo_es
+    float ultimo_ref_2 = ultimo_spx
+    float tick_ref_1 = tick_es
+    float tick_ref_2 = tick_spx
+    if nombre_principal == "SPX"
+        ultimo_principal := ultimo_spx
+        ultimo_ref_1 := ultimo_es
+        ultimo_ref_2 := ultimo_spy
+        tick_ref_1 := tick_es
+        tick_ref_2 := tick_spy
+    else if nombre_principal == "ES"
+        ultimo_principal := ultimo_es
+        ultimo_ref_1 := ultimo_spy
+        ultimo_ref_2 := ultimo_spx
+        tick_ref_1 := tick_spy
+        tick_ref_2 := tick_spx
+    string zona_nueva_york = "America/New_York"
+    int momento_estado = time
+    if barstate.isrealtime
+        momento_estado := timenow
+    int dia_semana_ny = dayofweek(momento_estado, zona_nueva_york)
+    int minuto_sesion_ny = hour(momento_estado, zona_nueva_york) * 60 + minute(momento_estado, zona_nueva_york)
+    bool dia_habil_ny = dia_semana_ny >= dayofweek.monday and dia_semana_ny <= dayofweek.friday
+    bool ventana_rth_calendario = dia_habil_ny and minuto_sesion_ny >= inicio_rth_ny_minuto and minuto_sesion_ny < fin_rth_ny_minuto
+    bool datos_spy_presentes = not na(ultimo_spy) and not na(tiempo_spy)
+    bool datos_spx_presentes = not na(ultimo_spx) and not na(tiempo_spx)
+    bool datos_es_presentes = not na(ultimo_es) and not na(tiempo_es)
+    bool datos_presentes = datos_spy_presentes and datos_spx_presentes and datos_es_presentes
+    int cierre_efectivo_spy = obtener_cierre_efectivo(tiempo_spy, tiempo_cierre_spy)
+    int cierre_efectivo_spx = obtener_cierre_efectivo(tiempo_spx, tiempo_cierre_spx)
+    int cierre_efectivo_es = obtener_cierre_efectivo(tiempo_es, tiempo_cierre_es)
+    int edad_spy_ms = calcular_edad_ms(tiempo_spy, tiempo_cierre_spy)
+    int edad_spx_ms = calcular_edad_ms(tiempo_spx, tiempo_cierre_spx)
+    int edad_es_ms = calcular_edad_ms(tiempo_es, tiempo_cierre_es)
+    int desfase_mercados_ms = na
+    bool cierres_presentes = not na(cierre_efectivo_spy) and not na(cierre_efectivo_spx) and not na(cierre_efectivo_es)
+    if cierres_presentes
+        int cierre_mas_antiguo = math.min(cierre_efectivo_spy, math.min(cierre_efectivo_spx, cierre_efectivo_es))
+        int cierre_mas_reciente = math.max(cierre_efectivo_spy, math.max(cierre_efectivo_spx, cierre_efectivo_es))
+        desfase_mercados_ms := cierre_mas_reciente - cierre_mas_antiguo
+    bool spy_fresco = datos_spy_presentes
+    bool spx_fresco = datos_spx_presentes
+    bool es_fresco = datos_es_presentes
+    bool mercados_sincronizados = datos_presentes and cierres_presentes
+    if barstate.isrealtime
+        spy_fresco := datos_spy_presentes and not na(edad_spy_ms) and edad_spy_ms <= antiguedad_maxima_ms
+        spx_fresco := datos_spx_presentes and not na(edad_spx_ms) and edad_spx_ms <= antiguedad_maxima_ms
+        es_fresco := datos_es_presentes and not na(edad_es_ms) and edad_es_ms <= antiguedad_maxima_ms
+        mercados_sincronizados := datos_presentes and cierres_presentes and desfase_mercados_ms <= desfase_maximo_ms
+    bool mercados_frescos = spy_fresco and spx_fresco and es_fresco
+    bool aplicar_bloqueo_rth = bloquear_datos_no_sincronizados and barstate.isrealtime and ventana_rth_calendario
+    bool spy_utilizable = datos_spy_presentes
+    bool spx_utilizable = datos_spx_presentes
+    bool es_utilizable = datos_es_presentes
+    if aplicar_bloqueo_rth
+        spy_utilizable := datos_spy_presentes and spy_fresco and sesion_mercado_spy
+        spx_utilizable := datos_spx_presentes and spx_fresco
+        es_utilizable := datos_es_presentes and es_fresco
+    bool principal_utilizable = spy_utilizable
+    bool ref_1_utilizable = es_utilizable
+    bool ref_2_utilizable = spx_utilizable
+    int cierre_efectivo_principal = cierre_efectivo_spy
+    int cierre_efectivo_ref_1 = cierre_efectivo_es
+    int cierre_efectivo_ref_2 = cierre_efectivo_spx
+    if nombre_principal == "SPX"
+        principal_utilizable := spx_utilizable
+        ref_1_utilizable := es_utilizable
+        ref_2_utilizable := spy_utilizable
+        cierre_efectivo_principal := cierre_efectivo_spx
+        cierre_efectivo_ref_1 := cierre_efectivo_es
+        cierre_efectivo_ref_2 := cierre_efectivo_spy
+    else if nombre_principal == "ES"
+        principal_utilizable := es_utilizable
+        ref_1_utilizable := spy_utilizable
+        ref_2_utilizable := spx_utilizable
+        cierre_efectivo_principal := cierre_efectivo_es
+        cierre_efectivo_ref_1 := cierre_efectivo_spy
+        cierre_efectivo_ref_2 := cierre_efectivo_spx
+    bool par_1_sincronizado = true
+    bool par_2_sincronizado = true
+    bool par_basis_sincronizado = true
+    if aplicar_bloqueo_rth
+        par_1_sincronizado := not na(cierre_efectivo_principal) and not na(cierre_efectivo_ref_1) and math.abs(cierre_efectivo_principal - cierre_efectivo_ref_1) <= desfase_maximo_ms
+        par_2_sincronizado := not na(cierre_efectivo_principal) and not na(cierre_efectivo_ref_2) and math.abs(cierre_efectivo_principal - cierre_efectivo_ref_2) <= desfase_maximo_ms
+        par_basis_sincronizado := not na(cierre_efectivo_es) and not na(cierre_efectivo_spx) and math.abs(cierre_efectivo_es - cierre_efectivo_spx) <= desfase_maximo_ms
+    bool permitir_ratio_1 = principal_utilizable and ref_1_utilizable and par_1_sincronizado
+    bool permitir_ratio_2 = principal_utilizable and ref_2_utilizable and par_2_sincronizado
+    bool permitir_basis = es_utilizable and spx_utilizable and par_basis_sincronizado
+    bool permitir_ancla_spx = spy_utilizable and spx_utilizable and es_utilizable and mercados_sincronizados
+    if not aplicar_bloqueo_rth
+        permitir_ancla_spx := datos_presentes
+    string texto_estado_datos = "HISTORICAL"
+    color color_estado_datos = color.gray
+    if mostrar_estado_datos
+        string texto_edades = "SPY " + formatear_edad(edad_spy_ms) + " | SPX " + formatear_edad(edad_spx_ms) + " | ES " + formatear_edad(edad_es_ms)
+        if barstate.isrealtime
+            if not ventana_rth_calendario
+                texto_estado_datos := "OUTSIDE RTH | " + texto_edades
+                color_estado_datos := color.rgb(255, 180, 70)
+            else if not datos_presentes
+                texto_estado_datos := "NO DATA"
+                color_estado_datos := color.rgb(230, 80, 80)
+            else if not mercados_frescos
+                texto_estado_datos := "STALE | " + texto_edades
+                color_estado_datos := color.rgb(230, 80, 80)
+            else if not sesion_mercado_spy
+                texto_estado_datos := "CASH CLOSED | " + texto_edades
+                color_estado_datos := color.rgb(255, 180, 70)
+            else if not mercados_sincronizados
+                texto_estado_datos := "DESYNC " + formatear_edad(desfase_mercados_ms) + " | " + texto_edades
+                color_estado_datos := color.rgb(230, 80, 80)
+            else
+                texto_estado_datos := "LIVE RTH | " + texto_edades + " | Skew " + formatear_edad(desfase_mercados_ms)
+                color_estado_datos := color.rgb(70, 210, 120)
+    float ratio_vivo_1 = na
+    float ratio_vivo_2 = na
+    if permitir_ratio_1 and not na(ultimo_principal) and ultimo_principal != 0 and not na(ultimo_ref_1)
+        ratio_vivo_1 := ultimo_ref_1 / ultimo_principal
+    if permitir_ratio_2 and not na(ultimo_principal) and ultimo_principal != 0 and not na(ultimo_ref_2)
+        ratio_vivo_2 := ultimo_ref_2 / ultimo_principal
+    float basis_es_spx = na
+    float basis_es_spx_pct = na
+    if permitir_basis and not na(ultimo_es) and not na(ultimo_spx) and ultimo_spx != 0
+        basis_es_spx := ultimo_es - ultimo_spx
+        basis_es_spx_pct := basis_es_spx / ultimo_spx * 100
+    float cambio_basis_5m = na
+    float cambio_basis_15m = na
+    bool historial_5m_disponible = not na(tiempo_es_5m) and not na(tiempo_spx_5m)
+    bool historial_15m_disponible = not na(tiempo_es_15m) and not na(tiempo_spx_15m)
+    bool historial_5m_contiguo = historial_5m_disponible and tiempo_es - tiempo_es_5m >= 300000 and tiempo_es - tiempo_es_5m <= 360000 and tiempo_spx - tiempo_spx_5m >= 300000 and tiempo_spx - tiempo_spx_5m <= 360000
+    bool historial_15m_contiguo = historial_15m_disponible and tiempo_es - tiempo_es_15m >= 900000 and tiempo_es - tiempo_es_15m <= 960000 and tiempo_spx - tiempo_spx_15m >= 900000 and tiempo_spx - tiempo_spx_15m <= 960000
+    bool historial_5m_sincronizado = historial_5m_disponible and math.abs(tiempo_es_5m - tiempo_spx_5m) <= desfase_maximo_ms
+    bool historial_15m_sincronizado = historial_15m_disponible and math.abs(tiempo_es_15m - tiempo_spx_15m) <= desfase_maximo_ms
+    if permitir_basis and not na(basis_es_spx) and historial_5m_contiguo and historial_5m_sincronizado and not na(precio_es_5m) and not na(precio_spx_5m)
+        float basis_es_spx_5m = precio_es_5m - precio_spx_5m
+        cambio_basis_5m := basis_es_spx - basis_es_spx_5m
+    if permitir_basis and not na(basis_es_spx) and historial_15m_contiguo and historial_15m_sincronizado and not na(precio_es_15m) and not na(precio_spx_15m)
+        float basis_es_spx_15m = precio_es_15m - precio_spx_15m
+        cambio_basis_15m := basis_es_spx - basis_es_spx_15m
+    float equivalente_ref_1 = na
+    float equivalente_ref_2 = na
+    if modelo_conversion == "SPX Cash Anchor"
+        if permitir_ancla_spx
+            equivalente_ref_1 := convertir_con_ancla_spx(nivel_referencia_principal, nombre_principal, nombre_ref_1, ultimo_spy, ultimo_spx, ultimo_es, tick_ref_1)
+            equivalente_ref_2 := convertir_con_ancla_spx(nivel_referencia_principal, nombre_principal, nombre_ref_2, ultimo_spy, ultimo_spx, ultimo_es, tick_ref_2)
+    else
+        if permitir_ratio_1
+            equivalente_ref_1 := convertir_ratio_directo(nivel_referencia_principal, ratio_vivo_1, tick_ref_1)
+        if permitir_ratio_2
+            equivalente_ref_2 := convertir_ratio_directo(nivel_referencia_principal, ratio_vivo_2, tick_ref_2)
+    string texto_precio_principal = "—"
+    string texto_precio_ref_1 = "—"
+    string texto_precio_ref_2 = "—"
+    string texto_ratio_1 = "—"
+    string texto_ratio_2 = "—"
+    string texto_basis_es_spx = "—"
+    string texto_cambio_basis = "—"
+    string texto_equivalente_ref_1 = "Set Ref. Level"
+    string texto_equivalente_ref_2 = "Set Ref. Level"
+    if nivel_referencia_principal > 0
+        texto_equivalente_ref_1 := "Data unavailable"
+        texto_equivalente_ref_2 := "Data unavailable"
+    if not na(ultimo_principal)
+        texto_precio_principal := str.tostring(ultimo_principal, "#.##")
+    if not na(ultimo_ref_1)
+        texto_precio_ref_1 := str.tostring(ultimo_ref_1, "#.##")
+    if not na(ultimo_ref_2)
+        texto_precio_ref_2 := str.tostring(ultimo_ref_2, "#.##")
+    if not na(ratio_vivo_1)
+        texto_ratio_1 := str.tostring(ratio_vivo_1, "#.######")
+    if not na(ratio_vivo_2)
+        texto_ratio_2 := str.tostring(ratio_vivo_2, "#.######")
+    if not na(basis_es_spx) and not na(basis_es_spx_pct)
+        string signo_basis = ""
+        if basis_es_spx > 0
+            signo_basis := "+"
+        texto_basis_es_spx := signo_basis + str.tostring(basis_es_spx, "#.00") + " (" + signo_basis + str.tostring(basis_es_spx_pct, "#.###") + "%)"
+    if not na(cambio_basis_5m) or not na(cambio_basis_15m)
+        string texto_cambio_5m = "—"
+        string texto_cambio_15m = "—"
+        if not na(cambio_basis_5m)
+            string signo_cambio_5m = ""
+            if cambio_basis_5m > 0
+                signo_cambio_5m := "+"
+            texto_cambio_5m := signo_cambio_5m + str.tostring(cambio_basis_5m, "#.00")
+        if not na(cambio_basis_15m)
+            string signo_cambio_15m = ""
+            if cambio_basis_15m > 0
+                signo_cambio_15m := "+"
+            texto_cambio_15m := signo_cambio_15m + str.tostring(cambio_basis_15m, "#.00")
+        texto_cambio_basis := "5m " + texto_cambio_5m + " | 15m " + texto_cambio_15m
+    if not na(equivalente_ref_1)
+        texto_equivalente_ref_1 := str.tostring(equivalente_ref_1, "#.00") + "  (" + nombre_principal + " " + str.tostring(nivel_referencia_principal, "#.##") + ")"
+    if not na(equivalente_ref_2)
+        texto_equivalente_ref_2 := str.tostring(equivalente_ref_2, "#.00") + "  (" + nombre_principal + " " + str.tostring(nivel_referencia_principal, "#.##") + ")"
+    if mostrar_precio_principal
+        table.cell_set_text(tabla_conversion, 1, fila_precio_principal, texto_precio_principal)
+    if mostrar_precio_ref_1
+        table.cell_set_text(tabla_conversion, 1, fila_precio_ref_1, texto_precio_ref_1)
+    if mostrar_precio_ref_2
+        table.cell_set_text(tabla_conversion, 1, fila_precio_ref_2, texto_precio_ref_2)
+    if mostrar_ratio_vivo_1
+        table.cell_set_text(tabla_conversion, 1, fila_ratio_1, texto_ratio_1)
+    if mostrar_ratio_vivo_2
+        table.cell_set_text(tabla_conversion, 1, fila_ratio_2, texto_ratio_2)
+    if mostrar_basis_es_spx
+        table.cell_set_text(tabla_conversion, 1, fila_basis_es_spx, texto_basis_es_spx)
+    if mostrar_cambio_basis
+        table.cell_set_text(tabla_conversion, 1, fila_cambio_basis, texto_cambio_basis)
+    if mostrar_equivalente_ref_1
+        table.cell_set_text(tabla_conversion, 1, fila_equivalente_ref_1, texto_equivalente_ref_1)
+    if mostrar_equivalente_ref_2
+        table.cell_set_text(tabla_conversion, 1, fila_equivalente_ref_2, texto_equivalente_ref_2)
+    if mostrar_estado_datos
+        table.cell_set_text(tabla_conversion, 1, fila_estado_datos, texto_estado_datos)
+        table.cell_set_text_color(tabla_conversion, 1, fila_estado_datos, color_estado_datos)

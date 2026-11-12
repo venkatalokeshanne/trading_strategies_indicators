@@ -1,0 +1,296 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © JustinTimeTunes
+
+//@version=6
+strategy(title = "Complex Single Trade Strategy", overlay = true, fill_orders_on_standard_ohlc = true)
+
+
+// This 'Complex Single Trade Strategy' is a generic trading strategy that features three different types of stops, and four take profits.
+// It takes a Buy/Sell source input of: [> 0 for Buy, < 0 for Sell, = 0 for Neither]
+//
+// The first signal will trigger a position to open immediately in that direction, but subsequent signals in the same direction will be ignored whilst the position remains open, as this strategy allows only one position at once.
+// A signal in the opposite direction to the current position can either be ignored, or it can close the position, or it can close it then immediately open another one in the opposite direction.
+// It also takes an optional 'Cancel' indicator just to close positions. [> 0 for Buy closes short, < 0 for Sell close long, = 0 no action] Other signals will be ignored.
+//
+// The three different types of stops, that can be applied individually, or together:
+// * Regular Stop
+// * Initial Trailing Stop
+// * Trailing Stop
+//
+// The initial trailing stop works like a regular trailing stop until it reaches the cut off level, a percentage of the current asset price above or below the entry level, then it will no longer trail the price, remaining statically at this level.
+// From here the regular trailing stop can take over trailing the price. This is useful to move the stop to the entry level (or there abouts) fairly quickly. From there you might want to trail the price with a larger trailing stop for the rest of the trade.
+// 0 cut off means it stops trailing the price at your entry level, positive above, negative below, for a long trade. For a short it would be the opposite.
+//
+// Typically you would want:
+// Trailing Stop > Initial Trailing Stop >= Stop
+//
+// The four take profits each specify an amount to reduce the position size by, and at what specified percentage gain in price this is triggered.
+//
+// My 'Simple Buy/Sell Indicator' and 'Custom Buy/Sell Indicator' (coming soon - watch this space) can be used to combine other indicators together into BUY/SELL strategies, using multiple custom rules. These can then be used as inputs to this strategy.
+
+
+
+// Constants
+const string OPPOSING_IGNORE = "Ignore close signals"
+const string OPPOSING_CLOSE = "Close on signal"
+const string OPPOSING_CLOSE_REVERSE = "Close and reverse on signal"
+
+
+// Inputs
+
+float buySellInput = input.source(defval = open, title = "Buy/Sell Indicator", display = display.none, group = "Input Sources",
+    tooltip = "Source for a Buy/Sell indicator to open or close a position. This source is required for the strategy to function.\n\n> 0 for Buy\n< 0 for Sell\n= 0 for Neither\n\nThe first signal will trigger a position to immediately open,"
+    + " but subsequent signals in the same direction will be ignored whilst the position remains open, as this strategy allows only one position at once. Signals in the opposite direction will be treated as specfied below.")
+
+string opposingSignalInput = input.string(defval = OPPOSING_IGNORE, title = "Opposing Signals", options = [OPPOSING_IGNORE, OPPOSING_CLOSE, OPPOSING_CLOSE_REVERSE], group = "Input Sources", display = display.none,
+    tooltip = "If the above source gives a signal in the opposite direction to the current position, that can either be ignored, or it can close the position, or it can close it then immediately open another one in the opposite direction.")
+
+bool useCloseInput = input.bool(defval = false, title = "Use Close Indicator", display = display.none, group = "Input Sources", inline = "closeInput")
+
+float closeInput = input.source(defval = open, title = "", display = display.none, group = "Input Sources", inline = "closeInput",
+    tooltip = "Source for an optional Buy/Sell close indicator, only used for closing positions.\n\n> 0 for Buy (closes short)\n< 0 for Sell (close long)\n= 0 for Neither (no action)\n\nOther signals will be ignored.")
+
+
+int positionSizeInput = input.int(defval = 10, title = "Initial Position Size", minval = 1, maxval = 100, step = 1, group = "Position Size", display = display.none,
+    tooltip = "Each position will open with this initial size.")
+
+
+float stopPercentInput = input.float(defval = 0, title = "Stop %", minval = 0, maxval = 100, step = 0.01, group = "Stops", display = display.none,
+    tooltip = "The stop distance as a percentage of the current asset price.\n\n0 means no stop will be applied.")
+
+float initialTrailingStopPercentInput = input.float(defval = 0, title = "Initial Trailing Stop %", minval = 0, maxval = 100, step = 0.01, group = "Stops", inline = "initialTrailingStop", display = display.none)
+
+float cutOffPercentInput = input.float(defval = 0, title = "Cut Off %", minval = -100, maxval = 100, step = 0.01, group = "Stops", inline = "initialTrailingStop", display = display.none,
+   tooltip = "The initial trailing stop distance, as a percentage of the current asset price.\n\n0 initial trailing stop means no stop will be applied.\n\nIf the initial trailing stop reaches the cut off level, as a percentage"
+   + " of the current asset price above or below the entry level, then it will no longer trail the price, remaining statically at this level. From here the trailing stop can take over trailing the price.\n\nThis is useful to move"
+   + " the stop to the entry level (or there abouts) fairly quickly. From there you might want to trail the price with a larger trailing stop for the rest of the trade.\n\n0 cut off means it stops trailing the price at your entry"
+   + " level, positive above, negative below, for a long trade. For a short it would be the opposite.")
+
+float trailingStopPercentInput = input.float(defval = 0, title = "Trailing Stop %", minval = 0, maxval = 100, step = 0.01, group = "Stops", display = display.none,
+   tooltip = "The trailing stop distance, as a percentage of the current asset price.\n\n0 means no stop will be applied.\n\nAll of the stops are optional and can be used individually, but typically you would want:"
+   + "\n\nTrailing Stop > Initial Trailing Stop >= Stop")
+
+
+int takeProfitSize1Input = input.int(defval = 2, title = "Profit 1 Size", minval = 0, maxval = 100, step = 1, group = "Take Profit", inline = "Take Profit 1", display = display.none)
+
+float takeProfitPercentGain1Input = input.float(defval = 2, title = "% Gain", minval = 0, maxval = 100, step = 0.1, group = "Take Profit", inline = "Take Profit 1", display = display.none,
+    tooltip = "The position size will be reduced by this amount if the price reaches this percentage gain.")
+
+
+int takeProfitSize2Input = input.int(defval = 2, title = "Profit 2 Size", minval = 0, maxval = 100, step = 1, group = "Take Profit", inline = "Take Profit 2", display = display.none)
+
+float takeProfitPercentGain2Input = input.float(defval = 3, title = "% Gain", minval = 0, maxval = 100, step = 0.1, group = "Take Profit", inline = "Take Profit 2", display = display.none,
+    tooltip = "The position size will be reduced by this amount if the price reaches this percentage gain.")
+
+
+int takeProfitSize3Input = input.int(defval = 2, title = "Profit 3 Size", minval = 0, maxval = 100, step = 1, group = "Take Profit", inline = "Take Profit 3", display = display.none)
+
+float takeProfitPercentGain3Input = input.float(defval = 4, title = "% Gain", minval = 0, maxval = 100, step = 0.1, group = "Take Profit", inline = "Take Profit 3", display = display.none,
+    tooltip = "The position size will be reduced by this amount if the price reaches this percentage gain.")
+
+
+int takeProfitSize4Input = input.int(defval = 2, title = "Profit 4 Size", minval = 0, maxval = 100, step = 1, group = "Take Profit", inline = "Take Profit 4", display = display.none)
+
+float takeProfitPercentGain4Input = input.float(defval = 5, title = "% Gain", minval = 0, maxval = 100, step = 0.1, group = "Take Profit", inline = "Take Profit 4", display = display.none,
+    tooltip = "The position size will be reduced by this amount if the price reaches this percentage gain.")
+
+
+// Persistent var variables
+
+var float currentTradeHigh = 0.0
+var float currentTradeLow = 0.0
+
+var int tradeCt = 1
+
+
+// Other variables
+
+float thisPrice = close
+
+float entryPrice = strategy.position_avg_price
+
+string tradeCtStr = ", T#:" + str.tostring(tradeCt)
+
+float stopDistance = 0.0
+float trailingStopDistance = 0.0
+float initialTrailingStopDistance = 0.0
+float cutOffDistance = 0.0
+float longStop = 0.0
+float shortStop = 0.0
+float longTrailingStop = 0.0
+float shortTrailingStop = 0.0
+float longInitialTrailingStop = 0.0
+float shortInitialTrailingStop = 0.0
+float longCutOff = 0.0
+float shortCutOff = 0.0
+
+string longStopType = "Long Stop"
+string shortStopType = "Short Stop"
+
+
+// Functions
+
+getPercentAsValue(percent) =>
+    (percent / 100) * thisPrice
+
+
+placeTakeProfitOrder(up, quantity, percentGain, msg) =>
+    if quantity > 0 and percentGain > 0
+        gain = getPercentAsValue(percentGain)
+        if up   // long
+            limitPrice = thisPrice + gain
+            strategy.order(msg,  strategy.short, qty = quantity, limit = limitPrice)
+            log.info("Placed order [" + msg + "] Sell " + str.tostring(quantity) + " at price: " + str.tostring(limitPrice))
+        else    // short
+            limitPrice = thisPrice - gain
+            strategy.order(msg,  strategy.long, qty = quantity, limit = limitPrice)
+            log.info("Placed order [" + msg + "] Buy " + str.tostring(quantity) + " at price: " + str.tostring(limitPrice))
+
+
+placeTakeProfitOrders(up) =>
+    placeTakeProfitOrder(up, takeProfitSize1Input, takeProfitPercentGain1Input, "Take Profit 1")
+    placeTakeProfitOrder(up, takeProfitSize2Input, takeProfitPercentGain2Input, "Take Profit 2")
+    placeTakeProfitOrder(up, takeProfitSize3Input, takeProfitPercentGain3Input, "Take Profit 3")
+    placeTakeProfitOrder(up, takeProfitSize4Input, takeProfitPercentGain4Input, "Take Profit 4")
+
+
+openLong() =>
+    strategy.cancel_all()
+    strategy.close_all()
+
+    msg = "Long Entry" + tradeCtStr
+    strategy.entry(msg, strategy.long, qty = positionSizeInput)
+    placeTakeProfitOrders(true)
+    log.info(msg)
+
+
+openShort() =>
+    strategy.cancel_all()
+    strategy.close_all()
+
+    msg = "Short Entry" + tradeCtStr
+    strategy.entry(msg, strategy.short, qty = positionSizeInput)
+    placeTakeProfitOrders(false)
+    log.info(msg)
+
+
+// Calculations
+
+
+if strategy.position_size == 0  // No position open
+
+    strategy.cancel_all()   // Cancels any take profit orders that may be left over after being stopped out.
+
+else    // Position currently open
+
+    if high > currentTradeHigh
+        currentTradeHigh := high
+
+    if low < currentTradeLow
+        currentTradeLow := low
+
+
+    if stopPercentInput != 0
+        stopDistance := getPercentAsValue(stopPercentInput)
+
+    if trailingStopPercentInput != 0
+        trailingStopDistance := getPercentAsValue(trailingStopPercentInput)
+
+    if initialTrailingStopPercentInput != 0
+        initialTrailingStopDistance := getPercentAsValue(initialTrailingStopPercentInput)
+        cutOffDistance := getPercentAsValue(cutOffPercentInput)
+
+        longCutOff := entryPrice + cutOffDistance
+        shortCutOff := entryPrice - cutOffDistance
+    
+
+    if stopDistance > 0 
+        longStop := entryPrice - stopDistance
+        shortStop := entryPrice + stopDistance
+
+
+    if trailingStopDistance > 0
+        longTrailingStop := currentTradeHigh - trailingStopDistance
+        shortTrailingStop := currentTradeLow + trailingStopDistance
+
+        if longTrailingStop > longStop
+            longStop := longTrailingStop
+            longStopType := "Trail Long Stop"
+
+        if shortTrailingStop < shortStop or shortStop == 0
+            shortStop := shortTrailingStop
+            shortStopType := "Trail Short Stop"
+
+
+    if initialTrailingStopDistance > 0
+
+        longInitialTrailingStop := currentTradeHigh - initialTrailingStopDistance
+        shortInitialTrailingStop := currentTradeLow + initialTrailingStopDistance
+
+        if longInitialTrailingStop > longCutOff
+            longInitialTrailingStop := longCutOff
+
+        if shortInitialTrailingStop < shortCutOff
+            shortInitialTrailingStop := shortCutOff
+
+
+        if longInitialTrailingStop > longStop
+            longStop := longInitialTrailingStop
+            longStopType := "Init Trail Long Stop"
+
+        if shortInitialTrailingStop < shortStop or shortStop == 0
+            shortStop := shortInitialTrailingStop
+            shortStopType := "Init Trail Short Stop"
+
+
+
+if strategy.position_size > 0   // long position
+
+    if longStop > 0 
+        strategy.exit(longStopType, stop = longStop)
+
+    if buySellInput < 0 and opposingSignalInput == OPPOSING_CLOSE_REVERSE
+        openShort()
+        currentTradeHigh := thisPrice
+        currentTradeLow := thisPrice
+        tradeCt += 1
+
+    else if (buySellInput < 0 and opposingSignalInput == OPPOSING_CLOSE) or (useCloseInput and closeInput < 0)
+        strategy.cancel_all()
+        strategy.close_all()
+        log.info("Long position closed with SELL signal.")
+
+
+else if strategy.position_size < 0  // short position
+
+    if shortStop > 0 
+        strategy.exit(shortStopType, stop = shortStop)
+
+    if buySellInput > 0 and opposingSignalInput == OPPOSING_CLOSE_REVERSE
+        openLong()
+        currentTradeHigh := thisPrice
+        currentTradeLow := thisPrice
+        tradeCt += 1
+
+    else if (buySellInput > 0 and opposingSignalInput == OPPOSING_CLOSE) or (useCloseInput and closeInput > 0)
+        strategy.cancel_all()
+        strategy.close_all()
+        log.info("Short position closed with BUY signal.")
+
+
+else    // no position
+
+    if buySellInput > 0
+        openLong()
+        currentTradeHigh := thisPrice
+        currentTradeLow := thisPrice
+        tradeCt += 1
+
+    else if buySellInput < 0
+        openShort()
+        currentTradeHigh := thisPrice
+        currentTradeLow := thisPrice
+        tradeCt += 1
+
+
+

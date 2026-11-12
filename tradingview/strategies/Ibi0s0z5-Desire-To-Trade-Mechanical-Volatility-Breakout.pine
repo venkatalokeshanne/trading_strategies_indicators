@@ -1,0 +1,265 @@
+//@version=6
+strategy("Desire To Trade Mechanical Volatility Breakout",
+     overlay=true,
+     initial_capital=100000,
+     pyramiding=0,
+     commission_type=strategy.commission.percent,
+     commission_value=0.01,
+     process_orders_on_close=false,
+     calc_on_order_fills=true)
+
+//=============================================================================
+// INPUTS
+//=============================================================================
+
+// Core mode
+tradeDirection = input.string("Long Only", "Trade Direction", options=["Long Only", "Long & Short"])
+entryMode      = input.string("Close Breakout", "Entry Mode", options=["Close Breakout", "Stop Order Breakout"])
+
+// Setup / range
+rangeLookback  = input.int(20, "Breakout Lookback Bars", minval=5)
+atrLen         = input.int(14, "ATR Length", minval=1)
+minRangeATR    = input.float(0.75, "Min Range Size (x ATR)", step=0.05, minval=0.1)
+maxRangeATR    = input.float(2.50, "Max Range Size (x ATR)", step=0.05, minval=0.2)
+
+// Trend filters
+useTrendFilter = input.bool(true, "Use Stock Trend Filter")
+trendEmaLen    = input.int(200, "Stock Trend EMA", minval=20)
+
+useMarketFilter = input.bool(true, "Use SPY Market Regime Filter")
+marketSymbol    = input.symbol("AMEX:SPY", "Market Regime Symbol")
+marketEmaLen    = input.int(200, "Market Regime EMA", minval=20)
+
+// Volatility / volume filters
+useAtrExpansionFilter = input.bool(true, "Use ATR Expansion Filter")
+atrSmaLen             = input.int(50, "ATR Average Length", minval=2)
+
+useVolumeFilter       = input.bool(true, "Use Relative Volume Filter")
+volSmaLen             = input.int(20, "Volume Average Length", minval=2)
+minRelVolume          = input.float(1.20, "Min Relative Volume", step=0.05, minval=0.5)
+
+// Risk / exits
+tpMode              = input.string("1R Partial + Trail Runner", "Take Profit Mode", options=["Full Exit At 2R", "1R Partial + Trail Runner", "Trail Only"])
+partialQtyPercent   = input.float(50.0, "Partial Take Profit %", step=1.0, minval=1.0, maxval=99.0)
+fullExitRR          = input.float(2.0, "Full Exit Risk:Reward", step=0.1, minval=0.5)
+partialRR           = input.float(1.0, "Partial Take Profit RR", step=0.1, minval=0.5)
+
+runnerTrailMode     = input.string("EMA 20", "Runner Trail Mode", options=["EMA 20", "EMA 50", "ATR"])
+runnerTrailEmaLen   = input.int(20, "Runner EMA Length", minval=2)
+runnerTrailATRMult  = input.float(1.0, "Runner ATR Trail Multiple", step=0.1, minval=0.1)
+
+exitOnTrendBreak    = input.bool(true, "Exit If Stock Closes Below Trend EMA (Longs) / Above Trend EMA (Shorts)")
+exitOnOppSignal     = input.bool(false, "Exit On Opposite Breakout Signal")
+
+// Date filter
+useDateFilter = input.bool(false, "Use Backtest Date Filter")
+startDate     = input.time(timestamp("2018-01-01T00:00:00"), "Start Date")
+endDate       = input.time(timestamp("2099-12-31T23:59:59"), "End Date")
+
+//=============================================================================
+// CALCULATIONS
+//=============================================================================
+
+inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+
+atr       = ta.atr(atrLen)
+atrAvg    = ta.sma(atr, atrSmaLen)
+stockEma  = ta.ema(close, trendEmaLen)
+runnerEma = ta.ema(close, runnerTrailEmaLen)
+volAvg    = ta.sma(volume, volSmaLen)
+relVol    = volAvg > 0 ? volume / volAvg : 0.0
+
+// Market regime from SPY
+marketClose = request.security(marketSymbol, timeframe.period, close)
+marketEma   = request.security(marketSymbol, timeframe.period, ta.ema(close, marketEmaLen))
+
+// Previous-bar range so current breakout bar is not included
+rangeHigh = ta.highest(high[1], rangeLookback)
+rangeLow  = ta.lowest(low[1], rangeLookback)
+rangeSize = rangeHigh - rangeLow
+
+// Direction toggles
+allowLongs  = tradeDirection == "Long Only" or tradeDirection == "Long & Short"
+allowShorts = tradeDirection == "Long & Short"
+
+// Filters
+rangeOk       = rangeSize >= minRangeATR * atr and rangeSize <= maxRangeATR * atr
+stockTrendUp  = not useTrendFilter or close > stockEma
+stockTrendDn  = not useTrendFilter or close < stockEma
+marketBull    = not useMarketFilter or marketClose > marketEma
+marketBear    = not useMarketFilter or marketClose < marketEma
+atrExpandOk   = not useAtrExpansionFilter or atr > atrAvg
+volumeOk      = not useVolumeFilter or relVol >= minRelVolume
+
+// Breakout triggers
+longBreakout  = close > rangeHigh
+shortBreakout = close < rangeLow
+
+longSetup  = inDateRange and allowLongs  and rangeOk and stockTrendUp and marketBull and atrExpandOk and volumeOk
+shortSetup = inDateRange and allowShorts and rangeOk and stockTrendDn and marketBear and atrExpandOk and volumeOk
+
+//=============================================================================
+// ENTRIES
+//=============================================================================
+
+if entryMode == "Close Breakout"
+    if longSetup and longBreakout and strategy.position_size <= 0
+        strategy.entry("Long", strategy.long)
+
+    if shortSetup and shortBreakout and strategy.position_size >= 0
+        strategy.entry("Short", strategy.short)
+
+if entryMode == "Stop Order Breakout"
+    if strategy.position_size == 0
+        if longSetup
+            strategy.entry("Long", strategy.long, stop=rangeHigh)
+        else
+            strategy.cancel("Long")
+
+        if shortSetup
+            strategy.entry("Short", strategy.short, stop=rangeLow)
+        else
+            strategy.cancel("Short")
+    else
+        strategy.cancel("Long")
+        strategy.cancel("Short")
+
+//=============================================================================
+// POSITION STATE
+//=============================================================================
+
+isLong     = strategy.position_size > 0
+isShort    = strategy.position_size < 0
+entryPrice = strategy.position_avg_price
+
+// Stop loss on other side of the range
+// Freeze the breakout range once in trade
+var float activeLongRangeLow  = na
+var float activeLongRangeHigh = na
+var float activeShortRangeLow  = na
+var float activeShortRangeHigh = na
+
+newLong  = isLong  and strategy.position_size[1] <= 0
+newShort = isShort and strategy.position_size[1] >= 0
+
+if newLong
+    activeLongRangeLow  := rangeLow
+    activeLongRangeHigh := rangeHigh
+if not isLong
+    activeLongRangeLow  := na
+    activeLongRangeHigh := na
+
+if newShort
+    activeShortRangeLow  := rangeLow
+    activeShortRangeHigh := rangeHigh
+if not isShort
+    activeShortRangeLow  := na
+    activeShortRangeHigh := na
+
+longStop  = activeLongRangeLow
+shortStop = activeShortRangeHigh
+
+longRisk  = isLong  ? math.max(entryPrice - longStop, syminfo.mintick) : na
+shortRisk = isShort ? math.max(shortStop - entryPrice, syminfo.mintick) : na
+
+longFullTP   = isLong  ? entryPrice + fullExitRR * longRisk : na
+shortFullTP  = isShort ? entryPrice - fullExitRR * shortRisk : na
+
+longPartTP   = isLong  ? entryPrice + partialRR * longRisk : na
+shortPartTP  = isShort ? entryPrice - partialRR * shortRisk : na
+
+//=============================================================================
+// RUNNER TRAILS
+//=============================================================================
+
+float rawLongTrail =
+     runnerTrailMode == "EMA 20" ? runnerEma :
+     runnerTrailMode == "EMA 50" ? ta.ema(close, 50) :
+     close - runnerTrailATRMult * atr
+
+float rawShortTrail =
+     runnerTrailMode == "EMA 20" ? runnerEma :
+     runnerTrailMode == "EMA 50" ? ta.ema(close, 50) :
+     close + runnerTrailATRMult * atr
+
+var float longRunnerStop = na
+var float shortRunnerStop = na
+
+if isLong
+    baseLongTrail  = math.max(longStop, rawLongTrail)
+    longRunnerStop := na(longRunnerStop[1]) ? baseLongTrail : math.max(longRunnerStop[1], baseLongTrail)
+else
+    longRunnerStop := na
+
+if isShort
+    baseShortTrail  = math.min(shortStop, rawShortTrail)
+    shortRunnerStop := na(shortRunnerStop[1]) ? baseShortTrail : math.min(shortRunnerStop[1], baseShortTrail)
+else
+    shortRunnerStop := na
+
+//=============================================================================
+// EXITS
+//=============================================================================
+
+if tpMode == "Full Exit At 2R"
+    if isLong
+        strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longFullTP)
+    if isShort
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortFullTP)
+
+if tpMode == "1R Partial + Trail Runner"
+    if isLong
+        strategy.exit("Long Partial", from_entry="Long", stop=longStop, limit=longPartTP, qty_percent=partialQtyPercent)
+        strategy.exit("Long Runner", from_entry="Long", stop=longRunnerStop, qty_percent=100 - partialQtyPercent)
+    if isShort
+        strategy.exit("Short Partial", from_entry="Short", stop=shortStop, limit=shortPartTP, qty_percent=partialQtyPercent)
+        strategy.exit("Short Runner", from_entry="Short", stop=shortRunnerStop, qty_percent=100 - partialQtyPercent)
+
+if tpMode == "Trail Only"
+    if isLong
+        strategy.exit("Long Trail", from_entry="Long", stop=longRunnerStop)
+    if isShort
+        strategy.exit("Short Trail", from_entry="Short", stop=shortRunnerStop)
+
+// Optional protective exits
+if exitOnTrendBreak and useTrendFilter
+    if isLong and close < stockEma
+        strategy.close("Long", comment="Trend Break")
+    if isShort and close > stockEma
+        strategy.close("Short", comment="Trend Break")
+
+if exitOnOppSignal
+    if isLong and shortSetup and shortBreakout
+        strategy.close("Long", comment="Opposite Signal")
+    if isShort and longSetup and longBreakout
+        strategy.close("Short", comment="Opposite Signal")
+
+//=============================================================================
+// PLOTS
+//=============================================================================
+
+plot(rangeHigh, "Range High", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+plot(rangeLow,  "Range Low",  color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+plot(stockEma,  "Stock Trend EMA", color=color.new(color.orange, 0), linewidth=2)
+
+plot(isLong ? longStop : na, "Long Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+plot(isShort ? shortStop : na, "Short Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+
+plot(isLong and tpMode == "Full Exit At 2R" ? longFullTP : na, "Long Full TP", color=color.new(color.green, 0), style=plot.style_linebr)
+plot(isShort and tpMode == "Full Exit At 2R" ? shortFullTP : na, "Short Full TP", color=color.new(color.green, 0), style=plot.style_linebr)
+
+plot(isLong and tpMode == "1R Partial + Trail Runner" ? longPartTP : na, "Long Partial TP", color=color.new(color.green, 45), style=plot.style_linebr)
+plot(isShort and tpMode == "1R Partial + Trail Runner" ? shortPartTP : na, "Short Partial TP", color=color.new(color.green, 45), style=plot.style_linebr)
+
+plot(isLong and (tpMode == "1R Partial + Trail Runner" or tpMode == "Trail Only") ? longRunnerStop : na, "Long Runner Stop", color=color.new(color.purple, 0), style=plot.style_linebr)
+plot(isShort and (tpMode == "1R Partial + Trail Runner" or tpMode == "Trail Only") ? shortRunnerStop : na, "Short Runner Stop", color=color.new(color.purple, 0), style=plot.style_linebr)
+
+plotshape(longSetup and longBreakout,  title="Long Signal",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="L")
+plotshape(shortSetup and shortBreakout, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),   size=size.tiny, text="S")
+
+//=============================================================================
+// ALERTS
+//=============================================================================
+
+alertcondition(longSetup and longBreakout, "Long Breakout Signal", "Long breakout signal")
+alertcondition(shortSetup and shortBreakout, "Short Breakout Signal", "Short breakout signal")

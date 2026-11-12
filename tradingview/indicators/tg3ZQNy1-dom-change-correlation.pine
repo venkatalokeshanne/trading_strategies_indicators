@@ -1,0 +1,1172 @@
+//@version=6
+indicator("[dom] % change correlation", shorttitle="[dom] % change corr", overlay=false, precision=2, max_labels_count=100, max_lines_count=200, dynamic_requests=true)
+
+// OptiPine by Alien_Algorithms — CC BY-NC-SA 4.0 (non-commercial use).
+// Credit Alien_Algorithms / OptiPine in the TradingView publication description.
+import Alien_Algorithms/OptiPine/1 as opti
+
+// ============================================================================
+// [dom] % CHANGE CORRELATION — V24 — TV CLOSE-TO-CLOSE / OPTIPINE
+//
+// Text syntax (comma-separated; multiline is fine):
+//   NASDAQ:AAPL, NASDAQ:MSFT
+//   TVC:US10Y - TVC:US02Y (10Y-2Y SPREAD)
+//   CBOE:VIX / CBOE:VIX3M (VIX TERM RATIO)
+//
+// Arithmetic supports chained + - * / expressions with normal * / precedence.
+// Operators must have spaces around them. Trailing parentheses are reserved for
+// the optional display tag, e.g. A - B (SPREAD).
+// Plain symbols automatically display only their ticker; redundant aliases are
+// intentionally unnecessary.
+//
+//
+// % change definition:
+// - Positive-valued instruments use the normal anchored return.
+// - Negative-valued arithmetic expressions use the same price difference divided
+//   by abs(anchor), so direction is not inverted merely because the spread is negative.
+// - A zero-valued anchor remains undefined rather than manufacturing a percentage.
+//
+// Performance architecture (OptiPine-style, dependency-free):
+// - Text/expression parsing is compiled ONCE per configured slot. Inputs restart
+//   the script when changed, so reparsing immutable text on every bar is wasted work.
+// - The compiled evaluator is allocation-light: no per-bar token/value/operator/
+//   term arrays. It evaluates the cached token stream with scalar accumulators.
+// - request.security() still executes historically/realtime where needed; source
+//   data itself is not memoized because its value can legitimately change each bar.
+// - Endpoint rendering uses a small Watch-style snapshot. On realtime updates it
+//   skips sorting, text rebuilding and drawing setters when endpoints did not change.
+// - Drawing IDs are pooled and updated with setters; *.new() is last-bar-only and
+//   only used when the live layout actually needs another object.
+//
+// 10 input slots are supported per group. To preserve BOTH a separate-pane
+// mode and an On-Chart mode while keeping plot styling in TradingView's Style
+// tab, the script multiplexes up to 32 logical visible lines into 64 plot calls
+// (32 pane + 32 on-chart). Additional configured lines still exist as inputs,
+// but only the first 32 enabled logical lines (including cumulatives) plot.
+//
+// Extended-session requests use ticker.modify(..., session.extended), which lets
+// requested equities include pre/post-market data when the symbol/feed supports
+// it. Pine itself still executes only when the HOST chart receives an update; an
+// external request cannot wake a closed/inactive chart by itself.
+//
+// Sparse/reference data handling: TVC/FRED/ECONOMICS symbols automatically use
+// a minimum request timeframe (1D by default) when the host chart is below that
+// resolution. This prevents daily-only macro series from disappearing on 1m/5m/
+// hourly charts. request.security(..., gaps=barmerge.gaps_off) carries the latest
+// available macro observation across lower-timeframe host bars. This does NOT
+// fabricate intraday macro observations: the line updates only when the source
+// dataset itself publishes/updates a value.
+//
+// Dynamic request contexts may depend on cached atom tokens, but the request
+// expression stays a loop-invariant tuple. Source/anchor clamping happens after
+// the request, preserving Pine's dynamic-request consistency rules.
+//
+// Any symbol atom can set a minimum source request timeframe with @TF:
+//   TVC:US10Y@D
+//   CBOE:COR1M@D - CBOE:COR3M@D (1M-3M CORR)
+// The @TF suffix affects data acquisition only; it is removed from display tags.
+//
+// Display scaling is GROUP-INDEPENDENT. Each group can stay Linear or visually
+// compress outliers without changing the underlying calculations, cumulative math,
+// raw values, or endpoint % text. "Outlier compression" uses a signed asinh-style
+// transform; "Soft cap" uses a smooth signed cap. Only the plotted Y coordinate is
+// transformed.
+// ============================================================================
+
+const int SLOTS_PER_GROUP = 10
+const int MAX_LOGICAL_LINES = 55
+
+string GENERAL = "General"
+string G1 = "Group 1 — Mag 7 / mega-cap tech (default examples — editable)"
+string G2 = "Group 2 — Volatility / term structure (default examples — editable)"
+string G3 = "Group 3 — Implied correlation (default examples — editable)"
+string G4 = "Group 4 — Treasuries / rates / curve (default examples — editable)"
+string G5 = "Group 5 — Equity index / commodity futures (default examples — editable)"
+
+// ------------------------- General controls ---------------------------------
+string tagTextSizeInput = input.string("Small", "Text size", options=["Tiny", "Small", "Normal", "Large", "Huge"], inline="textfmt", group=GENERAL)
+string tagTextColorMode = input.string("Line colors", "Text coloring", options=["Line colors", "Static"], inline="textfmt", group=GENERAL,
+     tooltip="Line colors (default) makes each endpoint row use the script's corresponding default line color. Static uses the single color picker. Note: Pine cannot read back manual color overrides made later in TradingView's Style tab, so Style-tab recolors do not automatically propagate to endpoint text.")
+color tagTextColor = input.color(color.rgb(210, 210, 210), "Static color", inline="textfmt", group=GENERAL, active=tagTextColorMode == "Static")
+bool linkedTextColors = tagTextColorMode == "Line colors"
+
+string requestedSessionMode = input.string("Symbol default", "Requested session", options=["Symbol default", "Extended", "Regular"], group=GENERAL,
+     tooltip="Symbol default leaves the requested ticker untouched and lets TradingView use that symbol's native/default session. Extended or Regular explicitly applies ticker.modify() when you want to override it. Symbol default is recommended for % comparisons because forcing a different session changes the opening baseline.")
+bool useExtendedRequests = requestedSessionMode == "Extended"
+bool useRegularRequests = requestedSessionMode == "Regular"
+
+string sparseDataMode = input.string("Auto macro-safe", "Sparse-data handling", options=["Auto macro-safe", "Chart timeframe only"], group=GENERAL,
+     tooltip="Auto macro-safe keeps normal exchange symbols on the chart timeframe, but requests TVC/FRED/ECONOMICS reference data at no less than the Sparse-data floor. This lets daily-only macro series display on intraday charts without consuming a second fallback request. Use SYMBOL@TF inside a textbox to set a minimum source resolution for any individual atom, e.g. CBOE:COR1M@D.")
+string sparseDataFloor = input.timeframe("D", "Sparse-data floor", group=GENERAL, active=sparseDataMode == "Auto macro-safe",
+     tooltip="Default 1D. On a chart below this timeframe, recognized sparse/reference datasets are requested at this floor and carried forward across the host bars. On charts at or above the floor, the chart timeframe is used. This cannot create data more granular than the source publishes.")
+bool autoSparseData = sparseDataMode == "Auto macro-safe"
+
+bool showRightTags = input.bool(true, "Right-side tags", group=GENERAL)
+bool tagShowRaw = input.bool(true, "Show raw value", inline="tagfmt", group=GENERAL)
+bool tagShowPct = input.bool(true, "Show % move", inline="tagfmt", group=GENERAL)
+int tagOffset = input.int(4, "Tag offset (bars)", minval=1, group=GENERAL)
+float tagMergeGap = input.float(0.18, "Merge gap (%)", minval=0.0, group=GENERAL,
+     tooltip="Nearby endpoints merge into one multiline tag. Individuals and cumulative lines participate equally.")
+bool showLeaderLines = input.bool(true, "Bloomberg-style leader lines", group=GENERAL,
+     tooltip="Each merged endpoint keeps its exact Y position and connects into the shared text block.")
+
+bool paneMode = true
+bool chartMode = false
+
+string tagTextSize = switch tagTextSizeInput
+    "Tiny" => size.tiny
+    "Small" => size.small
+    "Normal" => size.normal
+    "Large" => size.large
+    "Huge" => size.huge
+    => size.small
+
+// ------------------------- Group 1 ------------------------------------------
+bool g1Individual = input.bool(true, "Individual", inline="g1opts", group=G1)
+bool g1Cumulative = input.bool(true, "Cumulative", inline="g1opts", group=G1)
+string g1CumTitle = input.string("MAG 7 CUM", "Cumulative title", inline="g1cumtitle", group=G1, tooltip="Label used for this group\'s cumulative line/right-side tag. Editable; keep it short for cleaner labels.")
+string g1CalcMode = input.string("TradingView close-to-close", "Calculation", options=["TradingView close-to-close", "Open-to-current"], group=G1, tooltip="TradingView close-to-close (default): current price versus the previous close of the selected Anchor timeframe. Open-to-current: current price versus the current Anchor timeframe candle open. Globex open only affects Open-to-current mode.")
+bool g1SessionAnchor = input.bool(false, "Globex open", inline="g1opts2", group=G1, active=g1CalcMode == "Open-to-current",
+     tooltip="Off = use the selected timeframe candle open exactly as TradingView defines it for that symbol. On = ignore Anchor and use a hard-coded 17:00-16:00 exchange-time session open, intended for CME/Globex-style futures.")
+string g1Tf = input.timeframe("D", "Anchor", inline="g1opts2", group=G1, active=g1CalcMode == "TradingView close-to-close" or not g1SessionAnchor)
+string g1ScaleMode = input.string("Linear", "Display scaling", options=["Linear", "Outlier compression", "Soft cap"], inline="g1scale", group=G1,
+     tooltip="Visual-only scaling for this group. Linear plots the real % move. Outlier compression keeps small moves close to linear while squeezing large positive/negative outliers. Soft cap smoothly approaches ±Scale %. Labels, arithmetic, and cumulative calculations always use the real uncompressed values.")
+float g1ScaleAmount = input.float(1.50, "Scale %", inline="g1scale", group=G1, active=g1ScaleMode != "Linear",
+     tooltip="Outlier compression: roughly where compression starts becoming noticeable. Soft cap: the approximate visual ceiling in either direction. This changes display only, never the underlying % calculation.")
+string g1Text = input.text_area(
+     "NASDAQ:AAPL, NASDAQ:MSFT, NASDAQ:NVDA, NASDAQ:AMZN, NASDAQ:GOOGL, NASDAQ:META, NASDAQ:TSLA",
+     "Symbols / expressions", group=G1,
+     tooltip="These are editable default examples, not hard-locked constituents. Up to 10 comma-separated entries. Arithmetic supports chained + - * / with normal * / precedence; put spaces around operators. A trailing (...) is the display tag, e.g. NASDAQ:AAPL / NASDAQ:MSFT (AAPL/MSFT). Plain symbols need no redundant (TICKER) alias. Unprefixed symbols are passed to TradingView as-is; use EXCHANGE:TICKER whenever the venue matters. Optional source-TF override: SYMBOL@D (e.g. CBOE:COR1M@D).")
+
+// ------------------------- Group 2 ------------------------------------------
+bool g2Individual = input.bool(false, "Individual", inline="g2opts", group=G2)
+bool g2Cumulative = input.bool(true, "Cumulative", inline="g2opts", group=G2)
+string g2CumTitle = input.string("VOL CUM", "Cumulative title", inline="g2cumtitle", group=G2, tooltip="Label used for this group\'s cumulative line/right-side tag. Editable; keep it short for cleaner labels.")
+string g2CalcMode = input.string("TradingView close-to-close", "Calculation", options=["TradingView close-to-close", "Open-to-current"], group=G2, tooltip="TradingView close-to-close (default): current price versus the previous close of the selected Anchor timeframe. Open-to-current: current price versus the current Anchor timeframe candle open. Globex open only affects Open-to-current mode.")
+bool g2SessionAnchor = input.bool(false, "Globex open", inline="g2opts2", group=G2, active=g2CalcMode == "Open-to-current",
+     tooltip="Off = use the selected timeframe candle open exactly as TradingView defines it for that symbol. On = ignore Anchor and use a hard-coded 17:00-16:00 exchange-time session open, intended for CME/Globex-style futures.")
+string g2Tf = input.timeframe("D", "Anchor", inline="g2opts2", group=G2, active=g2CalcMode == "TradingView close-to-close" or not g2SessionAnchor)
+string g2ScaleMode = input.string("Soft cap", "Display scaling", options=["Linear", "Outlier compression", "Soft cap"], inline="g2scale", group=G2,
+     tooltip="Visual-only scaling for this group. Linear plots the real % move. Outlier compression keeps small moves close to linear while squeezing large positive/negative outliers. Soft cap smoothly approaches ±Scale %. Labels, arithmetic, and cumulative calculations always use the real uncompressed values.")
+float g2ScaleAmount = input.float(1.0, "Scale %", inline="g2scale", group=G2, active=g2ScaleMode != "Linear",
+     tooltip="Outlier compression: roughly where compression starts becoming noticeable. Soft cap: the approximate visual ceiling in either direction. This changes display only, never the underlying % calculation.")
+string g2Text = input.text_area(
+     "CBOE:VIX, CBOE:VIX1D, CBOE:VIX3M, CBOE:VIX6M, CBOE:VVIX",
+     "Symbols / expressions", group=G2,
+     tooltip="These are editable default examples, not hard-locked constituents. Up to 10 comma-separated entries. Arithmetic supports chained + - * / with normal * / precedence; put spaces around operators. A trailing (...) is the display tag, e.g. CBOE:VIX / CBOE:VIX3M (VIX/VIX3M). Plain symbols need no redundant alias. Unprefixed symbols are passed to TradingView as-is; use EXCHANGE:TICKER whenever the venue matters. Optional source-TF override: SYMBOL@D.")
+
+// ------------------------- Group 3 ------------------------------------------
+bool g3Individual = input.bool(false, "Individual", inline="g3opts", group=G3)
+bool g3Cumulative = input.bool(true, "Cumulative", inline="g3opts", group=G3)
+string g3CumTitle = input.string("CORR CUM", "Cumulative title", inline="g3cumtitle", group=G3, tooltip="Label used for this group\'s cumulative line/right-side tag. Editable; keep it short for cleaner labels.")
+string g3CalcMode = input.string("TradingView close-to-close", "Calculation", options=["TradingView close-to-close", "Open-to-current"], group=G3, tooltip="TradingView close-to-close (default): current price versus the previous close of the selected Anchor timeframe. Open-to-current: current price versus the current Anchor timeframe candle open. Globex open only affects Open-to-current mode.")
+bool g3SessionAnchor = input.bool(false, "Globex open", inline="g3opts2", group=G3, active=g3CalcMode == "Open-to-current",
+     tooltip="Off = use the selected timeframe candle open exactly as TradingView defines it for that symbol. On = ignore Anchor and use a hard-coded 17:00-16:00 exchange-time session open, intended for CME/Globex-style futures.")
+string g3Tf = input.timeframe("D", "Anchor", inline="g3opts2", group=G3, active=g3CalcMode == "TradingView close-to-close" or not g3SessionAnchor)
+string g3ScaleMode = input.string("Linear", "Display scaling", options=["Linear", "Outlier compression", "Soft cap"], inline="g3scale", group=G3,
+     tooltip="Visual-only scaling for this group. Linear plots the real % move. Outlier compression keeps small moves close to linear while squeezing large positive/negative outliers. Soft cap smoothly approaches ±Scale %. Labels, arithmetic, and cumulative calculations always use the real uncompressed values.")
+float g3ScaleAmount = input.float(1.50, "Scale %", inline="g3scale", group=G3, active=g3ScaleMode != "Linear",
+     tooltip="Outlier compression: roughly where compression starts becoming noticeable. Soft cap: the approximate visual ceiling in either direction. This changes display only, never the underlying % calculation.")
+string g3Text = input.text_area(
+     "CBOE:COR1M, CBOE:COR3M, CBOE:COR6M, CBOE:COR9M, CBOE:COR1Y",
+     "Symbols / expressions", group=G3,
+     tooltip="These are editable default examples, not hard-locked constituents. Up to 10 comma-separated entries. Arithmetic supports chained + - * / with normal * / precedence; put spaces around operators. A trailing (...) is the display tag, e.g. CBOE:COR1M - CBOE:COR3M (1M-3M CORR). Plain symbols need no redundant alias. Unprefixed symbols are passed to TradingView as-is; use EXCHANGE:TICKER whenever the venue matters. Optional source-TF override: SYMBOL@D.")
+
+// ------------------------- Group 4 ------------------------------------------
+bool g4Individual = input.bool(false, "Individual", inline="g4opts", group=G4)
+bool g4Cumulative = input.bool(true, "Cumulative", inline="g4opts", group=G4)
+string g4CumTitle = input.string("RATES CUM", "Cumulative title", inline="g4cumtitle", group=G4, tooltip="Label used for this group\'s cumulative line/right-side tag. Editable; keep it short for cleaner labels.")
+string g4CalcMode = input.string("TradingView close-to-close", "Calculation", options=["TradingView close-to-close", "Open-to-current"], group=G4, tooltip="TradingView close-to-close (default): current price versus the previous close of the selected Anchor timeframe. Open-to-current: current price versus the current Anchor timeframe candle open. Globex open only affects Open-to-current mode.")
+bool g4SessionAnchor = input.bool(false, "Globex open", inline="g4opts2", group=G4, active=g4CalcMode == "Open-to-current",
+     tooltip="Off = use the selected timeframe candle open exactly as TradingView defines it for that symbol. On = ignore Anchor and use a hard-coded 17:00-16:00 exchange-time session open, intended for CME/Globex-style futures.")
+string g4Tf = input.timeframe("D", "Anchor", inline="g4opts2", group=G4, active=g4CalcMode == "TradingView close-to-close" or not g4SessionAnchor)
+string g4ScaleMode = input.string("Soft cap", "Display scaling", options=["Linear", "Outlier compression", "Soft cap"], inline="g4scale", group=G4,
+     tooltip="Visual-only scaling for this group. Linear plots the real % move. Outlier compression keeps small moves close to linear while squeezing large positive/negative outliers. Soft cap smoothly approaches ±Scale %. Labels, arithmetic, and cumulative calculations always use the real uncompressed values.")
+float g4ScaleAmount = input.float(1.0, "Scale %", inline="g4scale", group=G4, active=g4ScaleMode != "Linear",
+     tooltip="Outlier compression: roughly where compression starts becoming noticeable. Soft cap: the approximate visual ceiling in either direction. This changes display only, never the underlying % calculation.")
+string g4Text = input.text_area(
+     "TVC:US01MY, TVC:US03MY, TVC:US02Y, TVC:US05Y, TVC:US10Y, TVC:US30Y, TVC:US10Y - TVC:US02Y (2s10s CURVE), TVC:US30Y - TVC:US05Y (5s30s CURVE), TVC:US10Y - TVC:US03MY (3m10y CURVE), 2 * TVC:US05Y - TVC:US02Y - TVC:US10Y (2s5s10s FLY)",
+     "Symbols / expressions", group=G4,
+     tooltip="These are editable default examples, not hard-locked constituents. Up to 10 comma-separated entries. Arithmetic supports chained + - * / with normal * / precedence; put spaces around operators. A trailing (...) is the display tag. Examples: TVC:US10Y - TVC:US02Y (2s10s CURVE), or 2 * TVC:US05Y - TVC:US02Y - TVC:US10Y (2s5s10s FLY). Parentheses here are tags, not arithmetic grouping. Optional source-TF override: append @TF to an atom, e.g. TVC:US10Y@D.")
+
+// ------------------------- Group 5 ------------------------------------------
+bool g5Individual = input.bool(false, "Individual", inline="g5opts", group=G5)
+bool g5Cumulative = input.bool(true, "Cumulative", inline="g5opts", group=G5)
+string g5CumTitle = input.string("FUTURES CUM", "Cumulative title", inline="g5cumtitle", group=G5, tooltip="Label used for this group\'s cumulative line/right-side tag. Editable; keep it short for cleaner labels.")
+string g5CalcMode = input.string("TradingView close-to-close", "Calculation", options=["TradingView close-to-close", "Open-to-current"], group=G5, tooltip="TradingView close-to-close (default): current price versus the previous close of the selected Anchor timeframe. Open-to-current: current price versus the current Anchor timeframe candle open. Globex open only affects Open-to-current mode.")
+bool g5SessionAnchor = input.bool(false, "Globex open", inline="g5opts2", group=G5, active=g5CalcMode == "Open-to-current",
+     tooltip="Off = use the selected timeframe candle open exactly as TradingView defines it for that symbol. On = ignore Anchor and use a hard-coded 17:00-16:00 exchange-time session open, intended for CME/Globex-style futures.")
+string g5Tf = input.timeframe("D", "Anchor", inline="g5opts2", group=G5, active=g5CalcMode == "TradingView close-to-close" or not g5SessionAnchor)
+string g5ScaleMode = input.string("Linear", "Display scaling", options=["Linear", "Outlier compression", "Soft cap"], inline="g5scale", group=G5,
+     tooltip="Visual-only scaling for this group. Linear plots the real % move. Outlier compression keeps small moves close to linear while squeezing large positive/negative outliers. Soft cap smoothly approaches ±Scale %. Labels, arithmetic, and cumulative calculations always use the real uncompressed values.")
+float g5ScaleAmount = input.float(1.50, "Scale %", inline="g5scale", group=G5, active=g5ScaleMode != "Linear",
+     tooltip="Outlier compression: roughly where compression starts becoming noticeable. Soft cap: the approximate visual ceiling in either direction. This changes display only, never the underlying % calculation.")
+string g5Text = input.text_area(
+     "CME_MINI:ES1!, CME_MINI:NQ1!, CBOT_MINI:YM1!, CME_MINI:RTY1!, NYMEX:CL1!, COMEX:GC1!, COMEX:SI1!, COMEX:HG1!, NYMEX:NG1!, CBOT:ZC1!",
+     "Symbols / expressions", group=G5,
+     tooltip="These are editable default examples, not hard-locked constituents. Up to 10 comma-separated entries. Defaults mix equity-index and commodity continuous futures (ES, NQ, YM, RTY, crude, gold, silver, copper, nat gas, corn). Arithmetic supports chained + - * / with normal * / precedence; put spaces around operators. A trailing (...) is the display tag, e.g. CME_MINI:NQ1! - CME_MINI:ES1! (NQ-ES). Parentheses here are tags, not arithmetic grouping. Optional source-TF override: append @TF to an atom.")
+
+// ============================================================================
+// Utility functions
+// ============================================================================
+
+// Dynamic requests inside the expression parser must not carry history-dependent
+// calculations in a loop/conditional call scope. Each atom therefore requests only
+// history-free primitives: current close, current source-bar open, and source-bar time.
+// Anchor state is maintained later in f_item(), whose 50 written calls execute once
+// on every chart calculation and therefore each have a stable, independent history.
+
+f_symbolPrefix(string symbolText) =>
+    string s = str.trim(symbolText)
+    int colon = str.pos(s, ":")
+    not na(colon) and colon > 0 ? str.upper(str.substring(s, 0, colon)) : ""
+
+f_isSparseReference(string symbolText) =>
+    string prefix = f_symbolPrefix(symbolText)
+    prefix == "FRED" or prefix == "TVC" or prefix == "ECONOMICS"
+
+// Returns the higher/equal of two timeframes. Used only for automatic floors,
+// so request.security() is never forced below the host chart timeframe by Auto.
+f_tfFloor(string candidateTf, string floorTf) =>
+    float candidateSeconds = timeframe.in_seconds(candidateTf)
+    float floorSeconds = timeframe.in_seconds(floorTf)
+    not na(candidateSeconds) and not na(floorSeconds) and candidateSeconds < floorSeconds ? floorTf : candidateTf
+
+// Optional atom syntax: SYMBOL@TF. The suffix is deliberately parsed at atom
+// level, so it also works inside arithmetic expressions.
+f_parseAtomTf(string atom) =>
+    string s = str.trim(atom)
+    string symbolText = s
+    string forcedTf = ""
+    int atPos = str.pos(s, "@")
+    if not na(atPos) and atPos > 0 and atPos + 1 < str.length(s)
+        symbolText := str.trim(str.substring(s, 0, atPos))
+        forcedTf := str.trim(str.substring(s, atPos + 1, str.length(s)))
+    [symbolText, forcedTf]
+
+f_resolveRequestTf(string symbolText, string forcedTf) =>
+    string outTf = timeframe.period
+    if str.length(forcedTf) > 0
+        // @TF is a minimum source resolution. Clamp it to at least the host
+        // timeframe so ordinary request.security() never becomes an accidental
+        // lower-timeframe/intrabar request on higher-timeframe charts.
+        outTf := f_tfFloor(forcedTf, timeframe.period)
+    else if autoSparseData and f_isSparseReference(symbolText)
+        outTf := f_tfFloor(timeframe.period, sparseDataFloor)
+    outTf
+
+// Prefix handling:
+// Pine has no Symbol Search API. Prefixed strings are deterministic; unprefixed
+// strings are passed through untouched so TradingView performs its normal symbol
+// resolution instead of this script guessing an exchange.
+f_requestTicker(string symbolText) =>
+    string s = str.trim(symbolText)
+    int colon = str.pos(s, ":")
+    string prefix = f_symbolPrefix(s)
+    bool sessionNeutral = prefix == "FRED" or prefix == "TVC" or prefix == "ECONOMICS"
+    if sessionNeutral or na(colon)
+        s
+    else if useExtendedRequests
+        ticker.modify(s, session=session.extended)
+    else if useRegularRequests
+        ticker.modify(s, session=session.regular)
+    else
+        s
+
+// Returns the atom's current value, the open of its actual requested source bar,
+// source resolution, source-bar timestamp, and the opening timestamp of the
+// requested anchor period in that symbol's own context/session. There are
+// deliberately NO []/ta.valuewhen()/rolling calculations in this scope.
+f_sessionStarts(string sessionSpec) =>
+    bool inSessionNow = not na(time(timeframe.period, sessionSpec))
+    bool inSessionPrev = not na(time(timeframe.period, sessionSpec)[1])
+    inSessionNow and not inSessionPrev
+
+f_atom(string atom, simple string anchorTf, simple bool sessionAnchor) =>
+    string s = str.trim(atom)
+    float numeric = str.tonumber(s)
+    float current = na
+    float previousAnchorClose = na
+    float directAnchorOpen = na
+    float sourceBarOpen = na
+    bool globexSessionStart = false
+
+    if str.length(s) == 0
+        current := na
+    else if not na(numeric)
+        current := numeric
+        previousAnchorClose := numeric
+        directAnchorOpen := numeric
+        sourceBarOpen := numeric
+    else
+        [baseSymbol, forcedTf] = f_parseAtomTf(s)
+        string requestSymbol = f_requestTicker(baseSymbol)
+        string sourceTf = f_resolveRequestTf(baseSymbol, forcedTf)
+        string anchorRequestTf = f_tfFloor(anchorTf, sourceTf)
+
+        // Current value in the requested source context.
+        [rqCurrent, rqSourceOpen, rqGlobexStart] = request.security(
+             requestSymbol, sourceTf, [close, open, f_sessionStarts("1700-1600")],
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off,
+             ignore_invalid_symbol=true)
+
+        current := rqCurrent
+        sourceBarOpen := rqSourceOpen
+        globexSessionStart := rqGlobexStart
+
+        // TradingView-style baseline: PREVIOUS CONFIRMED close of selected anchor TF.
+        // close[1] + lookahead_on is the standard non-repainting HTF pattern.
+        previousAnchorClose := request.security(
+             requestSymbol, anchorRequestTf, close[1],
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on,
+             ignore_invalid_symbol=true)
+
+        // Alternate baseline: current anchor timeframe candle OPEN.
+        // OPEN is fixed when the bar begins, so mapping it from the start is safe.
+        directAnchorOpen := request.security(
+             requestSymbol, anchorRequestTf, open,
+             gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on,
+             ignore_invalid_symbol=true)
+
+    [current, previousAnchorClose, directAnchorOpen, sourceBarOpen, globexSessionStart]
+
+f_apply(string op, float lc, float la, float rc, float ra) =>
+    float current = switch op
+        "+" => lc + rc
+        "-" => lc - rc
+        "*" => lc * rc
+        "/" => rc != 0 ? lc / rc : na
+        => na
+    float anchor = switch op
+        "+" => la + ra
+        "-" => la - ra
+        "*" => la * ra
+        "/" => ra != 0 ? la / ra : na
+        => na
+    [current, anchor]
+
+f_compileExpression(string expression, array<string> outTokens) =>
+    // Inputs are immutable during one script run. Compile once, then reuse.
+    array.clear(outTokens)
+    string e = str.trim(expression)
+    array<string> rawTokens = str.split(e, " ")
+    if array.size(rawTokens) > 0
+        for i = 0 to array.size(rawTokens) - 1
+            string tok = str.trim(array.get(rawTokens, i))
+            if str.length(tok) > 0
+                array.push(outTokens, tok)
+
+    bool valid = array.size(outTokens) > 0 and array.size(outTokens) % 2 == 1
+    if valid and array.size(outTokens) > 1
+        int opCount = int((array.size(outTokens) - 1) / 2)
+        for j = 0 to opCount - 1
+            string op = array.get(outTokens, j * 2 + 1)
+            if not (op == "+" or op == "-" or op == "*" or op == "/")
+                valid := false
+    valid
+
+f_evalCompiled(array<string> tokens, bool evaluate, simple string anchorTf, simple bool sessionAnchor) =>
+    float current = na
+    float previousCloseExpression = na
+    float directOpenExpression = na
+    float sourceOpenExpression = na
+    bool expressionGlobexStart = false
+
+    int tokenCount = array.size(tokens)
+    if evaluate and tokenCount > 0
+        [firstCurrent, firstPrevClose, firstDirectOpen, firstSourceOpen, firstGlobexStart] = f_atom(array.get(tokens, 0), anchorTf, sessionAnchor)
+
+        float totalCurrent = 0.0
+        float totalPrevClose = 0.0
+        float totalDirectOpen = 0.0
+        float totalSourceOpen = 0.0
+
+        float termCurrent = firstCurrent
+        float termPrevClose = firstPrevClose
+        float termDirectOpen = firstDirectOpen
+        float termSourceOpen = firstSourceOpen
+        string pendingAddOp = "+"
+        expressionGlobexStart := firstGlobexStart
+
+        int opCount = int((tokenCount - 1) / 2)
+        if opCount > 0
+            for j = 0 to opCount - 1
+                int opIndex = j * 2 + 1
+                string operator = array.get(tokens, opIndex)
+                string nextAtom = array.get(tokens, opIndex + 1)
+
+                [nextCurrent, nextPrevClose, nextDirectOpen, nextSourceOpen, nextGlobexStart] = f_atom(nextAtom, anchorTf, sessionAnchor)
+                expressionGlobexStart := expressionGlobexStart or nextGlobexStart
+
+                if operator == "*" or operator == "/"
+                    [tmpCurrent, tmpPrev] = f_apply(operator, termCurrent, termPrevClose, nextCurrent, nextPrevClose)
+                    [ignore1, tmpDirect] = f_apply(operator, termCurrent, termDirectOpen, nextCurrent, nextDirectOpen)
+                    [ignore2, tmpSource] = f_apply(operator, termCurrent, termSourceOpen, nextCurrent, nextSourceOpen)
+                    termCurrent := tmpCurrent
+                    termPrevClose := tmpPrev
+                    termDirectOpen := tmpDirect
+                    termSourceOpen := tmpSource
+                else
+                    [tmpTotalCurrent, tmpTotalPrev] = f_apply(pendingAddOp, totalCurrent, totalPrevClose, termCurrent, termPrevClose)
+                    [ignore3, tmpTotalDirect] = f_apply(pendingAddOp, totalCurrent, totalDirectOpen, termCurrent, termDirectOpen)
+                    [ignore4, tmpTotalSource] = f_apply(pendingAddOp, totalCurrent, totalSourceOpen, termCurrent, termSourceOpen)
+
+                    totalCurrent := tmpTotalCurrent
+                    totalPrevClose := tmpTotalPrev
+                    totalDirectOpen := tmpTotalDirect
+                    totalSourceOpen := tmpTotalSource
+                    pendingAddOp := operator
+
+                    termCurrent := nextCurrent
+                    termPrevClose := nextPrevClose
+                    termDirectOpen := nextDirectOpen
+                    termSourceOpen := nextSourceOpen
+
+        [finalCurrent, finalPrev] = f_apply(pendingAddOp, totalCurrent, totalPrevClose, termCurrent, termPrevClose)
+        [ignore5, finalDirect] = f_apply(pendingAddOp, totalCurrent, totalDirectOpen, termCurrent, termDirectOpen)
+        [ignore6, finalSource] = f_apply(pendingAddOp, totalCurrent, totalSourceOpen, termCurrent, termSourceOpen)
+
+        current := finalCurrent
+        previousCloseExpression := finalPrev
+        directOpenExpression := finalDirect
+        sourceOpenExpression := finalSource
+
+    [current, previousCloseExpression, directOpenExpression, sourceOpenExpression, expressionGlobexStart]
+
+f_parseTaggedItem(string token) =>
+    string s = str.trim(token)
+    string expression = s
+    string tag = ""
+    int openParen = str.pos(s, "(")
+    int n = str.length(s)
+    bool endsWithParen = n > 0 and str.substring(s, n - 1, n) == ")"
+    if not na(openParen) and endsWithParen
+        expression := str.trim(str.substring(s, 0, openParen))
+        tag := str.trim(str.substring(s, openParen + 1, n - 1))
+    [expression, tag]
+
+f_stripAtomTf(string atom) =>
+    [baseSymbol, forcedTf] = f_parseAtomTf(atom)
+    baseSymbol
+
+f_defaultTag(string expression) =>
+    string e = str.trim(expression)
+    bool arithmetic = not na(str.pos(e, " + ")) or not na(str.pos(e, " - ")) or not na(str.pos(e, " * ")) or not na(str.pos(e, " / "))
+    string out = e
+    if not arithmetic
+        string clean = f_stripAtomTf(e)
+        int colon = str.pos(clean, ":")
+        out := not na(colon) and colon + 1 < str.length(clean) ? str.trim(str.substring(clean, colon + 1)) : clean
+    else
+        // Keep an untagged arithmetic expression readable, but remove @TF
+        // acquisition annotations because they are implementation details.
+        array<string> rawTokens = str.split(e, " ")
+        string rebuilt = ""
+        if array.size(rawTokens) > 0
+            for i = 0 to array.size(rawTokens) - 1
+                string tok = array.get(rawTokens, i)
+                string cleanTok = (i % 2 == 0) ? f_stripAtomTf(tok) : tok
+                rebuilt := i == 0 ? cleanTok : rebuilt + " " + cleanTok
+        out := rebuilt
+    out
+
+f_hasItem(array<string> items, int idx) =>
+    idx < array.size(items) and str.length(str.trim(array.get(items, idx))) > 0
+
+f_hasAnyItem(array<string> items) =>
+    bool hasAny = false
+    for i = 0 to SLOTS_PER_GROUP - 1
+        hasAny := hasAny or f_hasItem(items, i)
+    hasAny
+
+// Each f_item() call is written explicitly in global scope below, so its local
+// `var` anchor storage has one independent, consistently updated history per slot.
+// Disabled groups still avoid requests by evaluating an empty expression.
+// Calculation contract:
+// This indicator only calculates each series' own % change. There is NO
+// pairwise correlation/statistical comparison in the calculation.
+//
+// TradingView close-to-close (DEFAULT):
+//   baseline = previous confirmed close of selected Anchor timeframe.
+//   current  = current/live requested value.
+//   D => current vs yesterday's close.
+//   W => current vs last week's close.
+//   M => current vs last month's close.
+//
+// Open-to-current:
+//   baseline = current selected Anchor timeframe candle open.
+//   Optional Globex open replaces that with the hard-coded 17:00-16:00
+//   exchange-time session's first bar open.
+//
+// % change = (current - baseline) / abs(baseline) * 100.
+//
+f_item(array<string> items, int idx, simple string anchorTf, simple bool sessionAnchor, simple string calcMode, bool active) =>
+    var array<string> compiledTokens = array.new<string>()
+    var bool compiledValid = false
+    var bool configured = false
+    var string cachedTag = ""
+
+    if barstate.isfirst
+        string token = idx < array.size(items) ? array.get(items, idx) : ""
+        string trimmed = str.trim(token)
+        configured := str.length(trimmed) > 0
+
+        if configured
+            [expression, parsedTag] = f_parseTaggedItem(trimmed)
+            compiledValid := f_compileExpression(expression, compiledTokens)
+            cachedTag := str.length(parsedTag) > 0 ? parsedTag : f_defaultTag(expression)
+        else
+            array.clear(compiledTokens)
+            compiledValid := false
+            cachedTag := ""
+
+    bool evaluate = active and configured and compiledValid
+    [current, previousCloseExpression, directOpenExpression, sourceOpenExpression, expressionGlobexStart] = f_evalCompiled(
+         compiledTokens, evaluate, anchorTf, sessionAnchor)
+
+    // Hard-coded Globex alternate baseline, only used by Open-to-current mode.
+    var float storedGlobexOpen = na
+    if sessionAnchor and expressionGlobexStart and not na(sourceOpenExpression)
+        storedGlobexOpen := sourceOpenExpression
+    if sessionAnchor and na(storedGlobexOpen) and not na(sourceOpenExpression)
+        storedGlobexOpen := sourceOpenExpression
+
+    bool closeToClose = calcMode == "TradingView close-to-close"
+    float anchorExpression = closeToClose ? previousCloseExpression : (sessionAnchor ? storedGlobexOpen : directOpenExpression)
+
+    float anchorMagnitude = math.abs(anchorExpression)
+    float pct = evaluate and not na(current) and not na(anchorExpression) and anchorMagnitude > 0 ? ((current - anchorExpression) / anchorMagnitude) * 100.0 : na
+    float raw = evaluate ? current : na
+    string tag = evaluate ? cachedTag : ""
+    [pct, raw, tag]
+
+f_average10(float a1, float a2, float a3, float a4, float a5, float a6, float a7, float a8, float a9, float a10) =>
+    float sum = 0.0
+    int count = 0
+    if not na(a1)
+        sum += a1
+        count += 1
+    if not na(a2)
+        sum += a2
+        count += 1
+    if not na(a3)
+        sum += a3
+        count += 1
+    if not na(a4)
+        sum += a4
+        count += 1
+    if not na(a5)
+        sum += a5
+        count += 1
+    if not na(a6)
+        sum += a6
+        count += 1
+    if not na(a7)
+        sum += a7
+        count += 1
+    if not na(a8)
+        sum += a8
+        count += 1
+    if not na(a9)
+        sum += a9
+        count += 1
+    if not na(a10)
+        sum += a10
+        count += 1
+    count > 0 ? sum / count : na
+
+// Visual-only percentage transform. Underlying pct/raw/cumulative values stay untouched.
+// asinh(x) is implemented directly for Pine compatibility: sign(x)*ln(|x|+sqrt(x^2+1)).
+f_visualPct(float realPct, string mode, float scaleAmount) =>
+    float k = math.max(scaleAmount, 0.000001)
+    float x = realPct / k
+    float ax = math.abs(x)
+    float asinhX = math.sign(x) * math.log(ax + math.sqrt(ax * ax + 1.0))
+    float softsignX = x / (1.0 + ax)
+    mode == "Outlier compression" ? k * asinhX : mode == "Soft cap" ? k * softsignX : realPct
+
+// Pane-only renderer metadata; does not participate in % calculation.
+f_chartAnchor(simple string anchorTf, simple bool sessionAnchor) =>
+    bool hostTradingDayChanged = na(time_tradingday[1]) or time_tradingday != time_tradingday[1]
+    bool anchorReset = sessionAnchor ? hostTradingDayChanged : timeframe.change(anchorTf)
+    ta.valuewhen(anchorReset or barstate.isfirst, open, 0)
+
+f_onChart(float pct, float chartAnchor) =>
+    not na(pct) and not na(chartAnchor) ? chartAnchor * (1.0 + pct / 100.0) : na
+
+f_lineIdText(int slotId) =>
+    string n = slotId < 10 ? "0" + str.tostring(slotId) : str.tostring(slotId)
+    "[L" + n + "]"
+
+f_valueText(int slotId, string tag, float raw, float pct, bool isCumulative) =>
+    string out = tag
+    if isCumulative
+        if tagShowPct and not na(pct)
+            out += "  " + str.tostring(pct, "#.##") + "%"
+    else
+        if tagShowRaw and not na(raw)
+            out += "  " + str.tostring(raw)
+        if tagShowPct and not na(pct)
+            out += "  (" + str.tostring(pct, "#.##") + "%)"
+    out + "  " + f_lineIdText(slotId)
+
+// ============================================================================
+// Parse groups + calculate ten slots per group
+// ============================================================================
+
+var array<string> g1Items = str.split(g1Text, ",")
+var array<string> g2Items = str.split(g2Text, ",")
+var array<string> g3Items = str.split(g3Text, ",")
+var array<string> g4Items = str.split(g4Text, ",")
+var array<string> g5Items = str.split(g5Text, ",")
+
+bool g1Active = g1Individual or g1Cumulative
+[g1p1, g1r1, g1t1] = f_item(g1Items, 0, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p2, g1r2, g1t2] = f_item(g1Items, 1, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p3, g1r3, g1t3] = f_item(g1Items, 2, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p4, g1r4, g1t4] = f_item(g1Items, 3, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p5, g1r5, g1t5] = f_item(g1Items, 4, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p6, g1r6, g1t6] = f_item(g1Items, 5, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p7, g1r7, g1t7] = f_item(g1Items, 6, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p8, g1r8, g1t8] = f_item(g1Items, 7, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p9, g1r9, g1t9] = f_item(g1Items, 8, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+[g1p10, g1r10, g1t10] = f_item(g1Items, 9, g1Tf, g1SessionAnchor, g1CalcMode, g1Active)
+float g1cum = f_average10(g1p1, g1p2, g1p3, g1p4, g1p5, g1p6, g1p7, g1p8, g1p9, g1p10)
+
+bool g2Active = g2Individual or g2Cumulative
+[g2p1, g2r1, g2t1] = f_item(g2Items, 0, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p2, g2r2, g2t2] = f_item(g2Items, 1, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p3, g2r3, g2t3] = f_item(g2Items, 2, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p4, g2r4, g2t4] = f_item(g2Items, 3, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p5, g2r5, g2t5] = f_item(g2Items, 4, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p6, g2r6, g2t6] = f_item(g2Items, 5, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p7, g2r7, g2t7] = f_item(g2Items, 6, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p8, g2r8, g2t8] = f_item(g2Items, 7, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p9, g2r9, g2t9] = f_item(g2Items, 8, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+[g2p10, g2r10, g2t10] = f_item(g2Items, 9, g2Tf, g2SessionAnchor, g2CalcMode, g2Active)
+float g2cum = f_average10(g2p1, g2p2, g2p3, g2p4, g2p5, g2p6, g2p7, g2p8, g2p9, g2p10)
+
+bool g3Active = g3Individual or g3Cumulative
+[g3p1, g3r1, g3t1] = f_item(g3Items, 0, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p2, g3r2, g3t2] = f_item(g3Items, 1, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p3, g3r3, g3t3] = f_item(g3Items, 2, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p4, g3r4, g3t4] = f_item(g3Items, 3, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p5, g3r5, g3t5] = f_item(g3Items, 4, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p6, g3r6, g3t6] = f_item(g3Items, 5, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p7, g3r7, g3t7] = f_item(g3Items, 6, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p8, g3r8, g3t8] = f_item(g3Items, 7, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p9, g3r9, g3t9] = f_item(g3Items, 8, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+[g3p10, g3r10, g3t10] = f_item(g3Items, 9, g3Tf, g3SessionAnchor, g3CalcMode, g3Active)
+float g3cum = f_average10(g3p1, g3p2, g3p3, g3p4, g3p5, g3p6, g3p7, g3p8, g3p9, g3p10)
+
+bool g4Active = g4Individual or g4Cumulative
+[g4p1, g4r1, g4t1] = f_item(g4Items, 0, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p2, g4r2, g4t2] = f_item(g4Items, 1, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p3, g4r3, g4t3] = f_item(g4Items, 2, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p4, g4r4, g4t4] = f_item(g4Items, 3, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p5, g4r5, g4t5] = f_item(g4Items, 4, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p6, g4r6, g4t6] = f_item(g4Items, 5, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p7, g4r7, g4t7] = f_item(g4Items, 6, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p8, g4r8, g4t8] = f_item(g4Items, 7, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p9, g4r9, g4t9] = f_item(g4Items, 8, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+[g4p10, g4r10, g4t10] = f_item(g4Items, 9, g4Tf, g4SessionAnchor, g4CalcMode, g4Active)
+float g4cum = f_average10(g4p1, g4p2, g4p3, g4p4, g4p5, g4p6, g4p7, g4p8, g4p9, g4p10)
+
+bool g5Active = g5Individual or g5Cumulative
+[g5p1, g5r1, g5t1] = f_item(g5Items, 0, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p2, g5r2, g5t2] = f_item(g5Items, 1, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p3, g5r3, g5t3] = f_item(g5Items, 2, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p4, g5r4, g5t4] = f_item(g5Items, 3, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p5, g5r5, g5t5] = f_item(g5Items, 4, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p6, g5r6, g5t6] = f_item(g5Items, 5, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p7, g5r7, g5t7] = f_item(g5Items, 6, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p8, g5r8, g5t8] = f_item(g5Items, 7, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p9, g5r9, g5t9] = f_item(g5Items, 8, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+[g5p10, g5r10, g5t10] = f_item(g5Items, 9, g5Tf, g5SessionAnchor, g5CalcMode, g5Active)
+float g5cum = f_average10(g5p1, g5p2, g5p3, g5p4, g5p5, g5p6, g5p7, g5p8, g5p9, g5p10)
+
+float g1ChartAnchor = f_chartAnchor(g1Tf, g1SessionAnchor)
+float g2ChartAnchor = f_chartAnchor(g2Tf, g2SessionAnchor)
+float g3ChartAnchor = f_chartAnchor(g3Tf, g3SessionAnchor)
+float g4ChartAnchor = f_chartAnchor(g4Tf, g4SessionAnchor)
+float g5ChartAnchor = f_chartAnchor(g5Tf, g5SessionAnchor)
+
+// ============================================================================
+// Build a stable logical-line queue.
+// The queue order is Group 1 -> Group 5, each group individuals then cumulative.
+// Empty text slots do not consume a logical plot slot.
+// ============================================================================
+
+var array<float> activePcts = array.new<float>()
+var array<float> activeDisplayPcts = array.new<float>()
+var array<float> activeRaws = array.new<float>()
+var array<string> activeTags = array.new<string>()
+var array<int> activeSlotIds = array.new<int>()
+var array<float> activeAnchors = array.new<float>()
+var array<bool> activeCumFlags = array.new<bool>()
+array.clear(activePcts)
+array.clear(activeDisplayPcts)
+array.clear(activeRaws)
+array.clear(activeTags)
+array.clear(activeSlotIds)
+array.clear(activeAnchors)
+array.clear(activeCumFlags)
+
+f_queueActive(bool include, float pct, float displayPct, float raw, string tag, float anchor, bool isCumulative) =>
+    // Nothing after slot 32 can be plotted in this dual-placement architecture,
+    // so don't keep pushing unreachable queue entries every bar.
+    if include and array.size(activePcts) < MAX_LOGICAL_LINES
+        array.push(activePcts, pct)
+        array.push(activeDisplayPcts, displayPct)
+        array.push(activeRaws, raw)
+        array.push(activeTags, tag)
+        array.push(activeSlotIds, array.size(activePcts))
+        array.push(activeAnchors, anchor)
+        array.push(activeCumFlags, isCumulative)
+
+f_queueActive(g1Individual and f_hasItem(g1Items, 0), g1p1, f_visualPct(g1p1, g1ScaleMode, g1ScaleAmount), g1r1, g1t1, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 1), g1p2, f_visualPct(g1p2, g1ScaleMode, g1ScaleAmount), g1r2, g1t2, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 2), g1p3, f_visualPct(g1p3, g1ScaleMode, g1ScaleAmount), g1r3, g1t3, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 3), g1p4, f_visualPct(g1p4, g1ScaleMode, g1ScaleAmount), g1r4, g1t4, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 4), g1p5, f_visualPct(g1p5, g1ScaleMode, g1ScaleAmount), g1r5, g1t5, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 5), g1p6, f_visualPct(g1p6, g1ScaleMode, g1ScaleAmount), g1r6, g1t6, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 6), g1p7, f_visualPct(g1p7, g1ScaleMode, g1ScaleAmount), g1r7, g1t7, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 7), g1p8, f_visualPct(g1p8, g1ScaleMode, g1ScaleAmount), g1r8, g1t8, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 8), g1p9, f_visualPct(g1p9, g1ScaleMode, g1ScaleAmount), g1r9, g1t9, g1ChartAnchor, false)
+f_queueActive(g1Individual and f_hasItem(g1Items, 9), g1p10, f_visualPct(g1p10, g1ScaleMode, g1ScaleAmount), g1r10, g1t10, g1ChartAnchor, false)
+f_queueActive(g1Cumulative and f_hasAnyItem(g1Items), g1cum, f_visualPct(g1cum, g1ScaleMode, g1ScaleAmount), na, g1CumTitle, g1ChartAnchor, true)
+
+f_queueActive(g2Individual and f_hasItem(g2Items, 0), g2p1, f_visualPct(g2p1, g2ScaleMode, g2ScaleAmount), g2r1, g2t1, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 1), g2p2, f_visualPct(g2p2, g2ScaleMode, g2ScaleAmount), g2r2, g2t2, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 2), g2p3, f_visualPct(g2p3, g2ScaleMode, g2ScaleAmount), g2r3, g2t3, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 3), g2p4, f_visualPct(g2p4, g2ScaleMode, g2ScaleAmount), g2r4, g2t4, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 4), g2p5, f_visualPct(g2p5, g2ScaleMode, g2ScaleAmount), g2r5, g2t5, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 5), g2p6, f_visualPct(g2p6, g2ScaleMode, g2ScaleAmount), g2r6, g2t6, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 6), g2p7, f_visualPct(g2p7, g2ScaleMode, g2ScaleAmount), g2r7, g2t7, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 7), g2p8, f_visualPct(g2p8, g2ScaleMode, g2ScaleAmount), g2r8, g2t8, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 8), g2p9, f_visualPct(g2p9, g2ScaleMode, g2ScaleAmount), g2r9, g2t9, g2ChartAnchor, false)
+f_queueActive(g2Individual and f_hasItem(g2Items, 9), g2p10, f_visualPct(g2p10, g2ScaleMode, g2ScaleAmount), g2r10, g2t10, g2ChartAnchor, false)
+f_queueActive(g2Cumulative and f_hasAnyItem(g2Items), g2cum, f_visualPct(g2cum, g2ScaleMode, g2ScaleAmount), na, g2CumTitle, g2ChartAnchor, true)
+
+f_queueActive(g3Individual and f_hasItem(g3Items, 0), g3p1, f_visualPct(g3p1, g3ScaleMode, g3ScaleAmount), g3r1, g3t1, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 1), g3p2, f_visualPct(g3p2, g3ScaleMode, g3ScaleAmount), g3r2, g3t2, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 2), g3p3, f_visualPct(g3p3, g3ScaleMode, g3ScaleAmount), g3r3, g3t3, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 3), g3p4, f_visualPct(g3p4, g3ScaleMode, g3ScaleAmount), g3r4, g3t4, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 4), g3p5, f_visualPct(g3p5, g3ScaleMode, g3ScaleAmount), g3r5, g3t5, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 5), g3p6, f_visualPct(g3p6, g3ScaleMode, g3ScaleAmount), g3r6, g3t6, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 6), g3p7, f_visualPct(g3p7, g3ScaleMode, g3ScaleAmount), g3r7, g3t7, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 7), g3p8, f_visualPct(g3p8, g3ScaleMode, g3ScaleAmount), g3r8, g3t8, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 8), g3p9, f_visualPct(g3p9, g3ScaleMode, g3ScaleAmount), g3r9, g3t9, g3ChartAnchor, false)
+f_queueActive(g3Individual and f_hasItem(g3Items, 9), g3p10, f_visualPct(g3p10, g3ScaleMode, g3ScaleAmount), g3r10, g3t10, g3ChartAnchor, false)
+f_queueActive(g3Cumulative and f_hasAnyItem(g3Items), g3cum, f_visualPct(g3cum, g3ScaleMode, g3ScaleAmount), na, g3CumTitle, g3ChartAnchor, true)
+
+f_queueActive(g4Individual and f_hasItem(g4Items, 0), g4p1, f_visualPct(g4p1, g4ScaleMode, g4ScaleAmount), g4r1, g4t1, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 1), g4p2, f_visualPct(g4p2, g4ScaleMode, g4ScaleAmount), g4r2, g4t2, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 2), g4p3, f_visualPct(g4p3, g4ScaleMode, g4ScaleAmount), g4r3, g4t3, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 3), g4p4, f_visualPct(g4p4, g4ScaleMode, g4ScaleAmount), g4r4, g4t4, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 4), g4p5, f_visualPct(g4p5, g4ScaleMode, g4ScaleAmount), g4r5, g4t5, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 5), g4p6, f_visualPct(g4p6, g4ScaleMode, g4ScaleAmount), g4r6, g4t6, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 6), g4p7, f_visualPct(g4p7, g4ScaleMode, g4ScaleAmount), g4r7, g4t7, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 7), g4p8, f_visualPct(g4p8, g4ScaleMode, g4ScaleAmount), g4r8, g4t8, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 8), g4p9, f_visualPct(g4p9, g4ScaleMode, g4ScaleAmount), g4r9, g4t9, g4ChartAnchor, false)
+f_queueActive(g4Individual and f_hasItem(g4Items, 9), g4p10, f_visualPct(g4p10, g4ScaleMode, g4ScaleAmount), g4r10, g4t10, g4ChartAnchor, false)
+f_queueActive(g4Cumulative and f_hasAnyItem(g4Items), g4cum, f_visualPct(g4cum, g4ScaleMode, g4ScaleAmount), na, g4CumTitle, g4ChartAnchor, true)
+
+f_queueActive(g5Individual and f_hasItem(g5Items, 0), g5p1, f_visualPct(g5p1, g5ScaleMode, g5ScaleAmount), g5r1, g5t1, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 1), g5p2, f_visualPct(g5p2, g5ScaleMode, g5ScaleAmount), g5r2, g5t2, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 2), g5p3, f_visualPct(g5p3, g5ScaleMode, g5ScaleAmount), g5r3, g5t3, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 3), g5p4, f_visualPct(g5p4, g5ScaleMode, g5ScaleAmount), g5r4, g5t4, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 4), g5p5, f_visualPct(g5p5, g5ScaleMode, g5ScaleAmount), g5r5, g5t5, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 5), g5p6, f_visualPct(g5p6, g5ScaleMode, g5ScaleAmount), g5r6, g5t6, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 6), g5p7, f_visualPct(g5p7, g5ScaleMode, g5ScaleAmount), g5r7, g5t7, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 7), g5p8, f_visualPct(g5p8, g5ScaleMode, g5ScaleAmount), g5r8, g5t8, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 8), g5p9, f_visualPct(g5p9, g5ScaleMode, g5ScaleAmount), g5r9, g5t9, g5ChartAnchor, false)
+f_queueActive(g5Individual and f_hasItem(g5Items, 9), g5p10, f_visualPct(g5p10, g5ScaleMode, g5ScaleAmount), g5r10, g5t10, g5ChartAnchor, false)
+f_queueActive(g5Cumulative and f_hasAnyItem(g5Items), g5cum, f_visualPct(g5cum, g5ScaleMode, g5ScaleAmount), na, g5CumTitle, g5ChartAnchor, true)
+
+int logicalLineCount = array.size(activePcts)
+
+f_slot(array<float> values, int idx) =>
+    idx < array.size(values) and idx < MAX_LOGICAL_LINES ? array.get(values, idx) : na
+
+f_slotOnChart(int idx) =>
+    float displayPct = f_slot(activeDisplayPcts, idx)
+    float anch = f_slot(activeAnchors, idx)
+    f_onChart(displayPct, anch)
+
+// Default colors are deliberately distinct, while width/style remain undeclared
+// so normal plot styling remains available in TradingView's Style tab.
+color C01 = color.rgb(41, 98, 255)
+color C02 = color.rgb(255, 109, 0)
+color C03 = color.rgb(0, 188, 212)
+color C04 = color.rgb(224, 64, 251)
+color C05 = color.rgb(0, 200, 83)
+color C06 = color.rgb(255, 214, 0)
+color C07 = color.rgb(255, 23, 68)
+color C08 = color.rgb(176, 190, 197)
+color C09 = color.rgb(124, 77, 255)
+color C10 = color.rgb(0, 191, 165)
+color C11 = color.rgb(255, 145, 0)
+color C12 = color.rgb(41, 182, 246)
+color C13 = color.rgb(171, 71, 188)
+color C14 = color.rgb(102, 187, 106)
+color C15 = color.rgb(255, 238, 88)
+color C16 = color.rgb(239, 83, 80)
+color C17 = color.rgb(120, 144, 156)
+color C18 = color.rgb(126, 87, 194)
+color C19 = color.rgb(38, 198, 218)
+color C20 = color.rgb(255, 167, 38)
+color C21 = color.rgb(66, 165, 245)
+color C22 = color.rgb(236, 64, 122)
+color C23 = color.rgb(156, 204, 101)
+color C24 = color.rgb(255, 202, 40)
+color C25 = color.rgb(171, 71, 188)
+color C26 = color.rgb(38, 166, 154)
+color C27 = color.rgb(255, 112, 67)
+color C28 = color.rgb(158, 158, 158)
+color C29 = color.rgb(255, 82, 82)
+color C30 = color.rgb(0, 230, 238)
+color C31 = color.rgb(76, 175, 80)
+color C32 = color.rgb(213, 0, 249)
+color C33 = C01
+color C34 = C02
+color C35 = C03
+color C36 = C04
+color C37 = C05
+color C38 = C06
+color C39 = C07
+color C40 = C08
+color C41 = C09
+color C42 = C10
+color C43 = C11
+color C44 = C12
+color C45 = C13
+color C46 = C14
+color C47 = C15
+color C48 = C16
+color C49 = C17
+color C50 = C18
+color C51 = C19
+color C52 = C20
+color C53 = C21
+color C54 = C22
+color C55 = C23
+
+f_slotColor(int idx) =>
+    switch idx
+        0 => C01
+        1 => C02
+        2 => C03
+        3 => C04
+        4 => C05
+        5 => C06
+        6 => C07
+        7 => C08
+        8 => C09
+        9 => C10
+        10 => C11
+        11 => C12
+        12 => C13
+        13 => C14
+        14 => C15
+        15 => C16
+        16 => C17
+        17 => C18
+        18 => C19
+        19 => C20
+        20 => C21
+        21 => C22
+        22 => C23
+        23 => C24
+        24 => C25
+        25 => C26
+        26 => C27
+        27 => C28
+        28 => C29
+        29 => C30
+        30 => C31
+        31 => C32
+        32 => C33
+        33 => C34
+        34 => C35
+        35 => C36
+        36 => C37
+        37 => C38
+        38 => C39
+        39 => C40
+        40 => C41
+        41 => C42
+        42 => C43
+        43 => C44
+        44 => C45
+        45 => C46
+        46 => C47
+        47 => C48
+        48 => C49
+        49 => C50
+        50 => C51
+        51 => C52
+        52 => C53
+        53 => C54
+        54 => C55
+        => C01
+
+//
+// ============================================================================
+// Plots: pane-only mode uses up to 55 logical lines within TradingView's 64-plot ceiling.
+// ============================================================================
+
+plot(f_slot(activeDisplayPcts, 0), "Line 01 [L01]", color=C01, format=format.percent)
+plot(f_slot(activeDisplayPcts, 1), "Line 02 [L02]", color=C02, format=format.percent)
+plot(f_slot(activeDisplayPcts, 2), "Line 03 [L03]", color=C03, format=format.percent)
+plot(f_slot(activeDisplayPcts, 3), "Line 04 [L04]", color=C04, format=format.percent)
+plot(f_slot(activeDisplayPcts, 4), "Line 05 [L05]", color=C05, format=format.percent)
+plot(f_slot(activeDisplayPcts, 5), "Line 06 [L06]", color=C06, format=format.percent)
+plot(f_slot(activeDisplayPcts, 6), "Line 07 [L07]", color=C07, format=format.percent)
+plot(f_slot(activeDisplayPcts, 7), "Line 08 [L08]", color=C08, format=format.percent)
+plot(f_slot(activeDisplayPcts, 8), "Line 09 [L09]", color=C09, format=format.percent)
+plot(f_slot(activeDisplayPcts, 9), "Line 10 [L10]", color=C10, format=format.percent)
+plot(f_slot(activeDisplayPcts, 10), "Line 11 [L11]", color=C11, format=format.percent)
+plot(f_slot(activeDisplayPcts, 11), "Line 12 [L12]", color=C12, format=format.percent)
+plot(f_slot(activeDisplayPcts, 12), "Line 13 [L13]", color=C13, format=format.percent)
+plot(f_slot(activeDisplayPcts, 13), "Line 14 [L14]", color=C14, format=format.percent)
+plot(f_slot(activeDisplayPcts, 14), "Line 15 [L15]", color=C15, format=format.percent)
+plot(f_slot(activeDisplayPcts, 15), "Line 16 [L16]", color=C16, format=format.percent)
+plot(f_slot(activeDisplayPcts, 16), "Line 17 [L17]", color=C17, format=format.percent)
+plot(f_slot(activeDisplayPcts, 17), "Line 18 [L18]", color=C18, format=format.percent)
+plot(f_slot(activeDisplayPcts, 18), "Line 19 [L19]", color=C19, format=format.percent)
+plot(f_slot(activeDisplayPcts, 19), "Line 20 [L20]", color=C20, format=format.percent)
+plot(f_slot(activeDisplayPcts, 20), "Line 21 [L21]", color=C21, format=format.percent)
+plot(f_slot(activeDisplayPcts, 21), "Line 22 [L22]", color=C22, format=format.percent)
+plot(f_slot(activeDisplayPcts, 22), "Line 23 [L23]", color=C23, format=format.percent)
+plot(f_slot(activeDisplayPcts, 23), "Line 24 [L24]", color=C24, format=format.percent)
+plot(f_slot(activeDisplayPcts, 24), "Line 25 [L25]", color=C25, format=format.percent)
+plot(f_slot(activeDisplayPcts, 25), "Line 26 [L26]", color=C26, format=format.percent)
+plot(f_slot(activeDisplayPcts, 26), "Line 27 [L27]", color=C27, format=format.percent)
+plot(f_slot(activeDisplayPcts, 27), "Line 28 [L28]", color=C28, format=format.percent)
+plot(f_slot(activeDisplayPcts, 28), "Line 29 [L29]", color=C29, format=format.percent)
+plot(f_slot(activeDisplayPcts, 29), "Line 30 [L30]", color=C30, format=format.percent)
+plot(f_slot(activeDisplayPcts, 30), "Line 31 [L31]", color=C31, format=format.percent)
+plot(f_slot(activeDisplayPcts, 31), "Line 32 [L32]", color=C32, format=format.percent)
+plot(f_slot(activeDisplayPcts, 32), "Line 33 [L33]", color=C33, format=format.percent)
+plot(f_slot(activeDisplayPcts, 33), "Line 34 [L34]", color=C34, format=format.percent)
+plot(f_slot(activeDisplayPcts, 34), "Line 35 [L35]", color=C35, format=format.percent)
+plot(f_slot(activeDisplayPcts, 35), "Line 36 [L36]", color=C36, format=format.percent)
+plot(f_slot(activeDisplayPcts, 36), "Line 37 [L37]", color=C37, format=format.percent)
+plot(f_slot(activeDisplayPcts, 37), "Line 38 [L38]", color=C38, format=format.percent)
+plot(f_slot(activeDisplayPcts, 38), "Line 39 [L39]", color=C39, format=format.percent)
+plot(f_slot(activeDisplayPcts, 39), "Line 40 [L40]", color=C40, format=format.percent)
+plot(f_slot(activeDisplayPcts, 40), "Line 41 [L41]", color=C41, format=format.percent)
+plot(f_slot(activeDisplayPcts, 41), "Line 42 [L42]", color=C42, format=format.percent)
+plot(f_slot(activeDisplayPcts, 42), "Line 43 [L43]", color=C43, format=format.percent)
+plot(f_slot(activeDisplayPcts, 43), "Line 44 [L44]", color=C44, format=format.percent)
+plot(f_slot(activeDisplayPcts, 44), "Line 45 [L45]", color=C45, format=format.percent)
+plot(f_slot(activeDisplayPcts, 45), "Line 46 [L46]", color=C46, format=format.percent)
+plot(f_slot(activeDisplayPcts, 46), "Line 47 [L47]", color=C47, format=format.percent)
+plot(f_slot(activeDisplayPcts, 47), "Line 48 [L48]", color=C48, format=format.percent)
+plot(f_slot(activeDisplayPcts, 48), "Line 49 [L49]", color=C49, format=format.percent)
+plot(f_slot(activeDisplayPcts, 49), "Line 50 [L50]", color=C50, format=format.percent)
+plot(f_slot(activeDisplayPcts, 50), "Line 51 [L51]", color=C51, format=format.percent)
+plot(f_slot(activeDisplayPcts, 51), "Line 52 [L52]", color=C52, format=format.percent)
+plot(f_slot(activeDisplayPcts, 52), "Line 53 [L53]", color=C53, format=format.percent)
+plot(f_slot(activeDisplayPcts, 53), "Line 54 [L54]", color=C54, format=format.percent)
+plot(f_slot(activeDisplayPcts, 54), "Line 55 [L55]", color=C55, format=format.percent)
+
+var array<label> endpointLabels = array.new<label>()
+var array<line> endpointLeaders = array.new<line>()
+
+// Reusable renderer scratch. These arrays are cleared/reused only when a render
+// pass is actually needed; they are not re-instantiated on each realtime tick.
+var array<string> renderTags = array.new<string>()
+var array<float> renderRaws = array.new<float>()
+var array<float> renderPcts = array.new<float>()
+var array<float> renderYs = array.new<float>()
+var array<float> renderMetrics = array.new<float>()
+var array<bool> renderCumFlags = array.new<bool>()
+var array<color> renderColors = array.new<color>()
+var array<int> renderSlotIds = array.new<int>()
+
+// OptiPine renderer change detector. One Watch instance retains the prior dependency
+// snapshot. Producer calculations still run normally; only the expensive consumer
+// (sorting, merged text, and drawing updates) is skipped when nothing changed.
+var opti.Watch rendererWatch = opti.watch()
+
+f_rendererChanged() =>
+    rendererWatch.begin()
+    rendererWatch.watchFloats(activePcts)
+    rendererWatch.watchFloats(activeRaws)
+    rendererWatch.watchFloats(activeAnchors)
+    rendererWatch.watchInt(bar_index)
+    rendererWatch.watchFloat(chartMode ? close : na)
+    rendererWatch.finish()
+
+f_displayY(float displayPct, float chartAnchor) =>
+    paneMode ? displayPct : f_onChart(displayPct, chartAnchor)
+
+f_mergeMetric(float displayPct, float displayY) =>
+    paneMode ? displayPct : (not na(displayY) and close != 0 ? (displayY / close - 1.0) * 100.0 : na)
+
+// Upsert helpers: create an object only when the pool needs to grow; otherwise
+// update the existing ID in place on realtime last-bar executions.
+f_upsertLine(array<line> pool, int poolIndex, int x1, float y1, int x2, float y2, color c, bool onChart) =>
+    line id = na
+    if poolIndex < array.size(pool)
+        id := array.get(pool, poolIndex)
+        line.set_xy1(id, x1, y1)
+        line.set_xy2(id, x2, y2)
+        line.set_color(id, c)
+        line.set_width(id, 1)
+        line.set_style(id, line.style_solid)
+    else
+        if onChart
+            id := line.new(x1, y1, x2, y2, xloc=xloc.bar_index, extend=extend.none, color=c, width=1, force_overlay=true)
+        else
+            id := line.new(x1, y1, x2, y2, xloc=xloc.bar_index, extend=extend.none, color=c, width=1)
+        array.push(pool, id)
+    id
+
+f_upsertLabel(array<label> pool, int poolIndex, int x, float y, string txt, color txtColor, bool onChart) =>
+    label id = na
+    if poolIndex < array.size(pool)
+        id := array.get(pool, poolIndex)
+        label.set_xy(id, x, y)
+        label.set_text(id, txt)
+        label.set_color(id, color.new(chart.bg_color, 100))
+        label.set_textcolor(id, txtColor)
+        label.set_style(id, label.style_label_left)
+        label.set_textalign(id, text.align_left)
+        label.set_size(id, tagTextSize)
+    else
+        if onChart
+            id := label.new(x, y, txt, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(chart.bg_color, 100), textcolor=txtColor, textalign=text.align_left, size=tagTextSize, force_overlay=true)
+        else
+            id := label.new(x, y, txt, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(chart.bg_color, 100), textcolor=txtColor, textalign=text.align_left, size=tagTextSize)
+        array.push(pool, id)
+    id
+
+// Builds a same-height multiline overlay where only one row contains visible
+// text. Overlaying one such label per row allows a visually merged label block
+// while preserving a different text color for each line.
+f_coloredRowText(string txt, int rowIndex, int rowCount) =>
+    string out = ""
+    if rowCount > 0
+        for i = 0 to rowCount - 1
+            string row = i == rowIndex ? txt : " "
+            out := i == 0 ? row : out + "\n" + row
+    out
+
+if barstate.islast
+    bool needsRender = f_rendererChanged()
+
+    if needsRender
+        int usedLabels = 0
+        int usedLines = 0
+
+        if showRightTags
+            array.clear(renderTags)
+            array.clear(renderRaws)
+            array.clear(renderPcts)
+            array.clear(renderYs)
+            array.clear(renderMetrics)
+            array.clear(renderCumFlags)
+            array.clear(renderColors)
+            array.clear(renderSlotIds)
+
+            int endpointCap = logicalLineCount
+            if endpointCap > 0
+                for slot = 0 to endpointCap - 1
+                    float pct = array.get(activePcts, slot)
+                    float displayPct = array.get(activeDisplayPcts, slot)
+                    float raw = array.get(activeRaws, slot)
+                    string tag = array.get(activeTags, slot)
+                    float anchor = array.get(activeAnchors, slot)
+                    bool isCum = array.get(activeCumFlags, slot)
+                    float y = f_displayY(displayPct, anchor)
+                    if str.length(tag) > 0 and not na(pct) and not na(y)
+                        array.push(renderTags, tag)
+                        array.push(renderRaws, raw)
+                        array.push(renderPcts, pct)
+                        array.push(renderYs, y)
+                        array.push(renderMetrics, f_mergeMetric(displayPct, y))
+                        array.push(renderCumFlags, isCum)
+                        array.push(renderColors, f_slotColor(slot))
+                        array.push(renderSlotIds, array.get(activeSlotIds, slot))
+
+            int nEndpoints = array.size(renderTags)
+            if nEndpoints > 0
+                array<int> sorted = array.sort_indices(renderMetrics, order.descending)
+                int clusterStart = 0
+
+                while clusterStart < nEndpoints
+                    int clusterEnd = clusterStart
+
+                    while clusterEnd + 1 < nEndpoints
+                        int aIdx = array.get(sorted, clusterEnd)
+                        int bIdx = array.get(sorted, clusterEnd + 1)
+                        float aMetric = array.get(renderMetrics, aIdx)
+                        float bMetric = array.get(renderMetrics, bIdx)
+                        bool joins = not na(aMetric) and not na(bMetric) and math.abs(aMetric - bMetric) <= tagMergeGap
+                        if joins
+                            clusterEnd += 1
+                        else
+                            break
+
+                    string mergedText = ""
+                    float ySum = 0.0
+                    float yMin = na
+                    float yMax = na
+                    int yCount = 0
+
+                    for rank = clusterStart to clusterEnd
+                        int idx = array.get(sorted, rank)
+                        string oneText = f_valueText(array.get(renderSlotIds, idx), array.get(renderTags, idx), array.get(renderRaws, idx), array.get(renderPcts, idx), array.get(renderCumFlags, idx))
+                        mergedText := str.length(mergedText) == 0 ? oneText : mergedText + "\n" + oneText
+                        float y = array.get(renderYs, idx)
+                        ySum += y
+                        yCount += 1
+                        yMin := na(yMin) ? y : math.min(yMin, y)
+                        yMax := na(yMax) ? y : math.max(yMax, y)
+
+                    float labelY = yCount > 0 ? ySum / yCount : na
+                    int spineX = bar_index + math.max(tagOffset - 1, 1)
+                    int labelX = bar_index + tagOffset
+
+                    if not na(labelY)
+                        if showLeaderLines
+                            for rank = clusterStart to clusterEnd
+                                int idx = array.get(sorted, rank)
+                                float y = array.get(renderYs, idx)
+                                color leaderColor = color.new(array.get(renderColors, idx), 28)
+                                f_upsertLine(endpointLeaders, usedLines, bar_index, y, spineX, y, leaderColor, chartMode)
+                                usedLines += 1
+
+                            if clusterEnd > clusterStart and not na(yMin) and not na(yMax)
+                                color spineColor = linkedTextColors ? color.new(chart.fg_color, 55) : color.new(tagTextColor, 45)
+                                f_upsertLine(endpointLeaders, usedLines, spineX, yMin, spineX, yMax, spineColor, chartMode)
+                                usedLines += 1
+
+                        if linkedTextColors
+                            int rowCount = clusterEnd - clusterStart + 1
+                            int rowIndex = 0
+                            for rank = clusterStart to clusterEnd
+                                int idx = array.get(sorted, rank)
+                                string oneText = f_valueText(array.get(renderSlotIds, idx), array.get(renderTags, idx), array.get(renderRaws, idx), array.get(renderPcts, idx), array.get(renderCumFlags, idx))
+                                string rowOverlay = f_coloredRowText(oneText, rowIndex, rowCount)
+                                color rowColor = array.get(renderColors, idx)
+                                f_upsertLabel(endpointLabels, usedLabels, labelX, labelY, rowOverlay, rowColor, chartMode)
+                                usedLabels += 1
+                                rowIndex += 1
+                        else
+                            f_upsertLabel(endpointLabels, usedLabels, labelX, labelY, mergedText, tagTextColor, chartMode)
+                            usedLabels += 1
+
+                    clusterStart := clusterEnd + 1
+
+        // Delete only surplus pooled objects when the live structure contracts.
+        while array.size(endpointLabels) > usedLabels
+            label.delete(array.pop(endpointLabels))
+        while array.size(endpointLeaders) > usedLines
+            line.delete(array.pop(endpointLeaders))
+
+
+// End v24

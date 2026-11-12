@@ -1,0 +1,1092 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ThrowMaster
+
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  PRECEDENT [ThrowMaster] v1.0
+//  A measurement instrument, not a forecast.
+//  It records what followed comparable events on THIS chart, and reports it
+//  with the sample size attached.
+//  Certified parts used: P01 P02 P03 P04 P06 P07 P08 P12 P13
+//  New parts introduced : P15 P16 P17 P18 P19
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("Precedent [ThrowMaster]", "PRECEDENT", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100, max_polylines_count = 100)
+
+max_bars_back(time, 500)
+
+// ═══ CERTIFIED P01: PALETTE v1.0 ═══
+COL_BULL = #0ABAB5
+COL_BEAR = #FF4D6D
+COL_TP   = #3DDC97
+COL_WARN = #F2B705
+COL_GOLD = #D4AF37
+COL_TEXT = color.new(color.white, 20)
+COL_MUTE = color.new(color.white, 55)
+COL_SLATE= #7A8B99
+// ── VISUAL INVARIANT: the level map owns { gold solid w2 } and { washed white
+//    dotted w1 }. The target family owns { mint / coral / slate solid w2 }.
+//    No resolved target may ever be drawn dotted or at width 1, because that
+//    is the MINOR level signature and confusing the two is a decision error.
+
+// ═══ CONSTANTS ═══
+CAL_WIN   = 300
+EV_SWEEP  = 1
+EV_SHIFT  = 2
+EV_SQUEEZE= 3
+EV_CLIMAX = 4
+EV_REJECT = 5
+EV_DIVERGE= 6
+ST_OPEN   = 0
+ST_HIT    = 1
+ST_ADV    = 2
+ST_AMB    = 3
+ST_EXP    = 4
+
+// ═══ CERTIFIED P08: INPUT GROUPS ═══
+G_ENG = "Engine"
+G_LVL = "Level Map"
+G_HTF = "Higher Timeframe"
+G_VIS = "Display"
+G_DSH = "Dashboard"
+
+horizonInput  = input.int(24, "Horizon H (bars)", minval = 8, maxval = 100, group = G_ENG, tooltip = "How far forward every outcome is measured. Also the minimum separation between two events of the same class, so stored samples never overlap.")
+nMinInput     = input.int(20, "Minimum sample n", minval = 5, maxval = 200, group = G_ENG, tooltip = "A projection is shown only when the matched bucket holds at least this many completed, non-overlapping outcomes. Below it the engine backs off to a coarser signature, then stays silent.")
+pivExtInput   = input.int(21, "External pivot length", minval = 3, maxval = 60, group = G_ENG, tooltip = "Defines which swings exist. Changing it changes the whole level map and therefore the statistics. Pivots confirm this many bars late - that delay is the price of not repainting.")
+pivIntInput   = input.int(5, "Internal pivot length", minval = 2, maxval = 30, group = G_ENG, tooltip = "Shorter swings used for structure sequence reading only.")
+
+majWeightInput= input.int(4, "MAJOR level weight threshold", minval = 2, maxval = 12, group = G_LVL, tooltip = "Total independent factors coinciding at one price before it is classified MAJOR rather than MINOR. This is a definition, not a tuned parameter.")
+levTolInput   = input.float(0.25, "Level merge tolerance (ATR)", minval = 0.05, maxval = 1.0, step = 0.05, group = G_LVL, tooltip = "Two factors closer than this are treated as one level rather than two.")
+maxLevInput   = input.int(60, "Maximum tracked levels", minval = 20, maxval = 200, group = G_LVL)
+
+htfModeInput  = input.string("Auto", "HTF selection", options = ["Auto", "Manual"], group = G_HTF, tooltip = "Auto locks the higher timeframe to the chart timeframe using a fixed ladder. Manual is allowed, but it changes the meaning of the signature key - so the outcome store is cleared and rebuilt from zero.")
+htfManInput   = input.timeframe("240", "Manual HTF", group = G_HTF)
+
+showLevInput  = input.bool(true, "Show level map", group = G_VIS)
+showFanInput  = input.bool(true, "Show projection fan", group = G_VIS)
+showMkrInput  = input.bool(true, "Show event markers", group = G_VIS)
+showTgtInput  = input.bool(true, "Show target line and countdown", group = G_VIS)
+retainInput   = input.int(6, "Retain resolved target lines", minval = 0, maxval = 20, group = G_VIS, tooltip = "How many past target lines stay on the chart after they resolve. They keep full thickness and fade to a state colour, because a price that was once selected as a target often remains structurally relevant. Set 0 to keep only the live one.")
+
+dashSizeInput = input.string("Small", "Dashboard size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DSH)
+dashPosInput  = input.string("Top Right", "Dashboard position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DSH)
+compactInput  = input.bool(false, "Compact mode (mobile)", group = G_DSH)
+showSeqInput  = input.bool(true, "Show sequence panel", group = G_DSH, tooltip = "How many events of this class had already occurred inside past runs before the run reversed.")
+showAxInput   = input.bool(true, "Show axis health panel", group = G_DSH, tooltip = "Median outcome split by score tier and by location class. If the groups do not separate, that axis is carrying no information - and this panel is how you find out.")
+jsonInput     = input.bool(false, "Emit JSON on alert", group = G_DSH, tooltip = "Formats the alert message as a JSON record for external logging.")
+
+// ═══ TYPES (declared before any use) ═══
+type Level
+    float price
+    bool  isSwing
+    bool  isEq
+    bool  isOb
+    bool  isHtf
+    int   fvgN
+    int   touches
+    int   birth
+    bool  alive
+
+type Outcome
+    int   ev
+    int   loc
+    int   rg
+    int   dir
+    int   tier
+    float sc
+    float e1
+    float e2
+    float e3
+    float e4
+    float mfe
+    float mae
+    int   fp1
+    int   fp2
+    int   fp3
+
+type Pending
+    int   ev
+    int   loc
+    int   rg
+    int   dir
+    int   tier
+    float sc
+    int   sBar
+    float anchor
+    float r
+    float e1
+    float e2
+    float e3
+    float e4
+    float mfe
+    float mae
+    int   fp1
+    int   fp2
+    int   fp3
+
+type Proj
+    int   sBar
+    float anchor
+    float r
+    int   dir
+    float tgt
+    float adv
+    int   ring
+    float hitPct
+    int   eta
+    int   n
+    int   lvl
+    bool  snapped
+    int   ev
+    int   state
+    label mk
+    line  tl
+    line  al
+    label tb
+
+type RunRec
+    int ev
+    int dir
+    int rg
+    int cnt
+    float ext
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 1 - PURE HELPER FUNCTIONS (no history-dependent calls inside)
+// ═══════════════════════════════════════════════════════════════════════════
+
+//@function Empirical quantile of a float collection. Returns 0 on empty input.
+f_q(array<float> a, float p) =>
+    r = 0.0
+    if array.size(a) > 0
+        r := array.percentile_linear_interpolation(a, p)
+    r
+
+//@function Median of a float collection. Returns 0 on empty input.
+f_med(array<float> a) =>
+    r = 0.0
+    if array.size(a) > 0
+        r := array.median(a)
+    r
+
+// ═══ CERTIFIED P18: LEVELMAP v1.0 ═══
+//@function Total independent factors coinciding at one level.
+f_wt(Level l, int bi) =>
+    w = 0
+    w += l.isSwing ? 1 : 0
+    w += l.isEq ? 1 : 0
+    w += l.isOb ? 1 : 0
+    w += l.isHtf ? 2 : 0
+    w += math.min(l.fvgN, 3)
+    w += math.min(l.touches, 3)
+    w += (bi - l.birth) > 200 ? 1 : 0
+    w
+
+//@function Index of the live level nearest to px within tol, else -1.
+f_find(array<Level> arr, float px, float tol) =>
+    idx = -1
+    best = tol
+    n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            l = array.get(arr, i)
+            if l.alive
+                d = math.abs(l.price - px)
+                if d <= best
+                    best := d
+                    idx := i
+    idx
+
+//@function Register one structural factor at a price. Merges into an existing
+//          level when within tolerance, so an OB sitting inside an FVG counts
+//          as one level with two factors, never as two levels.
+f_addF(array<Level> arr, float px, float tol, int kind, int bi, int cap) =>
+    i = f_find(arr, px, tol)
+    if i >= 0
+        l = array.get(arr, i)
+        if kind == 1
+            l.isSwing := true
+        if kind == 2
+            l.isEq := true
+            l.touches := l.touches + 1
+            l.price := (l.price + px) / 2.0
+        if kind == 3
+            l.fvgN := l.fvgN + 1
+        if kind == 4
+            l.isOb := true
+        if kind == 5
+            l.isHtf := true
+    else
+        nl = Level.new(px, kind == 1, kind == 2, kind == 4, kind == 5, kind == 3 ? 1 : 0, kind == 2 ? 1 : 0, bi, true)
+        array.push(arr, nl)
+        if array.size(arr) > cap
+            array.shift(arr)
+    // ── INVARIANT: explicit scalar terminal. A function must never end on an
+    //    if/else whose branches yield different types (CE10235).
+    i
+
+//@function Heaviest level weight within tol of px. 0 when no level is near.
+f_locW(array<Level> arr, float px, float tol, int bi) =>
+    best = 0
+    n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            l = array.get(arr, i)
+            if l.alive and math.abs(l.price - px) <= tol
+                w = f_wt(l, bi)
+                if w > best
+                    best := w
+    best
+
+//@function Nearest live level above px within maxD, else na.
+f_above(array<Level> arr, float px, float maxD) =>
+    res = float(na)
+    bestD = maxD
+    n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            l = array.get(arr, i)
+            if l.alive and l.price > px and (l.price - px) <= bestD
+                bestD := l.price - px
+                res := l.price
+    res
+
+//@function Nearest live level below px within maxD, else na.
+f_below(array<Level> arr, float px, float maxD) =>
+    res = float(na)
+    bestD = maxD
+    n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            l = array.get(arr, i)
+            if l.alive and l.price < px and (px - l.price) <= bestD
+                bestD := px - l.price
+                res := l.price
+    res
+
+//@function Level price closest to target within tol, else na. Used to snap a
+//          statistical zone onto a structural price.
+f_snap(array<Level> arr, float px, float tol) =>
+    res = float(na)
+    i = f_find(arr, px, tol)
+    if i >= 0
+        res := array.get(arr, i).price
+    res
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 2 - GLOBAL CALCULATIONS
+// ── INVARIANT: every ta.* / math.sum / request.* call lives here, at global
+//              scope, unconditional. Results are used conditionally later.
+// ═══════════════════════════════════════════════════════════════════════════
+
+atr14   = ta.atr(14)
+atr20   = ta.atr(20)
+rng     = high - low
+body    = math.abs(close - open)
+wickUp  = high - math.max(open, close)
+wickDn  = math.min(open, close) - low
+
+// ── flow (P03-style self-calibration; body-flow proxy when volume is absent)
+volSma    = ta.sma(volume, 50)
+volAvail  = not na(volSma) and volSma > 0
+bodyRatio = (close - open) / math.max(rng, syminfo.mintick)
+flowUnit  = volAvail ? bodyRatio * volume : bodyRatio
+cumFlow   = ta.cum(flowUnit)
+flowRank  = ta.percentrank(math.abs(flowUnit), 200)
+
+// ── self-calibrating thresholds (P03)
+wickUpThr = ta.percentile_nearest_rank(wickUp, 100, 75)
+wickDnThr = ta.percentile_nearest_rank(wickDn, 100, 75)
+volThr    = ta.percentile_nearest_rank(volume, 200, 95)
+rngThr    = ta.percentile_nearest_rank(rng, 200, 90)
+dispThr   = ta.percentile_nearest_rank(body, 100, 85)
+
+// ── CERTIFIED P04: REGIME v1.0 (Kaufman efficiency ratio, percentile ranked)
+erChange = math.abs(close - close[20])
+erVol    = math.sum(math.abs(close - close[1]), 20)
+erRaw    = erVol > 0 ? erChange / erVol : 0.0
+erRank   = ta.percentrank(erRaw, CAL_WIN)
+regime   = erRank >= 70 ? 2 : erRank <= 40 ? 0 : 1
+regTxt   = regime == 2 ? "TREND" : regime == 0 ? "RANGE" : "TRANS"
+
+// ── HTF-AUTOLOCK: the conventional ladder, always landing on a timeframe
+//    traders actually watch (roughly 4x to 16x the chart timeframe)
+TFMIN   = timeframe.in_seconds() / 60.0
+htfAuto = TFMIN <= 1 ? "15" : TFMIN <= 5 ? "60" : TFMIN <= 60 ? "240" : TFMIN <= 240 ? "D" : TFMIN <= 1440 ? "W" : "M"
+htfUsed = htfModeInput == "Auto" ? htfAuto : htfManInput
+
+// ═══ CERTIFIED P02: HTF-SECURE v1.0 ═══
+// ── INVARIANT: lookahead_on combined with a [1] offset returns the LAST
+//              COMPLETED higher-timeframe bar on every chart bar. One HTF bar
+//              of delay is the honest price of zero repaint.
+[htfC, htfE] = request.security(syminfo.tickerid, htfUsed, [close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_on)
+[pdH, pdL]   = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[pwH, pwL]   = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+htfAvail = not na(htfC) and not na(htfE)
+htfBias  = not htfAvail ? 0 : htfC > htfE ? 1 : htfC < htfE ? -1 : 0
+
+newDay  = timeframe.change("D")
+newWeek = timeframe.change("W")
+
+// ── pivots (confirm pivLen bars late; the delay is disclosed)
+phExt = ta.pivothigh(high, pivExtInput, pivExtInput)
+plExt = ta.pivotlow(low, pivExtInput, pivExtInput)
+phInt = ta.pivothigh(high, pivIntInput, pivIntInput)
+plInt = ta.pivotlow(low, pivIntInput, pivIntInput)
+
+// ── history reads hoisted out of conditionals (CW10003)
+flowAtPiv = cumFlow[pivExtInput]
+barAtPiv  = bar_index - pivExtInput
+
+// ── volatility compression (Bollinger inside Keltner)
+bbBasis = ta.sma(close, 20)
+bbDev   = 2.0 * ta.stdev(close, 20)
+bbU     = bbBasis + bbDev
+bbL     = bbBasis - bbDev
+kcU     = bbBasis + 1.5 * atr20
+kcL     = bbBasis - 1.5 * atr20
+inSqz   = bbU < kcU and bbL > kcL
+
+// ── fair value gaps
+fvgBull = low > high[2] and close[1] > open[1]
+fvgBear = high < low[2] and close[1] < open[1]
+fvgBullMid = (low + high[2]) / 2.0
+fvgBearMid = (high + low[2]) / 2.0
+
+// ── candle events
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bullPin    = wickDn >= wickDnThr and wickDn > body * 2.0 and close > (high + low) / 2.0
+bearPin    = wickUp >= wickUpThr and wickUp > body * 2.0 and close < (high + low) / 2.0
+
+calReady = bar_index > CAL_WIN and not na(erRank) and not na(wickUpThr)
+levTol   = levTolInput * atr14
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 3 - PERSISTENT STATE
+// ═══════════════════════════════════════════════════════════════════════════
+var array<Level>   levels  = array.new<Level>()
+var array<Outcome> store   = array.new<Outcome>()
+var array<Pending> pend    = array.new<Pending>()
+var array<Proj>    projs   = array.new<Proj>()
+var array<RunRec>  runs    = array.new<RunRec>()
+var array<int>     lastEv  = array.new<int>(7, -99999)
+var array<int>     seqCnt  = array.new<int>(14, 0)
+
+var float lastPH  = na
+var float prevPH  = na
+var float lastPL  = na
+var float prevPL  = na
+var float lastPHf = na
+var float prevPHf = na
+var float lastPLf = na
+var float prevPLf = na
+var float bosHi   = na
+var float bosLo   = na
+var float lastPHi = na
+var float lastPLi = na
+var int   sqzCnt  = 0
+
+var int   runDir   = 0
+var int   runStart = 0
+var float runStPx  = na
+var int   runStRg  = 1
+
+var int ledHit = 0
+var int ledAdv = 0
+var int ledAmb = 0
+var int ledExp = 0
+var float ledProjSum = 0.0
+var int   ledProjN   = 0
+
+var string htfLock = htfUsed
+storeReset = htfUsed != htfLock
+if storeReset
+    array.clear(store)
+    array.clear(runs)
+    htfLock := htfUsed
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 4 - LEVEL MAP MAINTENANCE (P18)
+// ═══════════════════════════════════════════════════════════════════════════
+if not na(phExt)
+    exH = f_find(levels, phExt, levTol)
+    f_addF(levels, phExt, levTol, 1, barAtPiv, maxLevInput)
+    if exH >= 0
+        f_addF(levels, phExt, levTol, 2, barAtPiv, maxLevInput)
+    prevPH  := lastPH
+    lastPH  := phExt
+    prevPHf := lastPHf
+    lastPHf := flowAtPiv
+    bosHi   := phExt
+
+if not na(plExt)
+    exL = f_find(levels, plExt, levTol)
+    f_addF(levels, plExt, levTol, 1, barAtPiv, maxLevInput)
+    if exL >= 0
+        f_addF(levels, plExt, levTol, 2, barAtPiv, maxLevInput)
+    prevPL  := lastPL
+    lastPL  := plExt
+    prevPLf := lastPLf
+    lastPLf := flowAtPiv
+    bosLo   := plExt
+
+if not na(phInt)
+    lastPHi := phInt
+if not na(plInt)
+    lastPLi := plInt
+
+if fvgBull
+    f_addF(levels, fvgBullMid, levTol, 3, bar_index, maxLevInput)
+if fvgBear
+    f_addF(levels, fvgBearMid, levTol, 3, bar_index, maxLevInput)
+
+prevDown = close[1] < open[1]
+prevUp   = close[1] > open[1]
+obLowPx  = low[1]
+obHighPx = high[1]
+dispUp   = close > open and body >= dispThr and prevDown and not na(lastPHi) and close > lastPHi
+dispDn   = close < open and body >= dispThr and prevUp and not na(lastPLi) and close < lastPLi
+if dispUp
+    f_addF(levels, obLowPx, levTol, 4, bar_index, maxLevInput)
+if dispDn
+    f_addF(levels, obHighPx, levTol, 4, bar_index, maxLevInput)
+
+if newDay and not na(pdH)
+    f_addF(levels, pdH, levTol, 5, bar_index, maxLevInput)
+    f_addF(levels, pdL, levTol, 5, bar_index, maxLevInput)
+if newWeek and not na(pwH)
+    f_addF(levels, pwH, levTol, 5, bar_index, maxLevInput)
+    f_addF(levels, pwL, levTol, 5, bar_index, maxLevInput)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 5 - EVENT DETECTION (all state locked at bar close)
+// ═══════════════════════════════════════════════════════════════════════════
+if inSqz
+    sqzCnt := sqzCnt + 1
+else
+    sqzCnt := 0
+sqzRelease = not inSqz and nz(sqzCnt[1]) >= 5
+
+lvlAbove = f_above(levels, close, 3.0 * atr14)
+lvlBelow = f_below(levels, close, 3.0 * atr14)
+locWnow  = f_locW(levels, close, levTol, bar_index)
+
+swDn = not na(lvlAbove) and high > lvlAbove and close < lvlAbove and wickUp >= wickUpThr
+swUp = not na(lvlBelow) and low < lvlBelow and close > lvlBelow and wickDn >= wickDnThr
+shUp = not na(bosHi) and close > bosHi
+shDn = not na(bosLo) and close < bosLo
+clxOn = volAvail and not na(volThr) ? (volume >= volThr and rng >= rngThr) : (rng >= rngThr and body >= dispThr)
+rjUp = (bullEngulf or bullPin) and locWnow >= 1
+rjDn = (bearEngulf or bearPin) and locWnow >= 1
+
+dvUp = false
+dvDn = false
+if not na(plExt) and not na(prevPL) and not na(prevPLf)
+    dvUp := lastPL < prevPL and lastPLf > prevPLf
+if not na(phExt) and not na(prevPH) and not na(prevPHf)
+    dvDn := lastPH > prevPH and lastPHf < prevPHf
+
+// priority: rarer and more informative classes claim the bar first
+evId  = 0
+evDir = 0
+if swUp
+    evId := EV_SWEEP
+    evDir := 1
+else if swDn
+    evId := EV_SWEEP
+    evDir := -1
+else if dvUp
+    evId := EV_DIVERGE
+    evDir := 1
+else if dvDn
+    evId := EV_DIVERGE
+    evDir := -1
+else if shUp
+    evId := EV_SHIFT
+    evDir := 1
+else if shDn
+    evId := EV_SHIFT
+    evDir := -1
+else if clxOn
+    evId := EV_CLIMAX
+    evDir := close > open ? 1 : -1
+else if sqzRelease
+    evId := EV_SQUEEZE
+    evDir := close > bbBasis ? 1 : -1
+else if rjUp
+    evId := EV_REJECT
+    evDir := 1
+else if rjDn
+    evId := EV_REJECT
+    evDir := -1
+
+if shUp
+    bosHi := na
+if shDn
+    bosLo := na
+
+// ── INVARIANT: two events of the same class stay at least H bars apart, so
+//              stored outcomes never share overlapping futures.
+sepOk = evId > 0 and (bar_index - array.get(lastEv, evId)) >= horizonInput
+evFired = evId > 0 and sepOk and barstate.isconfirmed and calReady and atr14 > 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 6 - SCORING (additive, renormalised, never gating)
+// ═══════════════════════════════════════════════════════════════════════════
+sUpCnt = (not na(lastPH) and not na(prevPH) and lastPH > prevPH ? 1 : 0) + (not na(lastPL) and not na(prevPL) and lastPL > prevPL ? 1 : 0)
+sDnCnt = (not na(lastPH) and not na(prevPH) and lastPH < prevPH ? 1 : 0) + (not na(lastPL) and not na(prevPL) and lastPL < prevPL ? 1 : 0)
+sScore = evDir > 0 ? sUpCnt * 50.0 : evDir < 0 ? sDnCnt * 50.0 : 0.0
+fAgree = (evDir > 0 and flowUnit > 0) or (evDir < 0 and flowUnit < 0)
+fScore = fAgree ? flowRank : flowRank * 0.2
+hScore = htfBias == 0 ? 50.0 : htfBias == evDir ? 100.0 : 0.0
+
+// ── residue fix: CLIMAX and DIVERGE are themselves defined from flow, so the
+//    flow voice is halved for them and the freed weight is split evenly.
+fHalf  = (evId == EV_CLIMAX or evId == EV_DIVERGE) ? 0.5 : 1.0
+wFe    = 30.0 * fHalf
+spare  = 30.0 - wFe
+wSe    = 35.0 + spare / 2.0
+wHe    = htfAvail ? 35.0 + spare / 2.0 : 0.0
+dS     = regime == 0 ? 0.70 : 1.0
+dF     = regime == 2 ? 0.85 : 1.0
+dH     = regime == 1 ? 0.80 : 1.0
+den    = wSe * dS + wFe * dF + wHe * dH
+score  = den > 0 ? (wSe * dS * sScore + wFe * dF * fScore + wHe * dH * hScore) / den : 0.0
+
+locCls = locWnow >= majWeightInput ? 2 : locWnow >= 1 ? 1 : 0
+locTxt = locCls == 2 ? "MAJOR" : locCls == 1 ? "MINOR" : "NONE"
+
+cp1 = math.max(1, int(math.round(horizonInput / 4.0)))
+cp2 = math.max(2, int(math.round(horizonInput / 2.0)))
+cp3 = math.max(3, int(math.round(horizonInput * 3.0 / 4.0)))
+cp4 = horizonInput
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 7 - RUN TRACKER (P19) - the observation unit is the RUN, not the
+//            event, so sequence statistics contain no overlapping samples.
+// ═══════════════════════════════════════════════════════════════════════════
+var int curSeq = 0
+if evFired and evId == EV_SHIFT and evDir != runDir
+    if runDir != 0
+        extV = na(runStPx) or atr14 <= 0 ? 0.0 : math.abs(close - runStPx) / atr14
+        for c = 1 to 6
+            for d = 0 to 1
+                cnt = array.get(seqCnt, c * 2 + d)
+                if cnt > 0
+                    array.push(runs, RunRec.new(c, d == 1 ? 1 : -1, runStRg, cnt, extV))
+        if array.size(runs) > 400
+            array.shift(runs)
+    for z = 0 to 13
+        array.set(seqCnt, z, 0)
+    runDir   := evDir
+    runStart := bar_index
+    runStPx  := close
+    runStRg  := regime
+
+if evFired
+    dIx = evDir > 0 ? 1 : 0
+    sIx = evId * 2 + dIx
+    array.set(seqCnt, sIx, array.get(seqCnt, sIx) + 1)
+    curSeq := array.get(seqCnt, sIx)
+    array.set(lastEv, evId, bar_index)
+
+runExt = na(runStPx) or atr14 <= 0 ? 0.0 : math.abs(close - runStPx) / atr14
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 8 - SIGNATURE MATCH, BACKOFF (P16) AND PROJECTION ISSUE (P17)
+// ═══════════════════════════════════════════════════════════════════════════
+var polyline fanOut = na
+var polyline fanIn  = na
+var polyline fanMid = na
+
+var int    dspN    = 0
+var int    dspLvl  = -1
+var float  dspHit  = 0.0
+var int    dspEta  = 0
+var int    dspRing = 1
+var float  dspTgt  = na
+var int    dspEv   = 0
+var int    dspDir  = 0
+var int    dspBar  = 0
+var bool   dspSnap = false
+var float  dspQ50  = 0.0
+var float  dspQ75  = 0.0
+var float  dspQ95  = 0.0
+var float  dspQ25  = 0.0
+var float  dspQ05  = 0.0
+var int    dspTier = 0
+var float  dspScore= 0.0
+
+if evFired
+    ns = array.size(store)
+    scArr = array.new<float>()
+    if ns > 0
+        for i = 0 to ns - 1
+            o = array.get(store, i)
+            if o.ev == evId
+                array.push(scArr, o.sc)
+    tierV = 0
+    if array.size(scArr) >= 10
+        tierV := score >= f_q(scArr, 60) ? 1 : 0
+
+    i0 = array.new<int>()
+    i1 = array.new<int>()
+    i2 = array.new<int>()
+    i3 = array.new<int>()
+    if ns > 0
+        for i = 0 to ns - 1
+            o = array.get(store, i)
+            if o.ev == evId and o.dir == evDir
+                array.push(i0, i)
+                if o.rg == regime
+                    array.push(i1, i)
+                    if o.loc == locCls
+                        array.push(i2, i)
+                        if o.tier == tierV
+                            array.push(i3, i)
+    sel = array.new<int>()
+    lvlUsed = -1
+    if array.size(i3) >= nMinInput
+        sel := i3
+        lvlUsed := 3
+    else if array.size(i2) >= nMinInput
+        sel := i2
+        lvlUsed := 2
+    else if array.size(i1) >= nMinInput
+        sel := i1
+        lvlUsed := 1
+    else if array.size(i0) >= nMinInput
+        sel := i0
+        lvlUsed := 0
+
+    // ── pending record is always created; the projection is only displayed
+    //    when the evidence exists to display it.
+    array.push(pend, Pending.new(evId, locCls, regime, evDir, tierV, score, bar_index, close, atr14, na, na, na, na, 0.0, 0.0, 0, 0, 0))
+
+    mkLab = label(na)
+    if showMkrInput
+        evTxt = evId == EV_SWEEP ? "SWP" : evId == EV_SHIFT ? "SHF" : evId == EV_SQUEEZE ? "SQZ" : evId == EV_CLIMAX ? "CLX" : evId == EV_REJECT ? "REJ" : "DIV"
+        mkLab := label.new(bar_index, evDir > 0 ? low : high, evTxt + " " + str.tostring(curSeq), style = evDir > 0 ? label.style_label_up : label.style_label_down, color = color.new(evDir > 0 ? COL_BULL : COL_BEAR, 25), textcolor = color.white, size = size.tiny)
+
+    if lvlUsed >= 0
+        nSel = array.size(sel)
+        a1 = array.new<float>()
+        a2 = array.new<float>()
+        a3 = array.new<float>()
+        a4 = array.new<float>()
+        aM = array.new<float>()
+        for k = 0 to nSel - 1
+            o = array.get(store, array.get(sel, k))
+            array.push(a1, nz(o.e1))
+            array.push(a2, nz(o.e2))
+            array.push(a3, nz(o.e3))
+            array.push(a4, nz(o.e4))
+            array.push(aM, nz(o.mfe))
+
+        dTgt = math.max(0.5, f_med(aM))
+        ring = math.max(1, math.min(3, int(math.round(dTgt))))
+        hitN = 0
+        etaArr = array.new<float>()
+        for k = 0 to nSel - 1
+            o = array.get(store, array.get(sel, k))
+            fpv = ring == 1 ? o.fp1 : ring == 2 ? o.fp2 : o.fp3
+            if fpv > 0
+                hitN += 1
+                array.push(etaArr, float(fpv))
+        hitPct = nSel > 0 ? hitN * 100.0 / nSel : 0.0
+        etaV   = int(math.round(f_med(etaArr)))
+
+        tgtRaw  = close + evDir * dTgt * atr14
+        snapPx  = f_snap(levels, tgtRaw, 0.5 * atr14)
+        snapped = not na(snapPx)
+        tgtPx   = snapped ? snapPx : tgtRaw
+        advPx   = close - evDir * atr14
+
+        tLn = line(na)
+        aLn = line(na)
+        tLb = label(na)
+        if showTgtInput
+            tLn := line.new(bar_index, tgtPx, bar_index + cp4, tgtPx, color = COL_TP, width = 2, extend = extend.right)
+            aLn := line.new(bar_index, advPx, bar_index + cp4, advPx, color = color.new(COL_BEAR, 55), width = 1, style = line.style_dotted)
+            tLb := label.new(bar_index + cp4, tgtPx, "", style = label.style_label_left, color = color.new(COL_TP, 82), textcolor = COL_TP, size = size.small)
+
+        array.push(projs, Proj.new(bar_index, close, atr14, evDir, tgtPx, advPx, ring, hitPct, etaV, nSel, lvlUsed, snapped, evId, ST_OPEN, mkLab, tLn, aLn, tLb))
+
+        // ── retain only the last (retainInput + 1) sets of target drawings
+        np2 = array.size(projs)
+        if np2 > retainInput + 1
+            for gi = 0 to np2 - retainInput - 2
+                pg = array.get(projs, gi)
+                if not na(pg.tl)
+                    line.delete(pg.tl)
+                    pg.tl := na
+                if not na(pg.al)
+                    line.delete(pg.al)
+                    pg.al := na
+                if not na(pg.tb)
+                    label.delete(pg.tb)
+                    pg.tb := na
+        if np2 > 40
+            array.shift(projs)
+        ledProjSum += hitPct
+        ledProjN   += 1
+
+        dspN    := nSel
+        dspLvl  := lvlUsed
+        dspHit  := hitPct
+        dspEta  := etaV
+        dspRing := ring
+        dspTgt  := tgtPx
+        dspEv   := evId
+        dspDir  := evDir
+        dspBar  := bar_index
+        dspSnap := snapped
+        dspTier := tierV
+        dspScore:= score
+        dspQ50  := f_q(a4, 50)
+        dspQ75  := f_q(a4, 75)
+        dspQ95  := f_q(a4, 95)
+        dspQ25  := f_q(a4, 25)
+        dspQ05  := f_q(a4, 5)
+
+        if showFanInput
+            if not na(fanOut)
+                polyline.delete(fanOut)
+            if not na(fanIn)
+                polyline.delete(fanIn)
+            if not na(fanMid)
+                polyline.delete(fanMid)
+            outer = array.new<chart.point>()
+            inner = array.new<chart.point>()
+            midl  = array.new<chart.point>()
+            array.push(outer, chart.point.from_index(bar_index, close))
+            array.push(outer, chart.point.from_index(bar_index + cp1, close + evDir * f_q(a1, 95) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp2, close + evDir * f_q(a2, 95) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp3, close + evDir * f_q(a3, 95) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp4, close + evDir * f_q(a4, 95) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp4, close + evDir * f_q(a4, 5) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp3, close + evDir * f_q(a3, 5) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp2, close + evDir * f_q(a2, 5) * atr14))
+            array.push(outer, chart.point.from_index(bar_index + cp1, close + evDir * f_q(a1, 5) * atr14))
+            array.push(inner, chart.point.from_index(bar_index, close))
+            array.push(inner, chart.point.from_index(bar_index + cp1, close + evDir * f_q(a1, 75) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp2, close + evDir * f_q(a2, 75) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp3, close + evDir * f_q(a3, 75) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp4, close + evDir * f_q(a4, 75) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp4, close + evDir * f_q(a4, 25) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp3, close + evDir * f_q(a3, 25) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp2, close + evDir * f_q(a2, 25) * atr14))
+            array.push(inner, chart.point.from_index(bar_index + cp1, close + evDir * f_q(a1, 25) * atr14))
+            array.push(midl, chart.point.from_index(bar_index, close))
+            array.push(midl, chart.point.from_index(bar_index + cp1, close + evDir * f_q(a1, 50) * atr14))
+            array.push(midl, chart.point.from_index(bar_index + cp2, close + evDir * f_q(a2, 50) * atr14))
+            array.push(midl, chart.point.from_index(bar_index + cp3, close + evDir * f_q(a3, 50) * atr14))
+            array.push(midl, chart.point.from_index(bar_index + cp4, close + evDir * f_q(a4, 50) * atr14))
+            cBase = evDir > 0 ? COL_BULL : COL_BEAR
+            fanOut := polyline.new(outer, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(cBase, 88), fill_color = color.new(cBase, 93), line_style = line.style_solid, line_width = 1)
+            fanIn  := polyline.new(inner, curved = false, closed = true, xloc = xloc.bar_index, line_color = color.new(cBase, 80), fill_color = color.new(cBase, 87), line_style = line.style_solid, line_width = 1)
+            fanMid := polyline.new(midl, curved = false, closed = false, xloc = xloc.bar_index, line_color = color.new(cBase, 35), line_style = line.style_dashed, line_width = 2)
+
+
+var int lastFiredEv  = 0
+var int lastFiredDir = 0
+if evFired
+    lastFiredEv  := evId
+    lastFiredDir := evDir
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 9 - OUTCOME RECORDING
+// ── INVARIANT: an outcome enters the store only after H bars have fully
+//              elapsed, so every projection is built exclusively from events
+//              that were already finished before it was issued.
+// ═══════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    np = array.size(pend)
+    if np > 0
+        for i = np - 1 to 0
+            p = array.get(pend, i)
+            age = bar_index - p.sBar
+            if p.r > 0
+                fav = (p.dir > 0 ? high - p.anchor : p.anchor - low) / p.r
+                adv = (p.dir > 0 ? p.anchor - low : high - p.anchor) / p.r
+                if fav > p.mfe
+                    p.mfe := fav
+                if adv > p.mae
+                    p.mae := adv
+                if p.fp1 == 0 and p.mfe >= 1.0
+                    p.fp1 := age
+                if p.fp2 == 0 and p.mfe >= 2.0
+                    p.fp2 := age
+                if p.fp3 == 0 and p.mfe >= 3.0
+                    p.fp3 := age
+                exc = (close - p.anchor) * p.dir / p.r
+                if age == cp1
+                    p.e1 := exc
+                if age == cp2
+                    p.e2 := exc
+                if age == cp3
+                    p.e3 := exc
+                if age >= cp4
+                    p.e4 := exc
+                    array.push(store, Outcome.new(p.ev, p.loc, p.rg, p.dir, p.tier, p.sc, nz(p.e1), nz(p.e2), nz(p.e3), nz(p.e4), p.mfe, p.mae, p.fp1, p.fp2, p.fp3))
+                    if array.size(store) > 1500
+                        array.shift(store)
+                    array.remove(pend, i)
+            else
+                array.remove(pend, i)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 10 - FORECAST LEDGER (P15) - four states, never merged
+// ═══════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    npr = array.size(projs)
+    if npr > 0
+        for i = 0 to npr - 1
+            pr = array.get(projs, i)
+            if pr.state == ST_OPEN and bar_index > pr.sBar
+                age2 = bar_index - pr.sBar
+                hitT = pr.dir > 0 ? high >= pr.tgt : low <= pr.tgt
+                hitA = pr.dir > 0 ? low <= pr.adv : high >= pr.adv
+                if hitT and hitA
+                    pr.state := ST_AMB
+                else if hitT
+                    pr.state := ST_HIT
+                else if hitA
+                    pr.state := ST_ADV
+                else if age2 >= cp4
+                    pr.state := ST_EXP
+                if pr.state != ST_OPEN
+                    if pr.state == ST_HIT
+                        ledHit += 1
+                    if pr.state == ST_ADV
+                        ledAdv += 1
+                    if pr.state == ST_AMB
+                        ledAmb += 1
+                    if pr.state == ST_EXP
+                        ledExp += 1
+                    stTxt = pr.state == ST_HIT ? "HIT" : pr.state == ST_ADV ? "ADV" : pr.state == ST_AMB ? "AMB" : "EXP"
+                    // the line keeps full width and stays solid; only hue and
+                    // opacity change, so it can never be mistaken for a MINOR level
+                    stCol = pr.state == ST_HIT ? COL_TP : pr.state == ST_ADV ? COL_BEAR : COL_SLATE
+                    if not na(pr.mk)
+                        label.set_text(pr.mk, label.get_text(pr.mk) + " " + stTxt)
+                        label.set_color(pr.mk, color.new(pr.state == ST_HIT ? COL_TP : pr.state == ST_ADV ? COL_BEAR : COL_WARN, 35))
+                    if not na(pr.tl)
+                        line.set_color(pr.tl, color.new(stCol, 58))
+                    if not na(pr.al)
+                        line.delete(pr.al)
+                        pr.al := na
+                    if not na(pr.tb)
+                        label.set_text(pr.tb, str.tostring(pr.tgt, format.mintick) + (pr.snapped ? "  level" : "  stat") + "\nhit " + str.tostring(pr.hitPct, "#") + "%  n=" + str.tostring(pr.n) + "\nRESOLVED  " + stTxt)
+                        label.set_textcolor(pr.tb, stCol)
+                        label.set_color(pr.tb, color.new(stCol, 86))
+
+// ── live countdown on the newest open projection (DISPLAY-ONLY: it decrements
+//    a number frozen at issue time; nothing is recalculated)
+liveEta  = 0
+liveOpen = false
+if array.size(projs) > 0
+    prL = array.get(projs, array.size(projs) - 1)
+    if prL.state == ST_OPEN
+        liveOpen := true
+        liveEta  := math.max(0, prL.eta - (bar_index - prL.sBar))
+        if not na(prL.tb)
+            etaTxt = liveEta > 0 ? str.tostring(liveEta) + " bars" : "due now"
+            label.set_text(prL.tb, str.tostring(prL.tgt, format.mintick) + (prL.snapped ? "  level" : "  stat") + "\nhit " + str.tostring(prL.hitPct, "#") + "%  n=" + str.tostring(prL.n) + "\nETA " + etaTxt + "  (+" + str.tostring(prL.ring) + "R ring)")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 11 - LEVEL MAP DISPLAY
+// ═══════════════════════════════════════════════════════════════════════════
+var array<line> levLn = array.new<line>()
+if barstate.islast and showLevInput
+    nl2 = array.size(levLn)
+    if nl2 > 0
+        for i = 0 to nl2 - 1
+            line.delete(array.get(levLn, i))
+    array.clear(levLn)
+    nlv = array.size(levels)
+    drawn = 0
+    if nlv > 0
+        for i = nlv - 1 to 0
+            if drawn < 14
+                l = array.get(levels, i)
+                if l.alive and math.abs(l.price - close) <= 6.0 * atr14
+                    w = f_wt(l, bar_index)
+                    isMaj = w >= majWeightInput
+                    ln = line.new(bar_index - 60, l.price, bar_index + 8, l.price, color = isMaj ? color.new(COL_GOLD, 25) : color.new(COL_MUTE, 45), width = isMaj ? 2 : 1, style = isMaj ? line.style_solid : line.style_dotted, extend = extend.right)
+                    array.push(levLn, ln)
+                    drawn += 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 12 - AXIS HEALTH + SEQUENCE STATISTICS (computed on last bar only)
+// ═══════════════════════════════════════════════════════════════════════════
+axTierA = 0.0
+axTierB = 0.0
+axNA    = 0
+axNB    = 0
+axMaj   = 0.0
+axMin   = 0.0
+axNon   = 0.0
+axNMaj  = 0
+axNMin  = 0
+axNNon  = 0
+seqMed  = 0.0
+seqRuns = 0
+seqB1   = 0.0
+seqB2   = 0.0
+seqB3   = 0.0
+seqB4   = 0.0
+if barstate.islast
+    tA = array.new<float>()
+    tB = array.new<float>()
+    lMj = array.new<float>()
+    lMn = array.new<float>()
+    lNo = array.new<float>()
+    nst = array.size(store)
+    if nst > 0
+        for i = 0 to nst - 1
+            o = array.get(store, i)
+            if o.tier == 1
+                array.push(tA, o.e4)
+            else
+                array.push(tB, o.e4)
+            if o.loc == 2
+                array.push(lMj, o.e4)
+            else if o.loc == 1
+                array.push(lMn, o.e4)
+            else
+                array.push(lNo, o.e4)
+    axTierA := f_med(tA)
+    axTierB := f_med(tB)
+    axNA    := array.size(tA)
+    axNB    := array.size(tB)
+    axMaj   := f_med(lMj)
+    axMin   := f_med(lMn)
+    axNon   := f_med(lNo)
+    axNMaj  := array.size(lMj)
+    axNMin  := array.size(lMn)
+    axNNon  := array.size(lNo)
+
+    sq = array.new<float>()
+    nrn = array.size(runs)
+    if nrn > 0
+        for i = 0 to nrn - 1
+            rr = array.get(runs, i)
+            if rr.ev == lastFiredEv and rr.dir == lastFiredDir
+                array.push(sq, float(rr.cnt))
+    seqRuns := array.size(sq)
+    if seqRuns > 0
+        seqMed := f_med(sq)
+        c1n = 0
+        c2n = 0
+        c3n = 0
+        c4n = 0
+        for i = 0 to seqRuns - 1
+            v = array.get(sq, i)
+            if v <= 1
+                c1n += 1
+            else if v <= 2
+                c2n += 1
+            else if v <= 3
+                c3n += 1
+            else
+                c4n += 1
+        seqB1 := c1n * 100.0 / seqRuns
+        seqB2 := c2n * 100.0 / seqRuns
+        seqB3 := c3n * 100.0 / seqRuns
+        seqB4 := c4n * 100.0 / seqRuns
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 13 - CERTIFIED P06: DASHBOARD
+// ── DISPLAY-ONLY: the table repaints intrabar by design; every number in it
+//    was frozen at the confirmed bar that produced it.
+// ═══════════════════════════════════════════════════════════════════════════
+dPos = dashPosInput == "Top Left" ? position.top_left : dashPosInput == "Bottom Right" ? position.bottom_right : dashPosInput == "Bottom Left" ? position.bottom_left : dashPosInput == "Middle Right" ? position.middle_right : position.top_right
+dSz  = dashSizeInput == "Tiny" ? size.tiny : dashSizeInput == "Normal" ? size.normal : dashSizeInput == "Large" ? size.large : size.small
+
+var table dash = table.new(dPos, 2, 18, border_width = 1, border_color = color.new(color.gray, 70), frame_width = 1, frame_color = color.new(color.gray, 60))
+
+f_row(table t, int r, string k, string v, color c) =>
+    table.cell(t, 0, r, k, text_color = COL_MUTE, text_size = dSz, text_halign = text.align_left, bgcolor = color.new(color.black, 82))
+    table.cell(t, 1, r, v, text_color = c, text_size = dSz, text_halign = text.align_right, bgcolor = color.new(color.black, 82))
+
+evName = lastFiredEv == EV_SWEEP ? "Sweep" : lastFiredEv == EV_SHIFT ? "Shift" : lastFiredEv == EV_SQUEEZE ? "Squeeze" : lastFiredEv == EV_CLIMAX ? "Climax" : lastFiredEv == EV_REJECT ? "Reject" : lastFiredEv == EV_DIVERGE ? "Diverge" : "none"
+dirArrow = lastFiredDir > 0 ? " UP" : lastFiredDir < 0 ? " DOWN" : ""
+dirCol   = lastFiredDir > 0 ? COL_BULL : lastFiredDir < 0 ? COL_BEAR : COL_MUTE
+lvlTxt   = dspLvl < 0 ? "-" : "L" + str.tostring(dspLvl)
+storeN   = array.size(store)
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 17)
+    r = 0
+    table.cell(dash, 0, r, "PRECEDENT", text_color = COL_GOLD, text_size = dSz, text_halign = text.align_left, bgcolor = color.new(color.black, 70))
+    table.cell(dash, 1, r, syminfo.ticker + "  " + timeframe.period, text_color = COL_TEXT, text_size = dSz, text_halign = text.align_right, bgcolor = color.new(color.black, 70))
+    r += 1
+    if not calReady or storeN < nMinInput
+        f_row(dash, r, "STATUS", "CALIBRATING", COL_WARN)
+        r += 1
+        f_row(dash, r, "SAMPLES", str.tostring(storeN) + " / " + str.tostring(nMinInput), COL_WARN)
+        r += 1
+        f_row(dash, r, "REGIME", regTxt, COL_TEXT)
+        r += 1
+        f_row(dash, r, "HTF", htfUsed + (htfModeInput == "Auto" ? "  auto" : "  manual"), COL_TEXT)
+        r += 1
+        f_row(dash, r, "FLOW", volAvail ? "volume" : "proxy", volAvail ? COL_TEXT : COL_WARN)
+    else
+        f_row(dash, r, "EVENT", evName + dirArrow + "  #" + str.tostring(curSeq), dirCol)
+        r += 1
+        f_row(dash, r, "LOCATION", locTxt + "  w" + str.tostring(locWnow), locCls == 2 ? COL_GOLD : COL_TEXT)
+        r += 1
+        f_row(dash, r, "REGIME", regTxt + "   score " + str.tostring(dspScore, "#") + "  " + (dspTier == 1 ? "A" : "B"), COL_TEXT)
+        r += 1
+        f_row(dash, r, "SIGNATURE", lvlTxt + "   n = " + str.tostring(dspN), dspLvl >= 2 ? COL_TP : COL_WARN)
+        r += 1
+        if not compactInput
+            f_row(dash, r, "WITH  q50 q75 q95", str.tostring(dspQ50, "#.0") + "  " + str.tostring(dspQ75, "#.0") + "  " + str.tostring(dspQ95, "#.0") + " R", COL_BULL)
+            r += 1
+            f_row(dash, r, "AGAINST  q25 q05", str.tostring(dspQ25, "#.0") + "  " + str.tostring(dspQ05, "#.0") + " R", COL_BEAR)
+            r += 1
+        f_row(dash, r, "TARGET", na(dspTgt) ? "-" : str.tostring(dspTgt, format.mintick) + "  hit " + str.tostring(dspHit, "#") + "%", COL_TP)
+        r += 1
+        f_row(dash, r, "ETA", liveOpen ? (str.tostring(liveEta) + " bars  (+" + str.tostring(dspRing) + "R)") : "no open projection", liveOpen ? COL_TEXT : COL_MUTE)
+        r += 1
+        if not compactInput
+            f_row(dash, r, "RUN EXT", str.tostring(runExt, "#.0") + " R", runExt >= 5.0 ? COL_WARN : COL_TEXT)
+            r += 1
+            f_row(dash, r, "FLOW SOURCE", volAvail ? "volume" : "proxy", volAvail ? COL_TEXT : COL_WARN)
+            r += 1
+        if showSeqInput and not compactInput
+            if seqRuns >= 10
+                f_row(dash, r, "SEQ  1 / 2 / 3 / 4+", str.tostring(seqB1, "#") + " " + str.tostring(seqB2, "#") + " " + str.tostring(seqB3, "#") + " " + str.tostring(seqB4, "#") + " %", COL_TEXT)
+                r += 1
+                f_row(dash, r, "RUNS median", str.tostring(seqMed, "#.0") + "   n = " + str.tostring(seqRuns), COL_TEXT)
+                r += 1
+            else
+                f_row(dash, r, "SEQUENCE", "calibrating " + str.tostring(seqRuns) + " / 10 runs", COL_WARN)
+                r += 1
+        if showAxInput and not compactInput
+            axOk = math.abs(axTierA - axTierB) >= 0.3 and axNA >= 15 and axNB >= 15
+            f_row(dash, r, "TIER A / B", str.tostring(axTierA, "#.0") + " R (" + str.tostring(axNA) + ")   " + str.tostring(axTierB, "#.0") + " R (" + str.tostring(axNB) + ")", axOk ? COL_TP : COL_WARN)
+            r += 1
+            f_row(dash, r, "LOC MAJ/MIN/NONE", str.tostring(axMaj, "#.0") + " / " + str.tostring(axMin, "#.0") + " / " + str.tostring(axNon, "#.0") + " R", COL_TEXT)
+            r += 1
+        f_row(dash, r, "LEDGER", "hit " + str.tostring(ledHit) + "  adv " + str.tostring(ledAdv) + "  amb " + str.tostring(ledAmb) + "  exp " + str.tostring(ledExp), COL_TEXT)
+        r += 1
+        if not compactInput
+            realPct = (ledHit + ledAdv + ledExp) > 0 ? ledHit * 100.0 / (ledHit + ledAdv + ledExp) : 0.0
+            projPct = ledProjN > 0 ? ledProjSum / ledProjN : 0.0
+            f_row(dash, r, "CALIBRATION", "projected " + str.tostring(projPct, "#") + "%   realised " + str.tostring(realPct, "#") + "%", COL_GOLD)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 14 - CERTIFIED P07: ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+newUp   = dspBar == bar_index and dspDir > 0 and barstate.isconfirmed
+newDown = dspBar == bar_index and dspDir < 0 and barstate.isconfirmed
+
+alertcondition(newUp, "Precedent - upward projection", "Precedent: upward projection issued on {{ticker}} {{interval}}")
+alertcondition(newDown, "Precedent - downward projection", "Precedent: downward projection issued on {{ticker}} {{interval}}")
+
+if newUp or newDown
+    jmsg = jsonInput ? '{"ts":"' + str.format_time(time, "yyyy-MM-dd HH:mm", syminfo.timezone) + '","sym":"' + syminfo.ticker + '","tf":"' + timeframe.period + '","ev":' + str.tostring(dspEv) + ',"dir":' + str.tostring(dspDir) + ',"loc":' + str.tostring(locCls) + ',"rg":' + str.tostring(regime) + ',"tier":' + str.tostring(dspTier) + ',"score":' + str.tostring(dspScore, "#.0") + ',"n":' + str.tostring(dspN) + ',"lvl":' + str.tostring(dspLvl) + ',"tgt":' + str.tostring(dspTgt, format.mintick) + ',"ring":' + str.tostring(dspRing) + ',"hit":' + str.tostring(dspHit, "#.0") + ',"eta":' + str.tostring(dspEta) + ',"q05":' + str.tostring(dspQ05, "#.00") + ',"q50":' + str.tostring(dspQ50, "#.00") + ',"q95":' + str.tostring(dspQ95, "#.00") + '}' : "Precedent: " + evName + dirArrow + " at " + locTxt + " in " + regTxt + " - target " + str.tostring(dspTgt, format.mintick) + ", hit " + str.tostring(dspHit, "#") + "% of " + str.tostring(dspN) + " comparable events, median " + str.tostring(dspEta) + " bars"
+    alert(jmsg, alert.freq_once_per_bar_close)

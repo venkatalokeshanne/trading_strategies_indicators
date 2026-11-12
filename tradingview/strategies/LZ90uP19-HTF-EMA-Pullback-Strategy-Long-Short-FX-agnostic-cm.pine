@@ -1,0 +1,100 @@
+//@version=5
+strategy("HTF EMA Pullback Strategy (Long & Short, FX-agnostic)",
+     overlay=true, initial_capital=100000,
+     commission_type=strategy.commission.percent, commission_value=0.005,
+     calc_on_every_tick=true, calc_on_order_fills=true,
+     pyramiding=0, process_orders_on_close=true)
+
+// ---------- Inputs ----------
+tfHTF          = input.timeframe("1D", "Higher Timeframe (direction filter)")
+lenShort       = input.int(9,  "Short EMA Length", minval=1)
+lenLong        = input.int(21, "Long EMA Length",  minval=2)
+useHTFFilter   = input.bool(true, "Use HTF EMA Direction Filter")
+
+pullbackLookback = input.int(6,  "Pullback lookback bars", minval=1)
+pullbackTolPct   = input.float(0.20, "Pullback tolerance to short EMA (%)", minval=0.0, step=0.05)
+requireCandle    = input.bool(true, "Require candlestick confirmation (engulfing / long wick)")
+requireMACD      = input.bool(true, "Require MACD histogram improvement")
+
+macdFast = input.int(12, "MACD Fast", minval=1)
+macdSlow = input.int(26, "MACD Slow", minval=1)
+macdSig  = input.int(9,  "MACD Signal", minval=1)
+
+useRRTarget  = input.bool(true, "Use R:R Target (based on stop distance)")
+rrMultiple   = input.float(1.5, "Take Profit R Multiple", minval=0.5, step=0.1)
+riskQtyPct   = input.float(10, "Order Size (% of equity)", minval=0.1, step=0.1)
+
+// ---------- HTF Direction Filter ----------
+emaShortHTF = request.security(syminfo.tickerid, tfHTF, ta.ema(close, lenShort))
+emaLongHTF  = request.security(syminfo.tickerid, tfHTF, ta.ema(close, lenLong))
+upTrendHTF   = emaShortHTF > emaLongHTF
+downTrendHTF = emaShortHTF < emaLongHTF
+
+// ---------- LTF signals ----------
+emaShort = ta.ema(close, lenShort)
+emaLong  = ta.ema(close, lenLong)
+
+tol = pullbackTolPct * 0.01
+touchedShortEMA = ta.lowest(math.abs(low - emaShort) / emaShort, pullbackLookback) <= tol
+
+bullEngulf = close > open and open <= close[1] and open[1] > close[1] and close >= open[1]
+bearEngulf = close < open and open >= close[1] and open[1] < close[1] and close <= open[1]
+lowerWickPct = (low < open ? (open - low) : (close - low)) / (high - low + 1e-10)
+upperWickPct = (high > open ? (high - open) : (high - close)) / (high - low + 1e-10)
+longLowerWick = lowerWickPct > 0.4
+longUpperWick = upperWickPct > 0.4
+candleOKLong  = requireCandle ? (bullEngulf or longLowerWick) : true
+candleOKShort = requireCandle ? (bearEngulf or longUpperWick)  : true
+
+macd      = ta.ema(close, macdFast) - ta.ema(close, macdSlow)
+macdSigLn = ta.ema(macd, macdSig)
+hist      = macd - macdSigLn
+macdOKLong  = requireMACD ? (hist > hist[1]) : true
+macdOKShort = requireMACD ? (hist < hist[1]) : true
+
+closeAboveShort = ta.crossover(close, emaShort) or close > emaShort
+closeBelowShort = ta.crossunder(close, emaShort) or close < emaShort
+
+longAllowed  = not useHTFFilter or upTrendHTF
+shortAllowed = not useHTFFilter or downTrendHTF
+longSetup  = longAllowed  and touchedShortEMA and candleOKLong  and macdOKLong  and closeAboveShort
+shortSetup = shortAllowed and touchedShortEMA and candleOKShort and macdOKShort and closeBelowShort
+
+// ---------- Stop (pivot) & Targets ----------
+lbL = input.int(2, "Pivot Left bars", minval=1)
+lbR = input.int(2, "Pivot Right bars", minval=1)
+pivotLow  = ta.pivotlow(low,  lbL, lbR)
+pivotHigh = ta.pivothigh(high, lbL, lbR)
+
+var float longSL  = na
+var float shortSL = na
+longSL  := not na(pivotLow)  ? pivotLow  : longSL
+shortSL := not na(pivotHigh) ? pivotHigh : shortSL
+
+longStop  = longSL
+shortStop = shortSL
+longTP  = useRRTarget and not na(longStop)  ? close + (close - longStop) * rrMultiple  : na
+shortTP = useRRTarget and not na(shortStop) ? close - (shortStop - close) * rrMultiple : na
+
+// ---------- Position sizing helper (percent of equity) ----------
+tradeQty() =>
+    // NOTE: For FX, TV backtests treat qty as units; this ignores broker-specific contract sizes/leverage.
+    posValue = strategy.equity * (riskQtyPct * 0.01)
+    posValue / close
+
+// ---------- Orders ----------
+if (longSetup and not na(longStop) and close > longStop)
+    strategy.entry("Long", strategy.long, qty=tradeQty())
+    strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=useRRTarget ? longTP : na)
+
+if (shortSetup and not na(shortStop) and close < shortStop)
+    strategy.entry("Short", strategy.short, qty=tradeQty())
+    strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=useRRTarget ? shortTP : na)
+
+// ---------- Visuals ----------
+plot(emaShort, "EMA Short", color=color.new(color.teal, 0))
+plot(emaLong,  "EMA Long",  color=color.new(color.orange, 0))
+plotchar(longSetup,  "Long Setup",  "▲", location.belowbar, color=color.new(color.teal, 0), size=size.tiny)
+plotchar(shortSetup, "Short Setup", "▼", location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+plot(strategy.position_size > 0 and useRRTarget ? longTP  : na, "Long TP",  color=color.new(color.teal, 60), style=plot.style_circles)
+plot(strategy.position_size < 0 and useRRTarget ? shortTP : na, "Short TP", color=color.new(color.orange, 60), style=plot.style_circles)    

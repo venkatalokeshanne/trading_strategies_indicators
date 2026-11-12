@@ -1,0 +1,280 @@
+//@version=5
+strategy("SuperTrend + EMA Strategy [BTC-USD]", overlay=true, format=format.price, precision=2, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// ═════════════════════════════════════════════════════════════════
+// GROUP 1 — SUPERTREND SETTINGS
+// ═════════════════════════════════════════════════════════════════
+Periods     = input.int(10,    title="ATR Period",                                group="SuperTrend Settings")
+Multiplier  = input.float(3.0, title="ATR Multiplier",        step=0.1,           group="SuperTrend Settings")
+changeATR   = input.bool(true, title="Use ATR (vs SMA of TR)?",                   group="SuperTrend Settings")
+stTimeframe = input.timeframe("", title="SuperTrend Timeframe (blank = chart TF)", group="SuperTrend Settings")
+
+// ═════════════════════════════════════════════════════════════════
+// GROUP 2 — EMA SETTINGS
+// ═════════════════════════════════════════════════════════════════
+ema50Period  = input.int(50,  title="EMA Fast Period", group="EMA Settings")
+ema200Period = input.int(200, title="EMA Slow Period", group="EMA Settings")
+
+// ═════════════════════════════════════════════════════════════════
+// GROUP 3 — CHOP FILTER SETTINGS
+// All three filters must pass for a new entry to be allowed.
+// Exits are never filtered — positions always close on ST flip.
+// ═════════════════════════════════════════════════════════════════
+useADX      = input.bool(true,  title="Enable ADX Filter",                         group="Chop Filters")
+adxPeriod   = input.int(14,     title="ADX Period",          minval=1,             group="Chop Filters")
+adxMinLevel = input.int(20,     title="ADX Minimum Level",   minval=1,             group="Chop Filters")
+
+useEMASep   = input.bool(true,  title="Enable EMA Separation Filter",              group="Chop Filters")
+emaSepMin   = input.float(0.5,  title="Min EMA Separation %", step=0.1, minval=0.0, group="Chop Filters")
+
+useCHOP     = input.bool(true,  title="Enable Choppiness Index Filter",            group="Chop Filters")
+chopPeriod  = input.int(14,     title="Choppiness Period",   minval=2,             group="Chop Filters")
+chopMax     = input.float(61.8, title="Max CHOP Level (above = choppy)", step=0.1, group="Chop Filters")
+
+// ═════════════════════════════════════════════════════════════════
+// GROUP 4 — DISPLAY SETTINGS
+// ═════════════════════════════════════════════════════════════════
+showsignals  = input.bool(true, title="Show Buy/Sell Signal Labels",       group="Display")
+highlighting = input.bool(true, title="SuperTrend Background Highlight",   group="Display")
+showChopBG   = input.bool(true, title="Highlight Choppy Zones (grey)",     group="Display")
+
+// ═════════════════════════════════════════════════════════════════
+// SUPERTREND FUNCTION
+// Returns previous confirmed bar values via internal [1] shift.
+// Combined with lookahead_on = repaint-safe MTF pattern.
+// ═════════════════════════════════════════════════════════════════
+f_supertrend_confirmed(factor, atrPeriod, useATR) =>
+    _src  = hl2
+    _atr  = useATR ? ta.atr(atrPeriod) : ta.sma(ta.tr, atrPeriod)
+
+    _up   = _src - factor * _atr
+    _up1  = nz(_up[1], _up)
+    _up  := close[1] > _up1 ? math.max(_up, _up1) : _up
+
+    _dn   = _src + factor * _atr
+    _dn1  = nz(_dn[1], _dn)
+    _dn  := close[1] < _dn1 ? math.min(_dn, _dn1) : _dn
+
+    _trend = 1
+    _trend := nz(_trend[1], _trend)
+    _trend := _trend == -1 and close > _dn1 ? 1 : _trend == 1 and close < _up1 ? -1 : _trend
+
+    [_up[1], _dn[1], _trend[1]]
+
+// ═════════════════════════════════════════════════════════════════
+// FETCH CONFIRMED HTF SUPERTREND
+// ═════════════════════════════════════════════════════════════════
+useMTF     = stTimeframe != ""
+resolvedTF = useMTF ? stTimeframe : timeframe.period
+
+[up_htf, dn_htf, trend_htf] = request.security(
+     syminfo.tickerid,
+     resolvedTF,
+     f_supertrend_confirmed(Multiplier, Periods, changeATR),
+     lookahead = barmerge.lookahead_on)
+
+// ═════════════════════════════════════════════════════════════════
+// EMA CALCULATION (chart timeframe — no MTF risk)
+// ═════════════════════════════════════════════════════════════════
+ema50  = ta.ema(close, ema50Period)
+ema200 = ta.ema(close, ema200Period)
+
+// ═════════════════════════════════════════════════════════════════
+// CHOP FILTER CALCULATIONS
+// ═════════════════════════════════════════════════════════════════
+adxSmoothing = adxPeriod
+[diPlus, diMinus, adxValue] = ta.dmi(adxPeriod, adxSmoothing)
+adxPass = not useADX or (adxValue >= adxMinLevel)
+
+emaSepPct  = math.abs(ema50 - ema200) / ema200 * 100
+emaSepPass = not useEMASep or (emaSepPct >= emaSepMin)
+
+chopATR   = ta.atr(1)
+chopHH    = ta.highest(high,  chopPeriod)
+chopLL    = ta.lowest(low,    chopPeriod)
+chopRange = chopHH - chopLL
+chopIndex = chopRange > 0
+             ? 100.0 * math.log10(math.sum(chopATR, chopPeriod) / chopRange) / math.log10(chopPeriod)
+             : 50.0
+chopPass  = not useCHOP or (chopIndex <= chopMax)
+
+marketIsTrending = adxPass and emaSepPass and chopPass
+
+// ═════════════════════════════════════════════════════════════════
+// SIGNAL LOGIC
+// ═════════════════════════════════════════════════════════════════
+stBullish  = trend_htf == 1
+stBearish  = trend_htf == -1
+stFlipBuy  = trend_htf == 1  and trend_htf[1] == -1
+stFlipSell = trend_htf == -1 and trend_htf[1] == 1
+
+emaBullish   = ema50 > ema200
+emaBearish   = ema50 < ema200
+emaCrossBull = ta.crossover(ema50,  ema200)
+emaCrossBear = ta.crossunder(ema50, ema200)
+
+freshBuy  = ((stFlipBuy  and emaBullish) or (emaCrossBull and stBullish)) and marketIsTrending
+freshSell = ((stFlipSell and emaBearish) or (emaCrossBear and stBearish)) and marketIsTrending
+
+exitLong  = stFlipSell
+exitShort = stFlipBuy
+
+// ═════════════════════════════════════════════════════════════════
+// STRATEGY EXECUTION
+//
+// strategy.entry() and strategy.close() automatically fire
+// TradingView order alerts. These are what Delta Exchange
+// listens to via the webhook — NOT alert() calls.
+//
+// The JSON message Delta Exchange expects must be pasted into
+// the TradingView alert MESSAGE BOX (see setup instructions
+// in the comment block at the bottom of this script).
+//
+// TradingView resolves the placeholder variables at runtime:
+//   {{ticker}}                   → e.g. BTCUSD
+//   {{strategy.order.action}}    → "buy" or "sell"
+//   {{strategy.order.contracts}} → quantity filled
+//   {{timenow}}                  → current timestamp
+// ═════════════════════════════════════════════════════════════════
+
+// Exits first — always execute regardless of chop filter
+if exitLong
+    strategy.close("Long",  comment="BUY Exit")
+
+if exitShort
+    strategy.close("Short", comment="SELL Exit")
+
+// Fresh entries — only when market is trending
+if freshBuy
+    strategy.entry("Long",  strategy.long,  comment="BUY: ST↑ + EMA50>EMA200")
+
+if freshSell
+    strategy.entry("Short", strategy.short, comment="SELL: ST↓ + EMA50<EMA200")
+
+// ═════════════════════════════════════════════════════════════════
+// PLOTS — SuperTrend Lines
+// ═════════════════════════════════════════════════════════════════
+upPlot = plot(stBullish ? up_htf : na, title="Up Trend",   style=plot.style_linebr, linewidth=2, color=color.green)
+dnPlot = plot(stBearish ? dn_htf : na, title="Down Trend", style=plot.style_linebr, linewidth=2, color=color.red)
+
+// ═════════════════════════════════════════════════════════════════
+// PLOTS — EMA Lines
+// ═════════════════════════════════════════════════════════════════
+plot(ema50,  title="EMA 50",  color=color.new(color.orange, 0), linewidth=2)
+plot(ema200, title="EMA 200", color=color.new(color.blue,   0), linewidth=2)
+
+// ═════════════════════════════════════════════════════════════════
+// SHAPES — SuperTrend flip markers (small dots)
+// ═════════════════════════════════════════════════════════════════
+plotshape(stFlipBuy  ? up_htf : na, title="ST Flip Bull", location=location.absolute, style=shape.circle, size=size.tiny, color=color.new(color.green, 0))
+plotshape(stFlipSell ? dn_htf : na, title="ST Flip Bear", location=location.absolute, style=shape.circle, size=size.tiny, color=color.new(color.red,   0))
+
+// ═════════════════════════════════════════════════════════════════
+// SHAPES — Entry labels (only when chop filter passes)
+// ═════════════════════════════════════════════════════════════════
+plotshape(freshBuy  and showsignals ? up_htf : na, title="Fresh BUY",  text="BUY",  location=location.absolute, style=shape.labelup,   size=size.small, color=color.new(color.green, 0), textcolor=color.white)
+plotshape(freshSell and showsignals ? dn_htf : na, title="Fresh SELL", text="SELL", location=location.absolute, style=shape.labeldown, size=size.small, color=color.new(color.red,   0), textcolor=color.white)
+
+// ═════════════════════════════════════════════════════════════════
+// BACKGROUND — Choppy zone (grey) and trend highlight
+// ═════════════════════════════════════════════════════════════════
+bgcolor(showChopBG and not marketIsTrending ? color.new(color.gray, 85) : na, title="Choppy Zone")
+
+mPlot = plot(ohlc4, title="", style=plot.style_circles, linewidth=1, color=color.new(color.white, 100))
+
+longFillColor  = highlighting and marketIsTrending ? (stBullish ? color.new(color.green, 90) : color.new(color.white, 100)) : color.new(color.white, 100)
+shortFillColor = highlighting and marketIsTrending ? (stBearish ? color.new(color.red,   90) : color.new(color.white, 100)) : color.new(color.white, 100)
+
+fill(mPlot, upPlot, title="UpTrend Highlight",   color=longFillColor)
+fill(mPlot, dnPlot, title="DownTrend Highlight", color=shortFillColor)
+
+// ═════════════════════════════════════════════════════════════════
+// TIMEFRAME LABEL — shows live ADX and CHOP values on chart
+// ═════════════════════════════════════════════════════════════════
+var label tfLabel = na
+label.delete(tfLabel)
+tfDisplay = useMTF ? stTimeframe : timeframe.period
+tfLabel  := label.new(bar_index, high,
+     "ST TF: " + tfDisplay + " | ADX: " + str.tostring(math.round(adxValue, 1)) + " | CHOP: " + str.tostring(math.round(chopIndex, 1)),
+     xloc      = xloc.bar_index,
+     yloc      = yloc.abovebar,
+     style     = label.style_label_lower_right,
+     color     = marketIsTrending ? color.new(color.teal, 60) : color.new(color.gray, 60),
+     textcolor = color.white,
+     size      = size.small)
+
+// ═════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────
+//  DELTA EXCHANGE WEBHOOK SETUP — READ CAREFULLY
+// ─────────────────────────────────────────────────────────────────
+//
+// PREVIOUS ERRORS EXPLAINED:
+//   400 Bad Request → "qty" was sent as a string "1" instead of
+//                     a number 1. Delta requires qty without quotes.
+//   404 Not Found   → strategy_id was placed in the JSON body.
+//                     It belongs in the Webhook URL only (Delta
+//                     appends it to the URL they generate for you).
+//                     Putting it in the body sends it to the wrong
+//                     endpoint, hence 404 resource not found.
+//   Decimal qty     → default_qty_type=strategy.percent_of_equity
+//                     produces decimals (e.g. 0.023 BTC). Delta
+//                     requires whole integer contract counts only.
+//                     Fixed to default_qty_type=strategy.fixed.
+//
+// ── STEP 1: On Delta Exchange ────────────────────────────────────
+//   • Go to: Algo Trading → Trading Bot → Create Webhook
+//   • Name it, select your account, confirm with 2FA + email OTP
+//   • Delta will show you a WEBHOOK URL — copy it in full.
+//     It looks like: https://api.india.delta.exchange/v2/.../<your_id>
+//     Your strategy_id is already embedded IN this URL by Delta.
+//     You do NOT add it to the JSON message.
+//
+// ── STEP 2: Set order quantity in TradingView ────────────────────
+//   • In TradingView, click the strategy Settings (gear icon)
+//   • Go to Properties tab
+//   • Set "Order Size" to the number of whole contracts you want
+//     per trade (e.g. 1, 10, 100). No decimals — Delta rejects them.
+//   • This value is what {{strategy.order.contracts}} will resolve to.
+//
+// ── STEP 3: Create ONE alert in TradingView ──────────────────────
+//   • Click the Alert (clock) button → Create Alert
+//   • Condition : this strategy → "Order fills" → "Any order event"
+//   • Expiry    : set to "Open-ended" so it never expires
+//   • Message   : paste EXACTLY this — nothing else, no extra spaces:
+//
+//   {"symbol":"{{ticker}}","side":"{{strategy.order.action}}","qty":{{strategy.order.contracts}},"trigger_time":"{{timenow}}"}
+//
+//   KEY: qty has NO quotes around {{strategy.order.contracts}}
+//        This makes it a JSON number, not a string — required by Delta
+//
+// ── STEP 4: Add the Webhook URL ──────────────────────────────────
+//   • In the alert dialog, go to Notifications tab
+//   • Enable "Webhook URL"
+//   • Paste the full Webhook URL you copied from Delta Exchange
+//   • Click Create
+//
+// ── HOW IT WORKS AT RUNTIME ──────────────────────────────────────
+//   Each time strategy.entry() or strategy.close() fires in Pine,
+//   TradingView resolves the placeholders and POSTs to Delta:
+//
+//   {{ticker}}                   → e.g. BTCUSD
+//   {{strategy.order.action}}    → "buy" or "sell" (auto, correct)
+//   {{strategy.order.contracts}} → whole integer e.g. 1
+//   {{timenow}}                  → UTC timestamp
+//
+//   Resulting JSON sent to Delta:
+//   {"symbol":"BTCUSD","side":"buy","qty":1,"trigger_time":"..."}
+//
+// ── SIDE IS AUTOMATIC — NO MANUAL MAPPING NEEDED ─────────────────
+//   Open Long   → "buy"    Close Long  → "sell"
+//   Open Short  → "sell"   Close Short → "buy"
+//   TradingView handles this correctly via strategy.order.action.
+//
+// ── IMPORTANT: Initial Position Requirement ──────────────────────
+//   Delta Exchange's webhook system works by reversing positions.
+//   Before running live, manually open a position on Delta with
+//   the same quantity you set in TradingView strategy properties.
+//   Without this, the first signal may create a duplicate position
+//   instead of a clean entry. This is a Delta Exchange requirement,
+//   not a Pine Script issue.
+// ═════════════════════════════════════════════════════════════════

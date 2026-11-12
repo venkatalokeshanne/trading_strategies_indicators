@@ -1,0 +1,830 @@
+//@version=6
+indicator("CantLewz SCALP WAR MACHINE - MQS 1M-15M", overlay=true, max_labels_count=150, dynamic_requests=true)
+
+//==================================================
+// DISPLAY
+//==================================================
+showPanel  = input.bool(true, "Show MQS Panel", group="DISPLAY")
+showLabels = input.bool(true, "Show Entry Labels", group="DISPLAY")
+
+//==================================================
+// SCALP TARGETS
+//==================================================
+minTargetPts   = input.float(5.0, "Minimum Target Room", minval=1.0, step=0.25, group="SCALP TARGETS")
+idealTargetPts = input.float(15.0, "Ideal Target Room", minval=1.0, step=0.25, group="SCALP TARGETS")
+maxTargetPts   = input.float(25.0, "Maximum Planned Target", minval=1.0, step=0.25, group="SCALP TARGETS")
+
+liqLookbackConfirm = input.int(20, "Confirmation TF Liquidity Lookback", minval=5, group="SCALP TARGETS")
+liqLookbackContext = input.int(12, "Context TF Liquidity Lookback", minval=3, group="SCALP TARGETS")
+
+//==================================================
+// QUALITY ENGINE
+//==================================================
+atrLen          = input.int(14, "Execution ATR Length", minval=5, group="QUALITY ENGINE")
+dcATRMult       = input.float(0.70, "DC Body ATR Requirement", minval=0.10, step=0.05, group="QUALITY ENGINE")
+dcBodyMinimum   = input.float(0.60, "DC Minimum Body Percent", minval=0.30, maxval=1.00, step=0.05, group="QUALITY ENGINE")
+closeExtremePct = input.float(0.22, "Close Near Extreme Percent", minval=0.05, maxval=0.50, step=0.01, group="QUALITY ENGINE")
+
+obcMaxBodyPct    = input.float(0.45, "OBC Maximum Body Percent", minval=0.10, maxval=0.80, step=0.05, group="QUALITY ENGINE")
+cbcMaxBodyPct    = input.float(0.45, "CBC1 Maximum Body Percent", minval=0.10, maxval=0.80, step=0.05, group="QUALITY ENGINE")
+baseMaxBodyPct   = input.float(0.40, "Base Maximum Body Percent", minval=0.10, maxval=0.80, step=0.05, group="QUALITY ENGINE")
+baseToleranceATR = input.float(0.15, "Base Violation Tolerance ATR", minval=0.00, step=0.05, group="QUALITY ENGINE")
+
+escapeLookback   = input.int(3, "DC Escape Lookback", minval=1, maxval=10, group="QUALITY ENGINE")
+baseHoldBars     = input.int(3, "Base Hold Bars", minval=1, maxval=10, group="QUALITY ENGINE")
+pullbackLookback = input.int(10, "Pullback Measurement Bars", minval=4, maxval=30, group="QUALITY ENGINE")
+
+//==================================================
+// EXECUTION FILTERS
+//==================================================
+watchScore     = input.float(60.0, "Watch Score", minval=40.0, maxval=90.0, step=1.0, group="EXECUTION")
+executeScore   = input.float(75.0, "Execute Score", minval=50.0, maxval=100.0, step=1.0, group="EXECUTION")
+minimumEdge    = input.float(18.0, "Minimum Bull Bear Score Edge", minval=5.0, maxval=50.0, step=1.0, group="EXECUTION")
+requireTrinity = input.bool(true, "Require Confirmed Trinity", group="EXECUTION")
+
+useSessionFilter = input.bool(true, "Use Session Filter", group="EXECUTION")
+tradeSession     = input.session("0930-1600", "Trading Session", group="EXECUTION")
+sessionTimezone  = input.string("America/New_York", "Session Timezone", group="EXECUTION")
+
+//==================================================
+// HELPER FUNCTIONS
+//==================================================
+f_bodyPct(_open, _high, _low, _close) =>
+    _range = _high - _low
+    _range > 0 ? math.abs(_close - _open) / _range : 0.0
+
+f_nearHigh(_high, _low, _close, _maximumPct) =>
+    _range = _high - _low
+    _range > 0 and (_high - _close) / _range <= _maximumPct
+
+f_nearLow(_high, _low, _close, _maximumPct) =>
+    _range = _high - _low
+    _range > 0 and (_close - _low) / _range <= _maximumPct
+
+f_positiveMinimum(_distance1, _distance2) =>
+    _distance1Positive = _distance1 > 0
+    _distance2Positive = _distance2 > 0
+
+    _distance1Positive and _distance2Positive ? math.min(_distance1, _distance2) :
+     _distance1Positive ? _distance1 :
+     _distance2Positive ? _distance2 : 0.0
+
+f_pullbackPoints(_retracement) =>
+    _retracement <= 0.25 ? 10.0 :
+     _retracement <= 0.40 ? 7.0 :
+     _retracement <= 0.60 ? 3.0 : 0.0
+
+f_grade(_score) =>
+    _score >= 85 ? "A+" :
+     _score >= 75 ? "A" :
+     _score >= 65 ? "B" :
+     _score >= 55 ? "C" : "NO TRADE"
+
+//==================================================
+// ADAPTIVE TIMEFRAME ENGINE
+//==================================================
+chartSeconds = timeframe.in_seconds(timeframe.period)
+chartMinutes = chartSeconds / 60.0
+
+validChart =
+     timeframe.isminutes and
+     chartMinutes >= 1 and
+     chartMinutes <= 15
+
+confirmTF =
+     chartMinutes <= 3 ? "5" :
+     chartMinutes <= 5 ? "15" :
+     "30"
+
+contextTF =
+     chartMinutes <= 3 ? "15" :
+     chartMinutes <= 5 ? "30" :
+     "60"
+
+chartTFText =
+     timeframe.isminutes ? timeframe.period + "M" :
+     timeframe.period
+
+confirmTFText = confirmTF + "M"
+contextTFText = contextTF + "M"
+
+inSession =
+     not useSessionFilter or
+     not na(time(timeframe.period, tradeSession, sessionTimezone))
+
+//==================================================
+// EXECUTION TIMEFRAME CONSTRUCTION
+// Uses whichever chart timeframe is selected
+//==================================================
+atrExec   = ta.atr(atrLen)
+rangeExec = high - low
+bodyExec  = math.abs(close - open)
+
+bodyPctExec  = f_bodyPct(open, high, low, close)
+nearHighExec = f_nearHigh(high, low, close, closeExtremePct)
+nearLowExec  = f_nearLow(high, low, close, closeExtremePct)
+
+bullExecBody =
+     close > open and
+     bodyPctExec >= 0.50
+
+bearExecBody =
+     close < open and
+     bodyPctExec >= 0.50
+
+bullExecSequence =
+     close > close[1] and
+     low >= low[1]
+
+bearExecSequence =
+     close < close[1] and
+     high <= high[1]
+
+//==================================================
+// CLOSED CONFIRMATION TIMEFRAME
+//==================================================
+[openConfirm, highConfirm, lowConfirm, closeConfirm, openConfirmPrev, highConfirmPrev, lowConfirmPrev, closeConfirmPrev, atrConfirm] = request.security(
+     syminfo.tickerid,
+     confirmTF,
+     [open[1], high[1], low[1], close[1], open[2], high[2], low[2], close[2], ta.atr(atrLen)[1]],
+     lookahead=barmerge.lookahead_on
+)
+
+bodyPctConfirm =
+     f_bodyPct(
+         openConfirm,
+         highConfirm,
+         lowConfirm,
+         closeConfirm
+     )
+
+nearHighConfirm =
+     f_nearHigh(
+         highConfirm,
+         lowConfirm,
+         closeConfirm,
+         closeExtremePct
+     )
+
+nearLowConfirm =
+     f_nearLow(
+         highConfirm,
+         lowConfirm,
+         closeConfirm,
+         closeExtremePct
+     )
+
+bullConfirmBody =
+     closeConfirm > openConfirm and
+     bodyPctConfirm >= 0.50
+
+bearConfirmBody =
+     closeConfirm < openConfirm and
+     bodyPctConfirm >= 0.50
+
+bullConfirmDirection =
+     bullConfirmBody and
+     closeConfirm > closeConfirmPrev
+
+bearConfirmDirection =
+     bearConfirmBody and
+     closeConfirm < closeConfirmPrev
+
+//==================================================
+// CLOSED CONTEXT TIMEFRAME
+//==================================================
+[openContext, highContext, lowContext, closeContext, openContextPrev, highContextPrev, lowContextPrev, closeContextPrev] = request.security(
+     syminfo.tickerid,
+     contextTF,
+     [open[1], high[1], low[1], close[1], open[2], high[2], low[2], close[2]],
+     lookahead=barmerge.lookahead_on
+)
+
+bullContextVotes =
+     (closeContext > openContext ? 1 : 0) +
+     (closeContext > closeContextPrev ? 1 : 0) +
+     (lowContext >= lowContextPrev ? 1 : 0)
+
+bearContextVotes =
+     (closeContext < openContext ? 1 : 0) +
+     (closeContext < closeContextPrev ? 1 : 0) +
+     (highContext <= highContextPrev ? 1 : 0)
+
+contextBullP =
+     bullContextVotes >= 2 and
+     bullContextVotes > bearContextVotes
+
+contextBearP =
+     bearContextVotes >= 2 and
+     bearContextVotes > bullContextVotes
+
+contextStructureA =
+     not contextBullP and
+     not contextBearP
+
+//==================================================
+// ADAPTIVE LOCAL LIQUIDITY
+//==================================================
+[liquidityHighConfirm, liquidityLowConfirm] = request.security(
+     syminfo.tickerid,
+     confirmTF,
+     [ta.highest(high[1], liqLookbackConfirm), ta.lowest(low[1], liqLookbackConfirm)],
+     lookahead=barmerge.lookahead_on
+)
+
+[liquidityHighContext, liquidityLowContext] = request.security(
+     syminfo.tickerid,
+     contextTF,
+     [ta.highest(high[1], liqLookbackContext), ta.lowest(low[1], liqLookbackContext)],
+     lookahead=barmerge.lookahead_on
+)
+
+upsideRoom =
+     f_positiveMinimum(
+         liquidityHighConfirm - close,
+         liquidityHighContext - close
+     )
+
+downsideRoom =
+     f_positiveMinimum(
+         close - liquidityLowConfirm,
+         close - liquidityLowContext
+     )
+
+plannedBullTarget =
+     upsideRoom >= minTargetPts ?
+     math.min(upsideRoom, maxTargetPts) :
+     0.0
+
+plannedBearTarget =
+     downsideRoom >= minTargetPts ?
+     math.min(downsideRoom, maxTargetPts) :
+     0.0
+
+//==================================================
+// TRINITY ENGINE
+// Runs on the selected chart timeframe
+//==================================================
+bullOBC =
+     close[1] < open[1] or
+     bodyPctExec[1] <= obcMaxBodyPct
+
+bearOBC =
+     close[1] > open[1] or
+     bodyPctExec[1] <= obcMaxBodyPct
+
+bullDCQuality =
+     close > open and
+     bodyExec >= atrExec * dcATRMult and
+     bodyPctExec >= dcBodyMinimum and
+     nearHighExec
+
+bearDCQuality =
+     close < open and
+     bodyExec >= atrExec * dcATRMult and
+     bodyPctExec >= dcBodyMinimum and
+     nearLowExec
+
+bullDCSequence =
+     bullOBC and
+     bullDCQuality
+
+bearDCSequence =
+     bearOBC and
+     bearDCQuality
+
+bullDCEscape =
+     bullDCSequence and
+     close > ta.highest(high[1], escapeLookback)
+
+bearDCEscape =
+     bearDCSequence and
+     close < ta.lowest(low[1], escapeLookback)
+
+barsFromBullDC = ta.barssince(bullDCSequence)
+barsFromBearDC = ta.barssince(bearDCSequence)
+
+barsFromBullEscape = ta.barssince(bullDCEscape)
+barsFromBearEscape = ta.barssince(bearDCEscape)
+
+bullDCActive =
+     not na(barsFromBullDC) and
+     barsFromBullDC <= 5
+
+bearDCActive =
+     not na(barsFromBearDC) and
+     barsFromBearDC <= 5
+
+bullEscapeActive =
+     not na(barsFromBullEscape) and
+     barsFromBullEscape <= 5
+
+bearEscapeActive =
+     not na(barsFromBearEscape) and
+     barsFromBearEscape <= 5
+
+bullDCOrigin =
+     ta.valuewhen(
+         bullDCSequence,
+         open,
+         0
+     )
+
+bearDCOrigin =
+     ta.valuewhen(
+         bearDCSequence,
+         open,
+         0
+     )
+
+bullCBC1 =
+     bullDCActive and
+     barsFromBullDC >= 1 and
+     barsFromBullDC <= 3 and
+     (close < open or bodyPctExec <= cbcMaxBodyPct) and
+     low >= bullDCOrigin - atrExec * baseToleranceATR
+
+bearCBC1 =
+     bearDCActive and
+     barsFromBearDC >= 1 and
+     barsFromBearDC <= 3 and
+     (close > open or bodyPctExec <= cbcMaxBodyPct) and
+     high <= bearDCOrigin + atrExec * baseToleranceATR
+
+barsFromBullCBC1 = ta.barssince(bullCBC1)
+barsFromBearCBC1 = ta.barssince(bearCBC1)
+
+bullCBC1High =
+     ta.valuewhen(
+         bullCBC1,
+         high,
+         0
+     )
+
+bearCBC1Low =
+     ta.valuewhen(
+         bearCBC1,
+         low,
+         0
+     )
+
+bullCBCActive =
+     not na(barsFromBullCBC1) and
+     barsFromBullCBC1 <= 2
+
+bearCBCActive =
+     not na(barsFromBearCBC1) and
+     barsFromBearCBC1 <= 2
+
+bullTrinityConfirmed =
+     bullCBCActive and
+     barsFromBullCBC1 >= 1 and
+     close > bullCBC1High and
+     close > open
+
+bearTrinityConfirmed =
+     bearCBCActive and
+     barsFromBearCBC1 >= 1 and
+     close < bearCBC1Low and
+     close < open
+
+//==================================================
+// BASE CONSTRUCTION
+//==================================================
+bullBaseCandle =
+     close <= open or
+     bodyPctExec <= baseMaxBodyPct
+
+bearBaseCandle =
+     close >= open or
+     bodyPctExec <= baseMaxBodyPct
+
+lastBullBaseLow =
+     ta.valuewhen(
+         bullBaseCandle,
+         low,
+         0
+     )
+
+priorBullBaseLow =
+     ta.valuewhen(
+         bullBaseCandle,
+         low,
+         1
+     )
+
+lastBearBaseHigh =
+     ta.valuewhen(
+         bearBaseCandle,
+         high,
+         0
+     )
+
+priorBearBaseHigh =
+     ta.valuewhen(
+         bearBaseCandle,
+         high,
+         1
+     )
+
+bullBaseProgressing =
+     not na(lastBullBaseLow) and
+     not na(priorBullBaseLow) and
+     lastBullBaseLow > priorBullBaseLow
+
+bearBaseProgressing =
+     not na(lastBearBaseHigh) and
+     not na(priorBearBaseHigh) and
+     lastBearBaseHigh < priorBearBaseHigh
+
+bullBaseHolding =
+     not na(lastBullBaseLow) and
+     ta.lowest(low, baseHoldBars) >=
+     lastBullBaseLow - atrExec * baseToleranceATR
+
+bearBaseHolding =
+     not na(lastBearBaseHigh) and
+     ta.highest(high, baseHoldBars) <=
+     lastBearBaseHigh + atrExec * baseToleranceATR
+
+bullBaseLaunch =
+     not na(lastBullBaseLow) and
+     close > ta.highest(high[1], 2) and
+     close > lastBullBaseLow
+
+bearBaseLaunch =
+     not na(lastBearBaseHigh) and
+     close < ta.lowest(low[1], 2) and
+     close < lastBearBaseHigh
+
+//==================================================
+// PULLBACK EFFICIENCY
+//==================================================
+recentHigh = ta.highest(high, pullbackLookback)
+recentLow  = ta.lowest(low, pullbackLookback)
+
+recentSpan =
+     math.max(
+         recentHigh - recentLow,
+         syminfo.mintick
+     )
+
+bullRetracement =
+     math.max(
+         0.0,
+         math.min(
+             1.0,
+             (recentHigh - close) / recentSpan
+         )
+     )
+
+bearRetracement =
+     math.max(
+         0.0,
+         math.min(
+             1.0,
+             (close - recentLow) / recentSpan
+         )
+     )
+
+overlapAmount =
+     math.max(
+         0.0,
+         math.min(high, high[1]) -
+         math.max(low, low[1])
+     )
+
+overlapDenominator =
+     math.max(
+         math.min(rangeExec, rangeExec[1]),
+         syminfo.mintick
+     )
+
+overlapPct =
+     overlapAmount / overlapDenominator
+
+overlapPoints =
+     overlapPct <= 0.35 ? 5.0 :
+     overlapPct <= 0.60 ? 3.0 :
+     0.0
+
+//==================================================
+// CONTROL SCORE - 25
+//==================================================
+float bullControlScore = 0.0
+float bearControlScore = 0.0
+
+bullControlScore += bullExecBody ? 5.0 : 0.0
+bullControlScore += nearHighExec and close > open ? 4.0 : 0.0
+bullControlScore += bullExecSequence ? 4.0 : 0.0
+bullControlScore += bullConfirmBody ? 7.0 : 0.0
+bullControlScore += nearHighConfirm and closeConfirm > openConfirm ? 5.0 : 0.0
+
+bearControlScore += bearExecBody ? 5.0 : 0.0
+bearControlScore += nearLowExec and close < open ? 4.0 : 0.0
+bearControlScore += bearExecSequence ? 4.0 : 0.0
+bearControlScore += bearConfirmBody ? 7.0 : 0.0
+bearControlScore += nearLowConfirm and closeConfirm < openConfirm ? 5.0 : 0.0
+
+//==================================================
+// TRINITY SCORE - 25
+//==================================================
+float bullTrinityScore = 0.0
+float bearTrinityScore = 0.0
+
+bullTrinityScore += bullDCActive ? 4.0 : 0.0
+bullTrinityScore += bullDCActive ? 8.0 : 0.0
+bullTrinityScore += bullEscapeActive ? 4.0 : 0.0
+bullTrinityScore += bullCBCActive ? 5.0 : 0.0
+bullTrinityScore += bullTrinityConfirmed ? 4.0 : 0.0
+
+bearTrinityScore += bearDCActive ? 4.0 : 0.0
+bearTrinityScore += bearDCActive ? 8.0 : 0.0
+bearTrinityScore += bearEscapeActive ? 4.0 : 0.0
+bearTrinityScore += bearCBCActive ? 5.0 : 0.0
+bearTrinityScore += bearTrinityConfirmed ? 4.0 : 0.0
+
+//==================================================
+// BASE SCORE - 20
+//==================================================
+float bullBaseScore = 0.0
+float bearBaseScore = 0.0
+
+bullBaseScore += bullBaseProgressing ? 5.0 : 0.0
+bullBaseScore += bullBaseHolding ? 5.0 : 0.0
+bullBaseScore += lowConfirm >= lowConfirmPrev ? 5.0 : 0.0
+bullBaseScore += bullBaseLaunch ? 5.0 : 0.0
+
+bearBaseScore += bearBaseProgressing ? 5.0 : 0.0
+bearBaseScore += bearBaseHolding ? 5.0 : 0.0
+bearBaseScore += highConfirm <= highConfirmPrev ? 5.0 : 0.0
+bearBaseScore += bearBaseLaunch ? 5.0 : 0.0
+
+//==================================================
+// PULLBACK SCORE - 15
+//==================================================
+bullPullbackScore =
+     f_pullbackPoints(bullRetracement) +
+     overlapPoints
+
+bearPullbackScore =
+     f_pullbackPoints(bearRetracement) +
+     overlapPoints
+
+//==================================================
+// ALIGNMENT SCORE - 15
+//==================================================
+float bullAlignmentScore = 0.0
+float bearAlignmentScore = 0.0
+
+bullAlignmentScore +=
+     bullExecSequence and bullConfirmDirection ?
+     4.0 :
+     0.0
+
+bearAlignmentScore +=
+     bearExecSequence and bearConfirmDirection ?
+     4.0 :
+     0.0
+
+bullAlignmentScore +=
+     bullConfirmDirection and contextBullP ? 6.0 :
+     bullConfirmDirection and contextStructureA ? 3.0 :
+     0.0
+
+bearAlignmentScore +=
+     bearConfirmDirection and contextBearP ? 6.0 :
+     bearConfirmDirection and contextStructureA ? 3.0 :
+     0.0
+
+bullAlignmentScore +=
+     upsideRoom >= idealTargetPts ? 5.0 :
+     upsideRoom >= minTargetPts ? 3.0 :
+     0.0
+
+bearAlignmentScore +=
+     downsideRoom >= idealTargetPts ? 5.0 :
+     downsideRoom >= minTargetPts ? 3.0 :
+     0.0
+
+//==================================================
+// TOTAL MQS
+//==================================================
+bullScore =
+     bullControlScore +
+     bullTrinityScore +
+     bullBaseScore +
+     bullPullbackScore +
+     bullAlignmentScore
+
+bearScore =
+     bearControlScore +
+     bearTrinityScore +
+     bearBaseScore +
+     bearPullbackScore +
+     bearAlignmentScore
+
+bullEdge = bullScore - bearScore
+bearEdge = bearScore - bullScore
+
+bullGrade = f_grade(bullScore)
+bearGrade = f_grade(bearScore)
+
+//==================================================
+// STATE ENGINE
+//==================================================
+stateText =
+     contextBullP ? "P BULL" :
+     contextBearP ? "P BEAR" :
+     bullScore >= watchScore and bullEdge >= minimumEdge ? "A TO P BULL" :
+     bearScore >= watchScore and bearEdge >= minimumEdge ? "A TO P BEAR" :
+     "STRUCTURE A"
+
+confirmationText =
+     bullConfirmDirection ? "BULL CONFIRM" :
+     bearConfirmDirection ? "BEAR CONFIRM" :
+     "ROTATIONAL"
+
+//==================================================
+// EXECUTION ENGINE
+//==================================================
+bullTrinityReady =
+     not requireTrinity or
+     bullTrinityConfirmed
+
+bearTrinityReady =
+     not requireTrinity or
+     bearTrinityConfirmed
+
+bullSetup =
+     validChart and
+     inSession and
+     barstate.isconfirmed and
+     bullScore >= executeScore and
+     bullEdge >= minimumEdge and
+     upsideRoom >= minTargetPts and
+     bullConfirmDirection and
+     not contextBearP and
+     bullTrinityReady
+
+bearSetup =
+     validChart and
+     inSession and
+     barstate.isconfirmed and
+     bearScore >= executeScore and
+     bearEdge >= minimumEdge and
+     downsideRoom >= minTargetPts and
+     bearConfirmDirection and
+     not contextBullP and
+     bearTrinityReady
+
+bullTrigger =
+     bullSetup and
+     not bullSetup[1]
+
+bearTrigger =
+     bearSetup and
+     not bearSetup[1]
+
+actionText =
+     not validChart ? "USE 1M TO 15M" :
+     not inSession ? "SESSION CLOSED" :
+     bullSetup ? "LONG ELIGIBLE" :
+     bearSetup ? "SHORT ELIGIBLE" :
+     bullScore >= watchScore and bullEdge >= minimumEdge ? "WATCH LONG" :
+     bearScore >= watchScore and bearEdge >= minimumEdge ? "WATCH SHORT" :
+     "WAIT"
+
+//==================================================
+// ENTRY LABELS
+//==================================================
+if showLabels and bullTrigger
+    label.new(
+         bar_index,
+         low,
+         "LONG ELIGIBLE" +
+         "\nChart: " + chartTFText +
+         " | Confirm: " + confirmTFText +
+         " | Context: " + contextTFText +
+         "\nMQS: " + str.tostring(bullScore, "#") +
+         "/100 - " + bullGrade +
+         "\nState: " + stateText +
+         "\nRoom: " + str.tostring(upsideRoom, "#.##") + " pts" +
+         "\nTarget: " + str.tostring(plannedBullTarget, "#.##") + " pts",
+         style=label.style_label_up,
+         color=color.green,
+         textcolor=color.white,
+         size=size.small
+    )
+
+if showLabels and bearTrigger
+    label.new(
+         bar_index,
+         high,
+         "SHORT ELIGIBLE" +
+         "\nChart: " + chartTFText +
+         " | Confirm: " + confirmTFText +
+         " | Context: " + contextTFText +
+         "\nMQS: " + str.tostring(bearScore, "#") +
+         "/100 - " + bearGrade +
+         "\nState: " + stateText +
+         "\nRoom: " + str.tostring(downsideRoom, "#.##") + " pts" +
+         "\nTarget: " + str.tostring(plannedBearTarget, "#.##") + " pts",
+         style=label.style_label_down,
+         color=color.red,
+         textcolor=color.white,
+         size=size.small
+    )
+
+//==================================================
+// MQS PANEL
+//==================================================
+var table panel =
+     table.new(
+         position.bottom_right,
+         3,
+         12,
+         border_width=1,
+         frame_color=color.white,
+         frame_width=1
+     )
+
+if barstate.islast and showPanel
+    bullTotalColor =
+         bullScore >= executeScore ? color.green :
+         bullScore >= watchScore ? color.orange :
+         color.gray
+
+    bearTotalColor =
+         bearScore >= executeScore ? color.red :
+         bearScore >= watchScore ? color.orange :
+         color.gray
+
+    actionColor =
+         bullSetup ? color.green :
+         bearSetup ? color.red :
+         actionText == "WATCH LONG" or actionText == "WATCH SHORT" ? color.orange :
+         color.gray
+
+    table.cell(panel, 0, 0, "CL MQS", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 0, "BULL", bgcolor=color.green, text_color=color.white)
+    table.cell(panel, 2, 0, "BEAR", bgcolor=color.red, text_color=color.white)
+
+    table.cell(panel, 0, 1, "TF Stack", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 1, chartTFText + " / " + confirmTFText, bgcolor=color.blue, text_color=color.white)
+    table.cell(panel, 2, 1, contextTFText, bgcolor=color.blue, text_color=color.white)
+
+    table.cell(panel, 0, 2, "Control", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 2, str.tostring(bullControlScore, "#") + "/25", bgcolor=color.new(color.green, 65), text_color=color.white)
+    table.cell(panel, 2, 2, str.tostring(bearControlScore, "#") + "/25", bgcolor=color.new(color.red, 65), text_color=color.white)
+
+    table.cell(panel, 0, 3, "Trinity", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 3, str.tostring(bullTrinityScore, "#") + "/25", bgcolor=color.new(color.green, 65), text_color=color.white)
+    table.cell(panel, 2, 3, str.tostring(bearTrinityScore, "#") + "/25", bgcolor=color.new(color.red, 65), text_color=color.white)
+
+    table.cell(panel, 0, 4, "Base", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 4, str.tostring(bullBaseScore, "#") + "/20", bgcolor=color.new(color.green, 65), text_color=color.white)
+    table.cell(panel, 2, 4, str.tostring(bearBaseScore, "#") + "/20", bgcolor=color.new(color.red, 65), text_color=color.white)
+
+    table.cell(panel, 0, 5, "Pullback", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 5, str.tostring(bullPullbackScore, "#") + "/15", bgcolor=color.new(color.green, 65), text_color=color.white)
+    table.cell(panel, 2, 5, str.tostring(bearPullbackScore, "#") + "/15", bgcolor=color.new(color.red, 65), text_color=color.white)
+
+    table.cell(panel, 0, 6, "Alignment", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 6, str.tostring(bullAlignmentScore, "#") + "/15", bgcolor=color.new(color.green, 65), text_color=color.white)
+    table.cell(panel, 2, 6, str.tostring(bearAlignmentScore, "#") + "/15", bgcolor=color.new(color.red, 65), text_color=color.white)
+
+    table.cell(panel, 0, 7, "TOTAL", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 7, str.tostring(bullScore, "#") + " " + bullGrade, bgcolor=bullTotalColor, text_color=color.white)
+    table.cell(panel, 2, 7, str.tostring(bearScore, "#") + " " + bearGrade, bgcolor=bearTotalColor, text_color=color.white)
+
+    table.cell(panel, 0, 8, "Room", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 8, str.tostring(upsideRoom, "#.##") + " pts", bgcolor=upsideRoom >= minTargetPts ? color.green : color.gray, text_color=color.white)
+    table.cell(panel, 2, 8, str.tostring(downsideRoom, "#.##") + " pts", bgcolor=downsideRoom >= minTargetPts ? color.red : color.gray, text_color=color.white)
+
+    table.cell(panel, 0, 9, "State", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 9, stateText, bgcolor=color.blue, text_color=color.white)
+    table.cell(panel, 2, 9, confirmationText, bgcolor=color.blue, text_color=color.white)
+
+    table.cell(panel, 0, 10, "Action", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 10, actionText, bgcolor=actionColor, text_color=color.white)
+    table.cell(panel, 2, 10, "Edge " + str.tostring(math.abs(bullScore - bearScore), "#"), bgcolor=actionColor, text_color=color.white)
+
+    table.cell(panel, 0, 11, "Status", bgcolor=color.black, text_color=color.white)
+    table.cell(panel, 1, 11, validChart ? "TF VALID" : "INVALID TF", bgcolor=validChart ? color.green : color.red, text_color=color.white)
+    table.cell(panel, 2, 11, inSession ? "SESSION ON" : "SESSION OFF", bgcolor=inSession ? color.green : color.gray, text_color=color.white)
+
+//==================================================
+// ALERTS
+//==================================================
+alertcondition(
+     bullTrigger,
+     "CL MQS LONG ELIGIBLE",
+     "CL MQS LONG ELIGIBLE | Trinity confirmed | Higher timeframe confirmation | Target room available"
+)
+
+alertcondition(
+     bearTrigger,
+     "CL MQS SHORT ELIGIBLE",
+     "CL MQS SHORT ELIGIBLE | Trinity confirmed | Higher timeframe confirmation | Target room available"
+)

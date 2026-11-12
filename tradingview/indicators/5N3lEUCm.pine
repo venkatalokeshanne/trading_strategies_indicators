@@ -1,0 +1,376 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © recturkfx 2026 — "DeltaLens · Order Flow Zones"
+
+//@version=6
+indicator("DeltaLens · Order Flow Zones", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+gData = "Data Source"
+iFootprint = input.bool(true, "Use native footprint (Premium+)", group=gData)
+iLTF       = input.timeframe("1", "Sub-bar resolution", group=gData)
+
+gEng = "Divergence Engine"
+iSmooth = input.int(14, "Smoothing length", minval=2, group=gEng)
+iLook   = input.int(50, "Reference lookback", minval=10, group=gEng)
+iSpikeK = input.float(2.0, "Spike threshold (σ)", step=0.1, minval=0.5, group=gEng)
+iDots   = input.bool(true, "Mark spike bars", group=gEng)
+
+gZone = "POC Zones (FVG style)"
+iZones  = input.bool(true, "Draw POC zones", group=gZone)
+iZoneW  = input.float(0.10, "Zone half-height (% of cluster range)", minval=0.02, maxval=0.5, step=0.01, group=gZone)
+iZoneT  = input.int(78, "Zone fill transparency", minval=0, maxval=95, group=gZone)
+iExtend = input.bool(true, "Extend until traded through", group=gZone)
+
+gProf = "Intra-bar Profiles"
+iProf  = input.bool(false, "Draw profiles on spike bars", group=gProf)
+iBins  = input.int(20, "Price bins", minval=5, maxval=50, group=gProf)
+iProfM = input.string("Delta", "Profile basis", options=["Delta", "Volume"], group=gProf)
+
+gBig = "Large Aggression Bubbles"
+iBig   = input.bool(true, "Show big trades", group=gBig)
+iBigP  = input.float(10, "Top % to qualify", minval=1, maxval=50, group=gBig)
+iBigV  = input.float(80, "Min volume vs avg %", minval=10, maxval=200, group=gBig)
+iBigB  = input.int(10, "Scan bins", minval=5, maxval=30, group=gBig)
+iBigT  = input.int(50, "Bubble transparency", minval=0, maxval=90, group=gBig)
+
+gTape = "Tape Readings"
+iDelta = input.bool(false, "Bar delta labels", group=gTape)
+iEff   = input.bool(false, "Effort / efficiency labels", group=gTape)
+iEffMin = input.int(50, "Min effort to print", minval=0, maxval=99, group=gTape)
+
+gSig = "Event Signals"
+iSig    = input.bool(true, "Climax / absorption labels", group=gSig)
+iClimE  = input.int(95, "Climax: min effort", group=gSig)
+iClimF  = input.int(70, "Climax: min efficiency", group=gSig)
+iAbsE   = input.int(85, "Absorption: min effort", group=gSig)
+iAbsF   = input.int(25, "Absorption: max efficiency", group=gSig)
+iAbsR   = input.float(0.75, "Absorption: min range (×ATR)", group=gSig)
+iSigSz  = input.string("small", "Label size", options=["tiny", "small", "normal"], group=gSig)
+
+gCol = "Palette"
+cBuy  = input.color(#089981, "Buy pressure", group=gCol)
+cSell = input.color(#F23645, "Sell pressure", group=gCol)
+cClim = input.color(#E91E63, "Climax", group=gCol)
+cAbs  = input.color(#FF9800, "Absorption", group=gCol)
+
+// ── DELTA & CVD ──
+bool  fpOk  = false
+float dlt   = na
+float totV  = na
+float pocHi = na
+float pocLo = na
+
+if iFootprint
+    int tpr = syminfo.mintick < 0.005 ? 500 : syminfo.mintick < 0.05 ? 300 : syminfo.mintick < 0.5 ? 200 : 100
+    footprint fp = request.footprint(tpr, 60)
+    if not na(fp)
+        fpOk := true
+        dlt  := fp.delta()
+        totV := fp.total_volume()
+        volume_row rw = fp.poc()
+        if not na(rw)
+            pocHi := rw.up_price()
+            pocLo := rw.down_price()
+
+float delta = fpOk ? nz(dlt) : (close >= open ? volume : -volume)
+float flow  = fpOk ? nz(totV, volume) : volume
+
+var float cvd = 0.0
+cvd += delta
+
+// ── DIVERGENCE ENGINE ──
+f_z(float src, int len) =>
+    float sd = ta.stdev(src, len)
+    sd > 0 ? (src - ta.sma(src, len)) / sd : 0.0
+
+float zPrice    = f_z(ta.ema(close, iSmooth), iSmooth)
+float zPressure = f_z(ta.ema(cvd, iSmooth), iSmooth)
+float relVol    = nz(flow / ta.sma(flow, iLook), 1)
+float pressSig  = (zPressure - zPrice) * relVol
+
+float sigMu = ta.sma(pressSig, iLook)
+float sigSd = ta.stdev(pressSig, iLook)
+bool spikeUp  = pressSig - sigMu >  iSpikeK * sigSd
+bool spikeDn  = sigMu - pressSig >  iSpikeK * sigSd
+bool anySpike = spikeUp or spikeDn
+
+plotshape(iDots and spikeUp,  title="Buy-side spike",  location=location.abovebar, style=shape.circle, size=size.tiny, color=cBuy)
+plotshape(iDots and spikeDn,  title="Sell-side spike", location=location.belowbar, style=shape.circle, size=size.tiny, color=cSell)
+// ── EFFORT & EFFICIENCY ──
+float eRaw  = math.abs(delta) * nz(flow / ta.sma(flow, 50), 1)
+int  effort = int(math.round(nz(ta.percentrank(eRaw, 500))))
+int  effic  = 0
+float rPct  = nz(ta.percentrank(math.abs(close - close[1]), 500))
+float ePct  = nz(ta.percentrank(eRaw, 500))
+if ePct > 0
+    bool aligned = (delta >= 0 and close >= close[1]) or (delta < 0 and close < close[1])
+    effic := int(math.max(math.min(math.round(rPct / ePct * 100) * (aligned ? 1 : -1), 999), -999))
+
+// ── SUB-BAR ARRAYS ──
+aH = request.security_lower_tf(syminfo.tickerid, iLTF, high)
+aL = request.security_lower_tf(syminfo.tickerid, iLTF, low)
+aV = request.security_lower_tf(syminfo.tickerid, iLTF, volume)
+aO = request.security_lower_tf(syminfo.tickerid, iLTF, open)
+aC = request.security_lower_tf(syminfo.tickerid, iLTF, close)
+
+// ── ZONE LIFECYCLE ──
+var array<box>   liveZ  = array.new_box()
+var array<float> liveP  = array.new_float()
+
+if iZones and iExtend and array.size(liveZ) > 0
+    int k = array.size(liveZ) - 1
+    while k >= 0
+        float lvl = array.get(liveP, k)
+        if low <= lvl and high >= lvl
+            box.set_right(array.get(liveZ, k), bar_index)
+            array.remove(liveZ, k)
+            array.remove(liveP, k)
+        k -= 1
+
+// ── CLUSTER BUILDER ──
+var array<float> cH  = array.new_float()
+var array<float> cL  = array.new_float()
+var array<float> cV  = array.new_float()
+var array<float> cO  = array.new_float()
+var array<float> cC  = array.new_float()
+var array<float> cFP = array.new_float()
+var array<float> cFD = array.new_float()
+var float cHi   = na
+var float cLo   = na
+var int   cX0   = na
+var int   cX1   = na
+var int   cBull = 0
+var int   cBear = 0
+var bool  cOpen = false
+var bool  cIsBull = true
+
+emitCluster(int bins, bool drawProf, string profMode, bool drawZone, bool extend, int zoneT, float zoneW, color upC, color dnC) =>
+    float rng = cHi - cLo
+    if rng > 0 and array.size(cH) > 0
+        float bs = rng / bins
+        array<float> vB = array.new_float(bins, 0.0)
+        array<float> dB = array.new_float(bins, 0.0)
+        int n = array.size(cH)
+        for i = 0 to n - 1
+            float sh = array.get(cH, i)
+            float sl = array.get(cL, i)
+            float sv = array.get(cV, i)
+            float so = array.get(cO, i)
+            float sc = array.get(cC, i)
+            if sv > 0
+                float sd = sc >= so ? sv : -sv
+                int b0 = math.max(0, math.min(bins - 1, int((sl - cLo) / bs)))
+                int b1 = math.max(0, math.min(bins - 1, int((sh - cLo) / bs)))
+                float mid = (sh + sl) / 2
+                if b1 - b0 <= 1
+                    int bi = math.max(0, math.min(bins - 1, int((math.max(cLo, math.min(cHi - syminfo.mintick, mid)) - cLo) / bs)))
+                    array.set(vB, bi, array.get(vB, bi) + sv)
+                    array.set(dB, bi, array.get(dB, bi) + sd)
+                else
+                    float sr = sh - sl
+                    for b = b0 to b1
+                        float ov = math.max(0.0, math.min(sh, cLo + (b + 1) * bs) - math.max(sl, cLo + b * bs))
+                        float fr = sr > 0 ? ov / sr : 0.0
+                        array.set(vB, b, array.get(vB, b) + sv * fr)
+                        array.set(dB, b, array.get(dB, b) + sd * fr)
+        float mxV = 0.0
+        float mxD = 0.0
+        int biV = 0
+        int biD = 0
+        for i = 0 to bins - 1
+            float v = array.get(vB, i)
+            float d = math.abs(array.get(dB, i))
+            if v > mxV
+                mxV := v
+                biV := i
+            if d > mxD
+                mxD := d
+                biD := i
+        bool bullCluster = cBull >= cBear
+        if drawProf
+            for i = 0 to bins - 1
+                float g = bs * 0.08
+                float y1 = cLo + i * bs + g
+                float y0 = cLo + (i + 1) * bs - g
+                if profMode == "Delta"
+                    float bd = array.get(dB, i)
+                    if bd != 0
+                        int tr = int(math.round(85 - (math.abs(bd) / mxD) * 70))
+                        box.new(cX0, y0, cX1 + 1, y1, border_color=na, bgcolor=bd > 0 ? color.new(upC, tr) : color.new(dnC, tr))
+                else
+                    float bv = array.get(vB, i)
+                    if bv > 0
+                        int tr = int(math.round(85 - (bv / mxV) * 70))
+                        box.new(cX0, y0, cX1 + 1, y1, border_color=na, bgcolor=color.new(bullCluster ? upC : dnC, tr))
+        float poc = na
+        color pc = bullCluster ? upC : dnC
+        if array.size(cFP) > 0
+            float sw = 0.0
+            float sp = 0.0
+            float nd = 0.0
+            for i = 0 to array.size(cFP) - 1
+                float w = math.abs(array.get(cFD, i))
+                sp += array.get(cFP, i) * w
+                sw += w
+                nd += array.get(cFD, i)
+            poc := sw > 0 ? sp / sw : (cHi + cLo) / 2
+            if profMode == "Delta"
+                pc := nd >= 0 ? upC : dnC
+        else
+            int bi = profMode == "Delta" and mxD > 0 ? biD : biV
+            poc := cLo + (bi + 0.5) * bs
+            if profMode == "Delta" and mxD > 0
+                pc := array.get(dB, bi) >= 0 ? upC : dnC
+        if drawZone and not na(poc)
+            float hw = math.max(5 * syminfo.mintick, rng * zoneW)
+            int xEnd = extend ? last_bar_index : cX1 + 1
+            box zb = box.new(cX0, poc + hw, xEnd, poc - hw, border_color=color.new(pc, 30), bgcolor=color.new(pc, zoneT), border_width=1)
+            if extend
+                array.push(liveZ, zb)
+                array.push(liveP, poc)
+
+if iZones or iProf
+    if anySpike
+        bool thisBull = spikeUp
+        if cOpen and (thisBull != cIsBull)
+            emitCluster(iBins, iProf, iProfM, iZones, iExtend, iZoneT, iZoneW, cBuy, cSell)
+            array.clear(cH)
+            array.clear(cL)
+            array.clear(cV)
+            array.clear(cO)
+            array.clear(cC)
+            array.clear(cFP)
+            array.clear(cFD)
+            cHi := na
+            cLo := na
+            cX0 := na
+            cX1 := na
+            cBull := 0
+            cBear := 0
+            cOpen := false
+        int m = array.size(aH)
+        if m > 0
+            for i = 0 to m - 1
+                array.push(cH, math.min(array.get(aH, i), high))
+                array.push(cL, math.max(array.get(aL, i), low))
+                array.push(cV, array.get(aV, i))
+                array.push(cO, array.get(aO, i))
+                array.push(cC, array.get(aC, i))
+        if fpOk and not na(pocHi) and not na(pocLo) and not na(dlt)
+            array.push(cFP, (pocHi + pocLo) / 2)
+            array.push(cFD, dlt)
+        cHi := na(cHi) ? high : math.max(cHi, high)
+        cLo := na(cLo) ? low  : math.min(cLo, low)
+        if na(cX0)
+            cX0 := bar_index
+            cIsBull := thisBull
+        cX1 := bar_index
+        if spikeUp
+            cBull += 1
+        else
+            cBear += 1
+        cOpen := true
+    else if cOpen
+        if bar_index - nz(cX1, 0) > 1
+            emitCluster(iBins, iProf, iProfM, iZones, iExtend, iZoneT, iZoneW, cBuy, cSell)
+            array.clear(cH)
+            array.clear(cL)
+            array.clear(cV)
+            array.clear(cO)
+            array.clear(cC)
+            array.clear(cFP)
+            array.clear(cFD)
+            cHi := na
+            cLo := na
+            cX0 := na
+            cX1 := na
+            cBull := 0
+            cBear := 0
+            cOpen := false
+    if cOpen and barstate.islast
+        emitCluster(iBins, iProf, iProfM, iZones, iExtend, iZoneT, iZoneW, cBuy, cSell)
+        array.clear(cH)
+        array.clear(cL)
+        array.clear(cV)
+        array.clear(cO)
+        array.clear(cC)
+        array.clear(cFP)
+        array.clear(cFD)
+        cHi := na
+        cLo := na
+        cX0 := na
+        cX1 := na
+        cBull := 0
+        cBear := 0
+        cOpen := false
+
+// ── BIG TRADES ──
+scanMaxDelta(float hh, float ll, int bins) =>
+    float px = (hh + ll) / 2
+    float val = 0.0
+    bool buy = true
+    if hh > ll and array.size(aH) > 0
+        float bs = (hh - ll) / bins
+        array<float> db = array.new_float(bins, 0.0)
+        for i = 0 to array.size(aH) - 1
+            float sh = math.min(array.get(aH, i), hh)
+            float sl = math.max(array.get(aL, i), ll)
+            float sv = array.get(aV, i)
+            if sv > 0
+                float sd = array.get(aC, i) >= array.get(aO, i) ? sv : -sv
+                int bi = math.max(0, math.min(bins - 1, int((((sh + sl) / 2) - ll) / bs)))
+                array.set(db, bi, array.get(db, bi) + sd)
+        float mx = 0.0
+        for i = 0 to bins - 1
+            if math.abs(array.get(db, i)) > mx
+                mx := math.abs(array.get(db, i))
+                val := array.get(db, i)
+                px := ll + (i + 0.5) * bs
+        buy := val >= 0
+    [px, val, buy]
+
+bool volGate = flow >= ta.sma(flow, 500) * iBigV / 100
+float bPx = na
+float bVal = 0.0
+bool bBuy = true
+if volGate and array.size(aH) > 0
+    [p, v, bb] = scanMaxDelta(high, low, iBigB)
+    bPx := p
+    bVal := math.abs(v)
+    bBuy := bb
+
+float bThr = ta.percentile_linear_interpolation(nz(bVal, 0), 500, 100 - iBigP)
+
+f_kfmt2(float v) =>
+    float a = math.abs(v)
+    string s = a >= 1e9 ? str.tostring(math.round(a / 1e9, 1)) + "B" : a >= 1e6 ? str.tostring(math.round(a / 1e6, 1)) + "M" : a >= 1e3 ? str.tostring(math.round(a / 1e3, 1)) + "K" : str.tostring(math.round(a))
+    (v >= 0 ? "+" : "-") + s
+
+if iBig and barstate.isconfirmed and not na(bPx) and bThr > 0 and bVal >= bThr
+    float ratio = math.min(bVal / bThr, 5)
+    string sz = ratio >= 4 ? size.huge : ratio >= 2.5 ? size.large : ratio >= 1.5 ? size.normal : ratio >= 1.2 ? size.small : size.tiny
+    label.new(bar_index, bPx, "", style=label.style_circle, color=color.new(bBuy ? cBuy : cSell, iBigT), size=sz)
+
+// ── TAPE LABELS ──
+float atr14 = ta.atr(14)
+
+if iDelta and barstate.isconfirmed and delta != 0
+    label.new(bar_index, high + atr14 * 0.3, f_kfmt2(delta), style=label.style_none, textcolor=delta > 0 ? cBuy : cSell, size=size.tiny)
+
+if iEff and barstate.isconfirmed and math.abs(effort) >= iEffMin
+    label.new(bar_index, low - atr14 * 0.5, str.tostring(math.abs(effort)) + "\n" + str.tostring(effic) + "%", style=label.style_none, textcolor=effort > 0 ? cBuy : cSell, size=size.small)
+
+// ── EVENT SIGNALS ──
+bool isClim = effort >= iClimE and anySpike and effic > iClimF
+bool isAbs  = not isClim and effort >= iAbsE and effic <= iAbsF and (high - low) >= iAbsR * atr14
+
+if iSig and barstate.isconfirmed and (isClim or isAbs)
+    bool bullSide = delta > 0
+    string txt = (isClim ? "CLIMAX" : "ABSORB") + (bullSide ? " ▲" : " ▼")
+    string sz = iSigSz == "tiny" ? size.tiny : iSigSz == "normal" ? size.normal : size.small
+    label.new(bar_index, low - atr14, txt, style=label.style_label_up, color=isClim ? cClim : cAbs, textcolor=color.white, size=sz)
+
+// ── SANITY ──
+var float volSum = 0.0
+volSum += nz(volume)
+if barstate.islast and volSum == 0
+    runtime.error("No volume data for this symbol.")

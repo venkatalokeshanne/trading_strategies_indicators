@@ -1,0 +1,193 @@
+// This Pine Script(tm) v6 indicator is subject to the Terms of Use:
+// https://www.tradingview.com/pine-script-reference/v6/
+// Vol Premium Gauge v2.0
+// Shows the implied-vs-realized volatility spread — the premium sellers collect.
+//
+// v2.0: TIER-1 ONLY IV RESOLUTION. The realized-vol ("est") fallback is removed
+//       and this gauge now reports a premium ONLY where implied volatility is
+//       directly observable. Previously every non-crypto symbol was scored
+//       against CBOE:VIX, i.e. the implied vol of the S&P 500 rather than of the
+//       instrument on the chart. With VIX near the low end of its range and a
+//       typical single name's realized vol well above it, the spread landed
+//       deeply negative on most stocks most of the time, so the gauge read
+//       "cheap" across nearly the whole equity universe.
+//
+//       Note this script deliberately does NOT take the derived (tier 2) path
+//       that Expected Move Bands uses. Deriving IV as referenceIV * (RV_symbol /
+//       RV_reference) gives an honest MAGNITUDE, which is all a band needs, but
+//       the premium it implies collapses to RV_symbol * (referenceIV/RV_reference
+//       - 1) — the reference index's premium rescaled. It could never say this
+//       instrument is rich while the index is cheap, because that information
+//       exists only in per-symbol implied vol, which Pine cannot fetch. A
+//       cross-sectional premium that cannot vary cross-sectionally is not a
+//       premium, so where no vol index exists this reports realized vol only.
+
+//@version=6
+indicator("Vol Premium Gauge", overlay = false, format = format.price, precision = 1)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grp_rv   = "Realized Volatility"
+rvFastLen = input.int(10,  "Fast RV Window",   minval = 3,  maxval = 50,  group = grp_rv)
+rvLen     = input.int(20,  "Standard RV Window",minval = 5,  maxval = 100, group = grp_rv)
+rvSlowLen = input.int(60,  "Slow RV Window",   minval = 20, maxval = 200, group = grp_rv)
+annFactor = input.float(365, "Annualization (365 crypto, 252 equities)", minval = 1, group = grp_rv)
+
+grp_iv   = "Implied volatility source"
+ivMode   = input.string("Auto", "IV source", options = ["Auto", "Custom"], group = grp_iv)
+customIV = input.string("CBOE:VIX", "Custom IV symbol (Custom mode only)", group = grp_iv, tooltip = "Only point this at a volatility index for the instrument on the chart. Pointing it at an unrelated index is the defect this version exists to remove.")
+ivSmooth = input.int(1, "IV Smoothing (EMA)", minval = 1, maxval = 10, group = grp_iv)
+
+grp_rank = "IV Rank / Percentile"
+rankLen  = input.int(252, "Lookback (bars)", minval = 50, maxval = 504, group = grp_rank)
+
+grp_prem = "Premium Zones"
+richThresh = input.float(8.0,  "Premium Rich (IV-RV >)", minval = 0, group = grp_prem)
+cheapThresh= input.float(-3.0, "Premium Cheap (IV-RV <)", minval = -30, maxval = 0, group = grp_prem)
+
+grp_disp = "Display"
+showTable  = input.bool(true,  "Show dashboard table",   group = grp_disp)
+showHisto  = input.bool(true,  "Show premium histogram",  group = grp_disp)
+showFill   = input.bool(true,  "Fill IV vs RV area",      group = grp_disp)
+
+// ── Detect asset class ──────────────────────────────────────────────────────
+isCrypto = (str.contains(str.lower(syminfo.type), "crypto") or (str.contains(str.lower(syminfo.currency), "usd") and (str.contains(str.lower(syminfo.basecurrency), "btc") or str.contains(str.lower(syminfo.basecurrency), "eth") or str.contains(str.lower(syminfo.basecurrency), "sol"))))
+
+annDays  = isCrypto ? 365.0 : 252.0
+actAnn   = annFactor != 365 ? annFactor : annDays
+
+// ── Realized Volatility (close-to-close) ────────────────────────────────────
+logRet    = math.log(close / close[1])
+rvFast    = ta.stdev(logRet, rvFastLen)  * math.sqrt(actAnn) * 100
+rvStd     = ta.stdev(logRet, rvLen)      * math.sqrt(actAnn) * 100
+rvSlow    = ta.stdev(logRet, rvSlowLen)  * math.sqrt(actAnn) * 100
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  IV RESOLUTION — tier 1 only. Map shared with Expected Move Bands; if you add
+//  a ticker there, add it here too.
+//
+//  TIER 1  REAL   this symbol has its own published volatility index. Used as-is.
+//  TIER 3  NONE   it does not. No premium is reported. Realized vol still plots.
+//
+//  WHY NO REALIZED-VOL FALLBACK: a Parkinson or close-to-close estimate is
+//  backward-looking and diverges from traded IV exactly in the regimes this tool
+//  gets opened for. Into a known event IV rises while RV is asleep; after a shock
+//  RV stays elevated while IV mean-reverts. The old code also hardcoded a 1.15
+//  variance-risk-premium multiplier, which is not a constant. Subtracting RV from
+//  an RV-derived estimate measures the multiplier, not a premium.
+//
+//  ⚠ ignore_invalid_symbol = true means a wrong or delisted vol ticker returns na
+//  SILENTLY. That is what hid the original defect: CBOE:VIX always resolves, so
+//  ivIsEst never fired and the symbol-aware path was unreachable on exactly the
+//  assets that needed it. Check for na, never substitute. Verify any ticker added.
+// ═══════════════════════════════════════════════════════════════════════════
+
+_sym = str.upper(syminfo.ticker)
+
+// Inlined as a ternary chain (not a function) so the result stays a simple
+// string, which is what request.security requires for its symbol argument.
+_volIdx = str.contains(_sym, "BTC") or str.contains(_sym, "XBT")                          ? "DERIBIT:DVOL" :
+   _sym == "SPX" or _sym == "SPY" or _sym == "US500" or _sym == "SPXUSD" or str.contains(_sym, "ES1!") ? "CBOE:VIX"  :
+   _sym == "NDX" or _sym == "QQQ" or _sym == "US100" or str.contains(_sym, "NQ1!")        ? "CBOE:VXN"  :
+   _sym == "RUT" or _sym == "IWM" or _sym == "US2000" or str.contains(_sym, "RTY1!")      ? "CBOE:RVX"  :
+   _sym == "DJI" or _sym == "DIA" or _sym == "US30" or str.contains(_sym, "YM1!")         ? "CBOE:VXD"  :
+   _sym == "XAUUSD" or _sym == "GOLD" or _sym == "GLD" or str.contains(_sym, "GC1!")      ? "CBOE:GVZ"  :
+   _sym == "USOIL" or _sym == "WTIUSD" or _sym == "USO" or _sym == "WTICOUSD" or str.contains(_sym, "CL1!") ? "CBOE:OVX" :
+   _sym == "EURUSD" or _sym == "FXE" or str.contains(_sym, "6E1!")                        ? "CBOE:EVZ"  : ""
+
+ivSymRaw = ivMode == "Custom" ? customIV : _volIdx
+ivSym    = ivSymRaw == "" ? "NO_VOL_INDEX_FOR_THIS_SYMBOL" : ivSymRaw   // sentinel resolves to na
+ivRaw    = request.security(ivSym, "D", close, ignore_invalid_symbol = true)
+ivSmooth_= ta.ema(ivRaw, ivSmooth)
+ivFinal  = (ivSymRaw == "" or na(ivRaw)) ? na : ivSmooth_
+hasIV    = not na(ivFinal)
+ivTier   = hasIV ? "REAL" : "NONE"
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Premium Spread (only where IV is observed) ──────────────────────────────
+premium   = hasIV ? ivFinal - rvStd : na
+
+// ── IV Rank & Percentile ────────────────────────────────────────────────────
+ivHigh    = ta.highest(ivFinal, rankLen)
+ivLow     = ta.lowest(ivFinal, rankLen)
+ivRange   = ivHigh - ivLow
+ivRank    = ivRange > 0 ? (ivFinal - ivLow) / ivRange * 100 : na
+ivPctile  = ta.percentrank(ivFinal, rankLen)
+
+// ── RV Rank (for context — available on every symbol) ───────────────────────
+rvPctile  = ta.percentrank(rvStd, rankLen)
+
+// ── Premium Zone Classification ─────────────────────────────────────────────
+isRich    = hasIV and premium >= richThresh
+isCheap   = hasIV and premium <= cheapThresh
+isNeutral = hasIV and not isRich and not isCheap
+
+zoneStr   = not hasIV ? "NO IV" : isRich ? "RICH" : isCheap ? "CHEAP" : "FAIR"
+zoneCol   = not hasIV ? color.new(color.gray, 0) : isRich ? color.new(color.green, 0) : isCheap ? color.new(color.red, 0) : color.new(color.gray, 0)
+
+// ── Sell/Buy Signal Heuristic ───────────────────────────────────────────────
+sellSignal = isRich  and not na(ivRank) and ivRank > 50
+buySignal  = isCheap and not na(ivRank) and ivRank < 30
+
+// ── Plots ───────────────────────────────────────────────────────────────────
+pIV = plot(ivFinal, "Implied Vol",  color = color.new(color.yellow, 0), linewidth = 2)
+pRV = plot(rvStd,   "Realized Vol", color = color.new(color.aqua, 0),   linewidth = 2)
+plot(rvFast,  "Fast RV",  color = color.new(color.aqua, 60), linewidth = 1, style = plot.style_line)
+plot(rvSlow,  "Slow RV",  color = color.new(color.blue, 40), linewidth = 1, style = plot.style_line)
+
+// Fill between IV and RV
+fillCol = showFill and hasIV ? (premium > 0 ? color.new(color.green, 82) : color.new(color.red, 82)) : na
+fill(pIV, pRV, color = fillCol)
+
+// Premium histogram
+histCol = not hasIV ? na : premium > richThresh ? color.new(color.green, 30) : premium < cheapThresh ? color.new(color.red, 30) : color.new(color.gray, 50)
+plot(showHisto and hasIV ? premium : na, "Premium Spread", style = plot.style_columns, color = histCol)
+
+hline(richThresh,  "Rich Line",  color = color.new(color.green, 60), linestyle = hline.style_dotted)
+hline(cheapThresh, "Cheap Line", color = color.new(color.red, 60),   linestyle = hline.style_dotted)
+hline(0,           "Zero",       color = color.new(color.gray, 70),  linestyle = hline.style_solid)
+
+// Bar coloring by premium zone
+barcolor(showFill and hasIV ? (isRich ? color.new(color.green, 0) : isCheap ? color.new(color.red, 0) : na) : na)
+
+// Sell / avoid markers
+plotshape(sellSignal and not sellSignal[1], "Sell Premium", shape.triangledown, location.top, color.green, size = size.tiny)
+plotshape(buySignal and not buySignal[1], "Thin Premium", shape.triangleup, location.bottom, color.red, size = size.tiny)
+
+// ── Dashboard Table ─────────────────────────────────────────────────────────
+if showTable and barstate.islast
+    var t = table.new(position.top_right, 2, 9, border_width = 1, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60))
+
+    table.cell(t, 0, 0, "VOL PREMIUM GAUGE", text_color = color.white, text_size = size.normal, bgcolor = zoneCol)
+    table.cell(t, 1, 0, zoneStr, text_color = color.white, text_size = size.normal, bgcolor = zoneCol)
+
+    table.cell(t, 0, 1, "IV source", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, hasIV ? ivSym : "none for this symbol", text_color = hasIV ? color.white : color.red, text_size = size.small)
+
+    table.cell(t, 0, 2, "IV", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, hasIV ? str.tostring(ivFinal, "#.#") + "%" : "-", text_color = color.yellow, text_size = size.small)
+
+    table.cell(t, 0, 3, "RV " + str.tostring(rvLen), text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(rvStd, "#.#") + "%", text_color = color.aqua, text_size = size.small)
+
+    table.cell(t, 0, 4, "Premium", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 4, hasIV ? str.tostring(premium, "+#.#;-#.#") + "pp" : "unavailable", text_color = not hasIV ? color.red : premium > 0 ? color.green : color.red, text_size = size.small)
+
+    table.cell(t, 0, 5, "IV Rank", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 5, na(ivRank) ? "-" : str.tostring(ivRank, "#.#") + "%", text_color = not na(ivRank) and ivRank > 50 ? color.green : color.white, text_size = size.small)
+
+    table.cell(t, 0, 6, "IV %ile", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 6, na(ivPctile) ? "-" : str.tostring(ivPctile, "#.#") + "%", text_color = color.white, text_size = size.small)
+
+    table.cell(t, 0, 7, "RV %ile", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 7, str.tostring(rvPctile, "#.#") + "%", text_color = color.white, text_size = size.small)
+
+    // Verdict row
+    verdict  = not hasIV ? "RV ONLY" : sellSignal ? "SELL PREMIUM" : buySignal ? "AVOID SELLING" : "NEUTRAL"
+    verdCol  = not hasIV ? color.gray : sellSignal ? color.green : buySignal ? color.red : color.gray
+    table.cell(t, 0, 8, "Signal", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 8, verdict,  text_color = verdCol, text_size = size.small)
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+alertcondition(sellSignal and not sellSignal[1], "Premium Rich", "Vol Premium Gauge: premium is RICH - favorable for selling")
+alertcondition(buySignal and not buySignal[1], "Premium Thin", "Vol Premium Gauge: premium is CHEAP - avoid selling")
+alertcondition(ta.crossover(ivRank, 80), "IV Rank > 80", "Vol Premium Gauge: IV Rank crossed above 80%")

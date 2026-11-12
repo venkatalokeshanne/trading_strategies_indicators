@@ -1,0 +1,2056 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//
+// ✦ Essence Model — Bias · 7H Profiles · Entries ✦
+//
+// Concepts: rytrades (Essence Model), AM Trades (7h daily profiles), with session-profile
+// reads popularized by Hudson Trades. The CISD engine, protected-swing qualifiers and
+// invalidation logic are adapted from the author's own open-source
+// "Universal Po3 Profiler × CIC [YUS]" (MPL-2.0). Correlated-asset pairing via
+// fstarcapital/AssetCorrelationUtils. Keep this notice when reusing.
+//@version=6
+indicator(title="Essence Model — Bias + Entries", shorttitle="✦ Essence ✦", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=250, dynamic_requests=true)
+import fstarcapital/AssetCorrelationUtils/13 as acu
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grpBias = "1 · Daily Bias"
+use210        = input.bool(true, "Validate with 210m closes", group=grpBias, tooltip="ON: only a completed 210-minute candle closing through the 25% invalidates the bias. OFF: any chart-timeframe close through it counts.")
+overnightOnly = input.bool(true, "Overnight candles only (18:00–08:00)", group=grpBias, tooltip="Only the four overnight 210m candles can invalidate the bias. After 08:00 the bias is locked in for the AM session.")
+useRev        = input.bool(true, "Reversal framework on 25% break", group=grpBias, tooltip="A close through the 25% reclassifies the day as a REVERSAL of the previous day instead of a dead setup — the working direction flips, the projections re-point to the other side of the range, and entries fire in the new direction. A later close back through the 25% un-flips it (the 50% must have held). Off = a broken 25% just stands entries down.")
+
+grpFw = "2 · 7h Frameworks & Profiles"
+showFw   = input.bool(true, "Detect 7h frameworks", group=grpFw, tooltip="Classifies each day on the 18:00 / 01:00 / 08:00 session grid (Asia · London · NY AM). F1 = Asia manipulates a valid level (previous-day extreme, daily swing, or daily FVG), London expands — decided 01:00. F2 = London manipulates the Asia extreme, NY expands — decided 08:00. F3 = London protracts all session into a valid level and closes near its extreme, NY reverses — decided 08:00, tested after F2. F4 = NY sweeps a London extreme; the sweeping candle's close decides the fork — back through = NY reversal, beyond = NY continues (F4→). P1/P1B = continuation profiles (Asia trends; London expands or coils), P4/P4B = the aligned day NY reverses. One framework per day; a disproven read is cleared and the day re-classified.")
+f3Frac   = input.float(0.25, "Protraction / reversal fraction", minval=0.05, maxval=0.5, step=0.05, group=grpFw, tooltip="One fraction of the London range, used three ways. F3: the close must sit within this band of the session extreme to read as a protraction (0.25 = the outer quarter, matching how the pattern is typically drawn), and the reached level must sit in the same band. F2: the close must sit at least this far AWAY from the swept extreme — a session that swept a level but closed on its own extreme never reversed. Loose = everything is a protraction; tight = F3 never fires.")
+dFvgMin  = input.int(4, "Daily FVG min size (ticks)", minval=0, group=grpFw, tooltip="Minimum size for a daily 3-candle fair value gap to count as a valid framework level. No fixed rule exists — tune per instrument.")
+usePW    = input.bool(true, "PWH/PWL", group=grpFw, inline="kl", tooltip="Untaken previous-week / previous-month highs and lows join the framework level pool. A level already traded through is spent liquidity and is skipped. Previous-day extremes and daily swings are always in the pool.")
+usePM    = input.bool(true, "PMH/PML", group=grpFw, inline="kl")
+p1Body   = input.float(0.5, "Trending-session body fraction", minval=0.2, maxval=0.9, step=0.05, group=grpFw, tooltip="Defines a TRENDING session for the continuation profiles: Asia's body must be at least this fraction of its range. P1 = Asia trends, London expands the same way, NY continues. P1B = Asia trends, London coils inside Asia's range, NY continues anyway. P4/P4B = the aligned day where NY reverses (with / without sweeping London's extreme). No fixed rule exists for the fraction.")
+useAdrGuard = input.bool(true, "ADR exhaustion guard", group=grpFw, tooltip="When the overnight sessions have already consumed most of the average daily range before the NY open, there is little left for NY to deliver — entries stand down and the status flags the day range-exhausted. The fill percentages show in the status readout.")
+adrPct   = input.float(0.75, "  Exhausted at (fraction of ADR)", minval=0.3, maxval=1.5, step=0.05, group=grpFw, tooltip="Fraction of the 14-day ADR consumed by 08:00 that reads as exhausted. No fixed rule exists — 0.75 = three quarters of the range already gone.")
+fw210    = input.bool(true, "Confirm frameworks on 210m closes", group=grpFw, tooltip="The 210m is the confirmation layer for the 7h. When ON, the NY-phase decisions — the F4 sweep fork and F2/F3 invalidation — resolve on COMPLETED 210-minute candles instead of chart closes, so a single lower-TF bar mid-flush cannot lock the day into the wrong branch. The 08:00 210m candle (closes 11:30) is the NY decision candle. P4B's no-sweep flip stays on chart structure. Falls back to chart closes when the chart TF cannot build 210m candles.")
+fw7hMode = input.string("Block opposing", "Entry gate", options=["Off", "Block opposing", "Require aligned"], group=grpFw, tooltip="How the day's framework gates entries. Off = informational only. Block opposing = entries stand down when a framework points against the working direction. Require aligned = entries need an aligned framework to exist at all — strict, and no-framework days never fire.")
+
+grpEnt = "3 · Entries"
+showEntry   = input.bool(true,  "Enable entries", group=grpEnt, tooltip="Entry = a protected trigger in the working direction: a CISD (close back through the open of the opposing run) or a reversal signature (RC / EC / IRC) at its candle close. A trigger only qualifies when an enabled event — SMT, FVG, LQ, C2 — fired before it, inside the leg being reversed: the event first, the trigger after. The diamond marks the protected swing — entry at the trigger close, stop at the swing.")
+useCisdEntry = input.bool(true, "CISD", group=grpEnt, inline="em")
+useSigEntry  = input.bool(true, "Signatures", group=grpEnt, inline="em", tooltip="Reversal signatures, classified on the close against the previous candle. RC = sweeps the last confirmed swing point and closes back through it. EC = takes the previous candle's low/high AND closes beyond its open. IRC = closes beyond the previous candle's 50% without qualifying as an EC. The protected point is the most recent extreme of the reversed leg.")
+useBO        = input.bool(true, "Breakout", group=grpEnt, inline="em", tooltip="The second entry model: when the 8–9 range does NOT get manipulated and price instead CLOSES through its extreme in the working direction, the breakout close is the signature — enter at the close, stop at the opposite side of the range, anticipate the 9:30 expansion. If it fails and the level is later reclaimed, the manipulation entry re-arms.")
+useStrong   = input.bool(true, "Strong-close filter", group=grpEnt, tooltip="Fib the trigger candle low→high: its close must land in the outer 25% of its own range (upper quarter for longs, lower for shorts). A weak close is not engaged — continuation entries want strong closures.")
+stopMode    = input.string("Protected swing", "Stop placement", options=["Protected swing", "Trigger candle (tight)"], group=grpEnt, tooltip="Protected swing = beyond the swing the trigger delivered off. Tight = the trigger candle's own extreme — when price penetrates 75% of the entry candle it very likely runs the full swing anyway, so the tight stop realizes the smaller loss. Entry invalidation (drawing removal) always uses the protected swing.")
+useRC  = input.bool(true, "RC ", group=grpEnt, inline="sg")
+useEC  = input.bool(true, "EC ", group=grpEnt, inline="sg")
+useIRC = input.bool(true, "IRC", group=grpEnt, inline="sg")
+sigGate = input.bool(true, "Signatures require event gate", group=grpEnt, tooltip="When on, a signature needs the same qualifying event (SMT / FVG / LQ / C2) before it that a CISD does — the signature must be the reaction OUT of something. When off, a bias-aligned signature alone is an entry (noisier, especially IRC).")
+firstOnly   = input.bool(true,  "One entry per day", group=grpEnt, tooltip="Only the first qualifying trigger of the day fires. If its protected swing gets closed through, the framework re-arms for another attempt.")
+maxEntries  = input.int(20, "Entries to keep", minval=1, maxval=50, group=grpEnt, tooltip="Past entries stay on the chart until price CLOSES through their protected swing. This caps how many are retained; the oldest drops first.")
+biasGate = input.string("Working direction", "Entry bias gate", options=["A+ only", "Working direction", "Any non-doji day"], group=grpEnt, tooltip="A+ only = entries require a 25% that has NEVER been closed through today — the strict setup, fewest trades (a reclaimed or reversal day never fires). Working direction = trade whatever the day currently is: intact A+, reclaimed A-framework, or a flipped reversal-framework day, always in the working direction. Any non-doji day = original bias direction regardless of the 25% state.")
+entMaxTf    = input.timeframe("15", "Max entry timeframe", group=grpEnt, tooltip="Entries only fire at or below this chart timeframe — signatures are a 5/15-minute tool (30m/1h earlier in the night: raise it those days). Higher-TF charts keep the bias engine running; entries just stand down.")
+evMaxBars   = input.int(40, "Event max age (chart bars)", minval=5, maxval=200, group=grpEnt, tooltip="A qualifying event older than this many chart bars can no longer qualify a trigger, even when the reversed leg reaches back further — keeps entries from leaning on stale events far behind price. 40 bars = 2h on 3m, 10h on 15m; tighten on higher timeframes.")
+entWindow   = input.bool(true, "Entry time window", group=grpEnt, inline="tw", tooltip="Only fire entries inside this window (indicator timezone). Default 09:00–10:30 — the manipulation-and-reclaim window with its hard 10:30 cutoff. Widen to 0800-1100 for the volatile-AM reading, or turn off for any-time entries.")
+entSess     = input.session("0900-1030", "", group=grpEnt, inline="tw")
+showStop    = input.bool(true,  "Stop line at protected swing", group=grpEnt, tooltip="Latest trigger only, like the R targets.")
+showRR      = input.bool(true,  "1R / 2R targets", group=grpEnt, tooltip="Drawn from the trigger candle's close against the protected swing. Only the latest trigger keeps its targets.")
+showPend    = input.bool(true,  "Pending CISD level", group=grpEnt, tooltip="Projects the level where the NEXT CISD would print — the open of the run currently in progress. Dotted, live only.")
+showPsLbl   = input.bool(true, "Entry labels", group=grpEnt, tooltip="The small 'PS · <event>→<trigger>' tag at each protected swing. The diamond, stop, and R targets draw regardless.")
+cisdBullCol = input.color(#00a2c7, "Entry colors", group=grpEnt, inline="cc", tooltip="Bullish (teal) / bearish (red) — used for entries, framework marks, and panel SMT.")
+cisdBearCol = input.color(#db5755, "",     group=grpEnt, inline="cc")
+useSmtEv = input.bool(true, "SMT ", group=grpEnt, inline="q1", tooltip="Qualifying events — a trigger only becomes an entry when at least one enabled event fired before it inside the reversed leg. Only the MOST RECENT event counts (it is the one that led to the trigger); events tying on the same bar are all named and drawn. SMT = a chart-TF swing where this symbol and a correlated asset diverge. FVG = price traded back into a chart-TF fair value gap. LQ = price swept a chart-TF swing point. C2 = a sweep-and-reclaim candle closing beyond its own wick-weighted midpoint.")
+useFvgEv = input.bool(true, "FVG", group=grpEnt, inline="q1")
+useLqEv  = input.bool(true, "LQ ",  group=grpEnt, inline="q2")
+useC2Ev  = input.bool(true, "C2",  group=grpEnt, inline="q2")
+smtSym1  = input.symbol("", "SMT asset 1 (blank = auto pairing)", group=grpEnt, tooltip="Blank = the correlation library resolves the pair from the chart symbol — index futures, metals, forex, energy, treasuries, crypto. Set a symbol to override.")
+smtSym2  = input.symbol("", "SMT asset 2 (blank = auto pairing)", group=grpEnt)
+
+grpLvl = "4 · Levels & Zones"
+show25   = input.bool(true, "25% / 50% levels",              group=grpLvl)
+showTgt  = input.bool(true, "Projections (PDH / PDL ± 25% & 50%)", group=grpLvl)
+showOpen = input.bool(true, "18:00 & 00:00 open lines",      group=grpLvl)
+showDFvg = input.bool(true, "Daily FVG zones", group=grpLvl, tooltip="The active daily fair value gaps — part of the framework level pool — as soft boxes from their origin day, extended right. A gap dies only when a completed DAY closes through it.")
+show210Q = input.bool(true, "210m signature quarters", group=grpLvl, tooltip="The quarter model applied fractally: when a completed 210m candle prints a reversal signature (IRC / EC) while rejecting the daily 25% in the working direction, its own high→close (or low→close) 25% and 50% are drawn — the continuation reference for the next 210m candles. Respect = continuation; a later 210m close through the intraday 25% against the signature invalidates it and removes the lines.")
+
+grpSess = "5 · Sessions"
+showSess = input.bool(true, "Asia / London session shading", group=grpSess)
+showVLines = input.bool(true, "Session dividers (18:00 / 01:00 / 08:00)", group=grpSess, tooltip="Thin full-height vertical lines at the 7h session opens.")
+show89   = input.bool(true, "8–9 AM range (→ 10:30 cutoff)", group=grpSess)
+tzName   = input.string("America/New_York", "Timezone",      group=grpSess)
+
+grpVis = "6 · Visuals & Status"
+showPanel1h = input.bool(true, "1H",   group=grpVis, inline="pn", tooltip="Mini candle panels floated right of price — today's candles at each of the model's timeframes, with the 25% guide and sweep lines. The 1H panel keeps the last 8 candles; 210m and 7H show the whole day.")
+showPanel   = input.bool(true, "210m", group=grpVis, inline="pn")
+showPanel7h = input.bool(true, "7H",   group=grpVis, inline="pn")
+showPanelSmt = input.bool(true, "Panel SMT lines", group=grpVis, tooltip="Cross-asset divergence on the newest pair of 210m and 7H candles — this symbol making the higher high / lower low while a correlated asset fails to. Drawn on the mini panels with the asset named; the LOD/HOD status tag gains +SMT when the confirming sweep itself diverged. The newest candle is still forming, so a live line can appear and disappear until it closes.")
+showStatus = input.bool(true,  "Status readout", group=grpVis, inline="st")
+stPos      = input.string("Bottom Center", "", options=["Bottom Left", "Bottom Center", "Bottom Right"], group=grpVis, inline="st")
+keepHist   = input.bool(false, "Keep previous days' drawings",  group=grpVis)
+colLevel   = input.color(#f23645, "Levels",     group=grpVis, inline="c1")
+colTgt     = input.color(#2962ff, "Projection", group=grpVis, inline="c1")
+colInk     = input.color(#787b86, "Text",       group=grpVis, inline="c1")
+colUpFill  = input.color(color.white, "Panel candles", group=grpVis, inline="pc", tooltip="Mini-panel candles: bull body / bear body / outline & wick. Defaults match a light chart (hollow white bulls, solid black bears) — flip for dark themes.")
+colDnFill  = input.color(color.black, "", group=grpVis, inline="pc")
+colOutline = input.color(color.black, "", group=grpVis, inline="pc")
+
+// ============================================================================
+// CALCULATIONS — previous day range tracked on the chart timeframe
+// ============================================================================
+newDay = timeframe.change("D")
+
+var float dO  = na
+var float dH  = na
+var float dL  = na
+var float dC  = na
+var float pdO = na
+var float pdH = na
+var float pdL = na
+var float pdC = na
+
+// Previous-day OHLC comes from TradingView's own daily series (non-repainting [1] +
+// lookahead_on read), NOT from chart-bar aggregation — so a 3m chart and a daily chart
+// latch the IDENTICAL previous day regardless of data gaps or session quirks. The
+// chart-tracked d* values remain for the CURRENT day (range, ADR guard).
+// settlement-as-close is forced OFF for the daily reads — the model reads the daily
+// candle's true close, and a chart with the settlement option on can flip the PD
+// direction relative to that read
+string dTicker = ticker.modify(syminfo.tickerid, settlement_as_close = settlement_as_close.off)
+// ONE daily request serves the whole script: previous-day OHLC (bias + quarter levels),
+// the [3]-offset fields for the daily FVG engine, and the 14-day ADR — all non-repainting
+// completed-day reads, available the moment the new day opens.
+[pdOs, pdHs, pdLs, pdCs, dGapH3, dGapL3, dGapT2, adrD] = request.security(dTicker, "D", [open[1], high[1], low[1], close[1], high[3], low[3], time[2], ta.sma(high - low, 14)[1]], lookahead=barmerge.lookahead_on)
+
+// correlated assets resolved by the AssetCorrelationUtils library — index futures,
+// metals, forex, energy, treasuries and crypto all auto-pair by chart symbol; the manual
+// SMT symbols under Entries override. Resolved up here so every engine below (chart-TF
+// SMT event, 210m/7h SMT, LOD/HOD confirmation) can read it.
+acuCfg = acu.resolveCurrentChart()
+string a1Auto  = acuCfg.detected ? acuCfg.secondary : ""
+string a2Auto  = acuCfg.detected and acuCfg.isTriadMode ? acuCfg.tertiary : ""
+string a1sym   = smtSym1 != "" ? smtSym1 : a1Auto
+string a2sym   = smtSym2 != "" ? smtSym2 : a2Auto
+bool   a1Ok    = useSmtEv and a1sym != ""
+bool   a2Ok    = useSmtEv and a2sym != ""
+bool   a1Inv   = smtSym1 == "" and acuCfg.detected and acuCfg.invertSecondary
+bool   a2Inv   = smtSym2 == "" and acuCfg.detected and acuCfg.invertTertiary
+[a1Hr, a1Lr] = request.security(a1sym == "" ? syminfo.tickerid : a1sym, timeframe.period, [high, low], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+[a2Hr, a2Lr] = request.security(a2sym == "" ? syminfo.tickerid : a2sym, timeframe.period, [high, low], lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+// inversely-correlated legs are negated so every higher-high / lower-low comparison
+// downstream keeps its meaning without special-casing
+float a1H = a1Inv ? -a1Lr : a1Hr
+float a1L = a1Inv ? -a1Hr : a1Lr
+float a2H = a2Inv ? -a2Lr : a2Hr
+float a2L = a2Inv ? -a2Hr : a2Lr
+shortSym(string s) =>
+    string r = s
+    // library pairings arrive as ticker-ID strings ("…\"symbol\":\"COMEX:HG\"…") —
+    // unwrap the plain symbol before trimming
+    int sp = str.pos(r, "\"symbol\":\"")
+    if not na(sp)
+        string rest = str.substring(r, sp + 10)
+        int qe = str.pos(rest, "\"")
+        if not na(qe)
+            r := str.substring(rest, 0, qe)
+    int cp = str.pos(r, ":")
+    if not na(cp)
+        r := str.substring(r, cp + 1)
+    str.replace_all(r, "1!", "")
+string a1Tag = a1sym == "" ? "" : shortSym(a1sym)
+string a2Tag = a2sym == "" ? "" : shortSym(a2sym)
+
+if newDay
+    pdO := pdOs
+    pdH := pdHs
+    pdL := pdLs
+    pdC := pdCs
+    dO  := open
+    dH  := high
+    dL  := low
+    dC  := close
+else
+    dH := math.max(nz(dH, high), high)
+    dL := math.min(nz(dL, low), low)
+    dC := close
+
+pdBull = not na(pdC) and pdC > pdO
+pdBear = not na(pdC) and pdC < pdO
+
+// Previous-day quarter fib — bearish PD: pulled HIGH → CLOSE, 0% at the close
+// (where the new day opens), so the 25% is the shallow retracement lid just above the
+// open and a bounce meets 25% before 50% (close above the 25% invalidates). Bullish PD:
+// pulled LOW → CLOSE, 0% at the close — the 25% is the shallow floor just below the
+// open (close below it invalidates).
+float q25 = na
+float q50 = na
+if pdBear
+    q25 := pdC + 0.25 * (pdH - pdC)
+    q50 := pdC + 0.50 * (pdH - pdC)
+if pdBull
+    q25 := pdC - 0.25 * (pdC - pdL)
+    q50 := pdC - 0.50 * (pdC - pdL)
+
+// ============================================================================
+// BIAS STATE & INVALIDATION
+// ============================================================================
+var int  bias      = 0    //  1 = bullish, -1 = bearish, 0 = none (doji PD)
+var bool invalid   = false
+var bool wasBroken = false    // the 25% was closed through at some point today — A+ is gone even if reclaimed
+var bool broke50   = false    // the 50% was ALSO closed through — "respect the 50%" (A framework) is gone, no un-flip
+
+if newDay
+    bias      := pdBull ? 1 : pdBear ? -1 : 0
+    invalid   := false
+    wasBroken := false
+    broke50   := false
+
+biasActive = bias != 0 and not na(q25)
+
+// 210m candle boundaries (only meaningful when chart tf <= 210m)
+// the chart TF must also DIVIDE 210m — on a 1H chart (210/60 = 3.5 bars) the boundaries
+// straddle bars and every "completed 210m candle" read would be misaligned
+can210 = timeframe.in_seconds() <= 210 * 60 and 210 * 60 % timeframe.in_seconds() == 0
+new210 = can210 and timeframe.change("210")
+
+var int  t210start      = na
+bool justInvalidated    = false
+bool justReclaimed      = false
+
+overnightStart(t) =>
+    h = hour(t, tzName)
+    h >= 18 or h < 8
+
+// validate on completed 210m candles (the just-closed candle = close[1]). A close through
+// the 25% breaks the bias; with the reversal framework on, a later candle closing BACK
+// through the 25% un-flips the day to the original bias (A+ stays gone — once broken,
+// the day is at best an A framework).
+if use210 and new210 and not newDay and not na(t210start) and biasActive
+    if not overnightOnly or overnightStart(t210start)
+        cc = close[1]
+        bool beyond = bias == 1 ? cc < q25 : cc > q25
+        if bias == 1 ? cc < q50 : cc > q50
+            broke50 := true
+        if not invalid and beyond
+            invalid         := true
+            wasBroken       := true
+            justInvalidated := true
+        else if invalid and useRev and not beyond and not broke50
+            invalid       := false
+            justReclaimed := true
+// completed / forming 210m candle tracking — the frameworks' confirmation layer.
+// p210* hold the candle that JUST closed (its start time in p210T).
+var float c210H = na
+var float c210L = na
+var float p210H = na
+var float p210L = na
+var float p210C = na
+var int   p210T = na
+var float pp210H = na    // the completed candle BEFORE the completed candle (sweep reference)
+var float pp210L = na
+var float c210O = na     // opens, for classifying reversal signatures on the 210m itself
+var float p210O = na
+var float pp210O = na
+// correlated assets aggregated on the SAME 210m boundaries (for 210m SMT and the
+// LOD/HOD +SMT confirmation)
+var float cA1H = na
+var float cA1L = na
+var float pA1H = na
+var float pA1L = na
+var float ppA1H = na
+var float ppA1L = na
+var float cA2H = na
+var float cA2L = na
+var float pA2H = na
+var float pA2L = na
+var float ppA2H = na
+var float ppA2L = na
+if new210
+    pp210H := p210H
+    pp210L := p210L
+    pp210O := p210O
+    p210O := c210O
+    p210H := c210H
+    p210L := c210L
+    p210C := close[1]
+    p210T := t210start
+    t210start := time
+    c210O := open
+    c210H := high
+    c210L := low
+    ppA1H := pA1H
+    ppA1L := pA1L
+    pA1H := cA1H
+    pA1L := cA1L
+    cA1H := a1H
+    cA1L := a1L
+    ppA2H := pA2H
+    ppA2L := pA2L
+    pA2H := cA2H
+    pA2L := cA2L
+    cA2H := a2H
+    cA2L := a2L
+else if can210
+    c210H := math.max(nz(c210H, high), high)
+    c210L := math.min(nz(c210L, low), low)
+    cA1H := math.max(nz(cA1H, a1H), a1H)
+    cA1L := math.min(nz(cA1L, a1L), a1L)
+    cA2H := math.max(nz(cA2H, a2H), a2H)
+    cA2L := math.min(nz(cA2L, a2L), a2L)
+
+// fallback: validate on chart-timeframe closes (also used when the chart TF is above
+// 210m, where the 210m path cannot run — otherwise validation would silently never fire)
+if (not use210 or not can210) and barstate.isconfirmed and biasActive
+    if not overnightOnly or overnightStart(time)
+        bool beyond = bias == 1 ? close < q25 : close > q25
+        if bias == 1 ? close < q50 : close > q50
+            broke50 := true
+        if not invalid and beyond
+            invalid         := true
+            wasBroken       := true
+            justInvalidated := true
+        else if invalid and useRev and not beyond and not broke50
+            invalid       := false
+            justReclaimed := true
+
+// Working direction — a close through the 25% flips the day into the REVERSAL framework
+// (when enabled): the break's direction becomes the working direction ("yesterday's 25%
+// was broken to the upside — reversal framework expecting higher prices") and the
+// projections re-point to the other side of the PD range.
+int dirEff = invalid and useRev and biasActive ? -bias : bias
+float tgt   = na
+float tgt50 = na
+if biasActive
+    tgt   := dirEff == 1 ? pdH + 0.25 * (pdH - pdL) : pdL - 0.25 * (pdH - pdL)
+    tgt50 := dirEff == 1 ? pdH + 0.50 * (pdH - pdL) : pdL - 0.50 * (pdH - pdL)
+
+// ============================================================================
+// DRAWINGS — daily levels with small end labels
+// ============================================================================
+var line  ln25   = na
+var line  ln50   = na
+var line  lnTgt  = na
+var line  lnTgt2 = na
+var line  lnOp   = na
+var line  lnMid  = na
+var label lb25   = na
+var label lb50   = na
+var label lbTgt  = na
+var label lbTgt2 = na
+var label lbOp   = na
+var label lbMid  = na
+
+extendLn(line ln, label lb) =>
+    if not na(ln)
+        line.set_x2(ln, bar_index + 1)
+    if not na(lb)
+        label.set_x(lb, bar_index + 5)
+
+if newDay
+    if not keepHist
+        line.delete(ln25)
+        line.delete(ln50)
+        line.delete(lnTgt)
+        line.delete(lnTgt2)
+        line.delete(lnOp)
+        line.delete(lnMid)
+        label.delete(lb25)
+        label.delete(lb50)
+        label.delete(lbTgt)
+        label.delete(lbTgt2)
+        label.delete(lbOp)
+        label.delete(lbMid)
+    ln25   := na
+    ln50   := na
+    lnTgt  := na
+    lnTgt2 := na
+    lnOp   := na
+    lnMid  := na
+    if biasActive and show25
+        ln25 := line.new(bar_index, q25, bar_index + 1, q25, color=colLevel, width=1)
+        lb25 := label.new(bar_index + 5, q25, "25%", style=label.style_none, textcolor=colLevel, size=size.small)
+        ln50 := line.new(bar_index, q50, bar_index + 1, q50, color=color.new(colLevel, 35), width=1)
+        lb50 := label.new(bar_index + 5, q50, "50%", style=label.style_none, textcolor=color.new(colLevel, 35), size=size.small)
+    if biasActive and showTgt
+        tgtTxt  = dirEff == 1 ? "PDH +25%" : "PDL -25%"
+        tgtTxt2 = dirEff == 1 ? "PDH +50%" : "PDL -50%"
+        lnTgt  := line.new(bar_index, tgt, bar_index + 1, tgt, color=color.new(colTgt, 30), width=1, style=line.style_dotted)
+        lbTgt  := label.new(bar_index + 5, tgt, tgtTxt, style=label.style_none, textcolor=color.new(colTgt, 30), size=size.tiny)
+        lnTgt2 := line.new(bar_index, tgt50, bar_index + 1, tgt50, color=color.new(colTgt, 55), width=1, style=line.style_dotted)
+        lbTgt2 := label.new(bar_index + 5, tgt50, tgtTxt2, style=label.style_none, textcolor=color.new(colTgt, 55), size=size.tiny)
+    if showOpen
+        lnOp := line.new(bar_index, open, bar_index + 1, open, color=color.new(colInk, 40), width=1, style=line.style_dotted)
+        lbOp := label.new(bar_index + 5, open, str.format_time(time, "HH:mm", tzName), style=label.style_none, textcolor=color.new(colInk, 40), size=size.tiny)
+
+isMidnight = hour(time, tzName) == 0 and hour(nz(time[1], time), tzName) != 0
+if showOpen and isMidnight
+    lnMid := line.new(bar_index, open, bar_index + 1, open, color=color.new(colInk, 40), width=1, style=line.style_dotted)
+    lbMid := label.new(bar_index + 5, open, "00:00", style=label.style_none, textcolor=color.new(colInk, 40), size=size.tiny)
+
+extendLn(ln25, lb25)
+extendLn(ln50, lb50)
+extendLn(lnTgt, lbTgt)
+extendLn(lnTgt2, lbTgt2)
+extendLn(lnOp, lbOp)
+extendLn(lnMid, lbMid)
+
+// On the reversal flip (or un-flip), re-point the projections to the working direction's
+// side of the PD range from the bar the 25% broke or was reclaimed on.
+if (justInvalidated and useRev or justReclaimed) and biasActive and showTgt
+    line.delete(lnTgt)
+    line.delete(lnTgt2)
+    label.delete(lbTgt)
+    label.delete(lbTgt2)
+    tgtTxtR  = dirEff == 1 ? "PDH +25%" : "PDL -25%"
+    tgtTxtR2 = dirEff == 1 ? "PDH +50%" : "PDL -50%"
+    lnTgt  := line.new(bar_index, tgt, bar_index + 1, tgt, color=color.new(colTgt, 30), width=1, style=line.style_dotted)
+    lbTgt  := label.new(bar_index + 5, tgt, tgtTxtR, style=label.style_none, textcolor=color.new(colTgt, 30), size=size.tiny)
+    lnTgt2 := line.new(bar_index, tgt50, bar_index + 1, tgt50, color=color.new(colTgt, 55), width=1, style=line.style_dotted)
+    lbTgt2 := label.new(bar_index + 5, tgt50, tgtTxtR2, style=label.style_none, textcolor=color.new(colTgt, 55), size=size.tiny)
+
+// ============================================================================
+// DRAWINGS — session shading (Asia 18:00–01:00, London 01:00–08:00)
+// ============================================================================
+inAsia = not na(time(timeframe.period, "1800-0100", tzName))
+inLdn  = not na(time(timeframe.period, "0100-0800", tzName))
+
+var box asiaBox = na
+var box ldnBox  = na
+
+updSession(box b) =>
+    if not na(b)
+        box.set_right(b, bar_index)
+        box.set_top(b, math.max(box.get_top(b), high))
+        box.set_bottom(b, math.min(box.get_bottom(b), low))
+
+if showSess
+    if inAsia and not inAsia[1]
+        if not keepHist
+            box.delete(asiaBox)
+        asiaBox := box.new(bar_index, high, bar_index, low, border_color=color.new(colInk, 100), bgcolor=color.new(colInk, 93), text="Asia", text_size=size.tiny, text_color=color.new(colInk, 45), text_halign=text.align_center, text_valign=text.align_bottom)
+    else if inAsia
+        updSession(asiaBox)
+    if inLdn and not inLdn[1]
+        if not keepHist
+            box.delete(ldnBox)
+        ldnBox := box.new(bar_index, high, bar_index, low, border_color=color.new(colInk, 100), bgcolor=color.new(colInk, 93), text="London", text_size=size.tiny, text_color=color.new(colInk, 45), text_halign=text.align_center, text_valign=text.align_bottom)
+    else if inLdn
+        updSession(ldnBox)
+
+// ============================================================================
+// DRAWINGS — 8–9 AM range, extended to the 10:30 cutoff (visual reference)
+// ============================================================================
+in89  = not na(time(timeframe.period, "0800-0900", tzName))
+inExt = not na(time(timeframe.period, "0900-1030", tzName))
+
+var float h89 = na
+var float l89 = na
+var int   x89 = na
+var line  ln89H = na
+var line  ln89L = na
+var label lb89H = na
+var label lb89L = na
+
+if in89
+    if not in89[1]
+        h89 := high
+        l89 := low
+        x89 := bar_index
+        if not keepHist
+            line.delete(ln89H)
+            line.delete(ln89L)
+            label.delete(lb89H)
+            label.delete(lb89L)
+        ln89H := na
+        ln89L := na
+        lb89H := na
+        lb89L := na
+    else
+        h89 := math.max(h89, high)
+        l89 := math.min(l89, low)
+
+if show89 and inExt and not inExt[1] and not na(h89)
+    ln89H := line.new(x89, h89, bar_index, h89, color=color.new(colInk, 20), width=1)
+    ln89L := line.new(x89, l89, bar_index, l89, color=color.new(colInk, 20), width=1)
+    lb89H := label.new(bar_index + 3, h89, "8–9 H", style=label.style_none, textcolor=color.new(colInk, 20), size=size.tiny)
+    lb89L := label.new(bar_index + 3, l89, "8–9 L", style=label.style_none, textcolor=color.new(colInk, 20), size=size.tiny)
+
+if inExt and not na(ln89H)
+    line.set_x2(ln89H, bar_index)
+    line.set_x2(ln89L, bar_index)
+    label.set_x(lb89H, bar_index + 3)
+    label.set_x(lb89L, bar_index + 3)
+
+// ============================================================================
+// 7H FRAMEWORKS & DAILY PROFILES (F1–F4 · P1–P4B)
+// The 7h day is bucketed by ET clock hour (18/1/8 grid + the 15:00 stub) rather
+// than a 420m aggregation, so exchange session config can never skew the grid.
+// Assigned temporally — F1 at the Asia close, F2/F3 at the London close (F2 first,
+// F3 the fallback), F4 live at
+// the NY open — and locked until 18:00. F1's "valid level" is the previous-day
+// extreme (the manual's own worked examples are all previous-day manipulations).
+// ============================================================================
+etHr = hour(time, tzName)
+int seg = etHr >= 18 ? 0 : etHr < 1 ? 0 : etHr < 8 ? 1 : etHr < 15 ? 2 : 3
+// the 18/1/8 grid needs every session boundary to land on a bar OPEN. Boundaries sit 0,
+// 420 and 840 minutes from the 18:00 anchor, so any timeframe dividing 420m qualifies —
+// 1m…60m and 210m included; 45m, 90m or 4H would straddle boundaries and misread silently
+bool segTfOk = timeframe.in_seconds() <= 210 * 60 and 420 * 60 % timeframe.in_seconds() == 0
+bool fwOn = showFw and segTfOk
+
+// thin full-height dividers at the 7h session opens (18:00 / 01:00 / 08:00)
+if showVLines and segTfOk and seg != nz(seg[1], seg) and seg <= 2
+    line.new(bar_index, high, bar_index, low, extend=extend.both, color=color.new(colInk, 78), width=1)
+
+var float asiaOv = na
+var float asiaHv = na
+var float asiaLv = na
+var float asiaCv = na
+var int   asiaHiBar = na
+var int   asiaLoBar = na
+var bool  nyTookLon = false       // NY traded through a London extreme at some point (for P4B's no-sweep test)
+var int   nyFirstSweep = 0        // which London extreme NY swept FIRST: 1 = low, -1 = high (sequence for the F4 outside-candle fork)
+var bool  rangeExhausted = false  // ADR guard state, latched at the NY open
+var float lonOv  = na
+var float lonHv  = na
+var float lonLv  = na
+var float lonCv  = na
+var int   lonHiBar = na
+var int   lonLoBar = na
+var int   day18Bar = na
+var int    fwDir    = 0
+var string fwName   = ""
+var string fwFail   = ""       // a framework that was assigned and then DISPROVEN (currently F1 only)
+var bool   fwF4Cont = false    // F4 fired as the breakout ("continues") branch, not the reversal
+var float  fwLvl     = na      // the level the framework manipulated, for the reference-style sweep line
+var int    fwLvlFrom = na
+bool fwJust = false
+
+if newDay
+    fwDir    := 0
+    fwName   := ""
+    fwFail   := ""
+    fwF4Cont := false
+    fwLvl     := na
+    fwLvlFrom := na
+    day18Bar := bar_index
+    nyTookLon := false
+    nyFirstSweep := 0
+    rangeExhausted := false
+    asiaOv := na
+    asiaHv := na
+    asiaLv := na
+    asiaCv := na
+    lonOv  := na
+    lonHv  := na
+    lonLv  := na
+    lonCv  := na
+
+if seg == 0
+    if seg[1] != 0 or newDay or na(asiaHv)
+        asiaOv := open
+        asiaHv := high
+        asiaLv := low
+        asiaHiBar := bar_index
+        asiaLoBar := bar_index
+    else
+        if high > asiaHv
+            asiaHv := high
+            asiaHiBar := bar_index
+        if low < asiaLv
+            asiaLv := low
+            asiaLoBar := bar_index
+    asiaCv := close
+if seg == 1
+    if seg[1] != 1 or na(lonHv)
+        lonOv := open
+        lonHv := high
+        lonLv := low
+        lonHiBar := bar_index
+        lonLoBar := bar_index
+    else
+        if high > lonHv
+            lonHv := high
+            lonHiBar := bar_index
+        if low < lonLv
+            lonLv := low
+            lonLoBar := bar_index
+    lonCv := close
+
+// ---- ADR exhaustion guard (AM): today's range at the NY open vs the 14-day ADR. When
+// London already took most of the average range, "New York's got nothing left to give" —
+// entries stand down for the day.
+if useAdrGuard and segTfOk and seg == 2 and seg[1] != 2 and not na(adrD) and adrD > 0 and not na(dH)
+    rangeExhausted := (dH - dL) >= adrPct * adrD
+
+// ---- Confirmed extreme-of-day: a completed 210m
+// candle that swept a low — the prior 210m candle's low or a previous-day extreme — and
+// CLOSED back above it, while its low stands as the day's low, is a CONFIRMED LOD
+// reversal, tagged by the session that printed it. Mirror for HOD. Invalidated the moment
+// a later bar takes the extreme out (a wick suffices — the extreme is simply gone).
+var float lodLvl = na
+var float lodPx  = na
+var int   lodSeg = -1     // 0 Asia · 1 London · 2 NY
+var float hodLvl = na
+var float hodPx  = na
+var int   hodSeg = -1
+var bool  lodSmt = false
+var bool  hodSmt = false
+var bool  lodFvg = false     // the confirmed extreme printed INSIDE an active daily FVG
+var bool  hodFvg = false
+if newDay
+    lodLvl := na
+    lodPx  := na
+    lodSeg := -1
+    lodSmt := false
+    lodFvg := false
+    hodLvl := na
+    hodPx  := na
+    hodSeg := -1
+    hodSmt := false
+    hodFvg := false
+if not na(lodPx) and low < lodPx
+    lodLvl := na
+    lodPx  := na
+    lodSeg := -1
+    lodSmt := false
+    lodFvg := false
+if not na(hodPx) and high > hodPx
+    hodLvl := na
+    hodPx  := na
+    hodSeg := -1
+    hodSmt := false
+    hodFvg := false
+if can210 and new210 and not newDay and not na(p210C) and not na(p210T)
+    int ph2 = hour(p210T, tzName)
+    int pSeg2 = ph2 >= 18 ? 0 : ph2 < 1 ? 0 : ph2 < 8 ? 1 : ph2 < 15 ? 2 : 3
+    if pSeg2 <= 2
+        float swLo210 = na
+        if not na(pp210L) and p210L < pp210L and p210C > pp210L
+            swLo210 := pp210L
+        if na(swLo210) and not na(pdL) and p210L < pdL and p210C > pdL
+            swLo210 := pdL
+        if not na(swLo210) and p210L <= dL
+            lodLvl := swLo210
+            lodPx  := p210L
+            lodSeg := pSeg2
+            // +SMT: our candle made the lower low but a correlated asset did NOT — the
+            // sweep diverged — SMT at the extreme strengthens the reversal
+            lodSmt := not na(pp210L) and p210L < pp210L and ((a1Ok and not na(pA1L) and not na(ppA1L) and pA1L >= ppA1L) or (a2Ok and not na(pA2L) and not na(ppA2L) and pA2L >= ppA2L))
+        float swHi210 = na
+        if not na(pp210H) and p210H > pp210H and p210C < pp210H
+            swHi210 := pp210H
+        if na(swHi210) and not na(pdH) and p210H > pdH and p210C < pdH
+            swHi210 := pdH
+        if not na(swHi210) and p210H >= dH
+            hodLvl := swHi210
+            hodPx  := p210H
+            hodSeg := pSeg2
+            hodSmt := not na(pp210H) and p210H > pp210H and ((a1Ok and not na(pA1H) and not na(ppA1H) and pA1H <= ppA1H) or (a2Ok and not na(pA2H) and not na(ppA2H) and pA2H <= ppA2H))
+
+// ---- 210m signature quarters (the quarter model applied fractally): a completed 210m
+// candle that rejects the daily 25% with a reversal signature in the working direction —
+// IRC (holds the prior extreme, closes through the prior candle's 50%) or EC (takes the
+// prior extreme, closes through the prior open) — gets its own high→close / low→close
+// quarters. The following 210m candles are read against that intraday 25%: respect =
+// continuation, a completed close through it against the signature invalidates.
+var float i25  = na
+var float i50  = na
+var int   iDir = 0
+var line  i25Ln = na
+var line  i50Ln = na
+var label i25Lb = na
+var label i50Lb = na
+if newDay
+    iDir := 0
+    i25  := na
+    i50  := na
+    line.delete(i25Ln)
+    line.delete(i50Ln)
+    label.delete(i25Lb)
+    label.delete(i50Lb)
+    i25Ln := na
+    i50Ln := na
+    i25Lb := na
+    i50Lb := na
+if show210Q and can210 and new210 and not newDay and not na(p210C) and not na(p210O)
+    // standing quarters die on a completed close through the intraday 25% against them
+    if iDir != 0 and not na(i25) and ((iDir == -1 and p210C > i25) or (iDir == 1 and p210C < i25))
+        iDir := 0
+        i25  := na
+        i50  := na
+        line.delete(i25Ln)
+        line.delete(i50Ln)
+        label.delete(i25Lb)
+        label.delete(i50Lb)
+        i25Ln := na
+        i50Ln := na
+        i25Lb := na
+        i50Lb := na
+    if not na(pp210H) and not na(pp210O) and biasActive and not na(q25)
+        float ppMid = math.avg(pp210H, pp210L)
+        bool bearSig = p210C < p210O and ((p210H <= pp210H and p210C < ppMid) or (p210H > pp210H and p210C < pp210O and p210C < ppMid))
+        bool bullSig = p210C > p210O and ((p210L >= pp210L and p210C > ppMid) or (p210L < pp210L and p210C > pp210O and p210C > ppMid))
+        if bearSig and dirEff == -1 and p210H >= q25 and p210C < q25
+            iDir := -1
+            i25  := p210C + 0.25 * (p210H - p210C)
+            i50  := p210C + 0.50 * (p210H - p210C)
+            line.delete(i25Ln)
+            line.delete(i50Ln)
+            label.delete(i25Lb)
+            label.delete(i50Lb)
+            i25Ln := line.new(p210T, i25, time, i25, xloc=xloc.bar_time, color=color.new(colLevel, 40), width=1, style=line.style_dashed)
+            i50Ln := line.new(p210T, i50, time, i50, xloc=xloc.bar_time, color=color.new(colLevel, 65), width=1, style=line.style_dashed)
+            i25Lb := label.new(time, i25, "210m 25%", xloc=xloc.bar_time, style=label.style_none, textcolor=color.new(colLevel, 35), size=size.tiny)
+            i50Lb := label.new(time, i50, "210m 50%", xloc=xloc.bar_time, style=label.style_none, textcolor=color.new(colLevel, 55), size=size.tiny)
+        else if bullSig and dirEff == 1 and p210L <= q25 and p210C > q25
+            iDir := 1
+            i25  := p210C - 0.25 * (p210C - p210L)
+            i50  := p210C - 0.50 * (p210C - p210L)
+            line.delete(i25Ln)
+            line.delete(i50Ln)
+            label.delete(i25Lb)
+            label.delete(i50Lb)
+            i25Ln := line.new(p210T, i25, time, i25, xloc=xloc.bar_time, color=color.new(colLevel, 40), width=1, style=line.style_dashed)
+            i50Ln := line.new(p210T, i50, time, i50, xloc=xloc.bar_time, color=color.new(colLevel, 65), width=1, style=line.style_dashed)
+            i25Lb := label.new(time, i25, "210m 25%", xloc=xloc.bar_time, style=label.style_none, textcolor=color.new(colLevel, 35), size=size.tiny)
+            i50Lb := label.new(time, i50, "210m 50%", xloc=xloc.bar_time, style=label.style_none, textcolor=color.new(colLevel, 55), size=size.tiny)
+if iDir != 0 and not na(i25Ln)
+    line.set_x2(i25Ln, time)
+    line.set_x2(i50Ln, time)
+    label.set_x(i25Lb, time)
+    label.set_x(i50Lb, time)
+
+// ---- Daily level classes for F1/F3: previous-day extremes (the workhorse),
+// daily swing points (pivot strength 1, confirmed one
+// day late), and the most recent unfilled daily FVG each way. "Once a swing is taken the
+// new extreme becomes the relevant level" is approximated by using the most recent
+// pivot not yet violated by a later day.
+var array<float> dHs = array.new_float()
+var array<float> dLs = array.new_float()
+var float dSwHi = na
+var float dSwLo = na
+if newDay and not na(pdH)
+    dHs.push(pdH)
+    dLs.push(pdL)
+    if dHs.size() > 30
+        dHs.shift()
+        dLs.shift()
+    int dn = dHs.size()
+    dSwHi := na
+    dSwLo := na
+    if dn >= 3
+        for i = dn - 2 to 1
+            if na(dSwHi) and dHs.get(i) > dHs.get(i - 1) and dHs.get(i) > dHs.get(i + 1)
+                bool violH = false
+                for j = i + 1 to dn - 1
+                    if dHs.get(j) > dHs.get(i)
+                        violH := true
+                if not violH
+                    dSwHi := dHs.get(i)
+            if na(dSwLo) and dLs.get(i) < dLs.get(i - 1) and dLs.get(i) < dLs.get(i + 1)
+                bool violL = false
+                for j = i + 1 to dn - 1
+                    if dLs.get(j) < dLs.get(i)
+                        violL := true
+                if not violL
+                    dSwLo := dLs.get(i)
+            if not na(dSwHi) and not na(dSwLo)
+                break
+// ---- Daily FVG engine (ported from Praxis — CRT + Key Levels [YUS]). True daily series
+// via request.security (lookahead_on with [1]/[3] offsets — the standard non-repainting
+// previous-period read, so completed-day data is available the moment the new day opens),
+// an ARRAY of active gaps instead of the single most recent, and invalidation only when a
+// DAILY close crosses the gap — the frameworks' fair-value-gap level class.
+// (daily fields come from the single merged daily request at the top — the completed
+// day's H/L/C are pdHs/pdLs/pdCs, the [3]-offset fields are dGapH3/dGapL3/dGapT2)
+var array<float> dFvgTop  = array.new_float()
+var array<float> dFvgBot  = array.new_float()
+var array<bool>  dFvgBull = array.new<bool>()
+var array<int>   dFvgT    = array.new_int()
+// yesterday's 7h candle extremes — the "7h Swing" class of the same label (filled at the
+// day roll from the 7h panel arrays, further down)
+var array<float> y7Ext = array.new_float()
+if newDay and not na(dGapH3)
+    if pdLs > dGapH3 and pdLs - dGapH3 >= dFvgMin * syminfo.mintick
+        bool exists = false
+        if dFvgTop.size() > 0
+            for i = 0 to dFvgTop.size() - 1
+                if dFvgBull.get(i) and dFvgTop.get(i) == pdLs and dFvgBot.get(i) == dGapH3
+                    exists := true
+                    break
+        if not exists
+            dFvgTop.push(pdLs)
+            dFvgBot.push(dGapH3)
+            dFvgBull.push(true)
+            dFvgT.push(dGapT2)
+    if pdHs < dGapL3 and dGapL3 - pdHs >= dFvgMin * syminfo.mintick
+        bool exists2 = false
+        if dFvgTop.size() > 0
+            for i = 0 to dFvgTop.size() - 1
+                if not dFvgBull.get(i) and dFvgTop.get(i) == dGapL3 and dFvgBot.get(i) == pdHs
+                    exists2 := true
+                    break
+        if not exists2
+            dFvgTop.push(dGapL3)
+            dFvgBot.push(pdHs)
+            dFvgBull.push(false)
+            dFvgT.push(dGapT2)
+    // a gap dies only when a completed DAY closes through it
+    if dFvgTop.size() > 0
+        for i = dFvgTop.size() - 1 to 0
+            bool gb = dFvgBull.get(i)
+            if (gb and pdCs < dFvgBot.get(i)) or (not gb and pdCs > dFvgTop.get(i))
+                dFvgTop.remove(i)
+                dFvgBot.remove(i)
+                dFvgBull.remove(i)
+                dFvgT.remove(i)
+    while dFvgTop.size() > 10
+        dFvgTop.shift()
+        dFvgBot.shift()
+        dFvgBull.shift()
+        dFvgT.shift()
+
+// FVG confluence for the confirmed extremes — evaluated here, after the gap ledger
+// exists in source order, and re-evaluated every bar so the tag self-clears if the gap
+// that held the extreme later dies. Direction-matched: bullish gap under a LOD, bearish
+// gap over a HOD.
+lodFvg := false
+hodFvg := false
+if (not na(lodPx) or not na(hodPx)) and dFvgTop.size() > 0
+    for gi = 0 to dFvgTop.size() - 1
+        float gT = dFvgTop.get(gi)
+        float gB = dFvgBot.get(gi)
+        float gH = gT - gB
+        // reached into the gap, overshoot bounded by the gap's own height — a wick that
+        // pierces the whole gap and reclaims is the strongest version of the hold
+        if not na(lodPx) and dFvgBull.get(gi) and lodPx <= gT and lodPx >= gB - gH
+            lodFvg := true
+        if not na(hodPx) and not dFvgBull.get(gi) and hodPx >= gB and hodPx <= gT + gH
+            hodFvg := true
+
+// draw the active daily gaps (soft monochrome boxes, origin day → right of price)
+var array<box> dFvgBx = array.new<box>()
+if barstate.islast
+    while dFvgBx.size() > 0
+        box.delete(dFvgBx.pop())
+    if showDFvg and dFvgTop.size() > 0
+        int rEdge = time + (time - time[1]) * 12
+        for i = 0 to dFvgTop.size() - 1
+            string gTxt = dFvgBull.get(i) ? "1D FVG+" : "1D FVG-"
+            dFvgBx.push(box.new(dFvgT.get(i), dFvgTop.get(i), rEdge, dFvgBot.get(i), xloc=xloc.bar_time, bgcolor=color.new(colInk, 92), border_color=color.new(colInk, 82), text=gTxt, text_size=size.tiny, text_color=color.new(colInk, 35), text_halign=text.align_right, text_valign=text.align_center))
+
+// ---- HTF pivot levels (ported from Praxis — Key Levels engine): previous week / month
+// high & low as additional Swing High/Low classes. Mitigation-tracked: a level that was
+// touched BEFORE today is spent liquidity and drops out of the pool (the sweep that
+// qualifies F1 is allowed to be the level's first touch).
+[pwH, pwL] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+[pmH, pmL] = request.security(syminfo.tickerid, "M", [high[1], low[1]], lookahead=barmerge.lookahead_on)
+var bool pwhT = false
+var bool pwlT = false
+var bool pmhT = false
+var bool pmlT = false
+if timeframe.change("W")
+    pwhT := false
+    pwlT := false
+if timeframe.change("M")
+    pmhT := false
+    pmlT := false
+var bool pwhT0 = false    // touch state latched at the day open — "taken before today"
+var bool pwlT0 = false
+var bool pmhT0 = false
+var bool pmlT0 = false
+if newDay
+    pwhT0 := pwhT
+    pwlT0 := pwlT
+    pmhT0 := pmhT
+    pmlT0 := pmlT
+if not na(pwH) and high >= pwH
+    pwhT := true
+if not na(pwL) and low <= pwL
+    pwlT := true
+if not na(pmH) and high >= pmH
+    pmhT := true
+if not na(pmL) and low <= pmL
+    pmlT := true
+
+// F1 — Asia manipulates a valid level — previous-day extreme, daily swing, or daily FVG
+// (a swing high, swing low, or FVG) — and London expands (decided 01:00). If Asia
+// swept qualifying levels on BOTH sides and closed inside both, that is a conflict: no F1
+// is assigned and the day falls through to F2/F3 (the manual's "sit and wait" answer).
+if fwOn and fwDir == 0 and seg == 1 and seg[1] != 1 and not na(asiaCv)
+    array<float> f1Lo = array.from(pdL, dSwLo)
+    array<float> f1Hi = array.from(pdH, dSwHi)
+    if dFvgTop.size() > 0
+        for gi = 0 to dFvgTop.size() - 1
+            if dFvgBull.get(gi)
+                f1Lo.push(dFvgTop.get(gi))
+            else
+                f1Hi.push(dFvgBot.get(gi))
+    if usePW
+        if not pwlT0
+            f1Lo.push(pwL)
+        if not pwhT0
+            f1Hi.push(pwH)
+    if usePM
+        if not pmlT0
+            f1Lo.push(pmL)
+        if not pmhT0
+            f1Hi.push(pmH)
+    bool f1Bull = false
+    bool f1Bear = false
+    float f1BullLvl = na
+    float f1BearLvl = na
+    // Same reversal-quality standard F2 carries: the manipulation candle must CLOSE
+    // at least the protraction fraction away from the swept extreme. A bearish Asia that
+    // dipped through a level and closed back on its own low is a technical reclaim with
+    // no rejection character — not an F1.
+    float aRf1 = asiaHv - asiaLv
+    bool aRejUp = aRf1 > 0 and (asiaCv - asiaLv) > f3Frac * aRf1
+    bool aRejDn = aRf1 > 0 and (asiaHv - asiaCv) > f3Frac * aRf1
+    for L in f1Lo
+        if aRejUp and not na(L) and asiaLv < L and asiaCv > L
+            f1Bull := true
+            if na(f1BullLvl)
+                f1BullLvl := L
+    for L in f1Hi
+        if aRejDn and not na(L) and asiaHv > L and asiaCv < L
+            f1Bear := true
+            if na(f1BearLvl)
+                f1BearLvl := L
+    // 210m-confirmed Asia reversal: a 210m sweep-and-reclaim that created the day's
+    // extreme during Asia counts as the F1 manipulation even when the session-aggregate
+    // candle doesn't test cleanly against a daily level — the reclaim IS the quality gate.
+    if not f1Bull and not na(lodPx) and lodSeg == 0
+        f1Bull := true
+        if na(f1BullLvl)
+            f1BullLvl := lodLvl
+    if not f1Bear and not na(hodPx) and hodSeg == 0
+        f1Bear := true
+        if na(f1BearLvl)
+            f1BearLvl := hodLvl
+    if f1Bull and not f1Bear
+        fwDir  := 1
+        fwName := "F1"
+        fwLvl  := f1BullLvl
+        fwLvlFrom := day18Bar
+        fwJust := true
+    else if f1Bear and not f1Bull
+        fwDir  := -1
+        fwName := "F1"
+        fwLvl  := f1BearLvl
+        fwLvlFrom := day18Bar
+        fwJust := true
+
+// F1 verification at the London close. F1's prediction — "London expands in the
+// framework direction" — is the only one that resolves BEFORE the NY open, so it can be
+// checked: a London that closed directionally AGAINST the framework, beyond Asia's close,
+// disproves it. The framework is cleared and the 08:00 evaluation below re-reads the day
+// from the London data — roll the read forward rather than dead-locking the day on a
+// disproven framework.
+if fwOn and fwName == "F1" and seg == 2 and seg[1] != 2 and not na(lonCv)
+    bool f1Failed = fwDir == 1 ? lonCv < lonOv and lonCv < asiaCv : lonCv > lonOv and lonCv > asiaCv
+    // a 210m-confirmed OPPOSITE extreme printed during London also disproves the
+    // expansion claim — the reversal already happened at 210m granularity
+    if not f1Failed
+        f1Failed := fwDir == 1 ? not na(hodPx) and hodSeg == 1 : not na(lodPx) and lodSeg == 1
+    if f1Failed
+        fwFail := "F1"
+        fwDir  := 0
+        fwName := ""
+        fwLvl  := na
+        fwLvlFrom := na
+
+// F2 — London manipulates the Asia extreme, NY expands; F3 — London protraction,
+// NY reverses (both decided at the London close; F2 tested first)
+if fwOn and fwDir == 0 and seg == 2 and seg[1] != 2 and not na(lonCv) and not na(asiaLv)
+    // The F2/F3 difference is whether London REVERSES: a qualifying F2 close must sit at
+    // least the protraction fraction away from the swept extreme — a London that swept the
+    // Asia high yet closed back near its own high never reversed, it protracted (and a day
+    // that already broke the daily quarters the other way and closed strong should not
+    // print an F2 against that break). Failing the gate falls through to F3, then F4.
+    // ... and the London candle must itself CLOSE as a reversal (directional against the
+    // sweep) — a bearish London that wicked under the Asia low
+    // and closed marginally back above it is still delivering down, not reversing.
+    float lrF2 = lonHv - lonLv
+    if lonLv < asiaLv and lonCv > asiaLv and lonCv > lonOv and lrF2 > 0 and lonCv - lonLv > f3Frac * lrF2
+        fwDir  := 1
+        fwName := "F2"
+        fwLvl  := asiaLv
+        fwLvlFrom := asiaLoBar
+        fwJust := true
+    else if lonHv > asiaHv and lonCv < asiaHv and lonCv < lonOv and lrF2 > 0 and lonHv - lonCv > f3Frac * lrF2
+        fwDir  := -1
+        fwName := "F2"
+        fwLvl  := asiaHv
+        fwLvlFrom := asiaHiBar
+        fwJust := true
+    // 210m-confirmed London extreme: a sweep-and-reclaim that made the day's extreme
+    // DURING London is the F2 manipulation even when the session-aggregate candle never
+    // closed back inside Asia's range — the reclaim is the reversal evidence, same
+    // principle as F1's confirmed-Asia-extreme path. Skipped if both sides confirmed.
+    else if not na(lodPx) and lodSeg == 1 and not (not na(hodPx) and hodSeg == 1)
+        fwDir  := 1
+        fwName := "F2"
+        fwLvl  := lodLvl
+        fwLvlFrom := day18Bar
+        fwJust := true
+    else if not na(hodPx) and hodSeg == 1 and not (not na(lodPx) and lodSeg == 1)
+        fwDir  := -1
+        fwName := "F2"
+        fwLvl  := hodLvl
+        fwLvlFrom := day18Bar
+        fwJust := true
+    else
+        float lr = lonHv - lonLv
+        if lr > 0
+            // F3 must REACH a valid level at or near the session extreme: the level sits
+            // INSIDE London's outer wick — it was traded, and it lies within the same
+            // outer fraction of the range the close test uses.
+            float band = f3Frac * lr
+            // level pool strictly per the diagram label "Daily/7h Swing/Fvg": previous-day
+            // extremes and daily swings (Daily Swing), today's Asia and yesterday's 7h
+            // extremes (7h Swing), and the daily gaps (Fvg). The quarter levels and range
+            // projections are NOT in the source's classes and are deliberately excluded.
+            array<float> f3Lvls = array.from(pdL, pdH, dSwLo, dSwHi, asiaLv, asiaHv)
+            for v in y7Ext
+                f3Lvls.push(v)
+            if dFvgTop.size() > 0
+                for gi = 0 to dFvgTop.size() - 1
+                    f3Lvls.push(dFvgTop.get(gi))
+                    f3Lvls.push(dFvgBot.get(gi))
+            if usePW
+                if not pwlT0
+                    f3Lvls.push(pwL)
+                if not pwhT0
+                    f3Lvls.push(pwH)
+            if usePM
+                if not pmlT0
+                    f3Lvls.push(pmL)
+                if not pmhT0
+                    f3Lvls.push(pmH)
+            bool lvlAtLo = false
+            bool lvlAtHi = false
+            float lvlLoPx = na
+            float lvlHiPx = na
+            for L in f3Lvls
+                if not na(L)
+                    if L >= lonLv and L - lonLv <= band
+                        lvlAtLo := true
+                        if na(lvlLoPx)
+                            lvlLoPx := L
+                    if L <= lonHv and lonHv - L <= band
+                        lvlAtHi := true
+                        if na(lvlHiPx)
+                            lvlHiPx := L
+            // F3 is vetoed by a standing CONFIRMED opposite extreme: a day whose low was
+            // made by a 210m sweep-and-reclaim and never looked back is an extreme-of-day
+            // reversal in progress — the London
+            // extension is the expansion away from it, not a wick-build into a level.
+            if lonCv < lonOv and (lonCv - lonLv) <= band and lvlAtLo and na(hodPx)
+                fwDir  := 1
+                fwName := "F3"
+                fwLvl  := lvlLoPx
+                fwLvlFrom := day18Bar
+                fwJust := true
+            else if lonCv > lonOv and (lonHv - lonCv) <= band and lvlAtHi and na(lodPx)
+                fwDir  := -1
+                fwName := "F3"
+                fwLvl  := lvlHiPx
+                fwLvlFrom := day18Bar
+                fwJust := true
+    // P1 / P1B — the continuation profiles, the days the manipulation-centric F1–F4
+    // cannot name. Tested LAST: F2 (sweep+reclaim) and F3 (protraction INTO a level →
+    // reversal) both outrank them, so a London extension that reached nothing reads as
+    // continuation with room, exactly the F3/P1 distinction. P1 = Asia trends, London
+    // expands the same way. P1B = Asia trends, London coils inside Asia's range — "the
+    // consolidation wasn't a dead day, it was the market building pressure."
+    if fwDir == 0 and not na(asiaOv)
+        int   asiaDir  = asiaCv > asiaOv ? 1 : asiaCv < asiaOv ? -1 : 0
+        float aRange   = asiaHv - asiaLv
+        bool  asiaTrends = asiaDir != 0 and aRange > 0 and math.abs(asiaCv - asiaOv) >= p1Body * aRange
+        bool  lonInside  = lonHv <= asiaHv and lonLv >= asiaLv
+        if asiaTrends
+            if asiaDir == 1 and lonCv > lonOv and lonHv > asiaHv and lonCv > asiaCv
+                fwDir  := 1
+                fwName := "P1"
+                fwJust := true
+            else if asiaDir == -1 and lonCv < lonOv and lonLv < asiaLv and lonCv < asiaCv
+                fwDir  := -1
+                fwName := "P1"
+                fwJust := true
+            else if lonInside
+                fwDir  := asiaDir
+                fwName := "P1B"
+                fwJust := true
+
+// ---- NY decision inputs, mode-aware: with fw210 on, sweeps and closes are judged on
+// the COMPLETED 210m candle (evaluated at its close boundary, start hour in the 8–11
+// window — in practice the 08:00 candle, closing 11:30); otherwise on confirmed chart
+// bars inside the window.
+bool  eff210 = fw210 and can210
+bool  f4Eval = eff210 ? new210 and not na(p210T) and hour(p210T, tzName) >= 8 and hour(p210T, tzName) < 11 : barstate.isconfirmed and etHr >= 8 and etHr < 11
+float f4H = eff210 ? p210H : high
+float f4L = eff210 ? p210L : low
+float f4C = eff210 ? p210C : close
+
+// NY-phase verification for EVERY standing framework. Two disproof tests, both the
+// breakout primitive: a qualifying close THROUGH the framework's own level (fwLvl)
+// against its direction, or THROUGH the London extreme OPPOSITE its direction — a
+// bullish read of any type is dead once NY closes below London's low, and mirrored.
+// The read is cleared, recorded in the audit trail, and the F4 evaluation below is
+// free to name what follows. Close = 210m close in fw210 mode, chart close otherwise.
+if fwOn and fwDir != 0 and seg == 2
+    bool vEval  = eff210 ? new210 and not na(p210C) and hour(nz(p210T, time), tzName) >= 8 : barstate.isconfirmed
+    float vC    = eff210 ? p210C : close
+    if vEval
+        bool lvlBroke = not na(fwLvl) and (fwDir == 1 ? vC < fwLvl : vC > fwLvl)
+        bool oppBroke = not na(lonLv) and (fwDir == 1 ? vC < lonLv : vC > lonHv)
+        if lvlBroke or oppBroke
+            fwFail := fwFail == "" ? fwName : fwFail + "+" + fwName
+            fwDir  := 0
+            fwName := ""
+            fwF4Cont := false
+            fwLvl  := na
+            fwLvlFrom := na
+
+// F4 — volatility at the NY open sweeps a London extreme (live, in the 8–11 AM volatile
+// window — reversals routinely print 9:00–10:30, not just the opening hour). The deciding
+// candle is the sweeping bar itself, resolved by the manipulation/breakout primitives:
+// closes back through the level = manipulation → "NY AM reverses from the sweep"; closes
+// beyond it = breakout → "the volatility confirms the direction and NY AM continues"
+// The two are mutually exclusive by construction, which is what makes the fork
+// decidable. An outside candle that took both extremes resolves by SEQUENCE — the side
+// swept first is the manipulation (a V-day that flushes the low then closes through the
+// high is a reversal off the low, not a continuation) — with sweep depth as fallback.
+if fwOn and fwDir == 0 and f4Eval and not na(lonLv) and not na(f4L)
+    bool sweptLo = f4L < lonLv
+    bool sweptHi = f4H > lonHv
+    if sweptLo and sweptHi
+        if nyFirstSweep == 1
+            sweptHi := false
+        else if nyFirstSweep == -1
+            sweptLo := false
+        else if lonLv - f4L >= f4H - lonHv
+            sweptHi := false
+        else
+            sweptLo := false
+    if sweptLo
+        fwLvl     := lonLv
+        fwLvlFrom := lonLoBar
+        if f4C > lonLv
+            fwDir  := 1
+            fwName := "F4"
+            fwJust := true
+        else if f4C < lonLv
+            fwDir    := -1
+            fwName   := "F4"
+            fwF4Cont := true
+            fwJust   := true
+    if sweptHi
+        fwLvl     := lonHv
+        fwLvlFrom := lonHiBar
+        if f4C < lonHv
+            fwDir  := -1
+            fwName := "F4"
+            fwJust := true
+        else if f4C > lonHv
+            fwDir    := 1
+            fwName   := "F4"
+            fwF4Cont := true
+            fwJust   := true
+
+// ---- developing F4 preview (fw210 mode): the FORMING 08:00 210m candle read live.
+// REPAINTS by construction until the candle closes at 11:30 — display only, never sets
+// the framework, never gates entries, never alerts.
+int  devDir  = 0
+bool devCont = false
+if fwOn and eff210 and fwDir == 0 and not na(lonLv) and not na(t210start) and not na(c210L)
+    int th = hour(t210start, tzName)
+    if th >= 8 and th < 11
+        bool dLo = c210L < lonLv
+        bool dHi = c210H > lonHv
+        if dLo and dHi
+            if nyFirstSweep == 1
+                dHi := false
+            else if nyFirstSweep == -1
+                dLo := false
+            else if lonLv - c210L >= c210H - lonHv
+                dHi := false
+            else
+                dLo := false
+        if dLo
+            devDir  := close > lonLv ? 1 : close < lonLv ? -1 : 0
+            devCont := devDir == -1
+        if dHi
+            devDir  := close < lonHv ? -1 : close > lonHv ? 1 : 0
+            devCont := devDir == 1
+
+// (framework sweep-line drawing happens after the P4/P4B re-classification, in the entry
+// section — a late re-classification must still be able to draw)
+
+// ============================================================================
+// ENTRY FRAMEWORK — CISD engine (adapted from Universal Po3 Profiler × CIC [YUS])
+// ============================================================================
+
+// Wick-aware, log-scaled equilibrium — a sweep candle's manipulation midpoint sits in its
+// dominant wick, not at the geometric centre. Used by the chart-TF C2 qualifier.
+logMid(float h, float l, float o, float c) =>
+    float res = math.avg(h, l)
+    if l > 0 and h > 0 and o > 0 and c > 0
+        float lh = math.log(h)
+        float ll = math.log(l)
+        float body   = math.abs(math.log(c) - math.log(o))
+        float upWick = lh - math.max(math.log(o), math.log(c))
+        float dnWick = math.min(math.log(o), math.log(c)) - ll
+        float m = math.max(upWick, dnWick) > body ? (upWick > dnWick ? lh - upWick / 2 : ll + dnWick / 2) : (lh + ll) / 2
+        res := math.exp(m)
+    res
+
+// ---- Run tracking. A run only flips on a CLEAR opposite candle; doji bars continue the current
+// run, keeping the run's opening anchored to the true start of the leg. The run's extreme is the
+// swing a CISD delivers off.
+var float dnRunOpen = na    // open of the first candle of the current down-run (armed for bullish CISD)
+var int   dnRunBar  = na
+var float upRunOpen = na    // open of the first candle of the current up-run (armed for bearish CISD)
+var int   upRunBar  = na
+var int   runDir    = 0
+var float dnLo    = na
+var int   dnLoBar = na
+var float upHi    = na
+var int   upHiBar = na
+
+// Extend the run active COMING INTO this bar before any flip, so the reversal bar's own extreme
+// still counts toward the run it ended — that is where the swing actually sits.
+if runDir == -1 and (na(dnLo) or low < dnLo)
+    dnLo    := low
+    dnLoBar := bar_index
+if runDir == 1 and (na(upHi) or high > upHi)
+    upHi    := high
+    upHiBar := bar_index
+if close < open and runDir != -1
+    runDir    := -1
+    dnRunOpen := open
+    dnRunBar  := bar_index
+    dnLo      := low
+    dnLoBar   := bar_index
+if close > open and runDir != 1
+    runDir    := 1
+    upRunOpen := open
+    upRunBar  := bar_index
+    upHi      := high
+    upHiBar   := bar_index
+
+// ---- CISD print: price closes back through the OPEN of the run in progress.
+bool  cisdBullNow = false
+bool  cisdBearNow = false
+float cisdLvl   = na
+int   cisdX1    = na
+float cisdSw    = na
+int   cisdSwBar = na
+if barstate.isconfirmed
+    if not na(dnRunOpen) and close > dnRunOpen and not (close[1] > dnRunOpen)
+        cisdBullNow := true
+        cisdLvl     := dnRunOpen
+        cisdX1      := nz(dnRunBar, bar_index - 1)
+        cisdSw      := dnLo
+        cisdSwBar   := dnLoBar
+        dnRunOpen   := na
+    if not na(upRunOpen) and close < upRunOpen and not (close[1] < upRunOpen)
+        cisdBearNow := true
+        cisdLvl     := upRunOpen
+        cisdX1      := nz(upRunBar, bar_index - 1)
+        cisdSw      := upHi
+        cisdSwBar   := upHiBar
+        upRunOpen   := na
+
+// ---- P4 / P4B — the reversal profiles on an aligned (P1) day, re-classified live at
+// the NY open. P4: NY spikes through London's extreme and closes back through it — the
+// alignment was bait. P4B: NY flips via a chart-TF CISD against the alignment WITHOUT
+// ever taking London's extreme — "the manipulation signal you normally wait for never
+// comes." One re-classification only; the day then stays P4/P4B.
+if fwOn and fwName == "P1" and not na(lonHv)
+    // the sweep fork resolves on the mode-aware NY decision candle (210m close in fw210
+    // mode); the P4B no-sweep flip stays on chart-TF CISD structure by definition
+    if fwDir == 1
+        if f4Eval and not na(f4H) and f4H > lonHv and f4C < lonHv
+            fwDir  := -1
+            fwName := "P4"
+            fwLvl  := lonHv
+            fwLvlFrom := lonHiBar
+            fwJust := true
+        else if barstate.isconfirmed and etHr >= 8 and etHr < 11 and cisdBearNow and not nyTookLon and high <= lonHv and low >= lonLv
+            fwDir  := -1
+            fwName := "P4B"
+            fwLvl  := na
+            fwJust := true
+    else if fwDir == -1
+        if f4Eval and not na(f4L) and f4L < lonLv and f4C > lonLv
+            fwDir  := 1
+            fwName := "P4"
+            fwLvl  := lonLv
+            fwLvlFrom := lonLoBar
+            fwJust := true
+        else if barstate.isconfirmed and etHr >= 8 and etHr < 11 and cisdBullNow and not nyTookLon and high <= lonHv and low >= lonLv
+            fwDir  := 1
+            fwName := "P4B"
+            fwLvl  := na
+            fwJust := true
+if barstate.isconfirmed and etHr >= 8 and etHr < 11 and not na(lonHv) and (high > lonHv or low < lonLv)
+    if nyFirstSweep == 0
+        if low < lonLv and high > lonHv
+            nyFirstSweep := lonLv - low >= high - lonHv ? 1 : -1
+        else if low < lonLv
+            nyFirstSweep := 1
+        else
+            nyFirstSweep := -1
+    nyTookLon := true
+
+// no on-chart F tag — the framework is named in the 7h panel header and the status readout;
+// only the manipulated level's sweep line is drawn on price
+if fwJust and not na(fwLvl)
+    line.new(nz(fwLvlFrom, bar_index), fwLvl, bar_index, fwLvl, color=color.new(colInk, 20), width=1)
+
+// ---- SMT / FVG confluence (chart TF), ported from the CIC engine ----------------------------
+// SMT: a confirmed pivot where this symbol and a correlated asset disagree on which of the last
+// two swings made the extreme. Auto triad by symbol root (NQ -> ES+YM, ES -> NQ+YM, YM -> NQ+ES).
+
+int   pvLen = 1
+float pvLo = ta.pivotlow(low, pvLen, pvLen)
+float pvHi = ta.pivothigh(high, pvLen, pvLen)
+var float lastPvLo   = na
+var float prevPvLo   = na
+var float lastPvLoA  = na
+var float prevPvLoA  = na
+var float lastPvLoB  = na
+var float prevPvLoB  = na
+var int   lastPvLoBar = na
+var int   prevPvLoBar = na
+var float lastPvHi   = na
+var float prevPvHi   = na
+var float lastPvHiA  = na
+var float prevPvHiA  = na
+var float lastPvHiB  = na
+var float prevPvHiB  = na
+var int   lastPvHiBar = na
+var int   prevPvHiBar = na
+// event stamps + geometry (bar the event last fired on, per side; na = never)
+var int   smtLoBar = na
+var float smtLoY1 = na
+var int   smtLoX1 = na
+var float smtLoY2 = na
+var int   smtLoX2 = na
+var int   smtHiBar = na
+var float smtHiY1 = na
+var int   smtHiX1 = na
+var float smtHiY2 = na
+var int   smtHiX2 = na
+var int   fvgLoBar = na
+var float fvgLoTop = na
+var float fvgLoBot = na
+var int   fvgLoFrom = na
+var int   fvgHiBar = na
+var float fvgHiTop = na
+var float fvgHiBot = na
+var int   fvgHiFrom = na
+var int   swpLoBar = na
+var float swpLoLvl = na
+var int   swpLoFrom = na
+var int   swpHiBar = na
+var float swpHiLvl = na
+var int   swpHiFrom = na
+var int   c2LoBar = na
+var float c2LoLvl = na
+var int   c2LoFrom = na
+var int   c2HiBar = na
+var float c2HiLvl = na
+var int   c2HiFrom = na
+// recent chart-TF fair value gaps
+var array<float> bfTop = array.new_float()
+var array<float> bfBot = array.new_float()
+var array<int>   bfIdx = array.new_int()
+var array<float> sfTop = array.new_float()
+var array<float> sfBot = array.new_float()
+var array<int>   sfIdx = array.new_int()
+
+if not na(pvLo)
+    prevPvLo    := lastPvLo
+    prevPvLoBar := lastPvLoBar
+    prevPvLoA := lastPvLoA
+    prevPvLoB := lastPvLoB
+    lastPvLo    := pvLo
+    lastPvLoBar := bar_index - pvLen
+    lastPvLoA := a1L[pvLen]
+    lastPvLoB := a2L[pvLen]
+    bool sBey = lastPvLo < prevPvLo
+    bool dA = a1Ok and not na(prevPvLo) and not na(lastPvLoA) and not na(prevPvLoA) and (sBey != (lastPvLoA < prevPvLoA))
+    bool dB = a2Ok and not na(prevPvLo) and not na(lastPvLoB) and not na(prevPvLoB) and (sBey != (lastPvLoB < prevPvLoB))
+    if dA or dB
+        smtLoBar := bar_index - pvLen
+        smtLoY1  := prevPvLo
+        smtLoX1  := prevPvLoBar
+        smtLoY2  := lastPvLo
+        smtLoX2  := lastPvLoBar
+if not na(pvHi)
+    prevPvHi    := lastPvHi
+    prevPvHiBar := lastPvHiBar
+    prevPvHiA := lastPvHiA
+    prevPvHiB := lastPvHiB
+    lastPvHi    := pvHi
+    lastPvHiBar := bar_index - pvLen
+    lastPvHiA := a1H[pvLen]
+    lastPvHiB := a2H[pvLen]
+    bool sBey = lastPvHi > prevPvHi
+    bool dA = a1Ok and not na(prevPvHi) and not na(lastPvHiA) and not na(prevPvHiA) and (sBey != (lastPvHiA > prevPvHiA))
+    bool dB = a2Ok and not na(prevPvHi) and not na(lastPvHiB) and not na(prevPvHiB) and (sBey != (lastPvHiB > prevPvHiB))
+    if dA or dB
+        smtHiBar := bar_index - pvLen
+        smtHiY1  := prevPvHi
+        smtHiX1  := prevPvHiBar
+        smtHiY2  := lastPvHi
+        smtHiX2  := lastPvHiBar
+
+if barstate.isconfirmed
+    // FVG taps BEFORE registering this bar's new gap, so the bar that creates a gap can never
+    // count as trading into it. A gap is spent once price closes through it.
+    if bfTop.size() > 0
+        for i = bfTop.size() - 1 to 0
+            if close < bfBot.get(i)
+                // a spent gap can no longer be a qualifying event — its stamp dies with it
+                if not na(fvgLoTop) and fvgLoTop == bfTop.get(i) and fvgLoBot == bfBot.get(i)
+                    fvgLoBar  := na
+                    fvgLoTop  := na
+                    fvgLoBot  := na
+                    fvgLoFrom := na
+                bfTop.remove(i)
+                bfBot.remove(i)
+                bfIdx.remove(i)
+                continue
+            if low <= bfTop.get(i) and high >= bfBot.get(i)
+                fvgLoBar  := bar_index
+                fvgLoTop  := bfTop.get(i)
+                fvgLoBot  := bfBot.get(i)
+                fvgLoFrom := bfIdx.get(i)
+    if sfTop.size() > 0
+        for i = sfTop.size() - 1 to 0
+            if close > sfTop.get(i)
+                // a spent gap can no longer be a qualifying event — its stamp dies with it
+                if not na(fvgHiTop) and fvgHiTop == sfTop.get(i) and fvgHiBot == sfBot.get(i)
+                    fvgHiBar  := na
+                    fvgHiTop  := na
+                    fvgHiBot  := na
+                    fvgHiFrom := na
+                sfTop.remove(i)
+                sfBot.remove(i)
+                sfIdx.remove(i)
+                continue
+            if high >= sfBot.get(i) and low <= sfTop.get(i)
+                fvgHiBar  := bar_index
+                fvgHiTop  := sfTop.get(i)
+                fvgHiBot  := sfBot.get(i)
+                fvgHiFrom := sfIdx.get(i)
+    if low > high[2]
+        bfTop.push(low)
+        bfBot.push(high[2])
+        bfIdx.push(bar_index - 2)
+        if bfTop.size() > 12
+            bfTop.shift()
+            bfBot.shift()
+            bfIdx.shift()
+    if high < low[2]
+        sfTop.push(low[2])
+        sfBot.push(high)
+        sfIdx.push(bar_index - 2)
+        if sfTop.size() > 12
+            sfTop.shift()
+            sfBot.shift()
+            sfIdx.shift()
+    // LQ: sweep of a chart-TF swing point, stamped on the bar it is taken.
+    if not na(lastPvLo) and low < lastPvLo and not (low[1] < lastPvLo)
+        swpLoBar  := bar_index
+        swpLoLvl  := lastPvLo
+        swpLoFrom := lastPvLoBar
+    if not na(lastPvHi) and high > lastPvHi and not (high[1] > lastPvHi)
+        swpHiBar  := bar_index
+        swpHiLvl  := lastPvHi
+        swpHiFrom := lastPvHiBar
+    // C2: a chart candle that sweeps the prior candle's extreme, closes back inside it, and closes
+    // beyond its own (wick-aware) equilibrium in the reversal direction. Decided on closed bars.
+    float c2mid1 = logMid(high[1], low[1], open[1], close[1])
+    if low[1] < low[2] and close[1] > low[2] and close[1] > c2mid1
+        c2LoBar  := bar_index - 1
+        c2LoLvl  := low[2]
+        c2LoFrom := bar_index - 2
+    if high[1] > high[2] and close[1] < high[2] and close[1] < c2mid1
+        c2HiBar  := bar_index - 1
+        c2HiLvl  := high[2]
+        c2HiFrom := bar_index - 2
+
+// ---- Entry: a protected CISD in the bias direction, any time of day -------------------------
+// Each entry keeps its own drawings and stays on the chart until price CLOSES through its
+// protected swing (invalidation) or it ages past the retention cap — like the CIC engine's
+// CISD list. The day boundary does NOT clear them.
+type PsEntry
+    int   dir
+    float swing
+    int   day        // dayStartBar when created, for the one-entry-per-day re-arm
+    label diam
+    line  cisdLn
+    line  smtLn
+    box   fvgBx
+    line  sweepLn
+    line  c2Ln
+    label lbl
+    line  stopLn
+    line  r1Ln
+    line  r2Ln
+    label r1Lb
+    label r2Lb
+
+delEntry(PsEntry e) =>
+    label.delete(e.diam)
+    line.delete(e.cisdLn)
+    line.delete(e.smtLn)
+    box.delete(e.fvgBx)
+    line.delete(e.sweepLn)
+    line.delete(e.c2Ln)
+    label.delete(e.lbl)
+    line.delete(e.stopLn)
+    line.delete(e.r1Ln)
+    line.delete(e.r2Ln)
+    label.delete(e.r1Lb)
+    label.delete(e.r2Lb)
+
+var bool entryDone   = false
+var int  dayStartBar = na
+var array<PsEntry> psEntries = array.new<PsEntry>()
+
+if newDay
+    entryDone   := false
+    dayStartBar := bar_index
+
+// Entries follow the WORKING direction: the PD bias normally, the break's direction once
+// the reversal framework has flipped the day. With the framework off, a broken 25% still
+// stands entries down under "Require valid A+ bias".
+biasOkEnt = biasGate == "A+ only" ? biasActive and not invalid and not wasBroken : biasGate == "Working direction" ? biasActive and (not invalid or useRev) : bias != 0
+int entDir = dirEff
+// Entries are a lower-timeframe tool (5/15m per the source) — stand down on charts above the cap.
+bool entTfOk = timeframe.in_seconds() <= timeframe.in_seconds(entMaxTf)
+// ... and a time-of-day tool: default 09:00–10:30 per the entry framework's window/cutoff
+bool entTimeOk = not entWindow or not na(time(timeframe.period, entSess, tzName))
+// 7h framework gate (p64: a 7h framework opposing the daily = no trade), plus the ADR
+// exhaustion guard (AM: London took everything → stay out)
+bool fw7hOk = not showFw or fw7hMode == "Off" or (fw7hMode == "Require aligned" ? fwDir == entDir : fwDir == 0 or fwDir == entDir)
+fw7hOk := fw7hOk and not rangeExhausted
+
+// The full protected-swing gate from the CIC engine, applied to both entry models: a
+// qualifying event (SMT / FVG / LQ / C2) must fire BEFORE the trigger, inside the leg being
+// reversed — event first, trigger after, order matters. Only the MOST RECENT qualifying event
+// counts (that is the one that actually led to the trigger); events tying on the same bar are
+// all named and drawn. Triggers: a CISD (reclaim of the opposing run's open), and Ry's
+// reversal signatures (RC / EC / IRC) taken at the signature candle's close with its own
+// extreme as the protected point.
+bool psLongNow  = false
+bool psShortNow = false
+if showEntry and entTfOk and entTimeOk and fw7hOk and barstate.isconfirmed and biasOkEnt and not (firstOnly and entryDone)
+    bool bull = entDir == 1
+    bool cisdFire = useCisdEntry and (bull ? cisdBullNow : cisdBearNow) and not na(cisdSw)
+    // ---- Ry's reversal signatures (Essence Foundation Model), classified on this candle's
+    // close against the previous candle. EC and IRC reverse an opposing previous candle; RC
+    // sweeps the last confirmed swing point and closes back through it.
+    float mid50   = math.avg(high[1], low[1])
+    bool  prevOpp = bull ? close[1] < open[1] : close[1] > open[1]
+    // p54: the 50% close is the COMMON requirement for every signature — the low/high
+    // only classifies the type. For a bearish prev candle with a large upper wick,
+    // close > open[1] does NOT imply close > range-50%, which is the case p54 exists for.
+    bool ecSig  = useEC and (bull ? low < low[1] and close > open[1] and close > mid50 and close > open and prevOpp : high > high[1] and close < open[1] and close < mid50 and close < open and prevOpp)
+    bool rcSig  = useRC and (bull ? not na(lastPvLo) and low < lastPvLo and close > lastPvLo and close > open : not na(lastPvHi) and high > lastPvHi and close < lastPvHi and close < open)
+    bool ircSig = useIRC and not ecSig and (bull ? close > mid50 and close > open and prevOpp : close < mid50 and close < open and prevOpp)
+    bool sigFire = useSigEntry and (ecSig or rcSig or ircSig)
+    // Breakout entry: the FIRST close through the 8–9 extreme in the working direction —
+    // no manipulation required, the breakout close is the signature. Stop = the opposite
+    // side of the range.
+    bool boSig = useBO and not na(h89) and (bull ? close > h89 and close > open and not (close[1] > h89) : close < l89 and close < open and not (close[1] < l89))
+    // Strong-close filter: the trigger candle's close must land in the outer 25% of its
+    // own low→high range — a weak close is not engaged.
+    float trigRange = high - low
+    bool strongOk = not useStrong or (trigRange > 0 and (bull ? (close - low) / trigRange >= 0.75 : (high - close) / trigRange >= 0.75))
+    if (cisdFire or sigFire or boSig) and strongOk
+        // Event window: the run the CISD reversed, or — for a signature-only trigger — the
+        // opposing run in progress when the signature printed.
+        int winStart = cisdFire ? cisdX1 : nz(bull ? dnRunBar : upRunBar, math.max(bar_index - 20, 0))
+        // stale-event cap: the run may reach back hours on a low TF — an event older than
+        // evMaxBars is no longer the reason this trigger printed
+        winStart := math.max(winStart, bar_index - evMaxBars)
+        int sB = bull ? smtLoBar : smtHiBar
+        int fB = bull ? fvgLoBar : fvgHiBar
+        int lB = bull ? swpLoBar : swpHiBar
+        int cB = bull ? c2LoBar : c2HiBar
+        bool smtQ = useSmtEv and not na(sB) and sB >= winStart
+        bool fvgQ = useFvgEv and not na(fB) and fB >= winStart
+        bool lqQ  = useLqEv and not na(lB) and lB >= winStart
+        bool c2Q  = useC2Ev and not na(cB) and cB >= winStart
+        bool gateHit = smtQ or fvgQ or lqQ or c2Q
+        bool okCisd = cisdFire and gateHit
+        bool okSig  = sigFire and (not sigGate or gateHit)
+        bool okBo   = boSig    // continuation, not a reversal-out-of-something: ungated
+        if okCisd or okSig or okBo
+            int best = -1
+            if smtQ
+                best := math.max(best, sB)
+            if fvgQ
+                best := math.max(best, fB)
+            if lqQ
+                best := math.max(best, lB)
+            if c2Q
+                best := math.max(best, cB)
+            bool useS = smtQ and sB == best
+            bool useF = fvgQ and fB == best
+            bool useL = lqQ  and lB == best
+            bool useC = c2Q  and cB == best
+            // trigger tag + protected point: the CISD's run extreme when a CISD fired;
+            // for a signature, the MOST RECENT extreme — the run low/high the signature
+            // reversed (bounded by the event max-age), not merely its own wick
+            string trig = okCisd ? "CISD" : ""
+            if okSig
+                if rcSig
+                    trig := trig + (trig == "" ? "" : "+") + "RC"
+                if ecSig
+                    trig := trig + (trig == "" ? "" : "+") + "EC"
+                if ircSig
+                    trig := trig + (trig == "" ? "" : "+") + "IRC"
+            if okBo
+                trig := trig + (trig == "" ? "" : "+") + "BO"
+            float sigSw  = bull ? low : high
+            int   sigSwB = bar_index
+            if bull and not na(dnLo) and dnLo <= low and bar_index - nz(dnLoBar, bar_index) <= evMaxBars
+                sigSw  := dnLo
+                sigSwB := dnLoBar
+            if not bull and not na(upHi) and upHi >= high and bar_index - nz(upHiBar, bar_index) <= evMaxBars
+                sigSw  := upHi
+                sigSwB := upHiBar
+            float sw  = okCisd ? cisdSw : okSig ? sigSw : (bull ? l89 : h89)
+            int   swB = okCisd ? cisdSwBar : okSig ? sigSwB : nz(x89, bar_index)
+            color pc = bull ? cisdBullCol : cisdBearCol
+            // stop per the 75% rule: tight mode stops at the trigger candle's own extreme
+            float stopPx = stopMode == "Protected swing" ? sw : (bull ? low : high)
+            // only the LATEST trigger carries R targets and the stop line — strip both
+            // off every entry first
+            if psEntries.size() > 0
+                for pi = 0 to psEntries.size() - 1
+                    PsEntry pe = psEntries.get(pi)
+                    line.delete(pe.r1Ln)
+                    line.delete(pe.r2Ln)
+                    label.delete(pe.r1Lb)
+                    label.delete(pe.r2Lb)
+                    line.delete(pe.stopLn)
+                    pe.r1Ln := na
+                    pe.r2Ln := na
+                    pe.r1Lb := na
+                    pe.r2Lb := na
+                    pe.stopLn := na
+            // MERGE: a trigger delivering off the SAME protected swing as a standing
+            // same-direction entry joins that entry — its label gains the new trigger,
+            // a CISD line is added if this trigger brought one — instead of printing a
+            // second diamond on the same point
+            bool mergedPs = false
+            PsEntry eTgt = na
+            if psEntries.size() > 0
+                for pj = 0 to psEntries.size() - 1
+                    PsEntry pex = psEntries.get(pj)
+                    if not mergedPs and pex.dir == (bull ? 1 : -1) and pex.swing == sw
+                        mergedPs := true
+                        eTgt := pex
+                        if showPsLbl and not na(pex.lbl)
+                            string oldTxt = label.get_text(pex.lbl)
+                            if not str.contains(oldTxt, trig)
+                                label.set_text(pex.lbl, oldTxt + "+" + trig)
+                        if okCisd and na(pex.cisdLn)
+                            pex.cisdLn := line.new(cisdX1, cisdLvl, bar_index + 3, cisdLvl, color=pc, width=2)
+            if not mergedPs
+                PsEntry e = PsEntry.new(dir = bull ? 1 : -1, swing = sw, day = nz(dayStartBar, bar_index))
+                string seq = ""
+                if useS
+                    seq := "SMT"
+                    e.smtLn := line.new(bull ? smtLoX1 : smtHiX1, bull ? smtLoY1 : smtHiY1, bull ? smtLoX2 : smtHiX2, bull ? smtLoY2 : smtHiY2, color=pc, width=1, style=line.style_dotted)
+                if useF
+                    seq := seq + (seq == "" ? "" : "+") + "FVG"
+                    // same gap already drawn by a still-standing entry → EXTEND that box
+                    // to this setup's tap instead of stacking another translucent copy
+                    float nfTop = bull ? fvgLoTop : fvgHiTop
+                    float nfBot = bull ? fvgLoBot : fvgHiBot
+                    bool fvgDrawn = false
+                    if psEntries.size() > 0
+                        for pj = 0 to psEntries.size() - 1
+                            PsEntry pex = psEntries.get(pj)
+                            if not na(pex.fvgBx)
+                                if box.get_top(pex.fvgBx) == nfTop and box.get_bottom(pex.fvgBx) == nfBot
+                                    box.set_right(pex.fvgBx, math.max(box.get_right(pex.fvgBx), fB))
+                                    fvgDrawn := true
+                                    break
+                    if not fvgDrawn
+                        e.fvgBx := box.new(bull ? fvgLoFrom : fvgHiFrom, nfTop, fB, nfBot, bgcolor=color.new(pc, 88), border_color=color.new(pc, 60))
+                if useL
+                    seq := seq + (seq == "" ? "" : "+") + "LQ"
+                    e.sweepLn := line.new(bull ? swpLoFrom : swpHiFrom, bull ? swpLoLvl : swpHiLvl, bar_index + 3, bull ? swpLoLvl : swpHiLvl, color=pc, width=1, style=line.style_dashed)
+                if useC
+                    seq := seq + (seq == "" ? "" : "+") + "C2"
+                    e.c2Ln := line.new(bull ? c2LoFrom : c2HiFrom, bull ? c2LoLvl : c2HiLvl, cB, bull ? c2LoLvl : c2HiLvl, color=pc, width=1, style=line.style_dotted)
+                string lblTxt = seq == "" ? "PS · " + trig : "PS · " + seq + "→" + trig
+                e.diam := label.new(swB, sw, "", color=pc, style=label.style_diamond, size=4)
+                if okCisd
+                    e.cisdLn := line.new(cisdX1, cisdLvl, bar_index + 3, cisdLvl, color=pc, width=2)
+                if showPsLbl
+                    e.lbl := label.new(swB, na, lblTxt, yloc=bull ? yloc.belowbar : yloc.abovebar, style=label.style_none, textcolor=pc, size=size.tiny)
+                psEntries.unshift(e)
+                if psEntries.size() > maxEntries
+                    delEntry(psEntries.pop())
+                eTgt := e
+            // stop — latest trigger only, like the R targets; tight mode anchors at the
+            // trigger candle instead of the swing
+            if showStop and not na(eTgt)
+                eTgt.stopLn := line.new(stopMode == "Protected swing" ? swB : bar_index, stopPx, bar_index + 8, stopPx, color=color.new(colInk, 30), width=1, style=line.style_dotted)
+            // 1R / 2R off THIS trigger's close vs the chosen stop
+            if showRR and not na(eTgt)
+                float rr = math.abs(close - stopPx)
+                if rr > 0
+                    float r1 = bull ? close + rr : close - rr
+                    float r2 = bull ? close + 2 * rr : close - 2 * rr
+                    eTgt.r1Ln := line.new(bar_index, r1, bar_index + 8, r1, color=color.new(pc, 50), width=1, style=line.style_dotted)
+                    eTgt.r2Ln := line.new(bar_index, r2, bar_index + 8, r2, color=color.new(pc, 50), width=1, style=line.style_dotted)
+                    eTgt.r1Lb := label.new(bar_index + 9, r1, "1R", style=label.style_none, textcolor=color.new(pc, 35), size=size.tiny)
+                    eTgt.r2Lb := label.new(bar_index + 9, r2, "2R", style=label.style_none, textcolor=color.new(pc, 35), size=size.tiny)
+            entryDone := true
+            if bull
+                psLongNow := true
+            else
+                psShortNow := true
+
+// Entry invalidation: each swing is protected only until price CLOSES through it. Then that
+// entry's drawings are removed; if it was today's entry, the framework re-arms.
+if barstate.isconfirmed and psEntries.size() > 0
+    for i = psEntries.size() - 1 to 0
+        PsEntry e = psEntries.get(i)
+        if (e.dir == 1 and close < e.swing) or (e.dir == -1 and close > e.swing)
+            if e.day == nz(dayStartBar, -1)
+                entryDone := false
+            delEntry(e)
+            psEntries.remove(i)
+
+// Pending CISD level: the open of the run in progress — the level the next CISD prints at.
+// Live only.
+var line pendLn = na
+if barstate.islast
+    if not na(pendLn)
+        line.delete(pendLn)
+        pendLn := na
+    if showEntry and showPend and entTfOk and entTimeOk and fw7hOk and biasOkEnt and not entryDone
+        if entDir == 1 and not na(dnRunOpen)
+            pendLn := line.new(nz(dnRunBar, bar_index - 1), dnRunOpen, bar_index + 4, dnRunOpen, color=cisdBullCol, width=1, style=line.style_dotted)
+        if entDir == -1 and not na(upRunOpen)
+            pendLn := line.new(nz(upRunBar, bar_index - 1), upRunOpen, bar_index + 4, upRunOpen, color=cisdBearCol, width=1, style=line.style_dotted)
+
+// ============================================================================
+// DRAWINGS — mini panels (today's 1H / 210m / 7H candles, floated right of price)
+// ============================================================================
+can60  = timeframe.in_seconds() <= 60 * 60 and 3600 % timeframe.in_seconds() == 0
+new60  = can60 and timeframe.change("60")
+can420 = timeframe.in_seconds() <= 420 * 60 and 420 * 60 % timeframe.in_seconds() == 0
+new420 = can420 and timeframe.change("420")
+
+var array<float> aO = array.new_float()   // 210m
+var array<float> aH = array.new_float()
+var array<float> aL = array.new_float()
+var array<float> aC = array.new_float()
+var array<float> bO = array.new_float()   // 1H (last 8 kept)
+var array<float> bH = array.new_float()
+var array<float> bL = array.new_float()
+var array<float> bC = array.new_float()
+var array<float> cO = array.new_float()   // 7H
+var array<float> cH = array.new_float()
+var array<float> cL = array.new_float()
+var array<float> cC = array.new_float()
+
+if newDay
+    // latch yesterday's 7h candle extremes for the F3 level pool before clearing
+    y7Ext.clear()
+    if cH.size() > 0
+        for i = 0 to cH.size() - 1
+            y7Ext.push(cH.get(i))
+            y7Ext.push(cL.get(i))
+    aO.clear()
+    aH.clear()
+    aL.clear()
+    aC.clear()
+    bO.clear()
+    bH.clear()
+    bL.clear()
+    bC.clear()
+    cO.clear()
+    cH.clear()
+    cL.clear()
+    cC.clear()
+
+// Track one panel timeframe on the chart TF: open a new candle on its boundary, otherwise
+// roll the forming one. `keep` caps retention (the 1H would otherwise hold 23 candles).
+trackTf(array<float> o_, array<float> h_, array<float> l_, array<float> c_, bool newBar, int keep) =>
+    bool newC = newBar or o_.size() == 0
+    if newC
+        o_.push(open)
+        h_.push(high)
+        l_.push(low)
+        c_.push(close)
+    else
+        int lastI = o_.size() - 1
+        h_.set(lastI, math.max(h_.get(lastI), high))
+        l_.set(lastI, math.min(l_.get(lastI), low))
+        c_.set(lastI, close)
+    if newC and o_.size() > keep
+        o_.shift()
+        h_.shift()
+        l_.shift()
+        c_.shift()
+
+if can210
+    trackTf(aO, aH, aL, aC, new210, 8)
+if can60
+    trackTf(bO, bH, bL, bC, new60, 8)
+if can420
+    trackTf(cO, cH, cL, cC, new420, 4)
+
+// correlated-asset H/L per panel candle, same boundaries — feeds the panel SMT lines
+var array<float> s1H210 = array.new_float()
+var array<float> s1L210 = array.new_float()
+var array<float> s2H210 = array.new_float()
+var array<float> s2L210 = array.new_float()
+var array<float> s1H7 = array.new_float()
+var array<float> s1L7 = array.new_float()
+var array<float> s2H7 = array.new_float()
+var array<float> s2L7 = array.new_float()
+var array<float> s1H60 = array.new_float()
+var array<float> s1L60 = array.new_float()
+var array<float> s2H60 = array.new_float()
+var array<float> s2L60 = array.new_float()
+if newDay
+    s1H210.clear()
+    s1L210.clear()
+    s2H210.clear()
+    s2L210.clear()
+    s1H7.clear()
+    s1L7.clear()
+    s2H7.clear()
+    s2L7.clear()
+    s1H60.clear()
+    s1L60.clear()
+    s2H60.clear()
+    s2L60.clear()
+trackHL(array<float> h_, array<float> l_, bool newBar, int keep, float sh, float sl) =>
+    bool newC = newBar or h_.size() == 0
+    if newC
+        h_.push(sh)
+        l_.push(sl)
+    else
+        int li = h_.size() - 1
+        h_.set(li, math.max(nz(h_.get(li), sh), sh))
+        l_.set(li, math.min(nz(l_.get(li), sl), sl))
+    if newC and h_.size() > keep
+        h_.shift()
+        l_.shift()
+// asset aggregation only feeds the panel SMT lines — skip the work when they're off
+if showPanelSmt
+    if can210
+        trackHL(s1H210, s1L210, new210, 8, a1H, a1L)
+        trackHL(s2H210, s2L210, new210, 8, a2H, a2L)
+    if can420
+        trackHL(s1H7, s1L7, new420, 4, a1H, a1L)
+        trackHL(s2H7, s2L7, new420, 4, a2H, a2L)
+    if can60
+        trackHL(s1H60, s1L60, new60, 8, a1H, a1L)
+        trackHL(s2H60, s2L60, new60, 8, a2H, a2L)
+
+var array<box>   pBoxes = array.new<box>()
+var array<line>  pLines = array.new<line>()
+var array<label> pLabs  = array.new<label>()
+
+// Render one panel at xStart; returns the x where the next panel begins.
+drawPanel(array<float> o_, array<float> h_, array<float> l_, array<float> c_, int xStart, string title, bool tagSessions, bool sweepLines) =>
+    int n = o_.size()
+    if n > 0
+        float hiAll = h_.max()
+        float loAll = l_.min()
+        float pad   = (hiAll - loAll) * 0.10
+        if not na(q25)
+            pLines.push(line.new(xStart - 2, q25, xStart + n * 4, q25, color=color.new(colLevel, 45), style=line.style_dotted))
+        for i = 0 to n - 1
+            o  = o_.get(i)
+            c  = c_.get(i)
+            hI = h_.get(i)
+            lI = l_.get(i)
+            up = c >= o
+            xL = xStart + i * 4
+            pLines.push(line.new(xL + 1, hI, xL + 1, lI, color=colOutline, width=1))
+            pBoxes.push(box.new(xL, math.max(o, c), xL + 2, math.min(o, c), border_color=colOutline, bgcolor=up ? colUpFill : colDnFill))
+            // genuine sweeps of the prior candle (level taken then HELD — a close through
+            // the level is expansion, not a sweep, and draws nothing). A sweep also stays
+            // valid only while its own extreme HOLDS: any later candle — including the one
+            // forming right now — printing beyond the sweep candle's high/low kills it.
+            if sweepLines and i > 0
+                float pvL = l_.get(i - 1)
+                float pvH = h_.get(i - 1)
+                int   xPv = xStart + (i - 1) * 4 + 1
+                if lI < pvL and c > pvL
+                    bool loHolds = true
+                    if i < n - 1
+                        for j = i + 1 to n - 1
+                            if l_.get(j) < lI
+                                loHolds := false
+                                break
+                    if loHolds
+                        pLines.push(line.new(xPv, pvL, xL + 2, pvL, color=colOutline, width=1))
+                if hI > pvH and c < pvH
+                    bool hiHolds = true
+                    if i < n - 1
+                        for j = i + 1 to n - 1
+                            if h_.get(j) > hI
+                                hiHolds := false
+                                break
+                    if hiHolds
+                        pLines.push(line.new(xPv, pvH, xL + 2, pvH, color=colOutline, width=1))
+            if tagSessions
+                string lt = i == 0 ? "A" : i == 1 ? "L" : i == 2 ? "N" : ""
+                if lt != ""
+                    pLabs.push(label.new(xL + 1, l_.get(i) - pad, lt, style=label.style_none, textcolor=color.new(colInk, 15), size=size.small, text_font_family=font.family_monospace))
+        if title != ""
+            pLabs.push(label.new(xStart + n * 4 / 2, hiAll + pad, title, style=label.style_none, textcolor=color.new(colInk, 20), size=size.small))
+    xStart + n * 4 + 5
+
+// SMT on a panel's newest candle pair: this symbol's extremes vs each correlated asset's,
+// divergence = disagreement on which candle made the higher high / lower low. Drawn as a
+// line joining the two extremes, asset named beside it.
+drawPanelSmt(array<float> h_, array<float> l_, array<float> a1h_, array<float> a1l_, array<float> a2h_, array<float> a2l_, int xStart) =>
+    int n = h_.size()
+    if xStart >= 0 and n >= 2 and n == a1h_.size() and n == a2h_.size()
+        int i = n - 1
+        float sH0 = h_.get(i)
+        float sH1 = h_.get(i - 1)
+        float sL0 = l_.get(i)
+        float sL1 = l_.get(i - 1)
+        float pad = (h_.max() - l_.min()) * 0.08
+        int xC0 = xStart + i * 4 + 1
+        int xC1 = xStart + (i - 1) * 4 + 1
+        bool hi1 = a1Ok and not na(a1h_.get(i)) and not na(a1h_.get(i - 1)) and (sH0 > sH1) != (a1h_.get(i) > a1h_.get(i - 1))
+        bool hi2 = a2Ok and not na(a2h_.get(i)) and not na(a2h_.get(i - 1)) and (sH0 > sH1) != (a2h_.get(i) > a2h_.get(i - 1))
+        bool lo1 = a1Ok and not na(a1l_.get(i)) and not na(a1l_.get(i - 1)) and (sL0 < sL1) != (a1l_.get(i) < a1l_.get(i - 1))
+        bool lo2 = a2Ok and not na(a2l_.get(i)) and not na(a2l_.get(i - 1)) and (sL0 < sL1) != (a2l_.get(i) < a2l_.get(i - 1))
+        if hi1 or hi2
+            pLines.push(line.new(xC1, sH1, xC0, sH0, color=cisdBearCol, width=1))
+            string nmH = (hi1 ? a1Tag : "") + (hi1 and hi2 ? "+" : "") + (hi2 ? a2Tag : "")
+            pLabs.push(label.new((xC0 + xC1) / 2, math.max(sH0, sH1) + pad * 0.5, nmH, style=label.style_none, textcolor=color.new(cisdBearCol, 20), size=size.tiny))
+        if lo1 or lo2
+            pLines.push(line.new(xC1, sL1, xC0, sL0, color=cisdBullCol, width=1))
+            string nmL = (lo1 ? a1Tag : "") + (lo1 and lo2 ? "+" : "") + (lo2 ? a2Tag : "")
+            pLabs.push(label.new((xC0 + xC1) / 2, math.min(sL0, sL1) - pad * 0.5, nmL, style=label.style_none, textcolor=color.new(cisdBullCol, 20), size=size.tiny))
+
+if barstate.islast and (showPanel1h or showPanel or showPanel7h)
+    while pBoxes.size() > 0
+        box.delete(pBoxes.pop())
+    while pLines.size() > 0
+        line.delete(pLines.pop())
+    while pLabs.size() > 0
+        label.delete(pLabs.pop())
+    int px = bar_index + 20
+    int px1hs = -1
+    if showPanel1h and bO.size() > 0
+        px1hs := px
+        px := drawPanel(bO, bH, bL, bC, px, "1H", false, true)
+    int px210s = -1
+    if showPanel and aO.size() > 0
+        px210s := px
+        px := drawPanel(aO, aH, aL, aC, px, "210m", false, true)
+    int px7 = -1
+    if showPanel7h and cO.size() > 0
+        px7 := px
+        px := drawPanel(cO, cH, cL, cC, px, fwDir == 0 ? "7H" : "", true, true)
+    // reference-style header: the day's framework named above the 7h panel, monospace
+    if showPanel7h and cO.size() > 0 and px7 >= 0 and fwDir != 0
+        float hi7  = cH.max()
+        float pad7 = (hi7 - cL.min()) * 0.10
+        string fwTitle = (str.startswith(fwName, "P") ? "Profile " : "Framework ") + str.substring(fwName, 1)
+        string fwSub = fwName == "F1" ? "Asia Manipulates, London Expansion" : fwName == "F2" ? "London Manipulates, New York Expansion" : fwName == "F3" ? "London Protraction, New York Reversal > Expansion" : fwName == "P1" ? "Asia Trends, London Expands, New York Continues" : fwName == "P1B" ? "Asia Trends, London Coils, New York Continues" : fwName == "P4" ? "Asia & London Aligned, New York Sweeps & Reverses" : fwName == "P4B" ? "Asia & London Aligned, New York Reverses, No Sweep" : fwF4Cont ? "New York Continuation > Expansion" : "New York Reversal > Expansion"
+        pLabs.push(label.new(px7 + cO.size() * 4 / 2, hi7 + pad7 * 3, fwTitle + "\n" + fwSub, style=label.style_none, textcolor=color.new(colInk, 0), size=size.small, text_font_family=font.family_monospace))
+    if showPanelSmt
+        drawPanelSmt(bH, bL, s1H60, s1L60, s2H60, s2L60, showPanel1h ? px1hs : -1)
+        drawPanelSmt(aH, aL, s1H210, s1L210, s2H210, s2L210, showPanel ? px210s : -1)
+        drawPanelSmt(cH, cL, s1H7, s1L7, s2H7, s2L7, showPanel7h ? px7 : -1)
+
+// ============================================================================
+// STATUS READOUT — quiet gray text, position per input
+// ============================================================================
+var table st = table.new(stPos == "Bottom Left" ? position.bottom_left : stPos == "Bottom Right" ? position.bottom_right : position.bottom_center, 1, 5)
+
+if showStatus and barstate.islast
+    int    tfS   = timeframe.in_seconds()
+    string tfStr = tfS < 60 ? str.tostring(tfS) + "s" : tfS < 3600 or tfS % 3600 != 0 ? str.tostring(tfS / 60) + "m" : tfS < 86400 ? str.tostring(tfS / 3600) + "H" : timeframe.period
+    string hdr   = syminfo.ticker + " · " + tfStr
+    pdTxt    = pdBull ? "PD BULLISH" : pdBear ? "PD BEARISH" : "PD NEUTRAL"
+    biasWord = bias == 1 ? "BULL" : bias == -1 ? "BEAR" : "—"
+    bool revOn = invalid and useRev and biasActive
+    effWord  = dirEff == 1 ? "BULL" : dirEff == -1 ? "BEAR" : "—"
+    stateTxt = invalid ? (broke50 ? "50% closed through" : "25% closed through") : wasBroken ? "25% reclaimed" : use210 and can210 ? "210m intact" : "intact"
+    line2    = revOn ? pdTxt + " · " + biasWord + " → " + effWord + " · 25% broken" : biasActive ? pdTxt + " · Bias " + biasWord + " · " + stateTxt : pdTxt + " · no bias (doji)"
+    revTxt   = dirEff == 1 ? "Reversal framework · expecting higher" : "Reversal framework · expecting lower"
+    line3    = not biasActive ? "" : revOn ? revTxt : invalid ? "A framework · lower prob" : wasBroken ? "A framework · 25% reclaimed" : "✓ A+ setup valid"
+    col3     = revOn ? (dirEff == 1 ? cisdBullCol : cisdBearCol) : (invalid or wasBroken) ? color.new(colLevel, 20) : color.new(colInk, 10)
+    string fwLine = ""
+    if showFw
+        if not segTfOk
+            fwLine := "7h · unsupported chart TF (use one dividing 210m)"
+        else if fwDir != 0
+            fwWord = fwDir == 1 ? "BULL" : "BEAR"
+            expTxt = fwName == "F1" ? "London expands" : fwName == "F2" ? "NY AM expands" : fwName == "F3" ? "NY reverses" : fwName == "P1" ? "NY continues" : fwName == "P1B" ? "NY continues (coiled)" : fwName == "P4" ? "NY reversal (bait)" : fwName == "P4B" ? "NY reverses · no sweep" : fwF4Cont ? "NY continues through London" : "NY open reversal"
+            fwLine := "7h " + fwName + (fwFail != "" ? " (" + fwFail + " ✗)" : "") + " " + fwWord + " · " + expTxt
+            if biasActive and fwDir != dirEff
+                fwLine := fwLine + " · opposes bias"
+        else
+            if devDir != 0
+                fwLine := "7h · F4" + (devCont ? "→" : "") + (devDir == 1 ? " BULL" : " BEAR") + " developing · unconfirmed"
+            else
+                fwLine := seg == 0 ? "7h · Asia forming" : seg == 1 ? "7h · F2/F3 developing" : etHr >= 8 and etHr < 11 ? "7h · watching NY (F4 · 8–11)" : "7h · no framework"
+            if fwFail != ""
+                fwLine := fwLine + " · " + fwFail + " ✗"
+        // confirmed extreme-of-day tags (210m sweep-and-reclaim that still holds)
+        string xod = ""
+        if not na(lodPx)
+            xod := "LOD " + (lodSeg == 0 ? "Asia" : lodSeg == 1 ? "Ldn" : "NY") + "✓" + (lodSmt ? "+SMT" : "") + (lodFvg ? "+FVG" : "")
+        if not na(hodPx)
+            xod := xod + (xod == "" ? "" : " ") + "HOD " + (hodSeg == 0 ? "Asia" : hodSeg == 1 ? "Ldn" : "NY") + "✓" + (hodSmt ? "+SMT" : "") + (hodFvg ? "+FVG" : "")
+        if xod != ""
+            fwLine := fwLine + " · " + xod
+    colFw = fwDir == 1 ? cisdBullCol : fwDir == -1 ? cisdBearCol : devDir == 1 ? color.new(cisdBullCol, 45) : devDir == -1 ? color.new(cisdBearCol, 45) : color.new(colInk, 25)
+    string adrLine = ""
+    if not na(adrD) and adrD > 0 and not na(dH)
+        float fillPct = (dH - dL) / adrD * 100
+        float leftPct = math.max(0, 100 - fillPct)
+        adrLine := "ADR " + str.tostring(adrD, format.mintick) + " · " + str.tostring(fillPct, "#.#") + "% filled · " + str.tostring(leftPct, "#.#") + "% left" + (rangeExhausted ? " · exhausted" : "")
+    colAdr = rangeExhausted ? color.new(colLevel, 20) : color.new(colInk, 25)
+    table.cell(st, 0, 0, hdr,     text_color=color.new(colInk, 0),  text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 1, line2,   text_color=color.new(colInk, 15), text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 2, line3,   text_color=col3,   text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 3, fwLine,  text_color=colFw,  text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 4, adrLine, text_color=colAdr, text_size=size.small, text_halign=text.align_center)
+
+// small markers: × on the candle that broke the 25%, ○ on the one that reclaimed it
+plotchar(justInvalidated, "Bias invalidated", "×", location.abovebar, colLevel, size=size.tiny)
+plotchar(justReclaimed, "25% reclaimed", "○", location.abovebar, color.new(colInk, 20), size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+newBullBias = newDay and bias == 1
+newBearBias = newDay and bias == -1
+
+alertcondition(newBullBias,     "New Bullish Bias", "Essence Model: new day opened with a BULLISH bias (PD was bullish).")
+alertcondition(newBearBias,     "New Bearish Bias", "Essence Model: new day opened with a BEARISH bias (PD was bearish).")
+alertcondition(justInvalidated, "Bias Invalidated", "Essence Model: a candle closed through the 25% level — A+ setup invalidated.")
+alertcondition(justInvalidated and useRev, "Reversal Framework", "Essence Model: the 25% was closed through — day reclassified as a REVERSAL of previous day; expecting prices in the direction of the break.")
+alertcondition(justReclaimed, "25% Reclaimed", "Essence Model: price closed back through the 25% — reversal un-flipped, working direction back to the original PD bias (A framework).")
+alertcondition(fwJust, "7h Framework / Profile Set", "Essence Model: the day's 7h framework or profile (F1–F4 / P1–P4B) has been assigned or re-classified — check the status readout for direction and expansion session.")
+alertcondition(psLongNow,       "PS Entry Long",    "Essence Model: protected entry LONG — bias-aligned trigger (CISD or RC/EC/IRC reversal signature). Entry at close, stop at the protected swing.")
+alertcondition(psShortNow,      "PS Entry Short",   "Essence Model: protected entry SHORT — bias-aligned trigger (CISD or RC/EC/IRC reversal signature). Entry at close, stop at the protected swing.")
+alertcondition(cisdBullNow,     "CISD Bullish (any)",  "CISD Bullish — price closed back above the down-run's opening.")
+alertcondition(cisdBearNow,     "CISD Bearish (any)",  "CISD Bearish — price closed back below the up-run's opening.")

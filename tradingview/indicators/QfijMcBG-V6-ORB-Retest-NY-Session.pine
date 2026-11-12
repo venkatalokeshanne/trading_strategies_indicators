@@ -1,0 +1,435 @@
+// ORB Retest — NY Session (MNQ)
+// Live companion to the walk-forward-validated strategy in orb_retest.py.
+//
+// Draws and alerts only. It never places an order.
+//
+// DESIGNED FOR A 5-MINUTE CHART. The strategy was validated on 5-minute bars;
+// on any other timeframe the breakout/retest granularity differs from what was
+// tested, so the panel shows a warning.
+//
+// Session times are pinned to America/New_York, so the 9:30 ET open is located
+// correctly no matter what timezone your chart displays, and DST is handled
+// automatically. No chart timezone change needed.
+//
+// Install: TradingView -> Pine Editor -> paste -> Save -> Add to chart.
+
+//@version=6
+indicator("ORB Retest — NY Session", "ORB Retest", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────────────────── Inputs ─────────────────────────
+grpS = "Session (always New York time)"
+orSessionInput    = input.session("0930-0945", "Opening range window",           group = grpS, display = display.none)
+tradeSessionInput = input.session("0930-1555", "Trading session (flat at end)",  group = grpS, display = display.none)
+cutoffInput       = input.session("0930-1200", "Breakout must occur before",     group = grpS, display = display.none)
+
+grpR = "Trade rules"
+targetR         = input.float(2.5, "Target (multiple of risk)", minval = 0.5, step = 0.5, group = grpR,
+     tooltip = "2.5R tested best across both 2019-2026 and 2023-onward: target is hit on 48% of trades vs 38% at 3R, win rate 58% vs 52%, slightly more total profit and a smaller drawdown.",
+     display = display.none)
+stopBufTicks    = input.int(4,  "Stop buffer beyond retest extreme (ticks)", minval = 0, group = grpR, display = display.none)
+touchTolTicks   = input.int(2,  "Retest touch tolerance (ticks)",            minval = 0, group = grpR, display = display.none)
+invalTicks      = input.int(4,  "Invalidation buffer past level (ticks)",    minval = 0, group = grpR, display = display.none)
+retestDeadlineM = input.int(60, "Cancel if no retest within (minutes)",      minval = 5, group = grpR, display = display.none)
+maxRiskPts      = input.float(0, "Skip if risk exceeds (points, 0 = no limit)", minval = 0, group = grpR,
+     tooltip = "Off by default. On a 5-minute chart a 40-point cap improved results (+0.72R to +0.80R, drawdown roughly halved). On a 15-minute chart stops are naturally wider and the same cap removes too many good trades, so leave it at 0 there.",
+     display = display.none)
+
+grpF = "Day filter"
+useRangeFilter = input.bool(true,  "Skip days with unusual opening-range width", group = grpF, display = display.none)
+rangeLookback  = input.int(20,     "Lookback (days)",              minval = 5,   group = grpF, display = display.none)
+rangeMinMult   = input.float(0.5,  "Minimum multiple of average",  step = 0.1,   group = grpF, display = display.none)
+rangeMaxMult   = input.float(2.0,  "Maximum multiple of average",  step = 0.1,   group = grpF, display = display.none)
+
+grpV = "Display"
+drawSessionInput = input.session("0930-1230", "Extend drawings during (NY time)", group = grpV,
+     tooltip = "Boxes and lines grow only inside this window, then freeze. Default = first 3 hours of the NY session, so old days stay compact.",
+     display = display.none)
+keepDays    = input.int(120, "Keep drawings for last N days", minval = 1, maxval = 250, group = grpV,
+     tooltip = "TradingView caps an indicator at 500 drawings per type; at 4 lines per traded day that is roughly 125 days of full markup. Beyond the cap the oldest drawings drop off automatically.",
+     display = display.none)
+pointValue  = input.float(2.0, "Contract $ per point (MNQ = 2)", minval = 0.01, group = grpV, display = display.none)
+showPanel   = input.bool(true, "Show status panel",   group = grpV, display = display.none)
+showBox     = input.bool(true, "Opening range box",   group = grpV, display = display.none)
+showLevels  = input.bool(true, "Entry / stop / target lines", group = grpV, display = display.none)
+showMarkers = input.bool(true, "Signal markers",      group = grpV, display = display.none)
+showLabels  = input.bool(true, "Outcome labels",      group = grpV, display = display.none)
+showLegend  = input.bool(true, "Show symbol legend (bottom-left)", group = grpV, display = display.none)
+
+TZ = "America/New_York"
+
+// ───────────────────── Session detection ─────────────────────
+inOR      = not na(time(timeframe.period, orSessionInput,    TZ))
+inTrade   = not na(time(timeframe.period, tradeSessionInput, TZ))
+beforeCut = not na(time(timeframe.period, cutoffInput,       TZ))
+inDraw    = not na(time(timeframe.period, drawSessionInput,  TZ))
+
+orStart  = inOR and not inOR[1]
+orEnd    = not inOR and inOR[1]
+tradeEnd = not inTrade and inTrade[1]
+
+tick        = syminfo.mintick
+isFiveMin   = timeframe.isminutes and timeframe.multiplier == 5
+
+// Live-chart safety: every decision waits for the bar to CLOSE, exactly like
+// the backtest. On the streaming realtime bar nothing updates until it
+// confirms, so signals never appear and then vanish mid-bar (no repainting).
+confirmed = barstate.isconfirmed
+
+// ───────────────────────── State ─────────────────────────
+// 0 = waiting for breakout, 1 = waiting for retest, 2 = in trade, 3 = done today
+var int   state         = 0
+var int   armedDir      = 0
+var int   armTime       = na
+var float orH           = na
+var float orL           = na
+var float orRange       = na
+var bool  orReady       = false
+var bool  dayEligible   = false
+var float retestExtreme = na
+var float entryPrice    = na
+var float stopPrice     = na
+var float targetPrice   = na
+var float riskPts       = na
+var string outcome      = "—"
+
+var array<float> orHistory = array.new_float()
+
+// Drawing handles for the current day
+var box  orBox      = na
+var line levelLine  = na
+var line entryLine  = na
+var line stopLine   = na
+var line targetLine = na
+
+// Rolling registry so old days' drawings get cleaned up instead of piling up.
+var array<box>   boxReg   = array.new<box>()
+var array<line>  lineReg  = array.new<line>()
+var array<label> labelReg = array.new<label>()
+
+// Signal flags at global scope so plotshape / alertcondition can read them.
+bool sigBreakout    = false
+bool sigEntry       = false
+bool sigInvalidated = false
+bool sigExpired     = false
+bool sigTargetHit   = false
+bool sigStopHit     = false
+
+// ───────────── Build the opening range, reset for a new day ─────────────
+if orStart and confirmed
+    orH           := high
+    orL           := low
+    orReady       := false
+    state         := 0
+    armedDir      := 0
+    dayEligible   := false
+    retestExtreme := na
+    entryPrice    := na
+    stopPrice     := na
+    targetPrice   := na
+    riskPts       := na
+    outcome       := "—"
+    levelLine     := na
+    entryLine     := na
+    stopLine      := na
+    targetLine    := na
+else if inOR and confirmed
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+
+if orEnd and confirmed
+    orRange := orH - orL
+    orReady := true
+
+    // Compare today's range against the trailing average BEFORE adding it.
+    // Starts judging after 5 days of history (averaging what it has, up to the
+    // full lookback) — demanding all 20 up front left short-history charts,
+    // like 5-minute ones, permanently stuck in "filtered out".
+    int warmup = math.min(rangeLookback, 5)
+    float avgRange = array.size(orHistory) >= warmup ? array.avg(orHistory) : na
+    dayEligible := not useRangeFilter or (not na(avgRange)
+                     and orRange >= avgRange * rangeMinMult
+                     and orRange <= avgRange * rangeMaxMult)
+
+    array.push(orHistory, orRange)
+    if array.size(orHistory) > rangeLookback
+        array.shift(orHistory)
+
+    if not dayEligible
+        outcome := na(avgRange) and useRangeFilter ? "warming up — collecting history" : "day filtered out"
+
+    if showBox
+        orBox := box.new(bar_index - 1, orH, bar_index, orL,
+             border_color = dayEligible ? color.new(color.orange, 20) : color.new(color.gray, 65),
+             border_style = line.style_dashed, border_width = 1,
+             bgcolor = dayEligible ? color.new(color.orange, 90) : color.new(color.gray, 96))
+        array.push(boxReg, orBox)
+        if array.size(boxReg) > keepDays
+            box.delete(array.shift(boxReg))
+
+// Stretch the box only inside the drawing window, then freeze it.
+if showBox and inDraw and orReady and not na(orBox)
+    box.set_right(orBox, bar_index)
+
+// ───────────────────── State machine ─────────────────────
+if orReady and inTrade and dayEligible and confirmed
+
+    // ---- Waiting for a breakout CLOSE (wicks do not count) ----
+    if state == 0 and beforeCut
+        if close > orH
+            armedDir      := 1
+            state         := 1
+            armTime       := time
+            retestExtreme := low
+            sigBreakout   := true
+            outcome       := "armed long — waiting for retest"
+        else if close < orL
+            armedDir      := -1
+            state         := 1
+            armTime       := time
+            retestExtreme := high
+            sigBreakout   := true
+            outcome       := "armed short — waiting for retest"
+
+        if sigBreakout and showLevels
+            float lvl = armedDir == 1 ? orH : orL
+            levelLine := line.new(bar_index, lvl, bar_index, lvl,
+                 color = color.orange, width = 2)
+            array.push(lineReg, levelLine)
+
+    // ---- Armed: waiting for price to come back and retest the level ----
+    else if state == 1
+        bool  isLong     = armedDir == 1
+        float lvl        = isLong ? orH : orL
+        float invalLevel = isLong ? lvl - invalTicks * tick : lvl + invalTicks * tick
+
+        bool invalidated = isLong ? close < invalLevel : close > invalLevel
+        bool expired     = (time - armTime) / 60000 > retestDeadlineM or not beforeCut
+
+        if invalidated
+            state          := 3
+            sigInvalidated := true
+            outcome        := "invalidated — closed back inside"
+            if not na(levelLine)
+                line.set_color(levelLine, color.new(color.gray, 40))
+        else if expired
+            state      := 3
+            sigExpired := true
+            outcome    := "no retest — expired"
+            if not na(levelLine)
+                line.set_color(levelLine, color.new(color.gray, 40))
+        else
+            // Track how far the pullback has run — this defines the stop.
+            retestExtreme := isLong ? math.min(retestExtreme, low) : math.max(retestExtreme, high)
+
+            float tol     = touchTolTicks * tick
+            bool  touched = isLong ? low <= lvl + tol : high >= lvl - tol
+            bool  pierced = isLong ? low <= lvl - tick : high >= lvl + tick
+
+            if touched and pierced
+                float eP = lvl
+                float sP = isLong ? retestExtreme - stopBufTicks * tick
+                                  : retestExtreme + stopBufTicks * tick
+                float rk = isLong ? eP - sP : sP - eP
+
+                if rk > 0 and (maxRiskPts == 0 or rk <= maxRiskPts)
+                    entryPrice  := eP
+                    stopPrice   := sP
+                    riskPts     := rk
+                    targetPrice := isLong ? eP + targetR * rk : eP - targetR * rk
+                    state       := 2
+                    sigEntry    := true
+                    outcome     := (isLong ? "LONG live" : "SHORT live")
+
+                    if showLevels
+                        entryLine  := line.new(bar_index, entryPrice, bar_index, entryPrice,
+                             color = color.blue,  width = 2)
+                        stopLine   := line.new(bar_index, stopPrice, bar_index, stopPrice,
+                             color = color.red,   width = 1, style = line.style_dashed)
+                        targetLine := line.new(bar_index, targetPrice, bar_index, targetPrice,
+                             color = color.green, width = 1, style = line.style_dashed)
+                        array.push(lineReg, entryLine)
+                        array.push(lineReg, stopLine)
+                        array.push(lineReg, targetLine)
+
+                    if showLabels
+                        label lb = label.new(bar_index, isLong ? low : high,
+                             (isLong ? "LONG  " : "SHORT  ")
+                               + str.tostring(rk, format.mintick) + " pts  ($"
+                               + str.tostring(rk * pointValue, "#.##") + ")",
+                             yloc = isLong ? yloc.belowbar : yloc.abovebar,
+                             style = isLong ? label.style_label_up : label.style_label_down,
+                             size = size.small,
+                             color = isLong ? color.new(color.green, 20) : color.new(color.red, 20),
+                             textcolor = color.white)
+                        array.push(labelReg, lb)
+                else
+                    state   := 3
+                    outcome := rk <= 0 ? "skipped — no risk defined" : "skipped — risk too wide"
+
+    // ---- In the trade: stop or target first? ----
+    else if state == 2
+        bool isLong    = armedDir == 1
+        bool hitStop   = isLong ? low  <= stopPrice   : high >= stopPrice
+        bool hitTarget = isLong ? high >= targetPrice : low  <= targetPrice
+
+        // If one bar spans both, assume the stop filled first (matches the backtest).
+        if hitStop
+            state      := 3
+            sigStopHit := true
+            outcome    := "stopped out  (−1R)"
+        else if hitTarget
+            state        := 3
+            sigTargetHit := true
+            outcome      := "target hit  (+" + str.tostring(targetR, "#.#") + "R)"
+
+// Grow active lines only inside the drawing window (no infinite extend,
+// and old days stay frozen at their 3-hour width).
+if inDraw
+    if state == 1 and not na(levelLine)
+        line.set_x2(levelLine, bar_index)
+    if state == 2
+        if not na(entryLine)
+            line.set_x2(entryLine, bar_index)
+        if not na(stopLine)
+            line.set_x2(stopLine, bar_index)
+        if not na(targetLine)
+            line.set_x2(targetLine, bar_index)
+
+// ---- Session over: anything still open is flattened ----
+if tradeEnd and state == 2 and confirmed
+    state   := 3
+    outcome := "flat — session end"
+    if showLabels
+        label lb2 = label.new(bar_index, close, "flat — session end", yloc = yloc.abovebar,
+             style = label.style_label_down, size = size.tiny,
+             color = color.new(color.gray, 35), textcolor = color.white)
+        array.push(labelReg, lb2)
+
+// ---- Prune old drawings so the chart doesn't fill up ----
+if array.size(lineReg) > keepDays * 4
+    line.delete(array.shift(lineReg))
+if array.size(labelReg) > keepDays * 2
+    label.delete(array.shift(labelReg))
+
+// ───────────────────────── Plots ─────────────────────────
+plotshape(showMarkers and sigBreakout, "Breakout close", shape.triangleup,
+     location.belowbar, color.new(color.orange, 0), size = size.tiny, display = display.pane)
+plotshape(showMarkers and sigEntry and armedDir == 1, "Long entry", shape.labelup,
+     location.belowbar, color.new(color.green, 0), text = "E", textcolor = color.white,
+     size = size.small, display = display.pane)
+plotshape(showMarkers and sigEntry and armedDir == -1, "Short entry", shape.labeldown,
+     location.abovebar, color.new(color.red, 0), text = "E", textcolor = color.white,
+     size = size.small, display = display.pane)
+plotshape(showMarkers and sigTargetHit, "Target hit", shape.xcross,
+     location.abovebar, color.new(color.green, 0), size = size.tiny, display = display.pane)
+plotshape(showMarkers and sigStopHit, "Stop hit", shape.xcross,
+     location.belowbar, color.new(color.red, 0), size = size.tiny, display = display.pane)
+plotshape(showMarkers and sigInvalidated, "Setup invalidated", shape.circle,
+     location.abovebar, color.new(color.gray, 25), size = size.tiny, display = display.pane)
+plotshape(showMarkers and sigExpired, "No retest — expired", shape.square,
+     location.abovebar, color.new(color.gray, 25), size = size.tiny, display = display.pane)
+
+// ───────────────────────── Status panel ─────────────────────────
+var table panel = table.new(position.top_right, 2, 7,
+     border_width = 1, border_color = color.new(color.gray, 60),
+     frame_width = 1, frame_color = color.new(color.gray, 60))
+
+if showPanel and barstate.islast
+    color hdrBg  = color.new(color.gray, 85)
+    color cellBg = color.new(color.gray, 92)
+
+    table.cell(panel, 0, 0, "ORB Retest", text_size = size.small, text_color = color.gray,
+         bgcolor = hdrBg, text_halign = text.align_left)
+    table.cell(panel, 1, 0, isFiveMin ? "5m ✓" : "⚠ tested on 5m",
+         text_size = size.small, bgcolor = hdrBg,
+         text_color = isFiveMin ? color.green : color.orange, text_halign = text.align_right)
+
+    table.cell(panel, 0, 1, "Status", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 1, outcome, text_size = size.small, bgcolor = cellBg,
+         text_color = state == 2 ? color.blue : color.gray, text_halign = text.align_right)
+
+    table.cell(panel, 0, 2, "Range high", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 2, na(orH) ? "—" : str.tostring(orH, format.mintick),
+         text_size = size.small, bgcolor = cellBg, text_color = color.orange,
+         text_halign = text.align_right)
+
+    table.cell(panel, 0, 3, "Range low", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 3, na(orL) ? "—" : str.tostring(orL, format.mintick),
+         text_size = size.small, bgcolor = cellBg, text_color = color.orange,
+         text_halign = text.align_right)
+
+    table.cell(panel, 0, 4, "Range width", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 4, na(orRange) ? "—" : str.tostring(orRange, "#.##") + " pts",
+         text_size = size.small, bgcolor = cellBg, text_color = color.gray,
+         text_halign = text.align_right)
+
+    table.cell(panel, 0, 5, "Entry / Stop", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 5, na(entryPrice) ? "—"
+         : str.tostring(entryPrice, format.mintick) + " / " + str.tostring(stopPrice, format.mintick),
+         text_size = size.small, bgcolor = cellBg, text_color = color.gray,
+         text_halign = text.align_right)
+
+    table.cell(panel, 0, 6, "Risk", text_size = size.small, text_color = color.gray,
+         bgcolor = cellBg, text_halign = text.align_left)
+    table.cell(panel, 1, 6, na(riskPts) ? "—"
+         : str.tostring(riskPts, "#.##") + " pts  $" + str.tostring(riskPts * pointValue, "#.##"),
+         text_size = size.small, bgcolor = cellBg, text_color = color.red,
+         text_halign = text.align_right)
+
+// ───────────────────────── Symbol legend ─────────────────────────
+var table legend = table.new(position.bottom_left, 4, 7,
+     border_width = 1, border_color = color.new(color.gray, 70),
+     frame_width = 1, frame_color = color.new(color.gray, 70))
+
+if showLegend and barstate.islast
+    color lgBg  = color.new(color.gray, 94)
+    color lgTxt = color.new(color.gray, 15)
+
+    table.cell(legend, 0, 0, "SYMBOL GUIDE", text_size = size.tiny, text_color = color.gray,
+         bgcolor = color.new(color.gray, 88), text_halign = text.align_left)
+    table.merge_cells(legend, 0, 0, 3, 0)
+
+    // column 0-1: setup phase          column 2-3: trade phase
+    table.cell(legend, 0, 1, "▭", text_size = size.small, text_color = color.orange, bgcolor = lgBg)
+    table.cell(legend, 1, 1, "opening range 9:30–9:45", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 1, "▬", text_size = size.small, text_color = color.blue, bgcolor = lgBg)
+    table.cell(legend, 3, 1, "entry price", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+    table.cell(legend, 0, 2, "▭", text_size = size.small, text_color = color.gray, bgcolor = lgBg)
+    table.cell(legend, 1, 2, "day skipped (range filter)", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 2, "╌", text_size = size.small, text_color = color.red, bgcolor = lgBg)
+    table.cell(legend, 3, 2, "stop loss", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+    table.cell(legend, 0, 3, "▲", text_size = size.small, text_color = color.orange, bgcolor = lgBg)
+    table.cell(legend, 1, 3, "breakout close — wait for retest", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 3, "╌", text_size = size.small, text_color = color.green, bgcolor = lgBg)
+    table.cell(legend, 3, 3, "take profit (3R)", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+    table.cell(legend, 0, 4, "▬", text_size = size.small, text_color = color.orange, bgcolor = lgBg)
+    table.cell(legend, 1, 4, "retest level = your entry", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 4, "✕", text_size = size.small, text_color = color.green, bgcolor = lgBg)
+    table.cell(legend, 3, 4, "target hit (win)", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+    table.cell(legend, 0, 5, "E", text_size = size.small, text_color = color.green, bgcolor = lgBg)
+    table.cell(legend, 1, 5, "long entry filled", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 5, "✕", text_size = size.small, text_color = color.red, bgcolor = lgBg)
+    table.cell(legend, 3, 5, "stop hit (−1R)", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+    table.cell(legend, 0, 6, "E", text_size = size.small, text_color = color.red, bgcolor = lgBg)
+    table.cell(legend, 1, 6, "short entry filled", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+    table.cell(legend, 2, 6, "● ■", text_size = size.small, text_color = color.gray, bgcolor = lgBg)
+    table.cell(legend, 3, 6, "invalidated / no retest — no trade", text_size = size.tiny, text_color = lgTxt, bgcolor = lgBg, text_halign = text.align_left)
+
+// ───────────────────────── Alerts ─────────────────────────
+alertcondition(sigBreakout,    "ORB: breakout close", "Opening range broken on the close — watch for a retest")
+alertcondition(sigEntry,       "ORB: retest entry",   "Retest reached — entry level touched")
+alertcondition(sigTargetHit,   "ORB: target hit",     "Target reached")
+alertcondition(sigStopHit,     "ORB: stop hit",       "Stop hit")
+alertcondition(sigInvalidated, "ORB: setup invalid",  "Price closed back inside the range — setup dead")
+alertcondition(sigExpired,     "ORB: no retest",      "Retest window expired — no trade today")

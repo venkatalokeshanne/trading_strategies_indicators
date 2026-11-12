@@ -1,0 +1,567 @@
+//@version=6
+// Unswept Equal Highs/Lows + Diagonals — Multi-Timeframe (2+ touches)
+// ────────────────────────────────────────────────────────────────────
+// HORIZONTAL (chart TF): a "touch" is a confirmed pivot low/high. Pivots
+// within tolerance of each other stack into one level. A level is drawn once
+// it has >= minTouch touches AND price has never swept it.
+//
+// HIGHER TIMEFRAME: chart bars are aggregated into HTF bars (e.g. 1m -> 1h),
+// pivots are detected on those HTF bars with their own left/right settings,
+// and the same clustering/sweep logic applies. HTF levels draw thicker and
+// their labels carry a TF prefix ("1h 2/3×"). Sweeps of HTF levels are
+// checked on every chart bar, so an intra-hour raid registers immediately.
+// The chart TF must be LOWER than the HTF (put the chart on 1m, HTF on 60).
+//
+// CONFLUENCE: when a displayed chart-TF level and a displayed HTF level of
+// the same side overlap (their tolerance zones touch), a shaded zone wraps
+// both and extends right until either member is swept. Toggle in settings.
+//
+// DIAGONAL (chart TF only): every new pivot is paired with the last N pivots
+// on its side to form candidate trendlines; valid only if price never
+// violated the line between the anchors; drawn at minTouchD touches.
+//
+// Touch  : pivot within ±tolerance of the level / projected line
+// Sweep  : price trades beyond it by more than tolerance
+//          (or by any tick, if "Strict sweep" is on)
+// Solid = level (thick = HTF)   Dotted = diagonal   Dashed faded = swept
+// Shaded box = chart-TF + HTF confluence zone
+//
+// Horizontal labels read "live/total ×": total = touches that built the
+// level, live = how many of those individual lows/highs have not yet been
+// traded through. A specific low is taken by ANY tick below it — tolerance
+// does not apply to the per-touch count. Diagonal labels stay plain totals.
+//
+// Honest limitations: a touch only registers `right bars` after the pivot
+// bar — in HTF bars for HTF levels (right=3 on 1h = ~3h lag). Diagonal
+// anchors are fixed at creation, the line is not re-fit through later touches.
+
+indicator("Unswept Equal Highs/Lows MTF + Diagonals", "Unswept 2+ MTF", overlay = true,
+     max_lines_count = 500, max_labels_count = 500, max_boxes_count = 100, max_bars_back = 2000)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grpP = "Pivots (chart TF)"
+leftLen  = input.int(5, "Pivot left bars",  minval = 1, group = grpP)
+rightLen = input.int(5, "Pivot right bars", minval = 1, group = grpP,
+     tooltip = "A touch is a confirmed pivot; confirmation lags by this many bars.")
+
+grpM = "Level matching"
+tolMode  = input.string("ATR", "Tolerance mode", options = ["ATR", "Ticks"], group = grpM,
+     tooltip = "Two touches belong to the same level when they sit within this distance of each other. ATR mode scales automatically per timeframe (chart ATR for chart levels, HTF ATR for HTF levels).")
+atrLen   = input.int(14, "ATR length", minval = 1, group = grpM)
+atrMult  = input.float(0.1, "ATR multiple", minval = 0, step = 0.05, group = grpM)
+tickTol  = input.int(4, "Ticks", minval = 0, group = grpM)
+minTouch = input.int(2, "Minimum touches to show", minval = 1, group = grpM)
+strictSwp = input.bool(false, "Strict sweep (any tick beyond the level)", group = grpM,
+     tooltip = "OFF: an undercut within tolerance still counts as part of the level; swept only when price goes beyond tolerance.\nON: any trade beyond the level's extreme kills it.")
+
+grpH = "Higher timeframe"
+useHtf = input.bool(true, "Add higher-timeframe levels", group = grpH)
+htfTf  = input.timeframe("60", "Higher timeframe", group = grpH,
+     tooltip = "Must be higher than the chart timeframe. Chart on 1m + this on 60 combines 1m and 1h levels.")
+leftH  = input.int(3, "HTF pivot left bars",  minval = 1, group = grpH)
+rightH = input.int(3, "HTF pivot right bars", minval = 1, group = grpH,
+     tooltip = "In HTF bars: right=3 on a 1h HTF means an HTF touch confirms ~3 hours after the pivot.")
+
+grpC = "Confluence"
+conjOn  = input.bool(true, "Merge overlapping chart-TF + HTF levels", group = grpC,
+     tooltip = "When a chart-TF level and an HTF level of the same side overlap (tolerance zones touch), draw one shaded confluence zone around both. The zone dies when either member is swept.")
+conjCol = input.color(color.orange, "Confluence zone", group = grpC)
+
+grpDg = "Diagonals (chart TF only)"
+useDiag   = input.bool(true, "Show diagonal lines", group = grpDg)
+minTouchD = input.int(3, "Minimum touches to show", minval = 2, group = grpDg,
+     tooltip = "Any two pivots define a line, so 2 shows every candidate pair. 3 means a third pivot confirmed the line.")
+pairN     = input.int(3, "Pair a new pivot with last N pivots", minval = 1, maxval = 5, group = grpDg)
+classicOnly = input.bool(false, "Classic only (rising lows / falling highs)", group = grpDg)
+expireD   = input.int(500, "Expire after N bars without a touch (0 = never)", minval = 0, group = grpDg,
+     tooltip = "Diagonals project forever; this quietly drops stale ones. Expiry is not a sweep — no alert fires.")
+maxKeepD  = input.int(30, "Max diagonals tracked per side", minval = 5, maxval = 100, group = grpDg)
+
+grpD = "Display"
+showSwept = input.bool(false, "Keep swept levels (faded, dashed)", group = grpD)
+sweptLabels = input.bool(false, "Labels on kept swept levels", group = grpD,
+     tooltip = "OFF: a swept level that is kept on the chart shows only its faded line — the label is removed.\nON: the label stays too, faded, with a ✗ mark.")
+maxKeep   = input.int(50, "Max levels tracked per side and TF", minval = 5, maxval = 100, group = grpD)
+lowCol    = input.color(color.teal, "Lows",  inline = "c", group = grpD)
+highCol   = input.color(color.red,  "Highs", inline = "c", group = grpD)
+lineW     = input.int(1, "Line width (HTF draws +1)", minval = 1, maxval = 3, group = grpD)
+
+// ── State ───────────────────────────────────────────────────────────────────
+type Liq
+    float price      // extreme of the cluster (lowest low / highest high)
+    float tol        // tolerance frozen at level creation
+    int   touches
+    int   startBar   // chart bar of the first touch's extreme
+    bool  isLow
+    line  ln
+    label lb
+    array<float> tps // individual touch extremes not yet traded through
+    float edge       // most vulnerable live touch: max for lows, min for highs
+    string pfx = ""  // label TF prefix
+    bool  dead = false
+    bool  inConj = false
+
+type Diag
+    int   bar1
+    float price1
+    int   bar2
+    float price2
+    float slope
+    float tol
+    int   touches
+    int   lastTouch
+    bool  isLow
+    line  ln
+    label lb
+
+type Conj
+    Liq a  // chart-TF member
+    Liq b  // HTF member
+    box bx
+
+// chart-TF levels
+var array<Liq> lows  = array.new<Liq>()
+var array<Liq> highs = array.new<Liq>()
+// HTF levels
+var array<Liq> lowsH  = array.new<Liq>()
+var array<Liq> highsH = array.new<Liq>()
+// diagonals + pivot pairing pool
+var array<Diag> dlows  = array.new<Diag>()
+var array<Diag> dhighs = array.new<Diag>()
+var array<int>   plB = array.new<int>()
+var array<float> plV = array.new<float>()
+var array<int>   phB = array.new<int>()
+var array<float> phV = array.new<float>()
+// confluence zones
+var array<Conj> conjs = array.new<Conj>()
+// HTF aggregation bucket + completed HTF bars (rolling pivot window)
+var float hAggH = na
+var float hAggL = na
+var float hAggC = na
+var float hPrevC = na
+var int   hAggHBar = na
+var int   hAggLBar = na
+var float htfAtr = na
+var array<float> hbL = array.new<float>()
+var array<float> hbH = array.new<float>()
+var array<int>   hbLBar = array.new<int>()
+var array<int>   hbHBar = array.new<int>()
+
+// ── Globals ─────────────────────────────────────────────────────────────────
+f_secFmt(int s) =>
+    s % 604800 == 0 ? str.tostring(s / 604800) + "W" :
+         s % 86400 == 0 ? str.tostring(s / 86400) + "D" :
+         s % 3600 == 0 ? str.tostring(s / 3600) + "h" :
+         s % 60 == 0 ? str.tostring(s / 60) + "m" : str.tostring(s) + "s"
+
+float atrVal = ta.atr(atrLen)
+float tolNow = tolMode == "ATR" ? atrVal * atrMult : tickTol * syminfo.mintick
+bool  htfOk  = useHtf and timeframe.in_seconds(htfTf) > timeframe.in_seconds(timeframe.period)
+string htfPfx = f_secFmt(timeframe.in_seconds(htfTf)) + " "
+string ltfPfx = htfOk ? f_secFmt(timeframe.in_seconds(timeframe.period)) + " " : ""
+bool  newHtf = timeframe.change(htfTf)
+
+// label text: unswept touches / total touches
+f_liqText(Liq L) =>
+    L.pfx + str.tostring(array.size(L.tps)) + "/" + str.tostring(L.touches) + "×"
+
+// ── Horizontal: join nearest matching level, else open a new one ───────────
+f_process(array<Liq> arr, float p, bool isLow, color col, int pvBar, float tolC, string pfx, int w) =>
+    bool formed = false
+    int best = -1
+    float bestDist = 1e10
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Liq L = array.get(arr, i)
+            float d = math.abs(p - L.price)
+            if d <= L.tol and d < bestDist
+                bestDist := d
+                best := i
+    if best >= 0
+        Liq L = array.get(arr, best)
+        L.touches := L.touches + 1
+        L.price := isLow ? math.min(L.price, p) : math.max(L.price, p)
+        array.push(L.tps, p)
+        L.edge := isLow ? math.max(L.edge, p) : math.min(L.edge, p)
+        if na(L.ln) and L.touches >= minTouch
+            int x1 = math.max(L.startBar, bar_index - 9000)
+            L.ln := line.new(x1, L.price, bar_index, L.price, color = col, width = w, extend = extend.right)
+            L.lb := label.new(bar_index, L.price, f_liqText(L),
+                 style = label.style_label_left, color = color.new(col, 15),
+                 textcolor = color.white, size = size.small)
+            formed := true
+        else if not na(L.ln)
+            line.set_y1(L.ln, L.price)
+            line.set_y2(L.ln, L.price)
+            label.set_y(L.lb, L.price)
+            label.set_text(L.lb, f_liqText(L))
+    else
+        array.push(arr, Liq.new(price = p, tol = tolC, touches = 1,
+             startBar = pvBar, isLow = isLow, ln = line(na), lb = label(na),
+             tps = array.new<float>(1, p), edge = p, pfx = pfx))
+        if array.size(arr) > maxKeep
+            Liq old = array.shift(arr)
+            old.dead := true
+            if not na(old.ln)
+                line.delete(old.ln)
+                label.delete(old.lb)
+    formed
+
+// ── Horizontal: drop (or fade) levels price has traded through ─────────────
+f_sweeps(array<Liq> arr, bool isLow, color col) =>
+    bool sweptEvt = false
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            Liq L = array.get(arr, i)
+            // individual touch sweeps: price trades through some of the
+            // touch lows/highs without killing the level itself
+            if (isLow ? low < L.edge : high > L.edge)
+                for j = array.size(L.tps) - 1 to 0
+                    float tp = array.get(L.tps, j)
+                    if isLow ? low < tp : high > tp
+                        array.remove(L.tps, j)
+                int live = array.size(L.tps)
+                L.edge := live > 0 ? (isLow ? array.max(L.tps) : array.min(L.tps)) : (isLow ? -1e10 : 1e10)
+                if not na(L.lb)
+                    label.set_text(L.lb, f_liqText(L))
+            float buf = strictSwp ? 0.0 : L.tol
+            bool hit = isLow ? low < L.price - buf : high > L.price + buf
+            if hit
+                L.dead := true
+                if not na(L.ln)
+                    sweptEvt := true
+                    if showSwept
+                        line.set_extend(L.ln, extend.none)
+                        line.set_x2(L.ln, bar_index)
+                        line.set_style(L.ln, line.style_dashed)
+                        line.set_color(L.ln, color.new(col, 75))
+                        if sweptLabels
+                            label.set_x(L.lb, bar_index)
+                            label.set_text(L.lb, f_liqText(L) + " ✗")
+                            label.set_color(L.lb, color.new(col, 75))
+                        else
+                            label.delete(L.lb)
+                    else
+                        line.delete(L.ln)
+                        label.delete(L.lb)
+                array.remove(arr, i)
+    sweptEvt
+
+f_refresh(array<Liq> arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Liq L = array.get(arr, i)
+            if not na(L.lb)
+                label.set_x(L.lb, bar_index)
+
+// ── Diagonal helpers ────────────────────────────────────────────────────────
+f_dproj(Diag D, int b) =>
+    D.price1 + D.slope * (b - D.bar1)
+
+f_ddraw(Diag D, color col) =>
+    int x1 = math.max(D.bar1, bar_index - 9000)
+    float y1 = f_dproj(D, x1)
+    float y2 = f_dproj(D, bar_index)
+    D.ln := line.new(x1, y1, bar_index, y2, color = col, width = lineW,
+         style = line.style_dotted, extend = extend.right)
+    D.lb := label.new(bar_index, y2, str.tostring(D.touches) + "×",
+         style = label.style_label_left, color = color.new(col, 15),
+         textcolor = color.white, size = size.small)
+
+// a new pivot lands on existing diagonals → touches
+f_dtouch(array<Diag> arr, float p, int pb, color col) =>
+    bool formed = false
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Diag D = array.get(arr, i)
+            if math.abs(p - f_dproj(D, pb)) <= D.tol
+                D.touches := D.touches + 1
+                D.lastTouch := pb
+                if na(D.ln) and D.touches >= minTouchD
+                    f_ddraw(D, col)
+                    formed := true
+                else if not na(D.ln)
+                    label.set_text(D.lb, str.tostring(D.touches) + "×")
+    formed
+
+// pair the new pivot with recent pivots → candidate lines
+f_dcand(array<Diag> arr, array<int> hB, array<float> hV, float p, int pb, bool isLow, color col) =>
+    bool formed = false
+    int n = array.size(hB)
+    int cnt = math.min(pairN, n)
+    if cnt > 0
+        for k = 1 to cnt
+            int ab = array.get(hB, n - k)
+            float ap = array.get(hV, n - k)
+            // skip: too far back, or effectively equal level (horizontal's job)
+            bool ok = pb - ab <= 1800 and pb > ab and math.abs(p - ap) > tolNow
+            float slp = ok ? (p - ap) / (pb - ab) : 0.0
+            if ok and classicOnly
+                ok := isLow ? slp > 0 : slp < 0
+            // dedup: both anchors already on an existing line
+            if ok
+                int m = array.size(arr)
+                if m > 0
+                    for j = 0 to m - 1
+                        Diag E = array.get(arr, j)
+                        if math.abs(ap - f_dproj(E, ab)) <= E.tol and math.abs(p - f_dproj(E, pb)) <= E.tol
+                            ok := false
+                            break
+            // validate: price never violated the line from anchor A to now
+            if ok
+                float buf = strictSwp ? 0.0 : tolNow
+                for b = ab + 1 to bar_index
+                    float projv = ap + slp * (b - ab)
+                    float val = isLow ? low[bar_index - b] : high[bar_index - b]
+                    if isLow ? val < projv - buf : val > projv + buf
+                        ok := false
+                        break
+            if ok
+                Diag D = Diag.new(bar1 = ab, price1 = ap, bar2 = pb, price2 = p,
+                     slope = slp, tol = tolNow, touches = 2, lastTouch = pb,
+                     isLow = isLow, ln = line(na), lb = label(na))
+                array.push(arr, D)
+                if minTouchD <= 2
+                    f_ddraw(D, col)
+                    formed := true
+                if array.size(arr) > maxKeepD
+                    Diag old = array.shift(arr)
+                    if not na(old.ln)
+                        line.delete(old.ln)
+                        label.delete(old.lb)
+    formed
+
+// ── Diagonal: expire stale lines, drop (or fade) broken ones ────────────────
+f_dsweeps(array<Diag> arr, bool isLow, color col) =>
+    bool sweptEvt = false
+    int n = array.size(arr)
+    if n > 0
+        for i = n - 1 to 0
+            Diag D = array.get(arr, i)
+            if expireD > 0 and bar_index - D.lastTouch > expireD
+                if not na(D.ln)
+                    line.delete(D.ln)
+                    label.delete(D.lb)
+                array.remove(arr, i)
+            else
+                float projv = f_dproj(D, bar_index)
+                float buf = strictSwp ? 0.0 : D.tol
+                bool hit = isLow ? low < projv - buf : high > projv + buf
+                if hit
+                    if not na(D.ln)
+                        sweptEvt := true
+                        if showSwept
+                            line.set_extend(D.ln, extend.none)
+                            line.set_x2(D.ln, bar_index)
+                            line.set_y2(D.ln, projv)
+                            line.set_style(D.ln, line.style_dashed)
+                            line.set_color(D.ln, color.new(col, 75))
+                            if sweptLabels
+                                label.set_xy(D.lb, bar_index, projv)
+                                label.set_text(D.lb, str.tostring(D.touches) + "× ✗")
+                                label.set_color(D.lb, color.new(col, 75))
+                            else
+                                label.delete(D.lb)
+                        else
+                            line.delete(D.ln)
+                            label.delete(D.lb)
+                    array.remove(arr, i)
+    sweptEvt
+
+f_drefresh(array<Diag> arr) =>
+    int n = array.size(arr)
+    if n > 0
+        for i = 0 to n - 1
+            Diag D = array.get(arr, i)
+            if not na(D.lb)
+                label.set_xy(D.lb, bar_index, f_dproj(D, bar_index))
+
+// ── HTF pivot check on the rolling window ───────────────────────────────────
+f_winPivot(array<float> vals, int ci, bool isLow) =>
+    bool ok = true
+    float cv = array.get(vals, ci)
+    for k = 0 to array.size(vals) - 1
+        if k != ci
+            float v = array.get(vals, k)
+            if isLow ? v <= cv : v >= cv
+                ok := false
+                break
+    ok
+
+// ── Confluence: maintain existing zones, detect new overlaps ────────────────
+f_conjMaint() =>
+    bool sweptEvt = false
+    int n = array.size(conjs)
+    if n > 0
+        for i = n - 1 to 0
+            Conj C = array.get(conjs, i)
+            bool died = C.a.dead or C.b.dead
+            bool overlap = not died and math.abs(C.a.price - C.b.price) <= C.a.tol + C.b.tol
+            if died or not overlap
+                if died
+                    sweptEvt := true
+                if died and showSwept
+                    box.set_extend(C.bx, extend.none)
+                    box.set_right(C.bx, bar_index)
+                    box.set_bgcolor(C.bx, color.new(conjCol, 94))
+                    box.set_border_color(C.bx, color.new(conjCol, 85))
+                else
+                    box.delete(C.bx)
+                C.a.inConj := false
+                array.remove(conjs, i)
+            else
+                box.set_top(C.bx, math.max(C.a.price + C.a.tol, C.b.price + C.b.tol))
+                box.set_bottom(C.bx, math.min(C.a.price - C.a.tol, C.b.price - C.b.tol))
+    sweptEvt
+
+f_conjDetect(array<Liq> la, array<Liq> ha) =>
+    bool formed = false
+    int n = array.size(la)
+    int m = array.size(ha)
+    if n > 0 and m > 0
+        for i = 0 to n - 1
+            Liq A = array.get(la, i)
+            if not A.dead and not na(A.ln) and not A.inConj
+                for j = 0 to m - 1
+                    Liq B = array.get(ha, j)
+                    if not B.dead and not na(B.ln) and math.abs(A.price - B.price) <= A.tol + B.tol
+                        float top = math.max(A.price + A.tol, B.price + B.tol)
+                        float bot = math.min(A.price - A.tol, B.price - B.tol)
+                        box bx = box.new(bar_index, top, bar_index, bot,
+                             border_color = color.new(conjCol, 40), bgcolor = color.new(conjCol, 85),
+                             extend = extend.right)
+                        array.push(conjs, Conj.new(a = A, b = B, bx = bx))
+                        A.inConj := true
+                        formed := true
+                        break
+    formed
+
+// ── Main: chart-TF pivots ───────────────────────────────────────────────────
+float pl = ta.pivotlow(low, leftLen, rightLen)
+float ph = ta.pivothigh(high, leftLen, rightLen)
+
+bool lowFormed   = false
+bool highFormed  = false
+bool dLowFormed  = false
+bool dHighFormed = false
+
+if not na(pl) and barstate.isconfirmed
+    lowFormed := f_process(lows, pl, true, lowCol, bar_index - rightLen, tolNow, ltfPfx, lineW)
+    if useDiag
+        int pb = bar_index - rightLen
+        bool t = f_dtouch(dlows, pl, pb, lowCol)
+        bool c = f_dcand(dlows, plB, plV, pl, pb, true, lowCol)
+        dLowFormed := t or c
+        array.push(plB, pb)
+        array.push(plV, pl)
+        if array.size(plB) > 8
+            array.shift(plB)
+            array.shift(plV)
+
+if not na(ph) and barstate.isconfirmed
+    highFormed := f_process(highs, ph, false, highCol, bar_index - rightLen, tolNow, ltfPfx, lineW)
+    if useDiag
+        int pb = bar_index - rightLen
+        bool t = f_dtouch(dhighs, ph, pb, highCol)
+        bool c = f_dcand(dhighs, phB, phV, ph, pb, false, highCol)
+        dHighFormed := t or c
+        array.push(phB, pb)
+        array.push(phV, ph)
+        if array.size(phB) > 8
+            array.shift(phB)
+            array.shift(phV)
+
+// ── Main: HTF aggregation + pivots ──────────────────────────────────────────
+bool hLowFormed  = false
+bool hHighFormed = false
+
+if htfOk and barstate.isconfirmed
+    if newHtf and not na(hAggL)
+        // finalize the completed HTF bar
+        float tr = na(hPrevC) ? hAggH - hAggL :
+             math.max(hAggH - hAggL, math.max(math.abs(hAggH - hPrevC), math.abs(hAggL - hPrevC)))
+        htfAtr := na(htfAtr) ? tr : (htfAtr * (atrLen - 1) + tr) / atrLen
+        hPrevC := hAggC
+        array.push(hbL, hAggL)
+        array.push(hbH, hAggH)
+        array.push(hbLBar, hAggLBar)
+        array.push(hbHBar, hAggHBar)
+        int winSz = leftH + rightH + 1
+        if array.size(hbL) > winSz
+            array.shift(hbL)
+            array.shift(hbH)
+            array.shift(hbLBar)
+            array.shift(hbHBar)
+        if array.size(hbL) == winSz
+            float htfTol = tolMode == "ATR" ? htfAtr * atrMult : tickTol * syminfo.mintick
+            if f_winPivot(hbL, leftH, true)
+                hLowFormed := f_process(lowsH, array.get(hbL, leftH), true, lowCol,
+                     array.get(hbLBar, leftH), htfTol, htfPfx, lineW + 1)
+            if f_winPivot(hbH, leftH, false)
+                hHighFormed := f_process(highsH, array.get(hbH, leftH), false, highCol,
+                     array.get(hbHBar, leftH), htfTol, htfPfx, lineW + 1)
+    if newHtf or na(hAggL)
+        hAggH := high
+        hAggL := low
+        hAggHBar := bar_index
+        hAggLBar := bar_index
+        hAggC := close
+    else
+        if high > hAggH
+            hAggH := high
+            hAggHBar := bar_index
+        if low < hAggL
+            hAggL := low
+            hAggLBar := bar_index
+        hAggC := close
+
+// ── Main: sweeps (chart-bar granularity for every TF), confluence ───────────
+bool lowSwept   = f_sweeps(lows, true, lowCol)
+bool highSwept  = f_sweeps(highs, false, highCol)
+bool hLowSwept  = htfOk and f_sweeps(lowsH, true, lowCol)
+bool hHighSwept = htfOk and f_sweeps(highsH, false, highCol)
+bool dLowSwept  = useDiag and f_dsweeps(dlows, true, lowCol)
+bool dHighSwept = useDiag and f_dsweeps(dhighs, false, highCol)
+
+bool confFormed = false
+bool confSwept  = false
+if conjOn and htfOk
+    confSwept := f_conjMaint()
+    bool c1 = f_conjDetect(lows, lowsH)
+    bool c2 = f_conjDetect(highs, highsH)
+    confFormed := c1 or c2
+
+if barstate.islast
+    f_refresh(lows)
+    f_refresh(highs)
+    f_refresh(lowsH)
+    f_refresh(highsH)
+    if useDiag
+        f_drefresh(dlows)
+        f_drefresh(dhighs)
+
+// misconfiguration hint
+var table warnT = table.new(position.top_right, 1, 1)
+if barstate.islast and useHtf and not htfOk
+    table.cell(warnT, 0, 0, "HTF must be above chart TF — HTF levels disabled",
+         text_color = color.orange, text_size = size.small, bgcolor = color.new(color.black, 40))
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+alertcondition(lowFormed,   "Low level formed",      "Equal-lows level reached minimum touches (unswept)")
+alertcondition(highFormed,  "High level formed",     "Equal-highs level reached minimum touches (unswept)")
+alertcondition(lowSwept,    "Low level swept",       "A displayed equal-lows level was swept")
+alertcondition(highSwept,   "High level swept",      "A displayed equal-highs level was swept")
+alertcondition(hLowFormed,  "HTF low level formed",  "HTF equal-lows level reached minimum touches (unswept)")
+alertcondition(hHighFormed, "HTF high level formed", "HTF equal-highs level reached minimum touches (unswept)")
+alertcondition(hLowSwept,   "HTF low level swept",   "A displayed HTF equal-lows level was swept")
+alertcondition(hHighSwept,  "HTF high level swept",  "A displayed HTF equal-highs level was swept")
+alertcondition(confFormed,  "Confluence formed",     "Chart-TF and HTF levels overlap — confluence zone created")
+alertcondition(confSwept,   "Confluence swept",      "A confluence zone member level was swept")
+alertcondition(dLowFormed,  "Diagonal low formed",   "Diagonal lows line reached minimum touches (unbroken)")
+alertcondition(dHighFormed, "Diagonal high formed",  "Diagonal highs line reached minimum touches (unbroken)")
+alertcondition(dLowSwept,   "Diagonal low swept",    "A displayed diagonal lows line was broken")
+alertcondition(dHighSwept,  "Diagonal high swept",   "A displayed diagonal highs line was broken")

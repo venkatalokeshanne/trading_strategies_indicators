@@ -1,0 +1,156 @@
+//@version=5
+strategy("Fibonacci Concept Execution Engine (Anchored)", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS - Identical Logic Maintained
+// ============================================================================
+grp_fib = "Fibonacci Settings"
+lookback  = input.int(20, "Swing Lookback (Bars)", minval=5, group=grp_fib)
+fib_level = input.float(0.618, "Fibonacci Entry Level", step=0.01, group=grp_fib)
+
+grp_ma = "Moving Average Filters"
+use_ma  = input.bool(true, "Use MA Filter (Above=Buy, Below=Sell)", group=grp_ma)
+sma_len = input.int(290, "SMA Length", minval=1, group=grp_ma)
+ema_len = input.int(200, "EMA Length", minval=1, group=grp_ma)
+
+grp_trade = "Trade Management"
+fixed_sl_ticks = input.int(100, "Fixed SL (Ticks)", minval=1, group=grp_trade)
+rr_ratio       = input.float(2.0, "Risk:Reward Ratio", step=0.1, group=grp_trade)
+tp_ticks       = input.int(0, "TP Ticks Buffer (Beyond Line)", minval=0, group=grp_trade)
+use_be         = input.bool(true, "Enable Break Even (BE)", group=grp_trade)
+be_at_rr       = input.float(1.0, "Trigger BE at RR (e.g., 1.0 = 1:1)", step=0.1, group=grp_trade)
+
+// ============================================================================
+// CALCULATIONS
+// ============================================================================
+sma_val = ta.sma(close, sma_len)
+ema_val = ta.ema(close, ema_len)
+
+bool long_ma_ok  = not use_ma or (close > sma_val and close > ema_val)
+bool short_ma_ok = not use_ma or (close < sma_val and close < ema_val)
+
+high_ref  = ta.highest(high, lookback)
+low_ref   = ta.lowest(low, lookback)
+range_ref = high_ref - low_ref
+
+long_fib_level  = high_ref - (range_ref * fib_level)
+short_fib_level = low_ref + (range_ref * fib_level)
+
+// ============================================================================
+// STATE VARIABLES - Persistent State
+// ============================================================================
+var bool  in_trade  = false
+var int   trade_dir = 0 
+var float entry_p   = na
+var float sl_p      = na
+var float tp_p      = na
+var float be_p      = na
+var bool  be_active = false
+
+var int wins   = 0
+var int losses = 0
+var int bes    = 0
+
+// Var pointers for extending lines of the CURRENT trade
+var line active_entry = na
+var line active_sl    = na
+var line active_tp    = na
+var line active_be    = na
+
+// ============================================================================
+// TRADE LOGIC & ANCHORED EXECUTION
+// ============================================================================
+
+// 1. ENTRY (On Bar Close Only)
+if not in_trade
+    bool long_condition  = long_ma_ok and ta.crossunder(close, long_fib_level)
+    bool short_condition = short_ma_ok and ta.crossover(close, short_fib_level)
+
+    if long_condition or short_condition
+        in_trade  := true
+        trade_dir := long_condition ? 1 : -1
+        entry_p   := close
+        be_active := false
+        
+        float risk_dist = fixed_sl_ticks * syminfo.mintick
+        
+        if long_condition
+            sl_p := entry_p - risk_dist
+            tp_p := entry_p + (risk_dist * rr_ratio) + (tp_ticks * syminfo.mintick)
+            be_p := entry_p + (risk_dist * be_at_rr)
+            strategy.entry("Long", strategy.long)
+            strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+        else
+            sl_p := entry_p + risk_dist
+            tp_p := entry_p - (risk_dist * rr_ratio) - (tp_ticks * syminfo.mintick)
+            be_p := entry_p - (risk_dist * be_at_rr)
+            strategy.entry("Short", strategy.short)
+            strategy.exit("Exit", "Short", stop=sl_p, limit=tp_p)
+
+        // Anchoring: Create new lines fixed to the entry bar_index
+        active_entry := line.new(bar_index, entry_p, bar_index, entry_p, color=color.blue, width=2)
+        active_sl    := line.new(bar_index, sl_p,    bar_index, sl_p,    color=color.red,  width=2)
+        active_tp    := line.new(bar_index, tp_p,    bar_index, tp_p,    color=color.green,width=2)
+        if use_be
+            active_be := line.new(bar_index, be_p, bar_index, be_p, color=color.gray, style=line.style_dashed)
+
+// 2. MANAGEMENT & EXIT (Triggered by High/Low Wicks)
+if in_trade
+    // Extend lines to the current candle while trade is active
+    line.set_x2(active_entry, bar_index)
+    line.set_x2(active_sl,    bar_index)
+    line.set_x2(active_tp,    bar_index)
+    if use_be
+        line.set_x2(active_be, bar_index)
+
+    // Triggers (Strict SL touch and Buffered TP touch)
+    bool hit_sl = (trade_dir == 1 and low <= sl_p) or (trade_dir == -1 and high >= sl_p)
+    bool hit_tp = (trade_dir == 1 and high >= tp_p) or (trade_dir == -1 and low <= tp_p)
+    bool hit_be = not be_active and use_be and ((trade_dir == 1 and high >= be_p) or (trade_dir == -1 and low <= be_p))
+
+    // Break Even Logic
+    if hit_be
+        be_active := true
+        sl_p      := entry_p 
+        line.set_y1(active_sl, sl_p)
+        line.set_y2(active_sl, sl_p)
+        line.set_color(active_sl, color.orange)
+        if trade_dir == 1
+            strategy.exit("Exit", "Long", stop=sl_p, limit=tp_p)
+        else
+            strategy.exit("Exit", "Short", stop=sl_p, limit=tp_p)
+
+    // Exit Detection
+    if hit_sl
+        if be_active
+            bes += 1
+            // Anchored Label: Uses exact SL price and bar_index
+            label.new(bar_index, sl_p, "BE", color=color.gray, textcolor=color.white, style=trade_dir == 1 ? label.style_label_up : label.style_label_down, size=size.small)
+        else
+            losses += 1
+            label.new(bar_index, sl_p, "LOSS", color=color.red, textcolor=color.white, style=trade_dir == 1 ? label.style_label_up : label.style_label_down, size=size.small)
+        in_trade := false
+
+    else if hit_tp
+        wins += 1
+        // Anchored Label: Uses exact TP buffered price and bar_index
+        label.new(bar_index, tp_p, "WIN", color=color.green, textcolor=color.white, style=trade_dir == 1 ? label.style_label_down : label.style_label_up, size=size.small)
+        in_trade := false
+
+// ============================================================================
+// DASHBOARD & PLOTS
+// ============================================================================
+plot(use_ma ? sma_val : na, "SMA Filter", color=color.new(color.blue, 0), linewidth=2)
+plot(use_ma ? ema_val : na, "EMA Filter", color=color.new(color.fuchsia, 0), linewidth=2)
+
+// Fixed Dashboard Table
+var table stats = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80), border_width=1, border_color=color.gray)
+if barstate.islast
+    table.cell(stats, 0, 0, "Trade Stats", text_color=color.white, text_halign=text.align_left)
+    table.cell(stats, 1, 0, "", text_color=color.white)
+    table.cell(stats, 0, 1, "Wins ✅", text_color=color.green, text_halign=text.align_left)
+    table.cell(stats, 1, 1, str.tostring(wins), text_color=color.green, text_halign=text.align_right)
+    table.cell(stats, 0, 2, "Losses ❌", text_color=color.red, text_halign=text.align_left)
+    table.cell(stats, 1, 2, str.tostring(losses), text_color=color.red, text_halign=text.align_right)
+    table.cell(stats, 0, 3, "BE 🤝", text_color=color.orange, text_halign=text.align_left)
+    table.cell(stats, 1, 3, str.tostring(bes), text_color=color.orange, text_halign=text.align_right)

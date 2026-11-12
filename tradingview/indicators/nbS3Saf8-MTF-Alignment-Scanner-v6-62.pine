@@ -1,0 +1,519 @@
+//@version=6
+indicator("MTF Alignment Scanner v6.62 (Configurable LTF + ATR Mult + Freshness Guard)", overlay = true)
+
+//====================================================
+// CHANGELOG
+//====================================================
+// v6.62 (this version)
+//   - Added H4 ("240") to the timeframe ladder, inserted between H1 and D1.
+//     Full TF set is now {M5, M15, H1, H4, D1, W1, MN}.
+//   - secondCode / thirdCode / fourthCode mappings all shift one slot
+//     to accommodate H4; fifthCode / fifthLabel / fifthFactor added as
+//     the new outermost leg for each LTF choice:
+//       LTF=M5:  M15 | H1 | H4 | D1 | W1  (2nd–5th slots + existing MN out of reach in 5TF)
+//       LTF=M15: H1  | H4 | D1 | W1 | (MN not reached in 5TF)
+//       LTF=H1:  H4  | D1 | W1 | MN
+//   - Added "5 Timeframes (LTF + LMTF + HMTF + HHTF + HTF)" to alignMode.
+//   - is5TF, needFifth, and fifthLong* / fifthLongT* variables added using
+//     the same gated security() + f_trustedState() pattern as third/fourth.
+//   - needFourth expanded from is4TF to (is4TF or is5TF) so the fourth leg
+//     is fetched in 5TF mode as well.
+//   - Alignment formula extended with (not needFifth or fifthLongT/ShortT).
+//   - Table: is5TF branch added before is4TF; pushes LMTF/HMTF/HHTF/HTF rows.
+//   - No other logic altered.
+//
+// v6.61 (prior version)
+//   - Gated request.security() and f_trustedState() calls for the third
+//     and fourth timeframe legs behind needThird / needFourth.
+//     Both are simple bools derived from the alignMode input, so Pine v6
+//     permits security() inside those branches. In 2TF mode this eliminates
+//     two redundant HTF data fetches plus the eight var-state variables
+//     tracked inside each of their freshness-guard calls. In 3TF mode it
+//     eliminates the one unused fourth-leg fetch. No change to logic or
+//     output — the alignment formula and table already short-circuit on
+//     (not needThird or ...) / (not needFourth or ...), so the na
+//     placeholders those vars held in unused modes were already ignored.
+//   - CE10173 fix: gated var declarations use the cast-function form
+//     (bool(na), int(na), float(na)) WITHOUT explicit type annotation,
+//     matching the pattern already used inside f_trustedState. Writing
+//     `var bool x = na` causes Pine to infer the variable as `const bool`
+//     because `na` is a compile-time constant; the explicit `bool` annotation
+//     locks in the const qualifier, making := reassignment impossible.
+//     `var x = bool(na)` is a function call — Pine treats the result as
+//     at minimum `simple`, and `var` promotes it to `series`, allowing :=.
+//   - NOTE on Pine tuple-reassignment syntax: [a,b] := security(...) is
+//     not valid in Pine v5/v6. The correct pattern used here is to declare
+//     var variables outside the if block, then inside the block capture the
+//     tuple into fresh local variables and individually reassign with :=.
+//
+// v6.60 (prior version)
+//   - f_confirmedState() now derives isLong/isShort from dir[1] == LONG /
+//     dir[1] == SHORT, same method as the LTF leg. Removes the theoretical
+//     close[1] == st[1] tie edge case.
+// v6.55 (prior version)
+//   - Configurable LTF + ATR multiplier + freshness guard.
+//====================================================
+
+grpTF   = "Timeframes"
+grpST   = "Supertrend"
+grpDisp = "Display"
+
+//====================================================
+// SUPERTREND SETTINGS
+//====================================================
+atrLen    = input.int(7, "ATR Length", minval = 3, step = 1, group = grpST)
+m5Factor  = input.float(3.5, "ATR Multiplier — M5",                minval = 0.1, step = 0.25, group = grpST)
+htfFactor = input.float(3.0, "ATR Multiplier — Higher Timeframes", minval = 0.1, step = 0.25, group = grpST,
+     tooltip = "Applied to every timeframe other than M5 (M15, H1, D1, W1, MN — whichever are active for the current LTF/alignment selection).")
+
+f_factorForTF(tfCode) =>
+    tfCode == "5" ? m5Factor : htfFactor
+
+//====================================================
+// TIMEFRAME SELECTION
+//====================================================
+ltfChoice = input.string("M15", "Lower Timeframe (LTF)", options = ["M5", "M15", "H"], group = grpTF,
+     tooltip = "The base / trigger timeframe. This chart must be set to the same timeframe you pick here — the indicator will refuse to run otherwise.")
+
+alignMode = input.string("2 Timeframes (LTF + HTF)", "Alignment Mode",
+     options = ["2 Timeframes (LTF + HTF)", "3 Timeframes (LTF + MTF + HTF)", "4 Timeframes (LTF + LMTF + HMTF + HTF)", "5 Timeframes (LTF + LMTF + HMTF + HHTF + HTF)"],
+     group = grpTF,
+     tooltip = "2TF = LTF aligned with the next higher timeframe.\n3TF = LTF aligned with the next TWO higher timeframes.\n4TF = LTF aligned with the next THREE higher timeframes. Never more than 4.")
+
+minBarsAfterOpen = input.int(1, "Suppress Signals for N Bars After Session Open", minval = 0, maxval = 10, group = grpTF,
+     tooltip = "MTF/HTF reads are least trustworthy in the first bar(s) right after a session gap (e.g. a gap-up open like COPPER1! at 9:00 IST). This holds off ALL triggers/alerts for N confirmed LTF bars after each session start. Set to 0 to disable. If a spurious alert still slips through right at the open, raise this — and check the ST Value / As Of columns to see exactly what was read.")
+
+is3TF = alignMode == "3 Timeframes (LTF + MTF + HTF)"
+is4TF = alignMode == "4 Timeframes (LTF + LMTF + HMTF + HTF)"
+is5TF = alignMode == "5 Timeframes (LTF + LMTF + HMTF + HHTF + HTF)"
+needThird  = is3TF or is4TF or is5TF   // simple bool — gating security() on this is valid in Pine v6
+needFourth = is4TF or is5TF             // simple bool — true in both 4TF and 5TF modes
+needFifth  = is5TF                      // simple bool
+activeCount = is5TF ? 5 : is4TF ? 4 : is3TF ? 3 : 2
+
+// ---- Hard-coded "next higher timeframe" mapping ----
+ltfCode    = ltfChoice == "M5" ? "5"  : ltfChoice == "M15" ? "15" : "60"
+secondCode = ltfChoice == "M5" ? "15"  : ltfChoice == "M15" ? "60"  : "240"
+thirdCode  = ltfChoice == "M5" ? "60"  : ltfChoice == "M15" ? "240" : "D"
+fourthCode = ltfChoice == "M5" ? "240" : ltfChoice == "M15" ? "D"   : "W"
+fifthCode  = ltfChoice == "M5" ? "D"   : ltfChoice == "M15" ? "W"   : "M"
+
+ltfLabel    = ltfChoice == "M5" ? "M5"  : ltfChoice == "M15" ? "M15" : "H1"
+secondLabel = ltfChoice == "M5" ? "M15" : ltfChoice == "M15" ? "H1"  : "H4"
+thirdLabel  = ltfChoice == "M5" ? "H1"  : ltfChoice == "M15" ? "H4"  : "D1"
+fourthLabel = ltfChoice == "M5" ? "H4"  : ltfChoice == "M15" ? "D1"  : "W1"
+fifthLabel  = ltfChoice == "M5" ? "D1"  : ltfChoice == "M15" ? "W1"  : "MN"
+
+ltfFactor    = f_factorForTF(ltfCode)
+secondFactor = f_factorForTF(secondCode)
+thirdFactor  = f_factorForTF(thirdCode)
+fourthFactor = f_factorForTF(fourthCode)
+fifthFactor  = f_factorForTF(fifthCode)
+
+//====================================================
+// CHART / LTF SAFETY CHECK
+//====================================================
+if timeframe.period != ltfCode
+    runtime.error("LTF is set to " + ltfLabel + " but this chart is on a different timeframe. Switch the chart to " + ltfLabel + " to use this indicator.")
+
+LONG  = -1
+SHORT =  1
+
+//====================================================
+// SESSION-OPEN GUARD
+//====================================================
+var int barsSinceOpen = 0
+if session.isfirstbar
+    barsSinceOpen := 0
+else
+    barsSinceOpen := barsSinceOpen + 1
+sessionReady = barsSinceOpen >= minBarsAfterOpen
+
+//====================================================
+// LTF SUPERTREND — LIVE (on-chart plot only)
+//====================================================
+[ltfST, ltfDir] = ta.supertrend(ltfFactor, atrLen)
+
+//====================================================
+// LTF CONFIRMED STATE
+//====================================================
+ltfConfLong  = ltfDir[1] == LONG
+ltfConfShort = ltfDir[1] == SHORT
+ltfBarTime   = time_close[1]
+ltfStVal     = ltfST[1]
+
+//====================================================
+// HIGHER TIMEFRAME STATE — REPAINT-SAFE
+//====================================================
+f_confirmedState(mult) =>
+    [st, dir] = ta.supertrend(mult, atrLen)
+    isLong  = dir[1] == LONG
+    isShort = dir[1] == SHORT
+    barTime = time_close[1]
+    stVal   = st[1]
+    [isLong, isShort, barTime, stVal]
+
+// ── Second TF: always fetched (present in every alignment mode) ──────────
+[secondLong, secondShort, secondBarTime, secondStVal] = request.security(
+     syminfo.tickerid, secondCode, f_confirmedState(secondFactor),
+     lookahead = barmerge.lookahead_off)
+
+// ── Third TF: gated behind needThird ────────────────────────────────────
+// Pine v5/v6 allows request.security() inside `if` blocks whose condition
+// is a simple value (constant or input-derived). needThird = is3TF or is4TF,
+// both derived from input.string(), so this branch is valid.
+//
+// Tuple reassignment ([a,b] :=) is NOT supported in Pine. Correct pattern:
+//   1. Declare var variables outside the if block.
+//   2. Inside, capture the tuple into fresh local names with =.
+//   3. Reassign the outer vars individually with :=.
+var thirdLong    = bool(na)
+var thirdShort   = bool(na)
+var thirdBarTime = int(na)
+var thirdStVal   = float(na)
+if needThird
+    [_tL, _tS, _tBT, _tSV] = request.security(
+         syminfo.tickerid, thirdCode, f_confirmedState(thirdFactor),
+         lookahead = barmerge.lookahead_off)
+    thirdLong    := _tL
+    thirdShort   := _tS
+    thirdBarTime := _tBT
+    thirdStVal   := _tSV
+
+// ── Fourth TF: gated behind needFourth ──────────────────────────────────
+var fourthLong    = bool(na)
+var fourthShort   = bool(na)
+var fourthBarTime = int(na)
+var fourthStVal   = float(na)
+if needFourth
+    [_fL, _fS, _fBT, _fSV] = request.security(
+         syminfo.tickerid, fourthCode, f_confirmedState(fourthFactor),
+         lookahead = barmerge.lookahead_off)
+    fourthLong    := _fL
+    fourthShort   := _fS
+    fourthBarTime := _fBT
+    fourthStVal   := _fSV
+
+// ── Fifth TF: gated behind needFifth ────────────────────────────────────
+var fifthLong    = bool(na)
+var fifthShort   = bool(na)
+var fifthBarTime = int(na)
+var fifthStVal   = float(na)
+if needFifth
+    [_5L, _5S, _5BT, _5SV] = request.security(
+         syminfo.tickerid, fifthCode, f_confirmedState(fifthFactor),
+         lookahead = barmerge.lookahead_off)
+    fifthLong    := _5L
+    fifthShort   := _5S
+    fifthBarTime := _5BT
+    fifthStVal   := _5SV
+
+//====================================================
+// FRESHNESS GUARD
+//====================================================
+f_trustedState(rawLong, rawShort, rawBarTime, rawStVal) =>
+    var trustedLong    = bool(na)
+    var trustedShort   = bool(na)
+    var trustedBarTime = int(na)
+    var trustedStVal   = float(na)
+    var pendingBarTime = int(na)
+    var pendingLong    = bool(na)
+    var pendingShort   = bool(na)
+    var pendingStVal   = float(na)
+
+    if barstate.isconfirmed
+        if na(trustedBarTime)
+            // first bar ever — trust immediately
+            trustedBarTime := rawBarTime
+            trustedLong    := rawLong
+            trustedShort   := rawShort
+            trustedStVal   := rawStVal
+        else if rawBarTime != trustedBarTime
+            if na(pendingBarTime) or pendingBarTime != rawBarTime
+                // first sighting of a new HTF bar time — hold, don't trust yet
+                pendingBarTime := rawBarTime
+                pendingLong    := rawLong
+                pendingShort   := rawShort
+                pendingStVal   := rawStVal
+            else
+                // same bar time confirmed on a later LTF bar — feed has settled
+                trustedBarTime := pendingBarTime
+                trustedLong    := pendingLong
+                trustedShort   := pendingShort
+                trustedStVal   := pendingStVal
+                pendingBarTime := na
+
+    [trustedLong, trustedShort, trustedBarTime, trustedStVal]
+
+// ── Second TF trusted: always computed ──────────────────────────────────
+[secondLongT, secondShortT, secondBarTimeT, secondStValT] = f_trustedState(
+     secondLong, secondShort, secondBarTime, secondStVal)
+
+// ── Third TF trusted: gated behind needThird ────────────────────────────
+// Each f_trustedState call site owns eight internal var variables. Gating
+// eliminates that footprint when the leg is not in use.
+var thirdLongT    = bool(na)
+var thirdShortT   = bool(na)
+var thirdBarTimeT = int(na)
+var thirdStValT   = float(na)
+if needThird
+    [_tLT, _tST, _tBTT, _tSVT] = f_trustedState(
+         thirdLong, thirdShort, thirdBarTime, thirdStVal)
+    thirdLongT    := _tLT
+    thirdShortT   := _tST
+    thirdBarTimeT := _tBTT
+    thirdStValT   := _tSVT
+
+// ── Fourth TF trusted: gated behind needFourth ──────────────────────────
+var fourthLongT    = bool(na)
+var fourthShortT   = bool(na)
+var fourthBarTimeT = int(na)
+var fourthStValT   = float(na)
+if needFourth
+    [_fLT, _fST, _fBTT, _fSVT] = f_trustedState(
+         fourthLong, fourthShort, fourthBarTime, fourthStVal)
+    fourthLongT    := _fLT
+    fourthShortT   := _fST
+    fourthBarTimeT := _fBTT
+    fourthStValT   := _fSVT
+
+// ── Fifth TF trusted: gated behind needFifth ────────────────────────────
+var fifthLongT    = bool(na)
+var fifthShortT   = bool(na)
+var fifthBarTimeT = int(na)
+var fifthStValT   = float(na)
+if needFifth
+    [_5LT, _5ST, _5BTT, _5SVT] = f_trustedState(
+         fifthLong, fifthShort, fifthBarTime, fifthStVal)
+    fifthLongT    := _5LT
+    fifthShortT   := _5ST
+    fifthBarTimeT := _5BTT
+    fifthStValT   := _5SVT
+
+//====================================================
+// FULL ALIGNMENT
+// The (not needThird or thirdLongT) guards were already correct in v6.60
+// and remain unchanged. When needThird = false the short-circuit makes
+// thirdLongT's value (na) irrelevant, so the gating above is purely a
+// footprint optimisation with zero effect on alignment decisions.
+//====================================================
+fullBullishConfirmed = ltfConfLong  and secondLongT  and (not needThird or thirdLongT)  and (not needFourth or fourthLongT)  and (not needFifth or fifthLongT)
+fullBearishConfirmed = ltfConfShort and secondShortT and (not needThird or thirdShortT) and (not needFourth or fourthShortT) and (not needFifth or fifthShortT)
+
+justBecameReady = sessionReady and not sessionReady[1]
+
+longEntry  = barstate.isconfirmed and sessionReady and fullBullishConfirmed and (not fullBullishConfirmed[1] or justBecameReady)
+shortEntry = barstate.isconfirmed and sessionReady and fullBearishConfirmed and (not fullBearishConfirmed[1] or justBecameReady)
+
+//====================================================
+// SUPERTREND PLOT (LTF)
+//====================================================
+longPlot  = ltfDir == LONG  ? ltfST : na
+shortPlot = ltfDir == SHORT ? ltfST : na
+
+plot(longPlot,  title = "Long Supertrend",  color = color.lime, linewidth = 2, style = plot.style_linebr)
+plot(shortPlot, title = "Short Supertrend", color = color.red,  linewidth = 2, style = plot.style_linebr)
+
+//====================================================
+// ENTRY MARKERS
+//====================================================
+plotshape(longEntry,  title = "BUY",  style = shape.triangleup,   location = location.belowbar, color = color.rgb(8, 255, 135), size = size.tiny, text = "↑")
+plotshape(shortEntry, title = "SELL", style = shape.triangledown, location = location.abovebar, color = color.orange,              size = size.tiny, text = "↓")
+
+//====================================================
+// ALERTS
+//====================================================
+alertcondition(longEntry,  title = "POSITIVE BIAS",  message = "BUY WATCH {{tickerid}} | TF: {{interval}} | Price: {{close}}")
+alertcondition(shortEntry, title = "NEGATIVE BIAS", message = "SELL WATCH {{tickerid}} | TF: {{interval}} | Price: {{close}}")
+
+//====================================================
+// TABLE DISPLAY SETTINGS
+//====================================================
+showTable       = input.bool(true, "Show Table", group = grpDisp)
+tablePosStr     = input.string("Bottom Left", "Table Position", options = ["Top Left","Top Center","Top Right","Middle Left","Middle Center","Middle Right","Bottom Left","Bottom Center","Bottom Right"], group = grpDisp)
+tblLayout       = input.string("Vertical", "Table Layout", options = ["Vertical", "Horizontal"], group = grpDisp,
+     tooltip = "Vertical: one row per timeframe — label, direction, ST value, as-of time.\nHorizontal: one column per timeframe, with name/direction/value/as-of rows stacked.")
+blankTopRows    = input.int(0, "Blank Spacer Rows (top)", minval = 0, maxval = 8, group = grpDisp,
+     tooltip = "Adds empty rows above the table. Useful for Top corners where the chart's symbol/OHLC legend can overlap the first rows.")
+blankBottomRows = input.int(0, "Blank Spacer Rows (bottom)", minval = 0, maxval = 8, group = grpDisp,
+     tooltip = "Adds empty rows below the table. Useful for Bottom corners or when stacking with other table-based indicators.")
+fontSizeStr     = input.string("Small", "Font Size", options = ["Tiny","Small","Normal","Large"], group = grpDisp)
+optimizeDark    = input.bool(true, "Optimise for dark background", group = grpDisp,
+     tooltip = "Leave checked for dark chart backgrounds -> table text renders white. Uncheck for a light background -> text renders navy blue. Overridden by Custom Text Color if enabled below.")
+useCustomColor  = input.bool(false, "Use Custom Text Color", group = grpDisp)
+customTextColor = input.color(color.white, "Custom Text Color", group = grpDisp)
+
+f_getPosition(p) =>
+    switch p
+        "Top Left"      => position.top_left
+        "Top Center"    => position.top_center
+        "Top Right"     => position.top_right
+        "Middle Left"   => position.middle_left
+        "Middle Center" => position.middle_center
+        "Middle Right"  => position.middle_right
+        "Bottom Left"   => position.bottom_left
+        "Bottom Center" => position.bottom_center
+        "Bottom Right"  => position.bottom_right
+        =>                 position.bottom_left
+
+f_getSize(s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        =>          size.small
+
+f_fmtTime(t) => na(t) ? "—" : str.format_time(t, "HH:mm", syminfo.timezone)
+f_fmtVal(v)  => na(v) ? "—" : str.tostring(v, format.mintick)
+
+tPos      = f_getPosition(tablePosStr)
+fontSize  = f_getSize(fontSizeStr)
+textColor = useCustomColor ? customTextColor : (optimizeDark ? color.white : color.new(#000080, 0))
+headerBg  = optimizeDark ? color.new(#1B2838, 0) : color.new(#E8E8E8, 0)
+
+bullColor = color.rgb(8, 130, 60)
+bearColor = color.rgb(190, 40, 40)
+mixColor  = color.rgb(120, 120, 120)
+syncColor = color.rgb(70, 90, 160)
+
+tblCols = tblLayout == "Vertical" ? 4 : math.max(activeCount, 1)
+tblRows = tblLayout == "Vertical" ? (1 + activeCount + 1 + blankTopRows + blankBottomRows) : (5 + blankTopRows + blankBottomRows)
+
+var table infoTable = showTable ? table.new(tPos, tblCols, tblRows, border_width = 1) : na
+
+//====================================================
+// INFO TABLE
+//====================================================
+if showTable and barstate.islast
+    biasText  = not sessionReady ? "SYNCING" : fullBullishConfirmed ? "BULLISH" : fullBearishConfirmed ? "BEARISH" : "MIXED"
+    biasColor = not sessionReady ? syncColor  : fullBullishConfirmed ? bullColor : fullBearishConfirmed ? bearColor : mixColor
+
+    rowLabel = array.new<string>()
+    rowTF    = array.new<string>()
+    rowBull  = array.new<bool>()
+    rowTime  = array.new<int>()
+    rowValue = array.new<float>()
+
+    array.push(rowLabel, "LTF (trigger)")
+    array.push(rowTF,    ltfLabel)
+    array.push(rowBull,  ltfConfLong)
+    array.push(rowTime,  ltfBarTime)
+    array.push(rowValue, ltfStVal)
+
+    if is5TF
+        array.push(rowLabel, "LMTF (auto)")
+        array.push(rowTF,    secondLabel)
+        array.push(rowBull,  secondLongT)
+        array.push(rowTime,  secondBarTimeT)
+        array.push(rowValue, secondStValT)
+        array.push(rowLabel, "HMTF (auto)")
+        array.push(rowTF,    thirdLabel)
+        array.push(rowBull,  thirdLongT)
+        array.push(rowTime,  thirdBarTimeT)
+        array.push(rowValue, thirdStValT)
+        array.push(rowLabel, "HHTF (auto)")
+        array.push(rowTF,    fourthLabel)
+        array.push(rowBull,  fourthLongT)
+        array.push(rowTime,  fourthBarTimeT)
+        array.push(rowValue, fourthStValT)
+        array.push(rowLabel, "HTF (auto)")
+        array.push(rowTF,    fifthLabel)
+        array.push(rowBull,  fifthLongT)
+        array.push(rowTime,  fifthBarTimeT)
+        array.push(rowValue, fifthStValT)
+    else if is4TF
+        array.push(rowLabel, "LMTF (auto)")
+        array.push(rowTF,    secondLabel)
+        array.push(rowBull,  secondLongT)
+        array.push(rowTime,  secondBarTimeT)
+        array.push(rowValue, secondStValT)
+        array.push(rowLabel, "HMTF (auto)")
+        array.push(rowTF,    thirdLabel)
+        array.push(rowBull,  thirdLongT)
+        array.push(rowTime,  thirdBarTimeT)
+        array.push(rowValue, thirdStValT)
+        array.push(rowLabel, "HTF (auto)")
+        array.push(rowTF,    fourthLabel)
+        array.push(rowBull,  fourthLongT)
+        array.push(rowTime,  fourthBarTimeT)
+        array.push(rowValue, fourthStValT)
+    else if is3TF
+        array.push(rowLabel, "MTF (auto)")
+        array.push(rowTF,    secondLabel)
+        array.push(rowBull,  secondLongT)
+        array.push(rowTime,  secondBarTimeT)
+        array.push(rowValue, secondStValT)
+        array.push(rowLabel, "HTF (auto)")
+        array.push(rowTF,    thirdLabel)
+        array.push(rowBull,  thirdLongT)
+        array.push(rowTime,  thirdBarTimeT)
+        array.push(rowValue, thirdStValT)
+    else
+        array.push(rowLabel, "HTF (auto)")
+        array.push(rowTF,    secondLabel)
+        array.push(rowBull,  secondLongT)
+        array.push(rowTime,  secondBarTimeT)
+        array.push(rowValue, secondStValT)
+
+    if tblLayout == "Vertical"
+        if blankTopRows > 0
+            for r = 0 to blankTopRows - 1
+                for c = 0 to tblCols - 1
+                    table.cell(infoTable, c, r, "", bgcolor = color.new(color.black, 100))
+
+        headerRow = blankTopRows
+        table.cell(infoTable, 0, headerRow, "Timeframe", text_color = textColor, bgcolor = headerBg, text_size = fontSize, text_halign = text.align_left)
+        table.cell(infoTable, 1, headerRow, "Bias",      text_color = textColor, bgcolor = headerBg, text_size = fontSize)
+        table.cell(infoTable, 2, headerRow, "ST Value",  text_color = textColor, bgcolor = headerBg, text_size = fontSize)
+        table.cell(infoTable, 3, headerRow, "As Of",     text_color = textColor, bgcolor = headerBg, text_size = fontSize)
+
+        for i = 0 to array.size(rowLabel) - 1
+            r    = headerRow + 1 + i
+            bull = array.get(rowBull, i)
+            rC   = bull ? bullColor : bearColor
+            table.cell(infoTable, 0, r, array.get(rowLabel, i) + "  " + array.get(rowTF, i), text_color = textColor, bgcolor = color.new(rC, 70), text_size = fontSize, text_halign = text.align_left)
+            table.cell(infoTable, 1, r, bull ? "▲" : "▼",                                    text_color = textColor, bgcolor = color.new(rC, 70), text_size = fontSize)
+            table.cell(infoTable, 2, r, f_fmtVal(array.get(rowValue, i)),                     text_color = textColor, bgcolor = color.new(rC, 70), text_size = fontSize)
+            table.cell(infoTable, 3, r, f_fmtTime(array.get(rowTime, i)),                     text_color = textColor, bgcolor = color.new(rC, 70), text_size = fontSize)
+
+        biasRow = headerRow + 1 + array.size(rowLabel)
+        table.cell(infoTable, 0, biasRow, "Alignment", text_color = color.white, bgcolor = biasColor, text_size = fontSize, text_halign = text.align_left)
+        table.cell(infoTable, 1, biasRow, biasText,    text_color = color.white, bgcolor = biasColor, text_size = fontSize)
+        table.cell(infoTable, 2, biasRow, "",           bgcolor = biasColor)
+        table.cell(infoTable, 3, biasRow, "",           bgcolor = biasColor)
+
+        if blankBottomRows > 0
+            for r = biasRow + 1 to biasRow + blankBottomRows
+                for c = 0 to tblCols - 1
+                    table.cell(infoTable, c, r, "", bgcolor = color.new(color.black, 100))
+
+    else // Horizontal
+        if blankTopRows > 0
+            for r = 0 to blankTopRows - 1
+                for c = 0 to tblCols - 1
+                    table.cell(infoTable, c, r, "", bgcolor = color.new(color.black, 100))
+
+        labelRow = blankTopRows
+        valueRow = blankTopRows + 1
+        stValRow = blankTopRows + 2
+        asOfRow  = blankTopRows + 3
+        biasRow  = blankTopRows + 4
+
+        for i = 0 to array.size(rowLabel) - 1
+            bull = array.get(rowBull, i)
+            rC   = bull ? bullColor : bearColor
+            table.cell(infoTable, i, labelRow, array.get(rowTF, i),                text_color = textColor, bgcolor = headerBg,            text_size = fontSize)
+            table.cell(infoTable, i, valueRow, bull ? "▲" : "▼",                   text_color = textColor, bgcolor = color.new(rC, 70),   text_size = fontSize)
+            table.cell(infoTable, i, stValRow, f_fmtVal(array.get(rowValue, i)),   text_color = textColor, bgcolor = color.new(rC, 70),   text_size = fontSize)
+            table.cell(infoTable, i, asOfRow,  f_fmtTime(array.get(rowTime, i)),   text_color = textColor, bgcolor = color.new(rC, 70),   text_size = fontSize)
+
+        table.cell(infoTable, 0, biasRow, biasText, text_color = color.white, bgcolor = biasColor, text_size = fontSize)
+        if tblCols > 1
+            for c = 1 to tblCols - 1
+                table.cell(infoTable, c, biasRow, "", bgcolor = biasColor)
+
+        if blankBottomRows > 0
+            for r = biasRow + 1 to biasRow + blankBottomRows
+                for c = 0 to tblCols - 1
+                    table.cell(infoTable, c, r, "", bgcolor = color.new(color.black, 100))

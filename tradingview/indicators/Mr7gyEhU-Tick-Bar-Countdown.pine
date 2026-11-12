@@ -1,0 +1,107 @@
+//@version=6
+indicator("Tick Bar Countdown (1000T)", overlay=true, max_labels_count=500)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+ticksPerBar   = input.int(1000, "Ticks Per Bar (chart setting)", minval=1, tooltip="Must match your tick chart interval, e.g. 1000 for a 1000T chart.")
+lookback      = input.int(20, "Lookback Bars for Avg Volume/Tick", minval=3, maxval=200)
+warnPct       = input.float(80, "Warning Threshold %", minval=1, maxval=99)
+readyPct      = input.float(93, "Ready-to-Act Threshold %", minval=1, maxval=99)
+showLabel     = input.bool(true, "Show % Label")
+labelOffset   = input.float(1.5, "Label Offset (ATR multiples)", minval=0, step=0.25, tooltip="How far above the bar the % label floats. Increase if it's overlapping price.")
+showBar       = input.bool(true, "Show Progress Bar")
+barGapAboveLabel = input.float(0.75, "Progress Bar Gap Above Label (ATR multiples)", minval=0, step=0.25, tooltip="Vertical space between the % label and the progress bar sitting above it.")
+showBg        = input.bool(true, "Highlight Background Near Close")
+showFormingBg = input.bool(true, "Static Grey Highlight While Bar Is Forming")
+smoothing     = input.string("SMA", "Volume/Tick Averaging", options=["SMA", "EMA"])
+
+// ─────────────────────────────────────────────────────────────
+// AVG VOLUME PER TICK (built from CLOSED bars only)
+// Each closed bar on a 1000T chart = exactly `ticksPerBar` ticks,
+// so closed-bar volume / ticksPerBar = a real sample of vol-per-tick.
+// ─────────────────────────────────────────────────────────────
+var float[] closedBarVols = array.new_float(0)
+
+if barstate.isconfirmed
+    array.push(closedBarVols, volume)
+    if array.size(closedBarVols) > lookback
+        array.shift(closedBarVols)
+
+avgVolPerTick = float(na)
+if array.size(closedBarVols) >= 3
+    sumV = array.sum(closedBarVols)
+    n    = array.size(closedBarVols)
+    avgVolPerTick := smoothing == "SMA" ? (sumV / n) / ticksPerBar : na
+
+// EMA variant of the same underlying series (only computed on confirmed bars)
+var float emaVolPerTick = na
+if barstate.isconfirmed
+    sampleVpt = volume / ticksPerBar
+    emaVolPerTick := na(emaVolPerTick) ? sampleVpt : emaVolPerTick + (2.0/(lookback+1)) * (sampleVpt - emaVolPerTick)
+
+vpt = smoothing == "EMA" ? emaVolPerTick : avgVolPerTick
+
+// ─────────────────────────────────────────────────────────────
+// ESTIMATE PROGRESS OF THE CURRENTLY FORMING BAR
+// ─────────────────────────────────────────────────────────────
+estTicks   = na(vpt) or vpt <= 0 ? na : volume / vpt
+progressPct = na(estTicks) ? na : math.min(100.0, (estTicks / ticksPerBar) * 100.0)
+
+isReady = not na(progressPct) and progressPct >= readyPct and not barstate.isconfirmed
+isWarn  = not na(progressPct) and progressPct >= warnPct and progressPct < readyPct and not barstate.isconfirmed
+
+// ─────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────
+// Static grey wash for the entire time the current bar is still forming (independent of progress %)
+formingBg = (not barstate.isconfirmed) ? color.new(color.gray, 88) : na
+bgcolor(showFormingBg ? formingBg : na, title="Forming Bar (static grey)")
+
+// Progress-based highlight layered on top of the static grey
+bgColor = isReady ? color.new(color.lime, 82) : isWarn ? color.new(color.yellow, 88) : na
+bgcolor(showBg ? bgColor : na, title="Bar-Close Proximity")
+
+// % label at the current bar, floating above the high
+var label pctLabel = na
+if showLabel
+    label.delete(pctLabel)
+    txt = na(progressPct) ? "warming up..." : str.tostring(math.round(progressPct)) + "% (" + str.tostring(int(math.round(na(estTicks) ? 0 : estTicks))) + "/" + str.tostring(ticksPerBar) + ")"
+    labelCol = isReady ? color.lime : isWarn ? color.yellow : color.gray
+    labelY   = high + (ta.atr(14) * labelOffset)
+    pctLabel := label.new(bar_index, labelY, txt, xloc=xloc.bar_index, yloc=yloc.price,
+                           style=label.style_label_down, color=color.new(color.black, 0),
+                           textcolor=labelCol, size=size.small)
+
+// progress bar drawn as boxes, stacked directly above the % label, centered on the forming bar
+var box[] barBoxes = array.new_box(0)
+if showBar
+    // clear previous frame's boxes for this bar (redraw each tick)
+    if array.size(barBoxes) > 0
+        for i = array.size(barBoxes) - 1 to 0
+            box.delete(array.get(barBoxes, i))
+        array.clear(barBoxes)
+
+    if not na(progressPct)
+        segments = 20
+        filled   = math.round((progressPct / 100.0) * segments)
+        atrNow   = ta.atr(14)
+        labelY   = high + (atrNow * labelOffset)
+        botRef   = labelY + (atrNow * barGapAboveLabel)
+        segH     = atrNow * 0.25
+        halfSeg  = segments / 2
+        for i = 0 to segments - 1
+            xStart = bar_index - halfSeg + i
+            xEnd   = xStart + 1
+            segCol = i < filled ? (isReady ? color.lime : isWarn ? color.yellow : color.aqua) : color.new(color.gray, 75)
+            b = box.new(xStart, botRef + segH, xEnd, botRef, border_color=color.new(color.black, 60), bgcolor=segCol)
+            array.push(barBoxes, b)
+
+// ─────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────
+alertcondition(isReady, title="Bar Nearing Close", message="1000T bar ~{{plot('progressPct')}}% formed — prepare to act on next bar")
+plot(progressPct, title="progressPct", display=display.none)
+
+if isReady and barstate.isrealtime
+    alert("Tick bar nearing close — prepare next-candle action", alert.freq_once_per_bar)

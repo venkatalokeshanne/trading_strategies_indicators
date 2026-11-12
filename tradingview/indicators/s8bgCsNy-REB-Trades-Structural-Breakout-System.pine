@@ -1,0 +1,843 @@
+// Based on "Trendline Breakouts With Targets" by ChartPrime
+// Modified by REB Trades: added stop loss, entry line, dashboard, win rate tracking, date filtering, structural SL logic
+
+//@version=6
+indicator('REB Trades, Structural Breakout System (mod of ChartPrime TBT)', shorttitle = 'REB Trades', overlay = true, max_bars_back = 500, max_lines_count = 500)
+
+
+bool ChartTime = time > chart.left_visible_bar_time and time < chart.right_visible_bar_time
+
+string CORE = '➞ Core Settings 🔸'
+string DASH = '➞ Dashboard 🔸'
+string VIZ = '➞ Sessions, FVG & OB (Visual Only) 🔸'
+var array<bool> tIsLong = array.new<bool>()
+var array<float> tTP = array.new<float>()
+var array<float> tSL = array.new<float>()
+var array<float> tEntry = array.new<float>()
+var array<bool> tBEActive = array.new<bool>()
+var array<int> tLineTime = array.new<int>()
+var array<float> tLinePrice = array.new<float>()
+var array<float> tLineSlope = array.new<float>()
+var array<float> tTP1 = array.new<float>()
+var array<bool> tTP1Hit = array.new<bool>()
+var array<line> tTP1Line = array.new<line>()
+var array<label> tTP1LAB = array.new<label>()
+var array<line> tTPLine = array.new<line>()
+var array<line> tSLLine = array.new<line>()
+var array<line> tEntryLine = array.new<line>()
+var array<label> tLAB = array.new<label>()
+var array<label> tSLLAB = array.new<label>()
+var array<label> tENTRYLAB = array.new<label>()
+var bool PendingActive = false
+var bool PendingIsLong = false
+var int PendingSetBar = na
+int BarTIME = time - time[1]
+var int UpdatedX = 0
+var float UpdatedY = 0.0
+var float UpdatedSLP = 0.0
+var int UpdatedXLow = 0
+var float UpdatedYLow = 0.0
+var float UpdatedSLPLow = 0.0
+
+// -- Win rate tracking --
+var int TotalTrades = 0
+var int TotalWins = 0
+var int TotalLosses = 0
+var int TotalBE = 0
+var int TotalTP1Only = 0
+
+
+int Period = input.int(10, title = '     Period     ➞', group = CORE, inline = '001', display = display.none)
+
+bool Trendtype = input.string(title = '     Type        ➞', defval = 'Wicks', options = ['Wicks', 'Body'], group = CORE, inline = '001', display = display.none) == 'Wicks'
+
+string Extensions = input.string(title = '     Extend    ➞', defval = '  25', options = ['  25', '  50', '  75'], group = CORE, inline = '001', display = display.none)
+
+
+color LineCol1 = input.color(color.rgb(109, 111, 111, 100), '', group = CORE, inline = '001', display = display.none)
+bool ShowTargets = input.bool(true, 'Show Targets', group = CORE, inline = '002', display = display.none)
+bool ShowSL = input.bool(true, 'Show Stop Loss', group = CORE, inline = '002', display = display.none)
+color SLColor = input.color(color.rgb(255, 152, 0), '', group = CORE, inline = '002', display = display.none)
+int SLLookback = input.int(20, 'SL Structure Lookback', group = CORE, inline = '006', minval = 2, display = display.none)
+string BiasTF = input.timeframe('60', 'HTF Bias Timeframe (visual only)', group = CORE, inline = '010', display = display.none)
+int BiasEMALen = input.int(50, 'Bias EMA Length', group = CORE, inline = '010', minval = 5, display = display.none)
+string TPMode = input.string('Fixed (Volatility)', 'TP Mode', options = ['Fixed (Volatility)', 'Recent Swing High/Low'], group = CORE, inline = '008', display = display.none)
+bool RequireFollowThrough = input.bool(false, 'Require Follow-Through Confirmation (next candle must agree)', group = CORE, inline = '009', display = display.none)
+bool InvalidateOnRetest = input.bool(false, 'Invalidate Trade if Price Returns to the Trendline', group = CORE, inline = '015', display = display.none)
+bool UseBE = input.bool(true, 'Move SL to Breakeven at Halfway to TP', group = CORE, inline = '011', display = display.none)
+float BELockPercent = input.float(20, 'BE Lock-in (% of TP distance)', minval = 0, maxval = 100, step = 5, group = CORE, inline = '011', display = display.none)
+float BETriggerPercent = input.float(50, 'BE Trigger (% of distance to TP)', minval = 5, maxval = 100, step = 5, group = CORE, inline = '013', display = display.none)
+int MaxConcurrentTrades = input.int(1, 'Max Concurrent Trades', minval = 1, maxval = 10, group = CORE, inline = '014', display = display.none)
+atCapacity = tIsLong.size() >= MaxConcurrentTrades
+bool ShowEntry = input.bool(true, 'Show Entry Line', group = CORE, inline = '007', display = display.none)
+color EntryColor = input.color(color.rgb(20, 20, 20), '', group = CORE, inline = '007', display = display.none)
+
+bool ShowDashboard = input.bool(true, 'Show Dashboard', group = DASH, inline = '003', display = display.none)
+string DashPos = input.string('Top Right', title = 'Position', options = ['Top Right', 'Top Left', 'Bottom Right', 'Bottom Left'], group = DASH, inline = '003', display = display.none)
+
+bool ShowWatermark = input.bool(true, 'Show Watermark', group = DASH, inline = '008', display = display.none)
+
+bool UseDateRange = input.bool(false, 'Filter by Date Range', group = DASH, inline = '004', display = display.none)
+int StartDate = input.time(timestamp('2020-01-01 00:00'), 'Start', group = DASH, inline = '005', display = display.none)
+int EndDate = input.time(timestamp('2069-12-31 23:59'), 'End', group = DASH, inline = '005', display = display.none)
+
+InRange = not UseDateRange or time >= StartDate and time <= EndDate
+
+bool ShowAsian = input.bool(true, 'Asian', group = VIZ, inline = 'sa', display = display.none)
+string AsianSess = input.session('2000-0000', '', group = VIZ, inline = 'sa', display = display.none)
+color AsianColor = input.color(color.new(#e91e63, 90), '', group = VIZ, inline = 'sa', display = display.none)
+
+bool ShowLondon = input.bool(true, 'London Open', group = VIZ, inline = 'sl', display = display.none)
+string LondonSess = input.session('0200-0500', '', group = VIZ, inline = 'sl', display = display.none)
+color LondonColor = input.color(color.new(#00bcd4, 90), '', group = VIZ, inline = 'sl', display = display.none)
+
+bool ShowNYAM = input.bool(true, 'New York AM', group = VIZ, inline = 'sn', display = display.none)
+string NYAMSess = input.session('0830-1100', '', group = VIZ, inline = 'sn', display = display.none)
+color NYAMColor = input.color(color.new(#ff5d00, 90), '', group = VIZ, inline = 'sn', display = display.none)
+
+bool ShowNYPM = input.bool(true, 'New York PM', group = VIZ, inline = 'sp', display = display.none)
+string NYPMSess = input.session('1330-1600', '', group = VIZ, inline = 'sp', display = display.none)
+color NYPMColor = input.color(color.new(#2157f3, 90), '', group = VIZ, inline = 'sp', display = display.none)
+
+bool ShowFVG = input.bool(true, 'Fair Value Gaps', group = VIZ, inline = 'fv1', display = display.none)
+float FVGMinSize = input.float(0.2, 'Min FVG Size (x ATR)', minval = 0, step = 0.1, group = VIZ, inline = 'fv2', display = display.none)
+int FVGFadeBars = input.int(150, 'Fade Old FVGs Over (bars)', minval = 10, group = VIZ, inline = 'fv2', display = display.none)
+color FVGBullColor = input.color(color.new(#4caf50, 80), 'Bullish', group = VIZ, inline = 'fv3', display = display.none)
+color FVGBearColor = input.color(color.new(color.red, 80), 'Bearish', group = VIZ, inline = 'fv3', display = display.none)
+
+bool ShowOB = input.bool(true, 'Order Blocks', group = VIZ, inline = 'ob1', display = display.none)
+int OBSwingLen = input.int(15, 'Swing Length', minval = 3, group = VIZ, inline = 'ob1', display = display.none)
+color OBBullColor = input.color(color.new(#2157f3, 80), 'Bullish', group = VIZ, inline = 'ob2', display = display.none)
+color OBBearColor = input.color(color.new(#9c27b0, 80), 'Bearish', group = VIZ, inline = 'ob2', display = display.none)
+
+bool ShowSR = input.bool(true, 'Support / Resistance', group = VIZ, inline = 'sr1', display = display.none)
+int SRPivotLen = input.int(15, 'Pivot Length', minval = 3, group = VIZ, inline = 'sr1', display = display.none)
+float SRTolerance = input.float(0.3, 'Level Tolerance (x ATR)', minval = 0.05, step = 0.05, group = VIZ, inline = 'sr2', display = display.none)
+int SRMinGapBars = input.int(20, 'Min Bars Between Touches', minval = 1, group = VIZ, inline = 'sr2', display = display.none)
+color SRColor = input.color(color.rgb(120, 120, 120), 'Line Color', group = VIZ, inline = 'sr3', display = display.none)
+
+DashPosSwitcher(p) =>
+    switch p
+        'Top Right' => position.top_right
+        'Top Left' => position.top_left
+        'Bottom Right' => position.bottom_right
+        => position.bottom_left
+
+ExtenSwitcher(ex) =>
+    switch ex
+        '  25' => 1
+        '  50' => 2
+        => 3
+
+
+WidthSwitcher(ex) =>
+    switch ex
+        '1' => 1
+        '2' => 2
+        => 3
+
+StyleSwitcher(style) =>
+    switch style
+        'Dashed' => line.style_dashed
+        'Dotted' => line.style_dotted
+        => line.style_solid
+
+
+
+
+method volAdj(int len) =>
+    math.min(ta.atr(len) * 0.3, close * (0.3 / 100))[20] / 2
+
+Zband = volAdj(30)
+
+
+
+
+method Trendlines(float src, int timeIndex, bool dir) =>
+
+    var int Start = 1
+    var int End = 0
+    var int TIME = 1
+    var float YEnd = 0
+    var float YStart = 0
+    var float Slope = 0
+    var line Line1 = line.new(na, na, na, na)
+    var line Line2 = line.new(na, na, na, na)
+    var line Line3 = line.new(na, na, na, na)
+
+    SCR = fixnan(src)
+    if ta.change(SCR) != 0
+        TIME := time[timeIndex]
+        YStart := SCR[1]
+        Start := TIME[1]
+        Slope := (SCR - YStart) / (TIME - Start)
+        Slope
+
+    EXTime = ExtenSwitcher(Extensions) * BarTIME * 25
+    End := TIME + EXTime
+    YEnd := SCR + EXTime * Slope
+
+    if ta.change(SCR) != 0 and not atCapacity
+        LineCond = Slope * time < 0 ? dir ? na : color.rgb(11, 139, 7, 0) : dir ? color.rgb(212, 46, 0, 0) : na
+        if not na(LineCond) //and ChartTime
+            Line1 := line.new(Start, YStart, End, YEnd, xloc.bar_time, extend.none, color = color.new(color.white, 100))
+
+            Line2 := line.new(Start, YStart - Zband * 2, End, YEnd - Zband * 2, xloc.bar_time, extend.none, color = color.new(color.black, 100))
+
+            Line3 := line.new(Start, YStart - Zband * 1, End, YEnd - Zband * 1, xloc.bar_time, extend.none, color = color.new(color.black, 100))
+
+            linefill.new(Line3, Line2, color = LineCol1)
+            linefill.new(Line3, Line1, color = LineCond)
+            // linefill.new(Line,Line2,color= color.rgb(28, 15, 2, 76))
+
+    [Start, YStart, Slope]
+
+
+
+PH = ta.pivothigh(Trendtype ? high : close > open ? close : open, Period, Period / 2)
+PL = ta.pivotlow(Trendtype ? low : close > open ? open : close, Period, Period / 2)
+
+var float SLSwingHigh = na
+var float SLSwingLow = na
+
+SLPivHigh = ta.pivothigh(high, SLLookback, SLLookback / 2)
+SLPivLow = ta.pivotlow(low, SLLookback, SLLookback / 2)
+
+if not na(SLPivHigh)
+    SLSwingHigh := SLPivHigh
+    SLSwingHigh
+if not na(SLPivLow)
+    SLSwingLow := SLPivLow
+    SLSwingLow
+
+
+// -- Higher Timeframe Bias (visual only, does not affect entries) --
+BiasClose = request.security(syminfo.tickerid, BiasTF, close, lookahead = barmerge.lookahead_off)
+BiasEMA = request.security(syminfo.tickerid, BiasTF, ta.ema(close, BiasEMALen), lookahead = barmerge.lookahead_off)
+HTFBias = BiasClose > BiasEMA ? 'Bullish' : BiasClose < BiasEMA ? 'Bearish' : 'Neutral'
+HTFBiasColor = BiasClose > BiasEMA ? color.rgb(6, 180, 15) : BiasClose < BiasEMA ? color.rgb(246, 7, 7) : color.gray
+
+
+// -- Sessions (visual only) --
+inAsian = timeframe.isintraday and ShowAsian and not na(time(timeframe.period, AsianSess, 'America/New_York'))
+inLondon = timeframe.isintraday and ShowLondon and not na(time(timeframe.period, LondonSess, 'America/New_York'))
+inNYAM = timeframe.isintraday and ShowNYAM and not na(time(timeframe.period, NYAMSess, 'America/New_York'))
+inNYPM = timeframe.isintraday and ShowNYPM and not na(time(timeframe.period, NYPMSess, 'America/New_York'))
+
+sessionBox(bool active, string txt, color col) =>
+    var float mx = na
+    var float mn = na
+    var line ln = na
+    var line lnLow = na
+    var label lb = na
+    var int sBar = na
+    if active and not active[1]
+        mx := high
+        mn := low
+        sBar := bar_index
+        if not na(ln)
+            ln.delete()
+        if not na(lnLow)
+            lnLow.delete()
+        if not na(lb)
+            lb.delete()
+        ln := line.new(bar_index, high, bar_index, high, style = line.style_solid, color = color.new(col, 0), width = 1)
+        lnLow := line.new(bar_index, low, bar_index, low, style = line.style_solid, color = color.new(col, 0), width = 1)
+        lb := label.new(bar_index, high, txt, style = label.style_label_down, color = color(na), textcolor = color.new(col, 0), size = size.small)
+        lb
+    if active
+        mx := math.max(high, mx)
+        mn := math.min(low, mn)
+        line.set_y1(ln, mx)
+        line.set_y2(ln, mx)
+        line.set_x2(ln, bar_index)
+        line.set_y1(lnLow, mn)
+        line.set_y2(lnLow, mn)
+        line.set_x2(lnLow, bar_index)
+        label.set_y(lb, mx)
+        label.set_x(lb, int(math.avg(bar_index, sBar)))
+
+sessionBox(inAsian, 'Asian', AsianColor)
+sessionBox(inLondon, 'London', LondonColor)
+sessionBox(inNYAM, 'New York AM', NYAMColor)
+sessionBox(inNYPM, 'New York PM', NYPMColor)
+
+
+// -- Fair Value Gaps (visual only) --
+var array<box> bullFVGs = array.new<box>()
+var array<box> bearFVGs = array.new<box>()
+var array<int> bullFVGStart = array.new<int>()
+var array<int> bearFVGStart = array.new<int>()
+var array<line> bullFVGCE = array.new<line>()
+var array<line> bearFVGCE = array.new<line>()
+var array<bool> bullFVGMit = array.new<bool>()
+var array<bool> bearFVGMit = array.new<bool>()
+
+fvgThresh = ta.atr(200) * FVGMinSize
+bullGap = ShowFVG and low > high[2] and low - high[2] > fvgThresh
+bearGap = ShowFVG and high < low[2] and low[2] - high > fvgThresh
+
+if bullGap
+    bullMid = math.avg(low, high[2])
+    bullFVGs.push(box.new(bar_index[2], low, bar_index, high[2], border_color = color.new(FVGBullColor, 0), bgcolor = FVGBullColor, text = 'FVG', text_size = size.tiny, text_color = color.new(FVGBullColor, 0)))
+    bullFVGStart.push(bar_index)
+    bullFVGCE.push(line.new(bar_index[2], bullMid, bar_index, bullMid, style = line.style_dashed, color = color.new(FVGBullColor, 0)))
+    bullFVGMit.push(false)
+
+if bearGap
+    bearMid = math.avg(high, low[2])
+    bearFVGs.push(box.new(bar_index[2], high, bar_index, low[2], border_color = color.new(FVGBearColor, 0), bgcolor = FVGBearColor, text = 'FVG', text_size = size.tiny, text_color = color.new(FVGBearColor, 0)))
+    bearFVGStart.push(bar_index)
+    bearFVGCE.push(line.new(bar_index[2], bearMid, bar_index, bearMid, style = line.style_dashed, color = color.new(FVGBearColor, 0)))
+    bearFVGMit.push(false)
+
+if ShowFVG and bullFVGs.size() > 0
+    for i = bullFVGs.size() - 1 to 0 by 1
+        fb = bullFVGs.get(i)
+        fbStart = bullFVGStart.get(i)
+        ceL = bullFVGCE.get(i)
+        mit = bullFVGMit.get(i)
+        if not mit and low < box.get_bottom(fb)
+            bullFVGMit.set(i, true)
+            mit := true
+            mit
+        if not mit
+            box.set_right(fb, bar_index)
+            age = bar_index - fbStart
+            fadeT = math.min(1.0, age / FVGFadeBars)
+            faded = int(70 + fadeT * 25)
+            lineFaded = int(fadeT * 40)
+            box.set_bgcolor(fb, color.new(FVGBullColor, faded))
+            box.set_border_color(fb, color.new(FVGBullColor, faded))
+            line.set_x2(ceL, bar_index)
+            line.set_color(ceL, color.new(FVGBullColor, lineFaded))
+        else
+            box.set_bgcolor(fb, color.new(FVGBullColor, 90))
+            box.set_border_color(fb, color.new(FVGBullColor, 90))
+            line.set_color(ceL, color.new(FVGBullColor, 60))
+
+if ShowFVG and bearFVGs.size() > 0
+    for i = bearFVGs.size() - 1 to 0 by 1
+        fb = bearFVGs.get(i)
+        fbStart = bearFVGStart.get(i)
+        ceL = bearFVGCE.get(i)
+        mit = bearFVGMit.get(i)
+        if not mit and high > box.get_top(fb)
+            bearFVGMit.set(i, true)
+            mit := true
+            mit
+        if not mit
+            box.set_right(fb, bar_index)
+            age = bar_index - fbStart
+            fadeT = math.min(1.0, age / FVGFadeBars)
+            faded = int(70 + fadeT * 25)
+            lineFaded = int(fadeT * 40)
+            box.set_bgcolor(fb, color.new(FVGBearColor, faded))
+            box.set_border_color(fb, color.new(FVGBearColor, faded))
+            line.set_x2(ceL, bar_index)
+            line.set_color(ceL, color.new(FVGBearColor, lineFaded))
+        else
+            box.set_bgcolor(fb, color.new(FVGBearColor, 90))
+            box.set_border_color(fb, color.new(FVGBearColor, 90))
+            line.set_color(ceL, color.new(FVGBearColor, 60))
+
+
+// -- Order Blocks (visual only, simplified: last opposite candle before a structure break) --
+var float lastBearH = na
+var float lastBearL = na
+var int lastBearI = na
+var float lastBullH = na
+var float lastBullL = na
+var int lastBullI = na
+
+if close < open
+    lastBearH := high
+    lastBearL := low
+    lastBearI := bar_index
+    lastBearI
+if close > open
+    lastBullH := high
+    lastBullL := low
+    lastBullI := bar_index
+    lastBullI
+
+obUpper = ta.highest(high, OBSwingLen)
+obLower = ta.lowest(low, OBSwingLen)
+
+obBullBreak = ShowOB and ta.crossover(close, obUpper[1])
+obBearBreak = ShowOB and ta.crossunder(close, obLower[1])
+
+var box bullOB = na
+var bool bullOBMit = false
+var box bearOB = na
+var bool bearOBMit = false
+
+if obBullBreak and not na(lastBearI)
+    if not na(bullOB)
+        bullOB.delete()
+    bullOB := box.new(lastBearI, lastBearH, bar_index, lastBearL, border_color = color.new(OBBullColor, 0), bgcolor = OBBullColor, text = 'Bullish OB', text_size = size.tiny, text_color = color.new(OBBullColor, 0))
+    bullOBMit := false
+    bullOBMit
+
+if obBearBreak and not na(lastBullI)
+    if not na(bearOB)
+        bearOB.delete()
+    bearOB := box.new(lastBullI, lastBullH, bar_index, lastBullL, border_color = color.new(OBBearColor, 0), bgcolor = OBBearColor, text = 'Bearish OB', text_size = size.tiny, text_color = color.new(OBBearColor, 0))
+    bearOBMit := false
+    bearOBMit
+
+if not na(bullOB)
+    if not bullOBMit and close < box.get_bottom(bullOB)
+        bullOBMit := true
+        bullOBMit
+    if not bullOBMit
+        box.set_right(bullOB, bar_index)
+    else
+        box.set_bgcolor(bullOB, color.new(OBBullColor, 90))
+        box.set_border_color(bullOB, color.new(OBBullColor, 90))
+
+if not na(bearOB)
+    if not bearOBMit and close > box.get_top(bearOB)
+        bearOBMit := true
+        bearOBMit
+    if not bearOBMit
+        box.set_right(bearOB, bar_index)
+    else
+        box.set_bgcolor(bearOB, color.new(OBBearColor, 90))
+        box.set_border_color(bearOB, color.new(OBBearColor, 90))
+
+
+
+
+// -- Support / Resistance (visual only, requires 2+ touches with a real gap between them) --
+var array<float> srLevels = array.new<float>()
+var array<int> srFirstBar = array.new<int>()
+var array<int> srTouchCount = array.new<int>()
+var array<line> srLines = array.new<line>()
+var array<label> srLabels = array.new<label>()
+
+srPivH = ta.pivothigh(high, SRPivotLen, SRPivotLen)
+srPivL = ta.pivotlow(low, SRPivotLen, SRPivotLen)
+srTol = ta.atr(200) * SRTolerance
+srTouchBar = bar_index - SRPivotLen
+
+processSR(float lvl) =>
+    if ShowSR and not na(lvl)
+        matched = false
+        if srLevels.size() > 0
+            for i = srLevels.size() - 1 to 0 by 1
+                if not matched and math.abs(lvl - srLevels.get(i)) <= srTol
+                    matched := true
+                    if srTouchBar - srFirstBar.get(i) >= SRMinGapBars
+                        cnt = srTouchCount.get(i) + 1
+                        srTouchCount.set(i, cnt)
+                        if cnt >= 2
+                            ln = srLines.get(i)
+                            srText = close > srLevels.get(i) ? 'Support' : 'Resistance'
+                            if na(ln)
+                                newLn = line.new(srFirstBar.get(i), srLevels.get(i), bar_index, srLevels.get(i), color = color.new(SRColor, 0), style = line.style_solid, width = 1)
+                                lb = label.new(bar_index, srLevels.get(i), srText, style = label.style_label_left, color = color(na), textcolor = color.new(SRColor, 0), size = size.tiny)
+                                srLines.set(i, newLn)
+                                srLabels.set(i, lb)
+                            else
+                                line.set_x2(ln, bar_index)
+                                label.set_x(srLabels.get(i), bar_index)
+                                label.set_text(srLabels.get(i), srText)
+        if not matched
+            srLevels.push(lvl)
+            srFirstBar.push(srTouchBar)
+            srTouchCount.push(1)
+            srLines.push(na)
+            srLabels.push(na)
+        if srLevels.size() > 60
+            oldLn = srLines.shift()
+            oldLb = srLabels.shift()
+            srFirstBar.shift()
+            srTouchCount.shift()
+            srLevels.shift()
+            if not na(oldLn)
+                oldLn.delete()
+            if not na(oldLb)
+                oldLb.delete()
+
+processSR(srPivH)
+processSR(srPivL)
+
+
+method GetlinePrice(int TIME, float Price, float SLOP, int LookB) =>
+    var float Current = 0.0
+    EsTime = time - TIME
+    Current := Price + (EsTime - LookB * BarTIME) * SLOP
+    Current
+
+
+method CheckCross(float Price, int StartTime, float StartPrice, float SLP) =>
+    var float Current = 0.0
+    var float Previous = 0.0
+    if StartPrice[Period] != StartPrice
+        Current := GetlinePrice(StartTime, StartPrice, SLP, 0)
+        Previous := GetlinePrice(StartTime, StartPrice, SLP, 1)
+        Crossover = Price[1] < Previous and Price > Current ? 1 : Price[1] > Previous - Zband * 0.1 and Price < Current - Zband * 0.1 ? -1 : 0
+        Crossover
+
+
+
+[Xx, XZ, SLPXZ] = Trendlines(PH, Period / 2, false)
+[XxL, XZL, SLPXZL] = Trendlines(PL, Period / 2, true)
+
+
+
+
+if ta.change(fixnan(PH)) != 0
+    UpdatedX := Xx
+    UpdatedY := XZ
+    UpdatedSLP := SLPXZ
+    UpdatedSLP
+
+if ta.change(fixnan(PL)) != 0
+    UpdatedXLow := XxL
+    UpdatedYLow := XZL
+    UpdatedSLPLow := SLPXZL
+    UpdatedSLPLow
+
+RawLong = not(UpdatedSLP * time > 0) and CheckCross(close, UpdatedX, UpdatedY, UpdatedSLP) == 1
+RawShort = not(UpdatedSLPLow * time < 0) and CheckCross(close, UpdatedXLow, UpdatedYLow, UpdatedSLPLow) == -1
+
+Long = RawLong and not atCapacity and not PendingActive
+Short = RawShort and not atCapacity and not PendingActive
+
+MissedLong = RawLong and (atCapacity or PendingActive)
+MissedShort = RawShort and (atCapacity or PendingActive)
+
+alertcondition(Long, title = 'Buy Signal', message = 'REB Trades: Buy signal, entry taken')
+alertcondition(Short, title = 'Sell Signal', message = 'REB Trades: Sell signal, entry taken')
+alertcondition(MissedLong, title = 'Missed Buy (slot full)', message = 'REB Trades: Buy breakout detected but no free trade slot, do not enter')
+alertcondition(MissedShort, title = 'Missed Sell (slot full)', message = 'REB Trades: Sell breakout detected but no free trade slot, do not enter')
+
+plotshape(MissedLong, size = size.tiny, color = color.new(color.gray, 30), location = location.belowbar, style = shape.xcross, text = '', textcolor = color.white)
+
+plotshape(MissedShort, size = size.tiny, color = color.new(color.gray, 30), location = location.abovebar, style = shape.xcross, text = '', textcolor = color.white)
+
+fireTrade(bool isLongDir) =>
+    tpVal = isLongDir ? TPMode == 'Recent Swing High/Low' and SLSwingHigh > high ? SLSwingHigh : high + Zband * 20 : TPMode == 'Recent Swing High/Low' and SLSwingLow < low ? SLSwingLow : low - Zband * 20
+    slVal = isLongDir ? SLSwingLow - Zband * 2 : SLSwingHigh + Zband * 2
+    entryVal = isLongDir ? high : low
+    tp1Val = isLongDir ? entryVal + (tpVal - entryVal) * 0.5 : entryVal - (entryVal - tpVal) * 0.5
+
+    line tpLn = na
+    line slLn = na
+    line enLn = na
+    line tp1Ln = na
+    label tpLb = na
+    label slLb = na
+    label enLb = na
+    label tp1Lb = na
+
+    if ShowTargets
+        line.new(bar_index, entryVal, bar_index, tpVal, width = 2, color = color.rgb(154, 103, 20), style = line.style_dashed)
+        tpLn := line.new(bar_index, tpVal, bar_index + 2, tpVal, style = line.style_dashed, color = color.rgb(154, 103, 20))
+        tpLb := label.new(bar_index, tpVal, 'TP2', color = color.rgb(154, 103, 20), style = label.style_label_left, size = size.small, textcolor = color.white)
+        tp1Ln := line.new(bar_index, tp1Val, bar_index + 2, tp1Val, style = line.style_dotted, color = color.new(color.teal, 20))
+        tp1Lb := label.new(bar_index, tp1Val, 'TP1', color = color(na), style = label.style_label_left, size = size.tiny, textcolor = color.new(color.teal, 0))
+        tp1Lb
+    if ShowSL
+        line.new(bar_index, entryVal, bar_index, slVal, width = 2, color = SLColor, style = line.style_dashed)
+        slLn := line.new(bar_index, slVal, bar_index + 2, slVal, style = line.style_dashed, color = SLColor)
+        slLb := label.new(bar_index, slVal, 'Stop', color = SLColor, style = label.style_label_left, size = size.small, textcolor = color.white)
+        slLb
+    if ShowEntry
+        enLn := line.new(bar_index, entryVal, bar_index + 2, entryVal, style = line.style_dashed, color = EntryColor)
+        enLb := label.new(bar_index, entryVal, 'Entry', color = EntryColor, style = label.style_label_left, size = size.small, textcolor = color.white)
+        enLb
+
+    tIsLong.push(isLongDir)
+    tTP.push(tpVal)
+    tTP1.push(tp1Val)
+    tTP1Hit.push(false)
+    tTP1Line.push(tp1Ln)
+    tTP1LAB.push(tp1Lb)
+    tSL.push(slVal)
+    tEntry.push(entryVal)
+    tBEActive.push(false)
+    tLineTime.push(isLongDir ? UpdatedX : UpdatedXLow)
+    tLinePrice.push(isLongDir ? UpdatedY : UpdatedYLow)
+    tLineSlope.push(isLongDir ? UpdatedSLP : UpdatedSLPLow)
+    tTPLine.push(tpLn)
+    tSLLine.push(slLn)
+    tEntryLine.push(enLn)
+    tLAB.push(tpLb)
+    tSLLAB.push(slLb)
+    tENTRYLAB.push(enLb)
+
+if Long and tIsLong.size() < MaxConcurrentTrades and not PendingActive
+    if RequireFollowThrough
+        PendingActive := true
+        PendingIsLong := true
+        PendingSetBar := bar_index
+        PendingSetBar
+    else
+        fireTrade(true)
+
+if Short and tIsLong.size() < MaxConcurrentTrades and not PendingActive
+    if RequireFollowThrough
+        PendingActive := true
+        PendingIsLong := false
+        PendingSetBar := bar_index
+        PendingSetBar
+    else
+        fireTrade(false)
+
+if PendingActive and bar_index > PendingSetBar
+    confirmed = PendingIsLong ? close > open : close < open
+    if confirmed
+        fireTrade(PendingIsLong)
+    PendingActive := false
+    PendingActive
+
+if tIsLong.size() > 0
+    for i = tIsLong.size() - 1 to 0 by 1
+        isL = tIsLong.get(i)
+        tpV = tTP.get(i)
+        tp1V = tTP1.get(i)
+        tp1Hit = tTP1Hit.get(i)
+        slV = tSL.get(i)
+        enV = tEntry.get(i)
+        beA = tBEActive.get(i)
+        tpLnI = tTPLine.get(i)
+        tp1LnI = tTP1Line.get(i)
+        tp1LabI = tTP1LAB.get(i)
+        slLnI = tSLLine.get(i)
+        enLnI = tEntryLine.get(i)
+        labI = tLAB.get(i)
+        slLabI = tSLLAB.get(i)
+        enLabI = tENTRYLAB.get(i)
+        lnTimeI = tLineTime.get(i)
+        lnPriceI = tLinePrice.get(i)
+        lnSlopeI = tLineSlope.get(i)
+
+        if not na(tpLnI)
+            line.set_x2(tpLnI, bar_index)
+            label.set_x(labI, bar_index + 1)
+        if not na(tp1LnI)
+            line.set_x2(tp1LnI, bar_index)
+            label.set_x(tp1LabI, bar_index + 1)
+        if not tp1Hit
+            tapped1 = isL ? high >= tp1V : low <= tp1V
+            if tapped1
+                tTP1Hit.set(i, true)
+                if not na(tp1LabI)
+                    label.set_color(tp1LabI, color.rgb(6, 180, 15))
+        if not na(slLnI)
+            line.set_x2(slLnI, bar_index)
+            label.set_x(slLabI, bar_index + 1)
+        if not na(enLnI)
+            line.set_x2(enLnI, bar_index)
+            label.set_x(enLabI, bar_index + 1)
+
+        if UseBE and not beA
+            if isL
+                halfwayI = enV + (tpV - enV) * (BETriggerPercent / 100)
+                if high >= halfwayI
+                    newSLI = enV + (tpV - enV) * (BELockPercent / 100)
+                    slV := newSLI
+                    beA := true
+                    tSL.set(i, newSLI)
+                    tBEActive.set(i, true)
+                    if not na(slLnI)
+                        line.set_y1(slLnI, newSLI)
+                        line.set_y2(slLnI, newSLI)
+                        label.set_y(slLabI, newSLI)
+                        label.set_text(slLabI, 'BE')
+            else
+                halfwayI = enV - (enV - tpV) * (BETriggerPercent / 100)
+                if low <= halfwayI
+                    newSLI = enV - (enV - tpV) * (BELockPercent / 100)
+                    slV := newSLI
+                    beA := true
+                    tSL.set(i, newSLI)
+                    tBEActive.set(i, true)
+                    if not na(slLnI)
+                        line.set_y1(slLnI, newSLI)
+                        line.set_y2(slLnI, newSLI)
+                        label.set_y(slLabI, newSLI)
+                        label.set_text(slLabI, 'BE')
+
+        closedTrade = false
+        tp1HitFinal = tTP1Hit.get(i)
+        if isL
+            if high >= tpV
+                if not na(labI)
+                    label.set_color(labI, color.rgb(6, 128, 10, 37))
+                if not na(slLabI)
+                    label.set_color(slLabI, color.new(color.gray, 70))
+                closedTrade := true
+                if InRange
+                    TotalTrades := TotalTrades + 1
+                    TotalWins := TotalWins + 1
+                    TotalWins
+            if InvalidateOnRetest and not closedTrade
+                lineNow = lnPriceI + (time - lnTimeI) * lnSlopeI
+                if low <= lineNow
+                    if not na(labI)
+                        label.set_color(labI, color.new(color.gray, 70))
+                    if not na(slLabI)
+                        label.set_color(slLabI, beA or tp1HitFinal ? color.rgb(6, 128, 10, 37) : color.new(color.rgb(246, 7, 7), 70))
+                        label.set_text(slLabI, 'Invalid')
+                    closedTrade := true
+                    if InRange
+                        TotalTrades := TotalTrades + 1
+                        if beA or tp1HitFinal
+                            TotalWins := TotalWins + 1
+                            if beA
+                                TotalBE := TotalBE + 1
+                                TotalBE
+                            else
+                                TotalTP1Only := TotalTP1Only + 1
+                                TotalTP1Only
+                        else
+                            TotalLosses := TotalLosses + 1
+                            TotalLosses
+            if low <= slV and not closedTrade
+                if not na(labI)
+                    label.set_color(labI, color.new(color.gray, 70))
+                if not na(slLabI)
+                    label.set_color(slLabI, beA or tp1HitFinal ? color.rgb(6, 128, 10, 37) : color.new(color.rgb(246, 7, 7), 70))
+                closedTrade := true
+                if InRange
+                    TotalTrades := TotalTrades + 1
+                    if beA or tp1HitFinal
+                        TotalWins := TotalWins + 1
+                        if beA
+                            TotalBE := TotalBE + 1
+                            TotalBE
+                        else
+                            TotalTP1Only := TotalTP1Only + 1
+                            TotalTP1Only
+                    else
+                        TotalLosses := TotalLosses + 1
+                        TotalLosses
+        else
+            if low <= tpV
+                if not na(labI)
+                    label.set_color(labI, color.rgb(6, 128, 10, 37))
+                if not na(slLabI)
+                    label.set_color(slLabI, color.new(color.gray, 70))
+                closedTrade := true
+                if InRange
+                    TotalTrades := TotalTrades + 1
+                    TotalWins := TotalWins + 1
+                    TotalWins
+            if InvalidateOnRetest and not closedTrade
+                lineNowS = lnPriceI + (time - lnTimeI) * lnSlopeI
+                if high >= lineNowS
+                    if not na(labI)
+                        label.set_color(labI, color.new(color.gray, 70))
+                    if not na(slLabI)
+                        label.set_color(slLabI, beA or tp1HitFinal ? color.rgb(6, 128, 10, 37) : color.new(color.rgb(246, 7, 7), 70))
+                        label.set_text(slLabI, 'Invalid')
+                    closedTrade := true
+                    if InRange
+                        TotalTrades := TotalTrades + 1
+                        if beA or tp1HitFinal
+                            TotalWins := TotalWins + 1
+                            if beA
+                                TotalBE := TotalBE + 1
+                                TotalBE
+                            else
+                                TotalTP1Only := TotalTP1Only + 1
+                                TotalTP1Only
+                        else
+                            TotalLosses := TotalLosses + 1
+                            TotalLosses
+            if high >= slV and not closedTrade
+                if not na(labI)
+                    label.set_color(labI, color.new(color.gray, 70))
+                if not na(slLabI)
+                    label.set_color(slLabI, beA or tp1HitFinal ? color.rgb(6, 128, 10, 37) : color.new(color.rgb(246, 7, 7), 70))
+                closedTrade := true
+                if InRange
+                    TotalTrades := TotalTrades + 1
+                    if beA or tp1HitFinal
+                        TotalWins := TotalWins + 1
+                        if beA
+                            TotalBE := TotalBE + 1
+                            TotalBE
+                        else
+                            TotalTP1Only := TotalTP1Only + 1
+                            TotalTP1Only
+                    else
+                        TotalLosses := TotalLosses + 1
+                        TotalLosses
+
+        if closedTrade
+            tIsLong.remove(i)
+            tTP.remove(i)
+            tTP1.remove(i)
+            tTP1Hit.remove(i)
+            tTP1Line.remove(i)
+            tTP1LAB.remove(i)
+            tSL.remove(i)
+            tEntry.remove(i)
+            tBEActive.remove(i)
+            tLineTime.remove(i)
+            tLinePrice.remove(i)
+            tLineSlope.remove(i)
+            tTPLine.remove(i)
+            tSLLine.remove(i)
+            tEntryLine.remove(i)
+            tLAB.remove(i)
+            tSLLAB.remove(i)
+            tENTRYLAB.remove(i)
+
+
+
+plotshape(Long, size = size.small, color = color.rgb(46, 192, 6, 11), location = location.belowbar, style = shape.labelup, text = '', textcolor = color.white)
+
+plotshape(Short, size = size.small, color = color.rgb(241, 2, 2, 11), location = location.abovebar, style = shape.labeldown, text = '', textcolor = color.white)
+
+
+// -- Dashboard --
+var table Dash = table.new(DashPosSwitcher(DashPos), 2, 9, border_width = 1, border_color = color.rgb(60, 60, 60), frame_color = color.rgb(60, 60, 60), frame_width = 1)
+
+if barstate.islast and ShowDashboard
+    winRate = TotalTrades > 0 ? TotalWins / TotalTrades * 100 : 0.0
+    beRate = TotalWins > 0 ? TotalBE / TotalWins * 100 : 0.0
+    tp1Rate = TotalWins > 0 ? TotalTP1Only / TotalWins * 100 : 0.0
+    rangeLabel = UseDateRange ? 'Total Trades (filtered)' : 'Total Trades'
+    currentSession = inAsian ? 'Asian' : inLondon ? 'London' : inNYAM ? 'New York AM' : inNYPM ? 'New York PM' : 'No Session'
+    sessionColor = inAsian ? AsianColor : inLondon ? LondonColor : inNYAM ? NYAMColor : inNYPM ? NYPMColor : color.gray
+
+    table.cell(Dash, 0, 0, 'REB TRADES', text_color = color.rgb(255, 193, 7), bgcolor = color.rgb(15, 15, 15), text_halign = text.align_center, text_size = size.normal)
+    table.merge_cells(Dash, 0, 0, 1, 0)
+
+    table.cell(Dash, 0, 1, 'Session', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 1, currentSession, text_color = color.new(sessionColor, 0), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 2, BiasTF + 'm Bias', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 2, HTFBias, text_color = color.new(HTFBiasColor, 0), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 3, rangeLabel, text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 3, str.tostring(TotalTrades), text_color = color.white, bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 4, 'Wins', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 4, str.tostring(TotalWins), text_color = color.rgb(6, 180, 15), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 5, 'Losses', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 5, str.tostring(TotalLosses), text_color = color.rgb(246, 7, 7), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 6, 'BE Hits', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 6, str.tostring(TotalBE) + ' (' + str.tostring(beRate, '#.##') + '% of wins)', text_color = color.rgb(255, 152, 0), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 7, 'TP1 Only', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 7, str.tostring(TotalTP1Only) + ' (' + str.tostring(tp1Rate, '#.##') + '% of wins)', text_color = color.rgb(6, 180, 15), bgcolor = color.rgb(30, 30, 30))
+
+    table.cell(Dash, 0, 8, 'Win Rate', text_color = color.white, bgcolor = color.rgb(30, 30, 30), text_halign = text.align_left)
+    table.cell(Dash, 1, 8, str.tostring(winRate, '#.##') + '%', text_color = color.rgb(255, 193, 7), bgcolor = color.rgb(30, 30, 30))
+
+
+// -- END -- .
+
+var table Watermark = table.new(position.bottom_center, 1, 1)
+
+if barstate.islast and ShowWatermark
+    table.cell(Watermark, 0, 0, 'REB TRADES', text_color = color.new(color.black, 85), text_size = size.huge, bgcolor = color.new(color.black, 100))

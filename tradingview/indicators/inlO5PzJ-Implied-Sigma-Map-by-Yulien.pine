@@ -1,0 +1,1450 @@
+//@version=6
+indicator("Implied Sigma Map", shorttitle = "Implied Sigma Map", overlay = true, format = format.price, precision = 2, max_lines_count = 70, max_labels_count = 70, max_boxes_count = 12)
+const string INDICATOR_NAME = "Implied Sigma Map"
+const string INDICATOR_AUTHOR = "Yulien Diaz"
+const string INDICATOR_LICENSE = "MIT License"
+const string INDICATOR_VERSION = "1.5.3"
+const string INDICATOR_MODIFIED = "2026-08-14"
+const int MAX_DRAWING_BARS_BACK = 5000
+const float VIX_TRADING_DAYS = 252.0
+max_bars_back(time, MAX_DRAWING_BARS_BACK)
+const string GROUP_CORE = "Core Calculation"
+const string GROUP_DIRECT = "Direct Daily IV Inputs"
+const string GROUP_ANNUAL = "Annualized IV Inputs"
+const string GROUP_CBOE = "CBOE Data and Freshness"
+const string GROUP_VIX1D = "VIX1D"
+const string GROUP_VIX = "VIX Daily Equivalent"
+const string GROUP_CONTRACT = "Contract Information"
+const string GROUP_LEVELS = "Sigma Levels"
+const string GROUP_VISUALS = "Visuals"
+const string GROUP_STRUCTURE = "Market Structure Levels"
+const string GROUP_DASHBOARD = "Dashboard"
+const string GROUP_ALERTS = "Alerts"
+const string MAP_CURRENT = "Current Session"
+const string MAP_NEXT = "Next Session"
+const string ANCHOR_AUTO = "Automatic"
+const string ANCHOR_MANUAL = "Manual"
+const string ANCHOR_SOURCE_PREVIOUS = "Previous Session Close"
+const string ANCHOR_SOURCE_CURRENT_RTH = "Current Session Final RTH Close"
+const string ANCHOR_SOURCE_MANUAL = "Manual"
+const string CONSUMPTION_ATM = "ATM IV"
+const string CONSUMPTION_VIX1D = "VIX1D"
+const string CONSUMPTION_VIX = "VIX Daily Equivalent"
+const string ATM_SHAPE_SYMMETRIC = "Symmetric"
+const string ATM_SHAPE_ASYMMETRIC = "Asymmetric"
+const string FEED_AUTO = "Auto"
+const string FEED_REALTIME = "Real-Time"
+const string FEED_DELAYED = "Delayed ~15m"
+const string FEED_STATUS_UNAVAILABLE = "DATA UNAVAILABLE"
+const string FEED_STATUS_CURRENT = "CURRENT"
+const string FEED_STATUS_EXPECTED_DELAY = "EXPECTED DELAY"
+const string FEED_STATUS_STALE = "STALE"
+const string FEED_STATUS_FINAL = "FINAL"
+const string FEED_STATUS_HISTORICAL = "HISTORICAL / UNVERIFIED"
+const string FEED_STATUS_INVALID_SOURCE_TF = "INVALID SOURCE TF"
+const string CBOE_TF_STATUS_VALID = "VALID"
+const string CBOE_TF_STATUS_SOURCE_ABOVE_CHART = "SOURCE TF > CHART TF"
+const string CBOE_TF_STATUS_SOURCE_UNAVAILABLE = "SOURCE TF UNAVAILABLE"
+const string CBOE_TF_STATUS_CHART_UNAVAILABLE = "CHART TF UNAVAILABLE"
+const string SNAPSHOT_REFERENCE_MANUAL = "Manual Price"
+const string SNAPSHOT_REFERENCE_ANCHOR = "Anchor"
+const string BENCHMARK_AUTO = "Auto"
+const string BENCHMARK_SPX_LINKED = "SPX-Linked"
+const string BENCHMARK_CONTEXT_ONLY = "Context Only"
+const string ALERT_CONFIRM_BAR_CLOSE = "Bar Close"
+const string ALERT_CONFIRM_INTRABAR = "Intrabar"
+const string METHOD_DIRECT = "Direct Daily ATM IV"
+const string METHOD_ANNUAL = "Annualized ATM IV"
+const string LABEL_SIGMA_PRICE = "Sigma + Price"
+const string LABEL_SIGMA_DISTANCE = "Sigma + Distance"
+const string LABEL_SIGMA_PRICE_DISTANCE = "Sigma + Price + Distance"
+const string LABEL_NONE = "No Labels"
+const string STYLE_SOLID = "Solid"
+const string STYLE_DASHED = "Dashed"
+const string STYLE_DOTTED = "Dotted"
+const string DIRECT_METHOD_TOOLTIP = "Use this mode when your broker provides daily option implied volatility directly. Example: IBKR Daily Midpoint IV."
+const string ANNUAL_METHOD_TOOLTIP = "Use this mode when your broker provides annualized implied volatility. The indicator converts it to daily volatility using sqrt(Trading Days Per Year)."
+f_line_style(string selectedStyle) =>
+    string result = line.style_solid
+    if selectedStyle == STYLE_DASHED
+        result := line.style_dashed
+    else if selectedStyle == STYLE_DOTTED
+        result := line.style_dotted
+    result
+f_dashboard_position(string selectedPosition) =>
+    string result = position.top_right
+    if selectedPosition == "Top Left"
+        result := position.top_left
+    else if selectedPosition == "Middle Right"
+        result := position.middle_right
+    else if selectedPosition == "Middle Left"
+        result := position.middle_left
+    else if selectedPosition == "Bottom Right"
+        result := position.bottom_right
+    else if selectedPosition == "Bottom Left"
+        result := position.bottom_left
+    result
+f_text_size(string selectedSize) =>
+    string result = size.small
+    if selectedSize == "Tiny"
+        result := size.tiny
+    else if selectedSize == "Normal"
+        result := size.normal
+    result
+f_number(float value, string numberFormat) =>
+    string result = "—"
+    if not na(value)
+        result := str.tostring(value, numberFormat)
+    result
+f_signed(float value, string numberFormat) =>
+    string result = "—"
+    if not na(value)
+        float normalizedValue = value
+        if math.abs(normalizedValue) < 0.0000001
+            normalizedValue := 0.0
+        if normalizedValue > 0.0
+            result := "+" + str.tostring(normalizedValue, numberFormat)
+        else
+            result := str.tostring(normalizedValue, numberFormat)
+    result
+f_date_key(int timestampValue, string timezoneValue) =>
+    int result = na
+    if not na(timestampValue)
+        result := year(timestampValue, timezoneValue) * 10000 + month(timestampValue, timezoneValue) * 100 + dayofmonth(timestampValue, timezoneValue)
+    result
+f_same_date(int firstTimestamp, int secondTimestamp, string timezoneValue) =>
+    bool result = false
+    int firstDateKey = f_date_key(firstTimestamp, timezoneValue)
+    int secondDateKey = f_date_key(secondTimestamp, timezoneValue)
+    if not na(firstDateKey) and not na(secondDateKey)
+        result := firstDateKey == secondDateKey
+    result
+f_parse_expiration_date_key(string expirationText, string timezoneValue) =>
+    int result = na
+    if str.length(expirationText) == 10
+        bool separatorsValid = str.substring(expirationText, 4, 5) == "-" and str.substring(expirationText, 7, 8) == "-"
+        if separatorsValid
+            float parsedYear = str.tonumber(str.substring(expirationText, 0, 4))
+            float parsedMonth = str.tonumber(str.substring(expirationText, 5, 7))
+            float parsedDay = str.tonumber(str.substring(expirationText, 8, 10))
+            if not na(parsedYear) and not na(parsedMonth) and not na(parsedDay)
+                int expirationYear = int(parsedYear)
+                int expirationMonth = int(parsedMonth)
+                int expirationDay = int(parsedDay)
+                int normalizedTimestamp = timestamp(timezoneValue, expirationYear, expirationMonth, expirationDay, 12, 0)
+                bool normalizedDateMatches = year(normalizedTimestamp, timezoneValue) == expirationYear and month(normalizedTimestamp, timezoneValue) == expirationMonth and dayofmonth(normalizedTimestamp, timezoneValue) == expirationDay
+                if normalizedDateMatches
+                    result := expirationYear * 10000 + expirationMonth * 100 + expirationDay
+    result
+f_feed_mode_label(string selectedFeedMode, int expectedDelayMinutes) =>
+    string result = "AUTO / UNKNOWN"
+    if selectedFeedMode == FEED_REALTIME
+        result := "REAL-TIME — USER"
+    else if selectedFeedMode == FEED_DELAYED
+        result := "DELAYED ~" + str.tostring(expectedDelayMinutes) + "m — USER"
+    result
+f_observed_freshness(string selectedFeedMode, bool dataValid, float sourceAgeMinutes, float currentToleranceMinutes, int expectedDelayMinutes, bool realtimeContext, bool finalObservation) =>
+    string result = FEED_STATUS_UNAVAILABLE
+    if dataValid
+        if finalObservation
+            result := FEED_STATUS_FINAL
+        else if not realtimeContext
+            result := FEED_STATUS_HISTORICAL
+        else if na(sourceAgeMinutes)
+            result := FEED_STATUS_STALE
+        else if sourceAgeMinutes <= currentToleranceMinutes
+            result := FEED_STATUS_CURRENT
+        else if selectedFeedMode != FEED_REALTIME and sourceAgeMinutes <= currentToleranceMinutes + expectedDelayMinutes
+            result := FEED_STATUS_EXPECTED_DELAY
+        else
+            result := FEED_STATUS_STALE
+    result
+f_cboe_source_payload(int finalEndHour, int finalEndMinute, string timezoneValue) =>
+    int configuredFinalTimestamp = timestamp(timezoneValue, year(time, timezoneValue), month(time, timezoneValue), dayofmonth(time, timezoneValue), finalEndHour, finalEndMinute)
+    var float finalSessionValue = na
+    var int finalSessionTime = na
+    bool configuredFinalBarClosed = time_close == configuredFinalTimestamp and time_close <= timenow
+    if configuredFinalBarClosed and not na(close) and close > 0.0
+        finalSessionValue := close
+        finalSessionTime := time_close
+    [close, time, time_close, close[1], time[1], time_close[1], finalSessionValue, finalSessionTime]
+f_update_line(line lineId, int leftBar, int rightBar, float levelPrice, bool visible, color baseColor, int transparency, int lineWidth, string selectedStyle) =>
+    float safePrice = levelPrice
+    if na(safePrice)
+        safePrice := close
+    line.set_xy1(lineId, leftBar, safePrice)
+    line.set_xy2(lineId, rightBar, safePrice)
+    line.set_width(lineId, lineWidth)
+    line.set_style(lineId, f_line_style(selectedStyle))
+    color displayColor = color.new(baseColor, 100)
+    if visible
+        displayColor := color.new(baseColor, transparency)
+    line.set_color(lineId, displayColor)
+f_update_structure_label(label labelId, int labelBar, float levelPrice, string levelName, bool visible, color baseColor, int transparency, string selectedSize) =>
+    float safePrice = levelPrice
+    if na(safePrice)
+        safePrice := close
+    label.set_xy(labelId, labelBar, safePrice)
+    label.set_size(labelId, f_text_size(selectedSize))
+    label.set_color(labelId, color.new(color.black, 100))
+    if visible
+        label.set_text(labelId, levelName + " | " + f_number(levelPrice, "0.00"))
+        label.set_textcolor(labelId, color.new(baseColor, transparency))
+    else
+        label.set_text(labelId, "")
+        label.set_textcolor(labelId, color.new(baseColor, 100))
+f_sigma_label_text(bool isUpper, string sigmaText, float levelPrice, float distancePoints, string modelPrefix, string selectedMode) =>
+    string signText = "-"
+    if isUpper
+        signText := "+"
+    string sigmaValueText = signText + sigmaText + "σ"
+    if str.length(modelPrefix) > 0
+        sigmaValueText := modelPrefix + " " + sigmaValueText
+    string priceText = f_number(levelPrice, "0.00")
+    string distanceText = f_signed(distancePoints, "0.00") + " pts"
+    string result = sigmaValueText
+    if selectedMode == LABEL_SIGMA_PRICE
+        result := sigmaValueText + " | " + priceText
+    else if selectedMode == LABEL_SIGMA_DISTANCE
+        result := sigmaValueText + " | " + distanceText
+    else if selectedMode == LABEL_SIGMA_PRICE_DISTANCE
+        result := sigmaValueText + " | " + priceText + " | " + distanceText
+    result
+f_update_sigma_label(label labelId, int labelBar, float levelPrice, float distancePoints, string sigmaText, bool isUpper, bool visible, color baseColor, int transparency, string modelPrefix, string selectedMode, string selectedSize) =>
+    float safePrice = levelPrice
+    if na(safePrice)
+        safePrice := close
+    label.set_xy(labelId, labelBar, safePrice)
+    label.set_size(labelId, f_text_size(selectedSize))
+    label.set_color(labelId, color.new(color.black, 100))
+    if visible
+        label.set_text(labelId, f_sigma_label_text(isUpper, sigmaText, levelPrice, distancePoints, modelPrefix, selectedMode))
+        label.set_textcolor(labelId, color.new(baseColor, transparency))
+    else
+        label.set_text(labelId, "")
+        label.set_textcolor(labelId, color.new(baseColor, 100))
+f_update_zone(box zoneBox, int leftBar, int rightBar, float topPrice, float bottomPrice, bool visible, color baseColor, int transparency) =>
+    float safeTop = topPrice
+    float safeBottom = bottomPrice
+    if na(safeTop)
+        safeTop := close
+    if na(safeBottom)
+        safeBottom := close
+    box.set_left(zoneBox, leftBar)
+    box.set_right(zoneBox, rightBar)
+    box.set_top(zoneBox, safeTop)
+    box.set_bottom(zoneBox, safeBottom)
+    box.set_border_color(zoneBox, color.new(baseColor, 100))
+    color zoneColor = color.new(baseColor, 100)
+    if visible
+        zoneColor := color.new(baseColor, transparency)
+    box.set_bgcolor(zoneBox, zoneColor)
+f_dashboard_row(table tableId, int row, string fieldText, string valueText, color valueColor, string selectedSize) =>
+    color fieldColor = color.new(color.white, 35)
+    color rowBackground = color.new(color.rgb(15, 20, 30), 8)
+    table.cell(tableId, 0, row, fieldText, text_color = fieldColor, text_size = f_text_size(selectedSize), text_halign = text.align_left, bgcolor = rowBackground)
+    table.cell(tableId, 1, row, valueText, text_color = valueColor, text_size = f_text_size(selectedSize), text_halign = text.align_right, bgcolor = rowBackground)
+string mapMode = input.string(MAP_CURRENT, "Map Mode", options = [MAP_CURRENT, MAP_NEXT], group = GROUP_CORE, tooltip = "Current Session uses the previous confirmed trading-session close. Next Session captures the current session's final confirmed regular-session close and keeps it fixed for the following session.")
+bool showAtmMap = input.bool(true, "Show ATM Map", group = GROUP_CORE, tooltip = "Primary expiration-specific volatility map.")
+bool showVix1dMap = input.bool(false, "Show VIX1D Map", group = GROUP_CORE, tooltip = "Short-horizon market-wide reference derived from the annualized CBOE VIX1D Index.")
+bool showVixMap = input.bool(false, "Show VIX Map", group = GROUP_CORE, tooltip = "30-day VIX volatility-regime reference converted to a daily equivalent.")
+string atmMapShape = input.string(ATM_SHAPE_SYMMETRIC, "ATM Map Shape", options = [ATM_SHAPE_SYMMETRIC, ATM_SHAPE_ASYMMETRIC], group = GROUP_CORE, tooltip = "Symmetric uses the Call/Put average on both sides. Asymmetric uses Call Daily IV above the Anchor and Put Daily IV below it as reference distances; it is not an exact probability distribution.")
+string anchorMode = input.string(ANCHOR_AUTO, "Anchor Mode", options = [ANCHOR_AUTO, ANCHOR_MANUAL], group = GROUP_CORE, tooltip = "Automatic resolves the Anchor from Map Mode. Manual uses Manual Anchor Price without changing the automatic state.")
+float manualAnchorPrice = input.float(0.0, "Manual Anchor Price", minval = 0.0, step = 0.25, group = GROUP_CORE, tooltip = "Used only when Anchor Mode is Manual. Must be greater than zero.")
+string automaticRthSession = input.session("0930-1600", "Automatic RTH Session", group = GROUP_CORE, tooltip = "Regular trading session used to capture the automatic closing Anchor. The default is the U.S. cash session.")
+string automaticRthTimezone = input.string("America/New_York", "Automatic RTH Timezone", group = GROUP_CORE, tooltip = "IANA timezone used to evaluate Automatic RTH Session. Keep America/New_York for U.S. cash products and related derivatives.")
+string ivCalculationMethod = input.string(METHOD_DIRECT, "IV Calculation Method", options = [METHOD_DIRECT, METHOD_ANNUAL], group = GROUP_CORE, tooltip = DIRECT_METHOD_TOOLTIP + "\n\n" + ANNUAL_METHOD_TOOLTIP)
+int tradingDaysPerYear = input.int(252, "Trading Days Per Year", minval = 1, maxval = 366, group = GROUP_CORE, tooltip = "Used only by Annualized ATM IV. Direct Daily ATM IV ignores this conversion setting.")
+string consumptionReference = input.string(CONSUMPTION_ATM, "Consumption Reference", options = [CONSUMPTION_ATM, CONSUMPTION_VIX1D, CONSUMPTION_VIX], group = GROUP_CORE, tooltip = "ATM IV uses the fixed session map and retains Move Consumed terminology. VIX1D and VIX use a live denominator in Current Session mode and are therefore labeled as vol-normalized distance rather than fixed-move consumption.")
+bool previewNextSessionMovementMetrics = input.bool(false, "Preview Next-Session Movement Metrics", group = GROUP_CORE, tooltip = "Advanced research override. When disabled, a prepared Next Session map does not calculate movement metrics until its regular session begins. Manual Anchor does not override session timing.")
+float callDailyIvPct = input.float(0.0, "ATM Call Daily IV %", minval = 0.0, step = 0.0001, group = GROUP_DIRECT, tooltip = DIRECT_METHOD_TOOLTIP)
+float putDailyIvPct = input.float(0.0, "ATM Put Daily IV %", minval = 0.0, step = 0.0001, group = GROUP_DIRECT, tooltip = DIRECT_METHOD_TOOLTIP)
+float callAnnualIvPct = input.float(0.0, "ATM Call Annualized IV %", minval = 0.0, step = 0.01, group = GROUP_ANNUAL, tooltip = ANNUAL_METHOD_TOOLTIP)
+float putAnnualIvPct = input.float(0.0, "ATM Put Annualized IV %", minval = 0.0, step = 0.01, group = GROUP_ANNUAL, tooltip = ANNUAL_METHOD_TOOLTIP)
+string cboeFeedMode = input.string(FEED_AUTO, "CBOE Feed Mode", options = [FEED_AUTO, FEED_REALTIME, FEED_DELAYED], group = GROUP_CBOE, tooltip = "Pine cannot inspect your CBOE market-data entitlement. Real-Time and Delayed are authoritative user selections. Auto is only a best-effort timestamp estimate on realtime bars.")
+string cboeSourceTimeframe = input.timeframe("1", "CBOE Source Timeframe", options = ["1", "3", "5"], group = GROUP_CBOE, tooltip = "Dedicated VIX/VIX1D source resolution. One minute is recommended so CBOE responsiveness and finalization do not depend on the chart timeframe. The selected resolution must be less than or equal to the chart timeframe.")
+int freshnessBufferMinutes = input.int(2, "Freshness Buffer Minutes", minval = 0, maxval = 15, group = GROUP_CBOE, tooltip = "Small technical allowance added to the CBOE source resolution when classifying observed timestamp freshness. It is independent from the chart timeframe.")
+int delayedFeedMinutes = input.int(15, "Delayed Feed Minutes", minval = 1, maxval = 60, group = GROUP_CBOE)
+int catchUpBufferMinutes = input.int(2, "Catch-Up Buffer Minutes", minval = 0, maxval = 15, group = GROUP_CBOE)
+string cboeFinalSession = input.session("0931-1615", "CBOE Final Session", group = GROUP_CBOE, tooltip = "Session whose ending timestamp is required before a Next Session CBOE value is considered final. The default follows VIX1D dissemination through approximately 16:15 ET. If a cash-only chart stops producing bars before this time, Pine must wait for the next host-chart update; the indicator will report that state explicitly rather than use future data.")
+string cboeTimezone = input.string("America/New_York", "CBOE Timezone", group = GROUP_CBOE)
+string vixBenchmarkApplicabilityInput = input.string(BENCHMARK_AUTO, "VIX Benchmark Applicability", options = [BENCHMARK_AUTO, BENCHMARK_SPX_LINKED, BENCHMARK_CONTEXT_ONLY], group = GROUP_CBOE, tooltip = "Auto conservatively recognizes common SPX/SPY/ES/MES relationships. Manual selections are authoritative. Context Only keeps the maps visible but labels them as SPX volatility proxies rather than the chart instrument's own implied volatility.")
+string vix1dSymbol = input.symbol("CBOE:VIX1D", "VIX1D Symbol", group = GROUP_VIX1D, tooltip = "TradingView symbol for Cboe's annualized one-business-day expected-volatility index.")
+color vix1dLevelColor = input.color(color.rgb(70, 205, 190), "VIX1D Level Color", group = GROUP_VIX1D)
+int vix1dLevelWidth = input.int(1, "VIX1D Level Width", minval = 1, maxval = 4, group = GROUP_VIX1D)
+string vix1dLevelStyle = input.string(STYLE_DASHED, "VIX1D Level Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VIX1D)
+int vix1dLevelTransparency = input.int(15, "VIX1D Level Transparency", minval = 0, maxval = 100, group = GROUP_VIX1D)
+bool showVix1dLabels = input.bool(true, "Show VIX1D Labels", group = GROUP_VIX1D)
+string vixSymbol = input.symbol("CBOE:VIX", "VIX Symbol", group = GROUP_VIX, tooltip = "TradingView symbol used for the VIX volatility-regime reference.")
+float volDiscountThreshold = input.float(0.80, "Discount Ratio Threshold", minval = 0.01, step = 0.05, group = GROUP_VIX)
+float volPremiumThreshold = input.float(1.20, "Premium Ratio Threshold", minval = 0.01, step = 0.05, group = GROUP_VIX)
+color vixLevelColor = input.color(color.rgb(175, 135, 235), "VIX Level Color", group = GROUP_VIX)
+int vixLevelWidth = input.int(1, "VIX Level Width", minval = 1, maxval = 4, group = GROUP_VIX)
+string vixLevelStyle = input.string(STYLE_DOTTED, "VIX Level Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VIX)
+int vixLevelTransparency = input.int(25, "VIX Level Transparency", minval = 0, maxval = 100, group = GROUP_VIX)
+bool showVixLabels = input.bool(true, "Show VIX Labels", group = GROUP_VIX)
+float atmStrike = input.float(0.0, "ATM Strike", minval = 0.0, step = 0.01, group = GROUP_CONTRACT, tooltip = "Enter the strike used to source the Call and Put IV values. It is used only for the distance sanity check and does not change the volatility calculations.")
+string ivSnapshotReferenceMode = input.string(SNAPSHOT_REFERENCE_MANUAL, "IV Snapshot Reference", options = [SNAPSHOT_REFERENCE_MANUAL, SNAPSHOT_REFERENCE_ANCHOR], group = GROUP_CONTRACT, tooltip = "Manual Price is the safest default and validates the strike against the underlying price observed when IV was captured. Anchor is an explicit convenience for snapshots taken at the map Anchor; it is never used implicitly.")
+float ivSnapshotUnderlyingPrice = input.float(0.0, "Underlying Price at IV Snapshot", minval = 0.0, step = 0.01, group = GROUP_CONTRACT, tooltip = "Primary reference for ATM Strike validation when IV Snapshot Reference is Manual Price. Zero means reference not provided.")
+float atmStrikeDistanceThresholdPct = input.float(0.50, "ATM Strike Distance Threshold %", minval = 0.05, maxval = 10.0, step = 0.05, group = GROUP_CONTRACT, tooltip = "A larger distance produces CHECK STRIKE but does not block the ATM map.")
+float maximumDailyAtmIvPct = input.float(10.0, "Maximum Daily ATM IV %", minval = 0.10, maxval = 100.0, step = 0.10, group = GROUP_CONTRACT, tooltip = "Sanity ceiling applied after resolving direct or annualized inputs to daily percentages.")
+string expirationLabel = input.string("", "Expiration Date", group = GROUP_CONTRACT, tooltip = "Enter the expiration as YYYY-MM-DD so Pine can perform a calendar sanity check. Holidays and exchange-specific expiry rules cannot be inferred from this text field.")
+bool ivConfirmedForExpiration = input.bool(false, "IV Confirmed for Selected Expiration", group = GROUP_CONTRACT, tooltip = "User attestation only. Pine cannot independently prove that manually entered IV belongs to the selected strike and expiration.")
+bool atmIvCurrentSnapshot = input.bool(false, "ATM IV Entered From Current Snapshot", group = GROUP_CONTRACT, tooltip = "User attestation used only for comparison confidence. Pine cannot timestamp manually entered IV values.")
+bool showAnchor = input.bool(true, "Show Anchor", group = GROUP_LEVELS)
+bool show025 = input.bool(false, "Show 0.25σ", group = GROUP_LEVELS)
+bool show050 = input.bool(true, "Show 0.50σ", group = GROUP_LEVELS)
+bool show075 = input.bool(false, "Show 0.75σ", group = GROUP_LEVELS)
+bool show100 = input.bool(true, "Show 1.00σ", group = GROUP_LEVELS)
+bool show125 = input.bool(false, "Show 1.25σ", group = GROUP_LEVELS)
+bool show150 = input.bool(true, "Show 1.50σ", group = GROUP_LEVELS)
+bool show175 = input.bool(false, "Show 1.75σ", group = GROUP_LEVELS)
+bool show200 = input.bool(true, "Show 2.00σ", group = GROUP_LEVELS)
+bool show250 = input.bool(false, "Show 2.50σ", group = GROUP_LEVELS)
+bool show300 = input.bool(true, "Show 3.00σ", group = GROUP_LEVELS)
+color anchorColor = input.color(color.rgb(180, 185, 195), "Anchor Color", group = GROUP_VISUALS)
+int anchorWidth = input.int(2, "Anchor Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string anchorStyle = input.string(STYLE_SOLID, "Anchor Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int anchorTransparency = input.int(10, "Anchor Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color intermediateColor = input.color(color.rgb(125, 140, 160), "Intermediate Level Color", group = GROUP_VISUALS)
+int intermediateWidth = input.int(1, "Intermediate Level Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string intermediateStyle = input.string(STYLE_DOTTED, "Intermediate Level Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int intermediateTransparency = input.int(55, "Intermediate Level Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color sigma050Color = input.color(color.rgb(90, 145, 205), "0.50σ Color", group = GROUP_VISUALS)
+int sigma050Width = input.int(1, "0.50σ Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string sigma050Style = input.string(STYLE_DASHED, "0.50σ Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int sigma050Transparency = input.int(25, "0.50σ Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color sigma100Color = input.color(color.rgb(0, 180, 235), "1.00σ Color", group = GROUP_VISUALS)
+int sigma100Width = input.int(2, "1.00σ Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string sigma100Style = input.string(STYLE_SOLID, "1.00σ Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int sigma100Transparency = input.int(8, "1.00σ Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color sigma150Color = input.color(color.rgb(245, 185, 45), "1.50σ Color", group = GROUP_VISUALS)
+int sigma150Width = input.int(2, "1.50σ Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string sigma150Style = input.string(STYLE_DASHED, "1.50σ Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int sigma150Transparency = input.int(8, "1.50σ Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color sigma200Color = input.color(color.rgb(245, 115, 45), "2.00σ Color", group = GROUP_VISUALS)
+int sigma200Width = input.int(3, "2.00σ Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string sigma200Style = input.string(STYLE_SOLID, "2.00σ Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int sigma200Transparency = input.int(5, "2.00σ Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+color sigma300Color = input.color(color.rgb(205, 65, 105), "3.00σ Color", group = GROUP_VISUALS)
+int sigma300Width = input.int(3, "3.00σ Width", minval = 1, maxval = 4, group = GROUP_VISUALS)
+string sigma300Style = input.string(STYLE_SOLID, "3.00σ Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_VISUALS)
+int sigma300Transparency = input.int(5, "3.00σ Transparency", minval = 0, maxval = 100, group = GROUP_VISUALS)
+string labelMode = input.string(LABEL_SIGMA_PRICE, "Labels", options = [LABEL_SIGMA_PRICE, LABEL_SIGMA_DISTANCE, LABEL_SIGMA_PRICE_DISTANCE, LABEL_NONE], group = GROUP_VISUALS)
+string labelSize = input.string("Small", "Label Size", options = ["Tiny", "Small", "Normal"], group = GROUP_VISUALS)
+int rightSideOffset = input.int(8, "Right-Side Label Offset (bars)", minval = 1, maxval = 50, group = GROUP_VISUALS)
+bool enableZoneShading = input.bool(false, "Enable Zone Shading", group = GROUP_VISUALS)
+bool showBalanceZone = input.bool(true, "Shade Balance Zone", group = GROUP_VISUALS)
+bool showDecisionZone = input.bool(true, "Shade Decision Zones", group = GROUP_VISUALS)
+bool showExpansionZone = input.bool(true, "Shade Expansion Zones", group = GROUP_VISUALS)
+bool showExtremeZone = input.bool(true, "Shade Extreme Expansion Zones", group = GROUP_VISUALS)
+bool showTailZone = input.bool(true, "Shade Tail Zones (2σ to 3σ)", group = GROUP_VISUALS)
+color balanceZoneColor = input.color(color.rgb(65, 150, 145), "Balance Zone Color", group = GROUP_VISUALS)
+color decisionZoneColor = input.color(color.rgb(95, 130, 185), "Decision Zone Color", group = GROUP_VISUALS)
+color expansionZoneColor = input.color(color.rgb(225, 175, 65), "Expansion Zone Color", group = GROUP_VISUALS)
+color extremeZoneColor = input.color(color.rgb(230, 105, 55), "Extreme Expansion Zone Color", group = GROUP_VISUALS)
+color tailZoneColor = input.color(color.rgb(185, 60, 105), "Tail Zone Color", group = GROUP_VISUALS)
+int zoneTransparency = input.int(90, "Zone Transparency", minval = 70, maxval = 100, group = GROUP_VISUALS)
+bool showPreviousDayHigh = input.bool(true, "Show Previous Day High", group = GROUP_STRUCTURE)
+bool showPreviousDayLow = input.bool(true, "Show Previous Day Low", group = GROUP_STRUCTURE)
+bool showPremarketHigh = input.bool(false, "Show Premarket High", group = GROUP_STRUCTURE)
+bool showPremarketLow = input.bool(false, "Show Premarket Low", group = GROUP_STRUCTURE)
+bool showMarketStructureLabels = input.bool(true, "Show Market Structure Labels", group = GROUP_STRUCTURE)
+bool showMarketStructureInDashboard = input.bool(false, "Show Market Structure in Dashboard", group = GROUP_STRUCTURE)
+string premarketSession = input.session("0400-0930", "Premarket Session", group = GROUP_STRUCTURE)
+string premarketTimezone = input.string("America/New_York", "Premarket Timezone", group = GROUP_STRUCTURE, tooltip = "IANA timezone used to evaluate the configured premarket session.")
+color previousDayLevelColor = input.color(color.rgb(115, 140, 165), "PDH/PDL Color", group = GROUP_STRUCTURE)
+int previousDayLevelWidth = input.int(1, "PDH/PDL Width", minval = 1, maxval = 4, group = GROUP_STRUCTURE)
+string previousDayLevelStyle = input.string(STYLE_DASHED, "PDH/PDL Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_STRUCTURE)
+int previousDayLevelTransparency = input.int(35, "PDH/PDL Transparency", minval = 0, maxval = 100, group = GROUP_STRUCTURE)
+color premarketLevelColor = input.color(color.rgb(135, 120, 165), "PMH/PML Color", group = GROUP_STRUCTURE)
+int premarketLevelWidth = input.int(1, "PMH/PML Width", minval = 1, maxval = 4, group = GROUP_STRUCTURE)
+string premarketLevelStyle = input.string(STYLE_DOTTED, "PMH/PML Style", options = [STYLE_SOLID, STYLE_DASHED, STYLE_DOTTED], group = GROUP_STRUCTURE)
+int premarketLevelTransparency = input.int(40, "PMH/PML Transparency", minval = 0, maxval = 100, group = GROUP_STRUCTURE)
+bool enableDashboard = input.bool(true, "Enable Dashboard", group = GROUP_DASHBOARD)
+string dashboardPositionInput = input.string("Top Right", "Dashboard Position", options = ["Top Right", "Top Left", "Middle Right", "Middle Left", "Bottom Right", "Bottom Left"], group = GROUP_DASHBOARD)
+string dashboardSize = input.string("Small", "Dashboard Size", options = ["Tiny", "Small", "Normal"], group = GROUP_DASHBOARD)
+string alertConfirmationMode = input.string(ALERT_CONFIRM_BAR_CLOSE, "Alert Confirmation Mode", options = [ALERT_CONFIRM_BAR_CLOSE, ALERT_CONFIRM_INTRABAR], group = GROUP_ALERTS, tooltip = "Bar Close requires barstate.isconfirmed and is the default. Intrabar permits responsive realtime cross events and can trigger before the candle closes.")
+bool enableCrossAbove050 = input.bool(false, "Enable Cross Above +0.50σ", group = GROUP_ALERTS)
+bool enableCrossBelow050 = input.bool(false, "Enable Cross Below -0.50σ", group = GROUP_ALERTS)
+bool enableCrossAbove100 = input.bool(false, "Enable Cross Above +1.00σ", group = GROUP_ALERTS)
+bool enableCrossBelow100 = input.bool(false, "Enable Cross Below -1.00σ", group = GROUP_ALERTS)
+bool enableCrossAbove150 = input.bool(false, "Enable Cross Above +1.50σ", group = GROUP_ALERTS)
+bool enableCrossBelow150 = input.bool(false, "Enable Cross Below -1.50σ", group = GROUP_ALERTS)
+bool enableCrossAbove200 = input.bool(false, "Enable Cross Above +2.00σ", group = GROUP_ALERTS)
+bool enableCrossBelow200 = input.bool(false, "Enable Cross Below -2.00σ", group = GROUP_ALERTS)
+bool enableReentryBelow100 = input.bool(false, "Enable Re-entry Below +1.00σ", group = GROUP_ALERTS)
+bool enableReentryAbove100 = input.bool(false, "Enable Re-entry Above -1.00σ", group = GROUP_ALERTS)
+int automaticRthBarOpenTime = time(timeframe.period, automaticRthSession, automaticRthTimezone)
+int automaticSessionDateKey = year(time, automaticRthTimezone) * 10000 + month(time, automaticRthTimezone) * 100 + dayofmonth(time, automaticRthTimezone)
+bool regularMarketBar = timeframe.isintraday and not na(automaticRthBarOpenTime)
+bool automaticSessionDateChanged = not na(automaticSessionDateKey[1]) and automaticSessionDateKey != automaticSessionDateKey[1]
+bool firstRegularSessionBar = regularMarketBar and (barstate.isfirst or na(automaticRthBarOpenTime[1]) or automaticSessionDateChanged)
+bool firstPremarketBar = timeframe.isintraday and session.ispremarket and (barstate.isfirst or not session.ispremarket[1])
+int automaticRthEndHour = int(str.tonumber(str.substring(automaticRthSession, 5, 7)))
+int automaticRthEndMinute = int(str.tonumber(str.substring(automaticRthSession, 7, 9)))
+int automaticRthEndTimestamp = timestamp(automaticRthTimezone, year(time, automaticRthTimezone), month(time, automaticRthTimezone), dayofmonth(time, automaticRthTimezone), automaticRthEndHour, automaticRthEndMinute)
+bool confirmedConfiguredRthCloseBar = regularMarketBar and time_close == automaticRthEndTimestamp and barstate.isconfirmed
+bool confirmedExchangeFallbackCloseBar = timeframe.isintraday and session.islastbar_regular and barstate.isconfirmed
+bool confirmedDailySessionCloseBar = timeframe.isdaily and barstate.isconfirmed
+int cboeFinalEndHour = int(str.tonumber(str.substring(cboeFinalSession, 5, 7)))
+int cboeFinalEndMinute = int(str.tonumber(str.substring(cboeFinalSession, 7, 9)))
+float cboeSourceTimeframeSeconds = timeframe.in_seconds(cboeSourceTimeframe)
+float chartTimeframeSeconds = timeframe.in_seconds(timeframe.period)
+float cboeSourceResolutionMinutes = na
+if not na(cboeSourceTimeframeSeconds) and cboeSourceTimeframeSeconds > 0.0
+    cboeSourceResolutionMinutes := cboeSourceTimeframeSeconds / 60.0
+bool cboeSourceTimeframeDefined = not na(cboeSourceTimeframeSeconds) and cboeSourceTimeframeSeconds > 0.0
+bool chartTimeframeDefined = not na(chartTimeframeSeconds) and chartTimeframeSeconds > 0.0
+bool cboeSourceTimeframeCompatible = cboeSourceTimeframeDefined and chartTimeframeDefined and cboeSourceTimeframeSeconds <= chartTimeframeSeconds
+bool cboeSourceTimeframeUsable = cboeSourceTimeframeDefined and chartTimeframeDefined and cboeSourceTimeframeCompatible
+string cboeSourceTimeframeStatus = CBOE_TF_STATUS_VALID
+if not cboeSourceTimeframeDefined
+    cboeSourceTimeframeStatus := CBOE_TF_STATUS_SOURCE_UNAVAILABLE
+else if not chartTimeframeDefined
+    cboeSourceTimeframeStatus := CBOE_TF_STATUS_CHART_UNAVAILABLE
+else if not cboeSourceTimeframeCompatible
+    cboeSourceTimeframeStatus := CBOE_TF_STATUS_SOURCE_ABOVE_CHART
+[liveVixValue, liveVixSourceTime, liveVixSourceCloseTime, confirmedVixValue, confirmedVixSourceTime, confirmedVixSourceCloseTime, sourceFinalVixValue, sourceFinalVixTime] = request.security(vixSymbol, cboeSourceTimeframe, f_cboe_source_payload(cboeFinalEndHour, cboeFinalEndMinute, cboeTimezone), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+[liveVix1dValue, liveVix1dSourceTime, liveVix1dSourceCloseTime, confirmedVix1dValue, confirmedVix1dSourceTime, confirmedVix1dSourceCloseTime, sourceFinalVix1dValue, sourceFinalVix1dTime] = request.security(vix1dSymbol, cboeSourceTimeframe, f_cboe_source_payload(cboeFinalEndHour, cboeFinalEndMinute, cboeTimezone), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+var float developingRegularHigh = na
+var float developingRegularLow = na
+var float lastConfirmedRegularClose = na
+var float lastConfirmedRegularHigh = na
+var float lastConfirmedRegularLow = na
+var int lastConfirmedRegularCloseTime = na
+var int lastConfirmedRegularCloseDate = na
+var float lastConfirmedVixSessionClose = na
+var int lastConfirmedVixSessionSourceTime = na
+var float lastConfirmedVix1dSessionClose = na
+var int lastConfirmedVix1dSessionSourceTime = na
+var float pendingVixFinalClose = na
+var int pendingVixFinalSourceTime = na
+var float pendingVix1dFinalClose = na
+var int pendingVix1dFinalSourceTime = na
+var int requiredCboeFinalSourceTime = na
+var int cboeFinalEligibilityTime = na
+var float currentSessionPreviousClose = na
+var float currentSessionPreviousHigh = na
+var float currentSessionPreviousLow = na
+var bool preparedMapSessionHasStarted = false
+bool closeNotCapturedForDate = na(lastConfirmedRegularCloseDate) or lastConfirmedRegularCloseDate != automaticSessionDateKey
+bool confirmedIntradayRthCloseBar = closeNotCapturedForDate and (confirmedConfiguredRthCloseBar or confirmedExchangeFallbackCloseBar)
+bool confirmedAutomaticSessionCloseBar = confirmedIntradayRthCloseBar or confirmedDailySessionCloseBar
+if firstPremarketBar or firstRegularSessionBar
+    currentSessionPreviousClose := lastConfirmedRegularClose
+    currentSessionPreviousHigh := lastConfirmedRegularHigh
+    currentSessionPreviousLow := lastConfirmedRegularLow
+if firstRegularSessionBar
+    developingRegularHigh := high
+    developingRegularLow := low
+    preparedMapSessionHasStarted := not na(lastConfirmedRegularClose)
+else if regularMarketBar
+    if na(developingRegularHigh)
+        developingRegularHigh := high
+    else
+        developingRegularHigh := math.max(developingRegularHigh, high)
+    if na(developingRegularLow)
+        developingRegularLow := low
+    else
+        developingRegularLow := math.min(developingRegularLow, low)
+else if timeframe.isdaily and not barstate.isconfirmed and not na(lastConfirmedRegularClose)
+    preparedMapSessionHasStarted := true
+if confirmedAutomaticSessionCloseBar
+    lastConfirmedRegularClose := close
+    if timeframe.isintraday
+        lastConfirmedRegularHigh := developingRegularHigh
+        lastConfirmedRegularLow := developingRegularLow
+    else
+        lastConfirmedRegularHigh := high
+        lastConfirmedRegularLow := low
+    lastConfirmedRegularCloseTime := time_close
+    lastConfirmedRegularCloseDate := automaticSessionDateKey
+    requiredCboeFinalSourceTime := timestamp(cboeTimezone, year(time, cboeTimezone), month(time, cboeTimezone), dayofmonth(time, cboeTimezone), cboeFinalEndHour, cboeFinalEndMinute)
+    int configuredCatchUpMinutes = catchUpBufferMinutes
+    if cboeFeedMode == FEED_DELAYED
+        configuredCatchUpMinutes := configuredCatchUpMinutes + delayedFeedMinutes
+    cboeFinalEligibilityTime := requiredCboeFinalSourceTime + configuredCatchUpMinutes * 60000
+    lastConfirmedVixSessionClose := na
+    lastConfirmedVixSessionSourceTime := na
+    lastConfirmedVix1dSessionClose := na
+    lastConfirmedVix1dSessionSourceTime := na
+    pendingVixFinalClose := na
+    pendingVixFinalSourceTime := na
+    pendingVix1dFinalClose := na
+    pendingVix1dFinalSourceTime := na
+    preparedMapSessionHasStarted := false
+int sourceFinalizationClock = time_close
+if barstate.islast
+    sourceFinalizationClock := timenow
+bool cboeFinalEligibilityReached = not na(cboeFinalEligibilityTime) and sourceFinalizationClock >= cboeFinalEligibilityTime
+bool sourceFinalVixMatchesPreparedSession = false
+bool sourceFinalVix1dMatchesPreparedSession = false
+if not na(requiredCboeFinalSourceTime)
+    sourceFinalVixMatchesPreparedSession := not na(sourceFinalVixTime) and sourceFinalVixTime == requiredCboeFinalSourceTime and f_same_date(sourceFinalVixTime, requiredCboeFinalSourceTime, cboeTimezone)
+    sourceFinalVix1dMatchesPreparedSession := not na(sourceFinalVix1dTime) and sourceFinalVix1dTime == requiredCboeFinalSourceTime and f_same_date(sourceFinalVix1dTime, requiredCboeFinalSourceTime, cboeTimezone)
+if na(pendingVixFinalClose)
+    if sourceFinalVixMatchesPreparedSession and not na(sourceFinalVixValue) and sourceFinalVixValue > 0.0
+        pendingVixFinalClose := sourceFinalVixValue
+        pendingVixFinalSourceTime := sourceFinalVixTime
+if na(pendingVix1dFinalClose)
+    if sourceFinalVix1dMatchesPreparedSession and not na(sourceFinalVix1dValue) and sourceFinalVix1dValue > 0.0
+        pendingVix1dFinalClose := sourceFinalVix1dValue
+        pendingVix1dFinalSourceTime := sourceFinalVix1dTime
+if cboeFinalEligibilityReached and na(lastConfirmedVixSessionClose) and not na(pendingVixFinalClose)
+    lastConfirmedVixSessionClose := pendingVixFinalClose
+    lastConfirmedVixSessionSourceTime := pendingVixFinalSourceTime
+if cboeFinalEligibilityReached and na(lastConfirmedVix1dSessionClose) and not na(pendingVix1dFinalClose)
+    lastConfirmedVix1dSessionClose := pendingVix1dFinalClose
+    lastConfirmedVix1dSessionSourceTime := pendingVix1dFinalSourceTime
+float autoPreviousClose = currentSessionPreviousClose
+float previousDayHigh = currentSessionPreviousHigh
+float previousDayLow = currentSessionPreviousLow
+if not timeframe.isintraday
+    autoPreviousClose := close[1]
+    previousDayHigh := high[1]
+    previousDayLow := low[1]
+float resolvedAnchor = na
+string resolvedAnchorSource = ANCHOR_SOURCE_PREVIOUS
+if anchorMode == ANCHOR_MANUAL
+    resolvedAnchor := manualAnchorPrice
+    resolvedAnchorSource := ANCHOR_SOURCE_MANUAL
+else
+    if mapMode == MAP_CURRENT
+        resolvedAnchor := autoPreviousClose
+        resolvedAnchorSource := ANCHOR_SOURCE_PREVIOUS
+    else
+        resolvedAnchor := lastConfirmedRegularClose
+        resolvedAnchorSource := ANCHOR_SOURCE_CURRENT_RTH
+bool waitingForRthClose = anchorMode == ANCHOR_AUTO and mapMode == MAP_NEXT and na(lastConfirmedRegularClose)
+bool mapSessionActive = mapMode == MAP_CURRENT or preparedMapSessionHasStarted
+bool movementMetricsEnabled = mapSessionActive or (mapMode == MAP_NEXT and previewNextSessionMovementMetrics)
+bool displayAtmMap = showAtmMap
+bool displayVix1dMap = showVix1dMap
+bool displayVixMap = showVixMap
+int enabledMapCount = 0
+if displayAtmMap
+    enabledMapCount += 1
+if displayVix1dMap
+    enabledMapCount += 1
+if displayVixMap
+    enabledMapCount += 1
+string chartTickerUpper = str.upper(syminfo.ticker)
+string chartRootUpper = str.upper(syminfo.root)
+bool autoSpXLinkedBenchmark = chartTickerUpper == "SPX" or chartTickerUpper == "SPXW" or chartTickerUpper == "SPY" or chartTickerUpper == "XSP" or chartRootUpper == "ES" or chartRootUpper == "MES"
+bool vixBenchmarkIsSpXLinked = autoSpXLinkedBenchmark
+string vixBenchmarkStatus = "MARKET CONTEXT ONLY — AUTO"
+if vixBenchmarkApplicabilityInput == BENCHMARK_SPX_LINKED
+    vixBenchmarkIsSpXLinked := true
+    vixBenchmarkStatus := "SPX-LINKED — USER"
+else if vixBenchmarkApplicabilityInput == BENCHMARK_CONTEXT_ONLY
+    vixBenchmarkIsSpXLinked := false
+    vixBenchmarkStatus := "SPX VOLATILITY PROXY — USER"
+else if autoSpXLinkedBenchmark
+    vixBenchmarkStatus := "SPX-LINKED — AUTO"
+bool usingDirectMethod = ivCalculationMethod == METHOD_DIRECT
+float activeCallIvPct = na
+float activePutIvPct = na
+float averageSourceIvPct = na
+float callDailyAtmIvPct = na
+float putDailyAtmIvPct = na
+float finalDailyAtmIvPct = na
+float finalDailyAtmIvDecimal = na
+if usingDirectMethod
+    activeCallIvPct := callDailyIvPct
+    activePutIvPct := putDailyIvPct
+    callDailyAtmIvPct := activeCallIvPct
+    putDailyAtmIvPct := activePutIvPct
+else
+    activeCallIvPct := callAnnualIvPct
+    activePutIvPct := putAnnualIvPct
+    if activeCallIvPct > 0.0 and activePutIvPct > 0.0 and tradingDaysPerYear > 0
+        callDailyAtmIvPct := activeCallIvPct / math.sqrt(tradingDaysPerYear)
+        putDailyAtmIvPct := activePutIvPct / math.sqrt(tradingDaysPerYear)
+if activeCallIvPct > 0.0 and activePutIvPct > 0.0
+    averageSourceIvPct := (activeCallIvPct + activePutIvPct) / 2.0
+if not na(callDailyAtmIvPct) and not na(putDailyAtmIvPct)
+    finalDailyAtmIvPct := (callDailyAtmIvPct + putDailyAtmIvPct) / 2.0
+    finalDailyAtmIvDecimal := finalDailyAtmIvPct / 100.0
+bool anchorValid = not na(resolvedAnchor) and resolvedAnchor > 0.0
+bool ivInputsValid = not na(callDailyAtmIvPct) and not na(putDailyAtmIvPct) and callDailyAtmIvPct > 0.0 and putDailyAtmIvPct > 0.0 and callDailyAtmIvPct <= maximumDailyAtmIvPct and putDailyAtmIvPct <= maximumDailyAtmIvPct
+bool atmInputsValid = ivInputsValid
+float putCallIvSpreadPct = na
+float putCallIvRatio = na
+if ivInputsValid
+    putCallIvSpreadPct := putDailyAtmIvPct - callDailyAtmIvPct
+    putCallIvRatio := putDailyAtmIvPct / callDailyAtmIvPct
+float atmSigmaSymmetricPoints = na
+float atmUpperSigmaPoints = na
+float atmLowerSigmaPoints = na
+if anchorValid and ivInputsValid
+    atmSigmaSymmetricPoints := resolvedAnchor * finalDailyAtmIvDecimal
+    atmUpperSigmaPoints := atmSigmaSymmetricPoints
+    atmLowerSigmaPoints := atmSigmaSymmetricPoints
+    if atmMapShape == ATM_SHAPE_ASYMMETRIC
+        atmUpperSigmaPoints := resolvedAnchor * (callDailyAtmIvPct / 100.0)
+        atmLowerSigmaPoints := resolvedAnchor * (putDailyAtmIvPct / 100.0)
+float atmSigmaPoints = atmSigmaSymmetricPoints
+bool atmMapValid = anchorValid and ivInputsValid and not na(atmUpperSigmaPoints) and atmUpperSigmaPoints > 0.0 and not na(atmLowerSigmaPoints) and atmLowerSigmaPoints > 0.0
+float latestConfirmedVixValue = confirmedVixValue
+int latestConfirmedVixSourceTime = confirmedVixSourceTime
+int latestConfirmedVixSourceCloseTime = confirmedVixSourceCloseTime
+bool liveVixObservationConfirmed = not na(liveVixSourceCloseTime) and liveVixSourceCloseTime <= sourceFinalizationClock
+if liveVixObservationConfirmed and not na(liveVixValue) and liveVixValue > 0.0
+    latestConfirmedVixValue := liveVixValue
+    latestConfirmedVixSourceTime := liveVixSourceTime
+    latestConfirmedVixSourceCloseTime := liveVixSourceCloseTime
+float latestConfirmedVix1dValue = confirmedVix1dValue
+int latestConfirmedVix1dSourceTime = confirmedVix1dSourceTime
+int latestConfirmedVix1dSourceCloseTime = confirmedVix1dSourceCloseTime
+bool liveVix1dObservationConfirmed = not na(liveVix1dSourceCloseTime) and liveVix1dSourceCloseTime <= sourceFinalizationClock
+if liveVix1dObservationConfirmed and not na(liveVix1dValue) and liveVix1dValue > 0.0
+    latestConfirmedVix1dValue := liveVix1dValue
+    latestConfirmedVix1dSourceTime := liveVix1dSourceTime
+    latestConfirmedVix1dSourceCloseTime := liveVix1dSourceCloseTime
+float activeCurrentVixValue = liveVixValue
+int activeCurrentVixSourceTime = liveVixSourceTime
+int activeCurrentVixSourceCloseTime = liveVixSourceCloseTime
+if na(activeCurrentVixValue) or activeCurrentVixValue <= 0.0
+    activeCurrentVixValue := latestConfirmedVixValue
+    activeCurrentVixSourceTime := latestConfirmedVixSourceTime
+    activeCurrentVixSourceCloseTime := latestConfirmedVixSourceCloseTime
+float activeCurrentVix1dValue = liveVix1dValue
+int activeCurrentVix1dSourceTime = liveVix1dSourceTime
+int activeCurrentVix1dSourceCloseTime = liveVix1dSourceCloseTime
+if na(activeCurrentVix1dValue) or activeCurrentVix1dValue <= 0.0
+    activeCurrentVix1dValue := latestConfirmedVix1dValue
+    activeCurrentVix1dSourceTime := latestConfirmedVix1dSourceTime
+    activeCurrentVix1dSourceCloseTime := latestConfirmedVix1dSourceCloseTime
+float vixValue = activeCurrentVixValue
+int vixSourceTime = activeCurrentVixSourceTime
+int vixSourceCloseTime = activeCurrentVixSourceCloseTime
+float vix1dValue = activeCurrentVix1dValue
+int vix1dSourceTime = activeCurrentVix1dSourceTime
+int vix1dSourceCloseTime = activeCurrentVix1dSourceCloseTime
+if mapMode == MAP_NEXT
+    vixValue := lastConfirmedVixSessionClose
+    vixSourceTime := lastConfirmedVixSessionSourceTime
+    vixSourceCloseTime := lastConfirmedVixSessionSourceTime
+    vix1dValue := lastConfirmedVix1dSessionClose
+    vix1dSourceTime := lastConfirmedVix1dSessionSourceTime
+    vix1dSourceCloseTime := lastConfirmedVix1dSessionSourceTime
+bool latestVixObservationAvailable = not na(activeCurrentVixValue) and activeCurrentVixValue > 0.0
+bool latestVix1dObservationAvailable = not na(activeCurrentVix1dValue) and activeCurrentVix1dValue > 0.0
+bool vixObservationAvailable = not na(vixValue) and vixValue > 0.0
+bool vix1dObservationAvailable = not na(vix1dValue) and vix1dValue > 0.0
+bool latestVixDataValid = cboeSourceTimeframeUsable and latestVixObservationAvailable
+bool latestVix1dDataValid = cboeSourceTimeframeUsable and latestVix1dObservationAvailable
+bool vixDataValid = cboeSourceTimeframeUsable and vixObservationAvailable
+bool vix1dDataValid = cboeSourceTimeframeUsable and vix1dObservationAvailable
+bool vixFinalReady = not na(lastConfirmedVixSessionClose) and not na(lastConfirmedVixSessionSourceTime)
+bool vix1dFinalReady = not na(lastConfirmedVix1dSessionClose) and not na(lastConfirmedVix1dSessionSourceTime)
+float vix1dDailyVolDecimal = na
+float vix1dDailyEquivalentPct = na
+if vix1dDataValid
+    vix1dDailyVolDecimal := (vix1dValue / 100.0) / math.sqrt(VIX_TRADING_DAYS)
+    vix1dDailyEquivalentPct := vix1dDailyVolDecimal * 100.0
+float vix1dSigmaPoints = na
+if anchorValid and vix1dDataValid and not na(vix1dDailyVolDecimal)
+    vix1dSigmaPoints := resolvedAnchor * vix1dDailyVolDecimal
+bool vix1dMapValid = anchorValid and cboeSourceTimeframeUsable and vix1dDataValid and not na(vix1dSigmaPoints) and vix1dSigmaPoints > 0.0
+float vixDailyVolDecimal = na
+float vixDailyEquivalentPct = na
+if vixDataValid
+    vixDailyVolDecimal := (vixValue / 100.0) / math.sqrt(VIX_TRADING_DAYS)
+    vixDailyEquivalentPct := vixDailyVolDecimal * 100.0
+float vixSigmaPoints = na
+if anchorValid and vixDataValid and not na(vixDailyVolDecimal)
+    vixSigmaPoints := resolvedAnchor * vixDailyVolDecimal
+bool vixMapValid = anchorValid and cboeSourceTimeframeUsable and vixDataValid and not na(vixSigmaPoints) and vixSigmaPoints > 0.0
+float sourceFreshToleranceMinutes = 1.0
+if cboeSourceTimeframeUsable
+    sourceFreshToleranceMinutes := math.max(1.0, cboeSourceResolutionMinutes + freshnessBufferMinutes)
+float vixAgeMinutes = na
+float vix1dAgeMinutes = na
+if barstate.isrealtime and cboeSourceTimeframeUsable
+    if not na(vixSourceTime)
+        vixAgeMinutes := math.max(0.0, (timenow - vixSourceTime) / 60000.0)
+    if not na(vix1dSourceTime)
+        vix1dAgeMinutes := math.max(0.0, (timenow - vix1dSourceTime) / 60000.0)
+bool vixFinalObservationActive = mapMode == MAP_NEXT and vixFinalReady
+bool vix1dFinalObservationActive = mapMode == MAP_NEXT and vix1dFinalReady
+string cboeFeedModeDisplay = f_feed_mode_label(cboeFeedMode, delayedFeedMinutes)
+string vixFreshness = FEED_STATUS_INVALID_SOURCE_TF
+string vix1dFreshness = FEED_STATUS_INVALID_SOURCE_TF
+if cboeSourceTimeframeUsable
+    vixFreshness := f_observed_freshness(cboeFeedMode, vixDataValid, vixAgeMinutes, sourceFreshToleranceMinutes, delayedFeedMinutes, barstate.isrealtime, vixFinalObservationActive)
+    vix1dFreshness := f_observed_freshness(cboeFeedMode, vix1dDataValid, vix1dAgeMinutes, sourceFreshToleranceMinutes, delayedFeedMinutes, barstate.isrealtime, vix1dFinalObservationActive)
+bool vixFresh = vixFreshness == FEED_STATUS_CURRENT or vixFreshness == FEED_STATUS_FINAL
+bool vix1dFresh = vix1dFreshness == FEED_STATUS_CURRENT or vix1dFreshness == FEED_STATUS_FINAL
+bool vixExpectedDelay = vixFreshness == FEED_STATUS_EXPECTED_DELAY
+bool vix1dExpectedDelay = vix1dFreshness == FEED_STATUS_EXPECTED_DELAY
+bool vixStale = vixFreshness == FEED_STATUS_STALE
+bool vix1dStale = vix1dFreshness == FEED_STATUS_STALE
+float atmVixRatio = na
+float atmVix1dRatio = na
+float vix1dVixRatio = na
+float atmVixSpreadPct = na
+if ivInputsValid and vixDataValid and not na(vixDailyVolDecimal) and vixDailyVolDecimal > 0.0
+    atmVixRatio := finalDailyAtmIvDecimal / vixDailyVolDecimal
+    atmVixSpreadPct := finalDailyAtmIvPct - vixDailyEquivalentPct
+if ivInputsValid and vix1dDataValid and not na(vix1dDailyVolDecimal) and vix1dDailyVolDecimal > 0.0
+    atmVix1dRatio := finalDailyAtmIvDecimal / vix1dDailyVolDecimal
+if vix1dDataValid and vixDataValid and not na(vix1dDailyVolDecimal) and not na(vixDailyVolDecimal) and vixDailyVolDecimal > 0.0
+    vix1dVixRatio := vix1dDailyVolDecimal / vixDailyVolDecimal
+string atmVixContext = "N/A"
+string atmVix1dContext = "N/A"
+string vix1dVixContext = "N/A"
+color atmVixContextColor = color.new(color.white, 15)
+color atmVix1dContextColor = color.new(color.white, 15)
+color vix1dVixContextColor = color.new(color.white, 15)
+bool contextThresholdsValid = volDiscountThreshold < volPremiumThreshold
+if not na(atmVixRatio) and contextThresholdsValid
+    if atmVixRatio < volDiscountThreshold
+        atmVixContext := "SHORT-TERM VOL DISCOUNT"
+        atmVixContextColor := color.rgb(115, 170, 235)
+    else if atmVixRatio <= volPremiumThreshold
+        atmVixContext := "ALIGNED"
+        atmVixContextColor := color.rgb(85, 200, 175)
+    else
+        atmVixContext := "SHORT-TERM VOL PREMIUM"
+        atmVixContextColor := color.rgb(245, 195, 75)
+if not na(atmVix1dRatio) and contextThresholdsValid
+    if atmVix1dRatio < volDiscountThreshold
+        atmVix1dContext := "EXPIRATION VOL DISCOUNT"
+        atmVix1dContextColor := color.rgb(115, 170, 235)
+    else if atmVix1dRatio <= volPremiumThreshold
+        atmVix1dContext := "SHORT-TERM VOL ALIGNED"
+        atmVix1dContextColor := color.rgb(85, 200, 175)
+    else
+        atmVix1dContext := "EXPIRATION VOL PREMIUM"
+        atmVix1dContextColor := color.rgb(245, 195, 75)
+if not na(vix1dVixRatio) and contextThresholdsValid
+    if vix1dVixRatio < volDiscountThreshold
+        vix1dVixContext := "NEAR-TERM VOL DISCOUNT"
+        vix1dVixContextColor := color.rgb(115, 170, 235)
+    else if vix1dVixRatio <= volPremiumThreshold
+        vix1dVixContext := "TERM STRUCTURE ALIGNED"
+        vix1dVixContextColor := color.rgb(85, 200, 175)
+    else
+        vix1dVixContext := "NEAR-TERM VOL PREMIUM"
+        vix1dVixContextColor := color.rgb(245, 195, 75)
+float atmStrikeReferencePrice = na
+string atmStrikeReferenceSource = SNAPSHOT_REFERENCE_MANUAL
+if ivSnapshotReferenceMode == SNAPSHOT_REFERENCE_ANCHOR
+    atmStrikeReferenceSource := SNAPSHOT_REFERENCE_ANCHOR
+    if anchorValid
+        atmStrikeReferencePrice := resolvedAnchor
+else if ivSnapshotUnderlyingPrice > 0.0
+    atmStrikeReferencePrice := ivSnapshotUnderlyingPrice
+float atmStrikeDistancePct = na
+bool atmStrikeProvided = atmStrike > 0.0
+bool atmStrikeReferenceProvided = not na(atmStrikeReferencePrice) and atmStrikeReferencePrice > 0.0
+if atmStrikeProvided and atmStrikeReferenceProvided
+    atmStrikeDistancePct := math.abs(atmStrike - atmStrikeReferencePrice) / atmStrikeReferencePrice * 100.0
+bool atmStrikeValid = atmStrikeProvided and atmStrikeReferenceProvided and not na(atmStrikeDistancePct) and atmStrikeDistancePct <= atmStrikeDistanceThresholdPct
+bool atmStrikeReferenceRequirementSatisfied = not atmStrikeProvided or atmStrikeReferenceProvided
+string atmStrikeStatus = "NOT PROVIDED"
+if atmStrikeProvided and not atmStrikeReferenceProvided
+    atmStrikeStatus := "REFERENCE NOT PROVIDED"
+else if atmStrikeProvided
+    atmStrikeStatus := "CHECK STRIKE"
+    if atmStrikeValid
+        atmStrikeStatus := "VALID"
+int parsedExpirationDateKey = f_parse_expiration_date_key(expirationLabel, automaticRthTimezone)
+int expirationReferenceDateKey = automaticSessionDateKey
+if mapMode == MAP_NEXT and not na(lastConfirmedRegularCloseDate)
+    expirationReferenceDateKey := lastConfirmedRegularCloseDate
+bool expirationValid = false
+if not na(parsedExpirationDateKey)
+    if mapMode == MAP_CURRENT
+        expirationValid := parsedExpirationDateKey >= expirationReferenceDateKey
+    else
+        expirationValid := parsedExpirationDateKey > expirationReferenceDateKey
+string expirationStatus = "CHECK EXPIRATION"
+if expirationValid
+    expirationStatus := "VALID"
+else if not na(parsedExpirationDateKey)
+    expirationStatus := "INVALID"
+string atmIvStatus = "INVALID INPUT"
+if ivInputsValid
+    atmIvStatus := "VALID"
+string ivExpirationCheck = "MANUAL — VERIFY"
+if ivConfirmedForExpiration
+    ivExpirationCheck := "USER CONFIRMED"
+bool waitingForVixFinal = mapMode == MAP_NEXT and anchorValid and displayVixMap and latestVixDataValid and not vixFinalReady
+bool waitingForVix1dFinal = mapMode == MAP_NEXT and anchorValid and displayVix1dMap and latestVix1dDataValid and not vix1dFinalReady
+bool waitingForFinalCboeData = waitingForVixFinal or waitingForVix1dFinal
+bool postFinalClockReached = barstate.islast and not na(cboeFinalEligibilityTime) and timenow >= cboeFinalEligibilityTime
+bool hostBarEndsBeforeRequiredFinal = not na(requiredCboeFinalSourceTime) and not na(time_close) and time_close < requiredCboeFinalSourceTime
+bool waitingForVixHostUpdate = waitingForVixFinal and postFinalClockReached and hostBarEndsBeforeRequiredFinal
+bool waitingForVix1dHostUpdate = waitingForVix1dFinal and postFinalClockReached and hostBarEndsBeforeRequiredFinal
+bool waitingForPostFinalHostUpdate = waitingForVixHostUpdate or waitingForVix1dHostUpdate
+float cboeSourceSkewMinutes = na
+if not na(vixSourceTime) and not na(vix1dSourceTime)
+    cboeSourceSkewMinutes := math.abs(vixSourceTime - vix1dSourceTime) / 60000.0
+bool cboeSourcesAligned = na(cboeSourceSkewMinutes) or cboeSourceSkewMinutes <= sourceFreshToleranceMinutes
+bool selectedCboeTimeframeIncompatible = (displayVixMap or displayVix1dMap) and not cboeSourceTimeframeUsable
+bool selectedCboeUnavailable = (displayVixMap and not vixObservationAvailable) or (displayVix1dMap and not vix1dObservationAvailable)
+bool selectedCboeExpectedDelay = mapMode == MAP_CURRENT and ((displayVixMap and vixExpectedDelay) or (displayVix1dMap and vix1dExpectedDelay))
+bool selectedCboeStale = mapMode == MAP_CURRENT and ((displayVixMap and vixStale) or (displayVix1dMap and vix1dStale))
+bool selectedCboeHistoricalTiming = mapMode == MAP_CURRENT and ((displayVixMap and vixFreshness == FEED_STATUS_HISTORICAL) or (displayVix1dMap and vix1dFreshness == FEED_STATUS_HISTORICAL))
+bool comparisonTimingAcceptable = not selectedCboeTimeframeIncompatible and not selectedCboeUnavailable and not selectedCboeExpectedDelay and not selectedCboeStale and not selectedCboeHistoricalTiming and cboeSourcesAligned and ivConfirmedForExpiration and atmIvCurrentSnapshot and atmStrikeReferenceRequirementSatisfied
+string comparisonStatus = "USER-ATTESTED / TIMING UNVERIFIED"
+if displayVixMap or displayVix1dMap
+    if selectedCboeTimeframeIncompatible
+        comparisonStatus := "INVALID CBOE SOURCE TF"
+    else if selectedCboeUnavailable
+        comparisonStatus := "DATA UNAVAILABLE"
+    else if selectedCboeStale
+        comparisonStatus := "TIME-MISMATCH / STALE"
+    else if selectedCboeExpectedDelay
+        comparisonStatus := "TIME-MISMATCH / EXPECTED DELAY"
+    else if selectedCboeHistoricalTiming
+        comparisonStatus := "HISTORICAL / TIMING UNVERIFIED"
+    else if not cboeSourcesAligned
+        comparisonStatus := "CBOE SOURCE TIME-MISMATCH"
+    else if not ivConfirmedForExpiration or not atmIvCurrentSnapshot or not atmStrikeReferenceRequirementSatisfied
+        comparisonStatus := "MANUAL IV TIMING UNVERIFIED"
+    else if cboeFeedMode == FEED_AUTO
+        comparisonStatus := "USER-ATTESTED / AUTO BEST EFFORT"
+else
+    comparisonStatus := "N/A"
+int validEnabledMapCount = 0
+if displayAtmMap and atmMapValid
+    validEnabledMapCount += 1
+if displayVix1dMap and vix1dMapValid
+    validEnabledMapCount += 1
+if displayVixMap and vixMapValid
+    validEnabledMapCount += 1
+bool mapIsValid = anchorValid and enabledMapCount > 0 and validEnabledMapCount > 0
+string validationMessage = "VALID MAP"
+color validationColor = color.rgb(85, 200, 135)
+if enabledMapCount == 0
+    validationMessage := "NO MAP SELECTED"
+    validationColor := color.rgb(245, 195, 75)
+else if waitingForRthClose
+    validationMessage := "WAITING FOR RTH CLOSE"
+    validationColor := color.rgb(245, 195, 75)
+else if not anchorValid
+    validationMessage := "INVALID ANCHOR"
+    validationColor := color.rgb(255, 105, 105)
+else if displayAtmMap and not ivInputsValid
+    validationMessage := "CHECK IV INPUTS"
+    validationColor := color.rgb(255, 105, 105)
+else if selectedCboeTimeframeIncompatible
+    validationMessage := "INCOMPATIBLE CBOE SOURCE TF"
+    validationColor := color.rgb(255, 105, 105)
+else if waitingForPostFinalHostUpdate
+    validationMessage := "WAITING FOR POST-FINAL HOST BAR"
+    validationColor := color.rgb(245, 195, 75)
+else if waitingForFinalCboeData
+    validationMessage := "WAITING FOR FINAL CBOE DATA"
+    validationColor := color.rgb(245, 195, 75)
+else if displayVix1dMap and not vix1dMapValid
+    validationMessage := "VIX1D DATA UNAVAILABLE"
+    validationColor := color.rgb(255, 105, 105)
+else if displayVixMap and not vixMapValid
+    validationMessage := "VIX DATA UNAVAILABLE"
+    validationColor := color.rgb(255, 105, 105)
+else if displayAtmMap and not expirationValid
+    validationMessage := "CHECK EXPIRATION"
+    validationColor := color.rgb(245, 195, 75)
+else if displayAtmMap and atmStrikeProvided and not atmStrikeReferenceProvided
+    validationMessage := "IV SNAPSHOT REFERENCE REQUIRED"
+    validationColor := color.rgb(245, 195, 75)
+else if displayAtmMap and atmStrikeProvided and atmStrikeReferenceProvided and not atmStrikeValid
+    validationMessage := "CHECK ATM STRIKE"
+    validationColor := color.rgb(245, 195, 75)
+else if displayAtmMap and not ivConfirmedForExpiration
+    validationMessage := "IV / EXPIRATION NOT CONFIRMED"
+    validationColor := color.rgb(245, 195, 75)
+else if selectedCboeStale
+    validationMessage := "CBOE DATA STALE"
+    validationColor := color.rgb(245, 195, 75)
+else if selectedCboeExpectedDelay
+    validationMessage := "CBOE DATA DELAYED"
+    validationColor := color.rgb(245, 195, 75)
+else if not mapIsValid
+    validationMessage := "INVALID DATA"
+    validationColor := color.rgb(255, 105, 105)
+float upper050 = na
+float lower050 = na
+float upper100 = na
+float lower100 = na
+float upper150 = na
+float lower150 = na
+float upper200 = na
+float lower200 = na
+float upper300 = na
+float lower300 = na
+if atmMapValid
+    upper050 := resolvedAnchor + atmUpperSigmaPoints * 0.50
+    lower050 := resolvedAnchor - atmLowerSigmaPoints * 0.50
+    upper100 := resolvedAnchor + atmUpperSigmaPoints
+    lower100 := resolvedAnchor - atmLowerSigmaPoints
+    upper150 := resolvedAnchor + atmUpperSigmaPoints * 1.50
+    lower150 := resolvedAnchor - atmLowerSigmaPoints * 1.50
+    upper200 := resolvedAnchor + atmUpperSigmaPoints * 2.00
+    lower200 := resolvedAnchor - atmLowerSigmaPoints * 2.00
+    upper300 := resolvedAnchor + atmUpperSigmaPoints * 3.00
+    lower300 := resolvedAnchor - atmLowerSigmaPoints * 3.00
+float currentSigmaPosition = na
+float movementDistancePct = na
+float consumptionSigmaPoints = na
+bool consumptionReferenceValid = false
+bool consumptionUsesFixedAtmMap = consumptionReference == CONSUMPTION_ATM
+if consumptionReference == CONSUMPTION_ATM
+    consumptionSigmaPoints := atmUpperSigmaPoints
+    if close < resolvedAnchor
+        consumptionSigmaPoints := atmLowerSigmaPoints
+    consumptionReferenceValid := atmMapValid
+else if consumptionReference == CONSUMPTION_VIX1D
+    consumptionSigmaPoints := vix1dSigmaPoints
+    consumptionReferenceValid := vix1dMapValid
+else if consumptionReference == CONSUMPTION_VIX
+    consumptionSigmaPoints := vixSigmaPoints
+    consumptionReferenceValid := vixMapValid
+if consumptionReferenceValid and movementMetricsEnabled and consumptionSigmaPoints != 0.0
+    currentSigmaPosition := (close - resolvedAnchor) / consumptionSigmaPoints
+    movementDistancePct := math.abs(currentSigmaPosition) * 100.0
+string volatilityRegime = "N/A"
+string consumptionStatus = "N/A"
+color regimeColor = color.new(color.white, 15)
+if not na(currentSigmaPosition)
+    float absoluteSigma = math.abs(currentSigmaPosition)
+    if absoluteSigma < 0.50
+        volatilityRegime := "BALANCE"
+        consumptionStatus := "Balance"
+        regimeColor := color.rgb(85, 200, 175)
+    else if absoluteSigma < 1.00
+        volatilityRegime := "DECISION"
+        consumptionStatus := "Decision"
+        regimeColor := color.rgb(115, 170, 235)
+    else if absoluteSigma < 1.50
+        volatilityRegime := "EXPANSION"
+        consumptionStatus := "1σ exceeded"
+        regimeColor := color.rgb(245, 195, 75)
+    else if absoluteSigma < 2.00
+        volatilityRegime := "EXTREME EXPANSION"
+        consumptionStatus := "1.5σ exceeded"
+        regimeColor := color.rgb(250, 125, 65)
+    else
+        volatilityRegime := "TAIL"
+        consumptionStatus := "2σ exceeded"
+        regimeColor := color.rgb(225, 80, 125)
+string sigmaMetricRowLabel = "SESSION • Current Sigma"
+string distanceMetricRowLabel = "SESSION • Move Consumed"
+string contextMetricRowLabel = "SESSION • Consumption"
+string regimeMetricRowLabel = "SESSION • Regime"
+if not consumptionUsesFixedAtmMap
+    sigmaMetricRowLabel := "SESSION • Vol-Normalized Sigma"
+    distanceMetricRowLabel := "SESSION • Normalized Distance"
+    contextMetricRowLabel := "SESSION • Distance Context"
+    regimeMetricRowLabel := "SESSION • Distance Regime"
+bool anyAtmAlertEnabled = enableCrossAbove050 or enableCrossBelow050 or enableCrossAbove100 or enableCrossBelow100 or enableCrossAbove150 or enableCrossBelow150 or enableCrossAbove200 or enableCrossBelow200 or enableReentryBelow100 or enableReentryAbove100
+bool newDailySession = timeframe.change("D")
+var int sessionStartBar = na
+if na(sessionStartBar) or newDailySession
+    sessionStartBar := bar_index
+bool inPremarketSession = timeframe.isintraday and not na(time(timeframe.period, premarketSession, premarketTimezone))
+bool newPremarketSession = inPremarketSession and (barstate.isfirst or not inPremarketSession[1])
+int structureCalendarDate = year(time, premarketTimezone) * 10000 + month(time, premarketTimezone) * 100 + dayofmonth(time, premarketTimezone)
+bool newStructureCalendarDate = barstate.isfirst or ta.change(structureCalendarDate) != 0
+var float premarketHigh = na
+var float premarketLow = na
+if newStructureCalendarDate
+    premarketHigh := na
+    premarketLow := na
+if newPremarketSession
+    premarketHigh := high
+    premarketLow := low
+else if inPremarketSession
+    if na(premarketHigh)
+        premarketHigh := high
+    else
+        premarketHigh := math.max(premarketHigh, high)
+    if na(premarketLow)
+        premarketLow := low
+    else
+        premarketLow := math.min(premarketLow, low)
+var array<float> sigmaMultipliers = array.from(0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.50, 3.00)
+var array<string> sigmaTexts = array.from("0.25", "0.50", "0.75", "1", "1.25", "1.50", "1.75", "2", "2.50", "3")
+var array<bool> sigmaVisibility = array.from(show025, show050, show075, show100, show125, show150, show175, show200, show250, show300)
+var array<line> sigmaLines = array.new_line(0)
+var array<label> sigmaLabels = array.new_label(0)
+var array<line> vix1dSigmaLines = array.new_line(0)
+var array<label> vix1dSigmaLabels = array.new_label(0)
+var array<line> vixSigmaLines = array.new_line(0)
+var array<label> vixSigmaLabels = array.new_label(0)
+var array<box> zoneBoxes = array.new_box(0)
+var line anchorLine = na
+var label anchorLabel = na
+var line pdhLine = na
+var line pdlLine = na
+var line pmhLine = na
+var line pmlLine = na
+var label pdhLabel = na
+var label pdlLabel = na
+var label pmhLabel = na
+var label pmlLabel = na
+string dashboardPosition = f_dashboard_position(dashboardPositionInput)
+var table dashboard = table.new(dashboardPosition, 2, 60, bgcolor = color.new(color.rgb(10, 14, 22), 6), frame_color = color.new(color.rgb(125, 145, 175), 55), frame_width = 1, border_width = 0)
+if barstate.isfirst
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+if barstate.islast
+    if na(anchorLine)
+        anchorLine := line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+    if na(anchorLabel)
+        anchorLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textcolor = anchorColor, textalign = text.align_left)
+    if na(pdhLine)
+        pdhLine := line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+        pdlLine := line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+        pmhLine := line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+        pmlLine := line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+    if na(pdhLabel)
+        pdhLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+        pdlLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+        pmhLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+        pmlLabel := label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+    if array.size(sigmaLines) == 0
+        for objectIndex = 0 to 19
+            line newLine = line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+            array.push(sigmaLines, newLine)
+    if array.size(sigmaLabels) == 0
+        for objectIndex = 0 to 19
+            label newLabel = label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+            array.push(sigmaLabels, newLabel)
+    if array.size(vix1dSigmaLines) == 0
+        for objectIndex = 0 to 19
+            line newVix1dLine = line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+            array.push(vix1dSigmaLines, newVix1dLine)
+    if array.size(vix1dSigmaLabels) == 0
+        for objectIndex = 0 to 19
+            label newVix1dLabel = label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+            array.push(vix1dSigmaLabels, newVix1dLabel)
+    if array.size(vixSigmaLines) == 0
+        for objectIndex = 0 to 19
+            line newVixLine = line.new(bar_index, close, bar_index, close, xloc = xloc.bar_index, extend = extend.none)
+            array.push(vixSigmaLines, newVixLine)
+    if array.size(vixSigmaLabels) == 0
+        for objectIndex = 0 to 19
+            label newVixLabel = label.new(bar_index, close, "", xloc = xloc.bar_index, yloc = yloc.price, style = label.style_none, textalign = text.align_left)
+            array.push(vixSigmaLabels, newVixLabel)
+    if array.size(zoneBoxes) == 0
+        for objectIndex = 0 to 8
+            box newBox = box.new(left = bar_index, top = close, right = bar_index, bottom = close, xloc = xloc.bar_index, border_color = color.new(color.black, 100), bgcolor = color.new(color.black, 100))
+            array.push(zoneBoxes, newBox)
+    int lineLeftBar = math.max(sessionStartBar, bar_index - MAX_DRAWING_BARS_BACK)
+    int lineRightBar = bar_index + rightSideOffset - 1
+    int labelBar = bar_index + rightSideOffset
+    int vix1dLabelBar = labelBar + 2
+    int vixLabelBar = labelBar + 4
+    int structureLabelBar = labelBar + 6
+    bool showLevelLabels = labelMode != LABEL_NONE
+    string atmLabelPrefix = ""
+    if enabledMapCount > 1
+        atmLabelPrefix := "ATM"
+    f_update_line(anchorLine, lineLeftBar, lineRightBar, resolvedAnchor, anchorValid and showAnchor, anchorColor, anchorTransparency, anchorWidth, anchorStyle)
+    float safeAnchorPrice = resolvedAnchor
+    if na(safeAnchorPrice)
+        safeAnchorPrice := close
+    label.set_xy(anchorLabel, labelBar, safeAnchorPrice)
+    label.set_size(anchorLabel, f_text_size(labelSize))
+    label.set_color(anchorLabel, color.new(color.black, 100))
+    if anchorValid and showAnchor and showLevelLabels
+        label.set_text(anchorLabel, resolvedAnchorSource + " | " + f_number(resolvedAnchor, "0.00"))
+        label.set_textcolor(anchorLabel, color.new(anchorColor, anchorTransparency))
+    else
+        label.set_text(anchorLabel, "")
+        label.set_textcolor(anchorLabel, color.new(anchorColor, 100))
+    for levelIndex = 0 to 9
+        float multiplier = array.get(sigmaMultipliers, levelIndex)
+        string sigmaText = array.get(sigmaTexts, levelIndex)
+        bool levelEnabled = array.get(sigmaVisibility, levelIndex)
+        float upperLevelPrice = na
+        float lowerLevelPrice = na
+        float upperLevelDistance = na
+        float lowerLevelDistance = na
+        if atmMapValid
+            upperLevelDistance := atmUpperSigmaPoints * multiplier
+            lowerLevelDistance := atmLowerSigmaPoints * multiplier
+            upperLevelPrice := resolvedAnchor + upperLevelDistance
+            lowerLevelPrice := resolvedAnchor - lowerLevelDistance
+        float upperVix1dLevelPrice = na
+        float lowerVix1dLevelPrice = na
+        float vix1dLevelDistance = na
+        if vix1dMapValid
+            vix1dLevelDistance := vix1dSigmaPoints * multiplier
+            upperVix1dLevelPrice := resolvedAnchor + vix1dLevelDistance
+            lowerVix1dLevelPrice := resolvedAnchor - vix1dLevelDistance
+        float upperVixLevelPrice = na
+        float lowerVixLevelPrice = na
+        float vixLevelDistance = na
+        if vixMapValid
+            vixLevelDistance := vixSigmaPoints * multiplier
+            upperVixLevelPrice := resolvedAnchor + vixLevelDistance
+            lowerVixLevelPrice := resolvedAnchor - vixLevelDistance
+        color levelColor = intermediateColor
+        int levelWidth = intermediateWidth
+        string levelStyle = intermediateStyle
+        int levelTransparency = intermediateTransparency
+        if levelIndex == 1
+            levelColor := sigma050Color
+            levelWidth := sigma050Width
+            levelStyle := sigma050Style
+            levelTransparency := sigma050Transparency
+        else if levelIndex == 3
+            levelColor := sigma100Color
+            levelWidth := sigma100Width
+            levelStyle := sigma100Style
+            levelTransparency := sigma100Transparency
+        else if levelIndex == 5
+            levelColor := sigma150Color
+            levelWidth := sigma150Width
+            levelStyle := sigma150Style
+            levelTransparency := sigma150Transparency
+        else if levelIndex == 7
+            levelColor := sigma200Color
+            levelWidth := sigma200Width
+            levelStyle := sigma200Style
+            levelTransparency := sigma200Transparency
+        else if levelIndex == 9
+            levelColor := sigma300Color
+            levelWidth := sigma300Width
+            levelStyle := sigma300Style
+            levelTransparency := sigma300Transparency
+        int upperObjectIndex = levelIndex * 2
+        int lowerObjectIndex = upperObjectIndex + 1
+        line upperLine = array.get(sigmaLines, upperObjectIndex)
+        line lowerLine = array.get(sigmaLines, lowerObjectIndex)
+        label upperLabel = array.get(sigmaLabels, upperObjectIndex)
+        label lowerLabel = array.get(sigmaLabels, lowerObjectIndex)
+        line upperVix1dLine = array.get(vix1dSigmaLines, upperObjectIndex)
+        line lowerVix1dLine = array.get(vix1dSigmaLines, lowerObjectIndex)
+        label upperVix1dLabel = array.get(vix1dSigmaLabels, upperObjectIndex)
+        label lowerVix1dLabel = array.get(vix1dSigmaLabels, lowerObjectIndex)
+        line upperVixLine = array.get(vixSigmaLines, upperObjectIndex)
+        line lowerVixLine = array.get(vixSigmaLines, lowerObjectIndex)
+        label upperVixLabel = array.get(vixSigmaLabels, upperObjectIndex)
+        label lowerVixLabel = array.get(vixSigmaLabels, lowerObjectIndex)
+        bool levelVisible = displayAtmMap and atmMapValid and levelEnabled
+        bool vix1dLevelVisible = displayVix1dMap and vix1dMapValid and levelEnabled
+        bool vixLevelVisible = displayVixMap and vixMapValid and levelEnabled
+        f_update_line(upperLine, lineLeftBar, lineRightBar, upperLevelPrice, levelVisible, levelColor, levelTransparency, levelWidth, levelStyle)
+        f_update_line(lowerLine, lineLeftBar, lineRightBar, lowerLevelPrice, levelVisible, levelColor, levelTransparency, levelWidth, levelStyle)
+        f_update_sigma_label(upperLabel, labelBar, upperLevelPrice, upperLevelDistance, sigmaText, true, levelVisible and showLevelLabels, levelColor, levelTransparency, atmLabelPrefix, labelMode, labelSize)
+        f_update_sigma_label(lowerLabel, labelBar, lowerLevelPrice, -lowerLevelDistance, sigmaText, false, levelVisible and showLevelLabels, levelColor, levelTransparency, atmLabelPrefix, labelMode, labelSize)
+        f_update_line(upperVix1dLine, lineLeftBar, lineRightBar, upperVix1dLevelPrice, vix1dLevelVisible, vix1dLevelColor, vix1dLevelTransparency, vix1dLevelWidth, vix1dLevelStyle)
+        f_update_line(lowerVix1dLine, lineLeftBar, lineRightBar, lowerVix1dLevelPrice, vix1dLevelVisible, vix1dLevelColor, vix1dLevelTransparency, vix1dLevelWidth, vix1dLevelStyle)
+        f_update_sigma_label(upperVix1dLabel, vix1dLabelBar, upperVix1dLevelPrice, vix1dLevelDistance, sigmaText, true, vix1dLevelVisible and showLevelLabels and showVix1dLabels, vix1dLevelColor, vix1dLevelTransparency, "VIX1D", labelMode, labelSize)
+        f_update_sigma_label(lowerVix1dLabel, vix1dLabelBar, lowerVix1dLevelPrice, -vix1dLevelDistance, sigmaText, false, vix1dLevelVisible and showLevelLabels and showVix1dLabels, vix1dLevelColor, vix1dLevelTransparency, "VIX1D", labelMode, labelSize)
+        f_update_line(upperVixLine, lineLeftBar, lineRightBar, upperVixLevelPrice, vixLevelVisible, vixLevelColor, vixLevelTransparency, vixLevelWidth, vixLevelStyle)
+        f_update_line(lowerVixLine, lineLeftBar, lineRightBar, lowerVixLevelPrice, vixLevelVisible, vixLevelColor, vixLevelTransparency, vixLevelWidth, vixLevelStyle)
+        f_update_sigma_label(upperVixLabel, vixLabelBar, upperVixLevelPrice, vixLevelDistance, sigmaText, true, vixLevelVisible and showLevelLabels and showVixLabels, vixLevelColor, vixLevelTransparency, "VIX", labelMode, labelSize)
+        f_update_sigma_label(lowerVixLabel, vixLabelBar, lowerVixLevelPrice, -vixLevelDistance, sigmaText, false, vixLevelVisible and showLevelLabels and showVixLabels, vixLevelColor, vixLevelTransparency, "VIX", labelMode, labelSize)
+    bool previousDayHighVisible = showPreviousDayHigh and not na(previousDayHigh)
+    bool previousDayLowVisible = showPreviousDayLow and not na(previousDayLow)
+    bool premarketHighVisible = showPremarketHigh and not na(premarketHigh)
+    bool premarketLowVisible = showPremarketLow and not na(premarketLow)
+    f_update_line(pdhLine, lineLeftBar, lineRightBar, previousDayHigh, previousDayHighVisible, previousDayLevelColor, previousDayLevelTransparency, previousDayLevelWidth, previousDayLevelStyle)
+    f_update_line(pdlLine, lineLeftBar, lineRightBar, previousDayLow, previousDayLowVisible, previousDayLevelColor, previousDayLevelTransparency, previousDayLevelWidth, previousDayLevelStyle)
+    f_update_line(pmhLine, lineLeftBar, lineRightBar, premarketHigh, premarketHighVisible, premarketLevelColor, premarketLevelTransparency, premarketLevelWidth, premarketLevelStyle)
+    f_update_line(pmlLine, lineLeftBar, lineRightBar, premarketLow, premarketLowVisible, premarketLevelColor, premarketLevelTransparency, premarketLevelWidth, premarketLevelStyle)
+    f_update_structure_label(pdhLabel, structureLabelBar, previousDayHigh, "PDH", previousDayHighVisible and showMarketStructureLabels, previousDayLevelColor, previousDayLevelTransparency, labelSize)
+    f_update_structure_label(pdlLabel, structureLabelBar, previousDayLow, "PDL", previousDayLowVisible and showMarketStructureLabels, previousDayLevelColor, previousDayLevelTransparency, labelSize)
+    f_update_structure_label(pmhLabel, structureLabelBar, premarketHigh, "PMH", premarketHighVisible and showMarketStructureLabels, premarketLevelColor, premarketLevelTransparency, labelSize)
+    f_update_structure_label(pmlLabel, structureLabelBar, premarketLow, "PML", premarketLowVisible and showMarketStructureLabels, premarketLevelColor, premarketLevelTransparency, labelSize)
+    bool shadeBalance = enableZoneShading and showBalanceZone and displayAtmMap and atmMapValid
+    bool shadeDecision = enableZoneShading and showDecisionZone and displayAtmMap and atmMapValid
+    bool shadeExpansion = enableZoneShading and showExpansionZone and displayAtmMap and atmMapValid
+    bool shadeExtreme = enableZoneShading and showExtremeZone and displayAtmMap and atmMapValid
+    bool shadeTail = enableZoneShading and showTailZone and displayAtmMap and atmMapValid
+    f_update_zone(array.get(zoneBoxes, 0), lineLeftBar, lineRightBar, upper050, lower050, shadeBalance, balanceZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 1), lineLeftBar, lineRightBar, upper100, upper050, shadeDecision, decisionZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 2), lineLeftBar, lineRightBar, lower050, lower100, shadeDecision, decisionZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 3), lineLeftBar, lineRightBar, upper150, upper100, shadeExpansion, expansionZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 4), lineLeftBar, lineRightBar, lower100, lower150, shadeExpansion, expansionZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 5), lineLeftBar, lineRightBar, upper200, upper150, shadeExtreme, extremeZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 6), lineLeftBar, lineRightBar, lower150, lower200, shadeExtreme, extremeZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 7), lineLeftBar, lineRightBar, upper300, upper200, shadeTail, tailZoneColor, zoneTransparency)
+    f_update_zone(array.get(zoneBoxes, 8), lineLeftBar, lineRightBar, lower200, lower300, shadeTail, tailZoneColor, zoneTransparency)
+    table.clear(dashboard, 0, 0, 1, 59)
+    if enableDashboard
+        table.cell(dashboard, 0, 0, "IMPLIED SIGMA MAP", text_color = color.white, text_size = f_text_size(dashboardSize), text_halign = text.align_center, bgcolor = color.new(color.rgb(32, 78, 118), 5))
+        string enabledMapsDisplay = "NONE"
+        if displayAtmMap
+            enabledMapsDisplay := "ATM"
+        if displayVix1dMap
+            if enabledMapsDisplay == "NONE"
+                enabledMapsDisplay := "VIX1D"
+            else
+                enabledMapsDisplay := enabledMapsDisplay + " + VIX1D"
+        if displayVixMap
+            if enabledMapsDisplay == "NONE"
+                enabledMapsDisplay := "VIX"
+            else
+                enabledMapsDisplay := enabledMapsDisplay + " + VIX"
+        string expirationDisplay = expirationLabel
+        if str.length(expirationDisplay) == 0
+            expirationDisplay := "—"
+        expirationDisplay := expirationDisplay + " | " + expirationStatus
+        string strikeDisplay = "— | " + atmStrikeStatus
+        if atmStrikeProvided
+            strikeDisplay := f_number(atmStrike, "0.00") + " | " + atmStrikeStatus
+            if not na(atmStrikeDistancePct)
+                strikeDisplay := f_number(atmStrike, "0.00") + " | " + f_number(atmStrikeDistancePct, "0.00") + "% | " + atmStrikeStatus
+        string snapshotReferenceDisplay = atmStrikeReferenceSource + " | NOT PROVIDED"
+        if atmStrikeReferenceProvided
+            snapshotReferenceDisplay := atmStrikeReferenceSource + " | " + f_number(atmStrikeReferencePrice, "0.00")
+        string calculationSource = METHOD_DIRECT
+        if not usingDirectMethod
+            calculationSource := "Annualized ATM IV → Daily"
+        string callDailyDisplay = "—"
+        string putDailyDisplay = "—"
+        string atmAverageDisplay = "—"
+        string putCallSpreadDisplay = "—"
+        string putCallRatioDisplay = "—"
+        if not na(callDailyAtmIvPct)
+            callDailyDisplay := f_number(callDailyAtmIvPct, "0.0000") + "%"
+        if not na(putDailyAtmIvPct)
+            putDailyDisplay := f_number(putDailyAtmIvPct, "0.0000") + "%"
+        if not na(finalDailyAtmIvPct)
+            atmAverageDisplay := f_number(finalDailyAtmIvPct, "0.0000") + "%"
+        if not na(putCallIvSpreadPct)
+            putCallSpreadDisplay := f_signed(putCallIvSpreadPct, "0.0000") + "%"
+        if not na(putCallIvRatio)
+            putCallRatioDisplay := f_number(putCallIvRatio, "0.00")
+        string atmSigmaDisplay = "—"
+        if atmMapValid
+            if atmMapShape == ATM_SHAPE_ASYMMETRIC
+                atmSigmaDisplay := "U " + f_number(atmUpperSigmaPoints, "0.00") + " / D " + f_number(atmLowerSigmaPoints, "0.00") + " pts"
+            else
+                atmSigmaDisplay := f_number(atmSigmaSymmetricPoints, "0.00") + " pts"
+        string vix1dDisplay = "—"
+        string vix1dDailyDisplay = "—"
+        string vix1dSigmaDisplay = "—"
+        string vix1dAgeDisplay = "—"
+        if vix1dDataValid
+            vix1dDisplay := f_number(vix1dValue, "0.00")
+        if not na(vix1dDailyEquivalentPct)
+            vix1dDailyDisplay := f_number(vix1dDailyEquivalentPct, "0.0000") + "%"
+        if not na(vix1dSigmaPoints)
+            vix1dSigmaDisplay := f_number(vix1dSigmaPoints, "0.00") + " pts"
+        if not na(vix1dAgeMinutes)
+            vix1dAgeDisplay := f_number(vix1dAgeMinutes, "0.0") + " min"
+        if cboeSourceTimeframeUsable and mapMode == MAP_NEXT and vix1dFinalReady
+            vix1dAgeDisplay := "FINAL"
+        string vixDisplay = "—"
+        string vixDailyDisplay = "—"
+        string vixSigmaDisplay = "—"
+        string vixAgeDisplay = "—"
+        if vixDataValid
+            vixDisplay := f_number(vixValue, "0.00")
+        if not na(vixDailyEquivalentPct)
+            vixDailyDisplay := f_number(vixDailyEquivalentPct, "0.0000") + "%"
+        if not na(vixSigmaPoints)
+            vixSigmaDisplay := f_number(vixSigmaPoints, "0.00") + " pts"
+        if not na(vixAgeMinutes)
+            vixAgeDisplay := f_number(vixAgeMinutes, "0.0") + " min"
+        if cboeSourceTimeframeUsable and mapMode == MAP_NEXT and vixFinalReady
+            vixAgeDisplay := "FINAL"
+        string vix1dStatusText = "DATA UNAVAILABLE"
+        color vix1dStatusColor = color.rgb(255, 105, 105)
+        if not cboeSourceTimeframeUsable
+            vix1dStatusText := "INVALID SOURCE TF"
+        else if waitingForVix1dHostUpdate
+            vix1dStatusText := "WAITING HOST UPDATE"
+            vix1dStatusColor := color.rgb(245, 195, 75)
+        else if waitingForVix1dFinal
+            vix1dStatusText := "WAITING FINAL CBOE"
+            vix1dStatusColor := color.rgb(245, 195, 75)
+        else if vix1dMapValid
+            vix1dStatusText := "VALID"
+            vix1dStatusColor := color.rgb(85, 200, 135)
+        string vixStatusText = "DATA UNAVAILABLE"
+        color vixStatusColor = color.rgb(255, 105, 105)
+        if not cboeSourceTimeframeUsable
+            vixStatusText := "INVALID SOURCE TF"
+        else if waitingForVixHostUpdate
+            vixStatusText := "WAITING HOST UPDATE"
+            vixStatusColor := color.rgb(245, 195, 75)
+        else if waitingForVixFinal
+            vixStatusText := "WAITING FINAL CBOE"
+            vixStatusColor := color.rgb(245, 195, 75)
+        else if vixMapValid
+            vixStatusText := "VALID"
+            vixStatusColor := color.rgb(85, 200, 135)
+        color vix1dFreshnessColor = color.rgb(85, 200, 135)
+        if vix1dFreshness == FEED_STATUS_EXPECTED_DELAY or vix1dFreshness == FEED_STATUS_HISTORICAL
+            vix1dFreshnessColor := color.rgb(245, 195, 75)
+        else if vix1dFreshness == FEED_STATUS_STALE or vix1dFreshness == FEED_STATUS_UNAVAILABLE or vix1dFreshness == FEED_STATUS_INVALID_SOURCE_TF
+            vix1dFreshnessColor := color.rgb(255, 105, 105)
+        color vixFreshnessColor = color.rgb(85, 200, 135)
+        if vixFreshness == FEED_STATUS_EXPECTED_DELAY or vixFreshness == FEED_STATUS_HISTORICAL
+            vixFreshnessColor := color.rgb(245, 195, 75)
+        else if vixFreshness == FEED_STATUS_STALE or vixFreshness == FEED_STATUS_UNAVAILABLE or vixFreshness == FEED_STATUS_INVALID_SOURCE_TF
+            vixFreshnessColor := color.rgb(255, 105, 105)
+        string currentSigmaDisplay = "—"
+        string movementDistanceDisplay = "—"
+        if not na(currentSigmaPosition)
+            currentSigmaDisplay := f_signed(currentSigmaPosition, "0.00") + "σ"
+        if not na(movementDistancePct)
+            movementDistanceDisplay := f_number(movementDistancePct, "0.0") + "%"
+        string atmVixRatioDisplay = f_number(atmVixRatio, "0.00")
+        string atmVix1dRatioDisplay = f_number(atmVix1dRatio, "0.00")
+        string vix1dVixRatioDisplay = f_number(vix1dVixRatio, "0.00")
+        string atmVixSpreadDisplay = "—"
+        if not na(atmVixSpreadPct)
+            atmVixSpreadDisplay := f_signed(atmVixSpreadPct, "0.0000") + "%"
+        color atmStatusColor = color.rgb(255, 105, 105)
+        if ivInputsValid
+            atmStatusColor := color.rgb(85, 200, 135)
+        color comparisonColor = color.rgb(85, 200, 135)
+        if not comparisonTimingAcceptable and (displayVixMap or displayVix1dMap)
+            comparisonColor := color.rgb(245, 195, 75)
+        int dashboardRow = 1
+        f_dashboard_row(dashboard, dashboardRow, "Map Mode", mapMode, color.rgb(135, 195, 245), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "Enabled Maps", enabledMapsDisplay, color.rgb(135, 195, 245), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM Map Shape", atmMapShape, sigma100Color, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "Anchor", f_number(resolvedAnchor, "0.00"), color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "Anchor Source", resolvedAnchorSource, color.white, dashboardSize)
+        dashboardRow += 1
+        if displayVix1dMap or displayVixMap
+            f_dashboard_row(dashboard, dashboardRow, "CBOE Source TF", cboeSourceTimeframe + " min", color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+            color cboeSourceTimeframeStatusColor = color.rgb(85, 200, 135)
+            if not cboeSourceTimeframeUsable
+                cboeSourceTimeframeStatusColor := color.rgb(255, 105, 105)
+            f_dashboard_row(dashboard, dashboardRow, "CBOE TF Status", cboeSourceTimeframeStatus, cboeSourceTimeframeStatusColor, dashboardSize)
+            dashboardRow += 1
+            color benchmarkColor = color.rgb(245, 195, 75)
+            if vixBenchmarkIsSpXLinked
+                benchmarkColor := color.rgb(85, 200, 135)
+            f_dashboard_row(dashboard, dashboardRow, "VIX Benchmark", vixBenchmarkStatus, benchmarkColor, dashboardSize)
+            dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "Expiration", expirationDisplay, color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM Strike", strikeDisplay, color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "IV Snapshot Reference", snapshotReferenceDisplay, color.new(color.white, 10), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "IV Check", ivExpirationCheck, color.new(color.white, 10), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "Overall Status", validationMessage, validationColor, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Source", calculationSource, color.rgb(135, 195, 245), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Call Daily IV", callDailyDisplay, color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Put Daily IV", putDailyDisplay, color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Average Daily IV", atmAverageDisplay, color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Put-Call Spread", putCallSpreadDisplay, color.new(color.white, 10), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Put/Call Ratio", putCallRatioDisplay, color.new(color.white, 10), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • 1 Sigma", atmSigmaDisplay, sigma100Color, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "ATM • Status", atmIvStatus, atmStatusColor, dashboardSize)
+        dashboardRow += 1
+        if displayVix1dMap
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Value", vix1dDisplay, vix1dLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Daily Vol", vix1dDailyDisplay, vix1dLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • 1 Sigma", vix1dSigmaDisplay, vix1dLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Source Age", vix1dAgeDisplay, color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Feed Mode", cboeFeedModeDisplay, color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Freshness", vix1dFreshness, vix1dFreshnessColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX1D • Status", vix1dStatusText, vix1dStatusColor, dashboardSize)
+            dashboardRow += 1
+        if displayVixMap
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Value", vixDisplay, vixLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Daily Equivalent", vixDailyDisplay, vixLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • 1 Sigma", vixSigmaDisplay, vixLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Source Age", vixAgeDisplay, color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Feed Mode", cboeFeedModeDisplay, color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Freshness", vixFreshness, vixFreshnessColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "VIX • Status", vixStatusText, vixStatusColor, dashboardSize)
+            dashboardRow += 1
+        if displayVix1dMap or displayVixMap
+            f_dashboard_row(dashboard, dashboardRow, "REL • ATM / VIX1D", atmVix1dRatioDisplay, atmVix1dContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • ATM / VIX", atmVixRatioDisplay, atmVixContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • VIX1D / VIX", vix1dVixRatioDisplay, vix1dVixContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • ATM vs VIX Spread", atmVixSpreadDisplay, atmVixContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • Expiration Context", atmVix1dContext, atmVix1dContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • 30D Context", atmVixContext, atmVixContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • Term Structure", vix1dVixContext, vix1dVixContextColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "REL • Comparison", comparisonStatus, comparisonColor, dashboardSize)
+            dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "SESSION • Current Price", f_number(close, "0.00"), color.white, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, "SESSION • Consumption Ref", consumptionReference, color.new(color.white, 10), dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, sigmaMetricRowLabel, currentSigmaDisplay, regimeColor, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, distanceMetricRowLabel, movementDistanceDisplay, regimeColor, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, contextMetricRowLabel, consumptionStatus, regimeColor, dashboardSize)
+        dashboardRow += 1
+        f_dashboard_row(dashboard, dashboardRow, regimeMetricRowLabel, volatilityRegime, regimeColor, dashboardSize)
+        dashboardRow += 1
+        if anyAtmAlertEnabled
+            f_dashboard_row(dashboard, dashboardRow, "Alert Confirmation", alertConfirmationMode, color.new(color.white, 10), dashboardSize)
+            dashboardRow += 1
+        if showMarketStructureInDashboard
+            f_dashboard_row(dashboard, dashboardRow, "Previous Day High", f_number(previousDayHigh, "0.00"), previousDayLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "Previous Day Low", f_number(previousDayLow, "0.00"), previousDayLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "Premarket High", f_number(premarketHigh, "0.00"), premarketLevelColor, dashboardSize)
+            dashboardRow += 1
+            f_dashboard_row(dashboard, dashboardRow, "Premarket Low", f_number(premarketLow, "0.00"), premarketLevelColor, dashboardSize)
+bool rawCrossAbove050 = ta.crossover(close, upper050)
+bool rawCrossBelow050 = ta.crossunder(close, lower050)
+bool rawCrossAbove100 = ta.crossover(close, upper100)
+bool rawCrossBelow100 = ta.crossunder(close, lower100)
+bool rawCrossAbove150 = ta.crossover(close, upper150)
+bool rawCrossBelow150 = ta.crossunder(close, lower150)
+bool rawCrossAbove200 = ta.crossover(close, upper200)
+bool rawCrossBelow200 = ta.crossunder(close, lower200)
+bool rawReentryBelow100 = ta.crossunder(close, upper100)
+bool rawReentryAbove100 = ta.crossover(close, lower100)
+bool intradayResetBar = timeframe.isintraday and newDailySession
+bool anchorTransitionBar = confirmedAutomaticSessionCloseBar or firstPremarketBar or firstRegularSessionBar
+bool alertSessionEligible = mapMode == MAP_CURRENT or preparedMapSessionHasStarted
+bool alertConfirmationEligible = alertConfirmationMode == ALERT_CONFIRM_INTRABAR or barstate.isconfirmed
+bool alertEventAllowed = displayAtmMap and atmMapValid and alertSessionEligible and alertConfirmationEligible and not intradayResetBar and not anchorTransitionBar
+alertcondition(enableCrossAbove050 and alertEventAllowed and rawCrossAbove050, "Price Crossed Above +0.50σ", "Price crossed above +0.50σ")
+alertcondition(enableCrossBelow050 and alertEventAllowed and rawCrossBelow050, "Price Crossed Below -0.50σ", "Price crossed below -0.50σ")
+alertcondition(enableCrossAbove100 and alertEventAllowed and rawCrossAbove100, "Price Crossed Above +1σ", "Price crossed above +1σ")
+alertcondition(enableCrossBelow100 and alertEventAllowed and rawCrossBelow100, "Price Crossed Below -1σ", "Price crossed below -1σ")
+alertcondition(enableCrossAbove150 and alertEventAllowed and rawCrossAbove150, "Price Crossed Above +1.50σ", "Price crossed above +1.50σ")
+alertcondition(enableCrossBelow150 and alertEventAllowed and rawCrossBelow150, "Price Crossed Below -1.50σ", "Price crossed below -1.50σ")
+alertcondition(enableCrossAbove200 and alertEventAllowed and rawCrossAbove200, "Price Crossed Above +2σ", "Price crossed above +2σ")
+alertcondition(enableCrossBelow200 and alertEventAllowed and rawCrossBelow200, "Price Crossed Below -2σ", "Price crossed below -2σ")
+alertcondition(enableReentryBelow100 and alertEventAllowed and rawReentryBelow100, "Price Re-entered Below +1σ", "Price re-entered below +1σ")
+alertcondition(enableReentryAbove100 and alertEventAllowed and rawReentryAbove100, "Price Re-entered Above -1σ", "Price re-entered above -1σ")

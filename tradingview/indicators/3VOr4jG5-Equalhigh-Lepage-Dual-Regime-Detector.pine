@@ -1,0 +1,415 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Stevesyl
+
+//@version=6
+indicator(
+     "Equalhigh - Lepage Dual-Regime Detector",
+     shorttitle = "Lepage Regime",
+     overlay = false,
+     precision = 1,
+     max_bars_back = 500
+)
+
+// Rolling non-parametric location-scale change-point detector.
+// The Lepage statistic combines standardized Wilcoxon rank-sum and
+// Ansari-Bradley scale components. The scan p-value uses a conservative
+// Bonferroni adjustment across all admissible split points.
+//
+// Signals are displayed on the current detection bar. The script never
+// back-places a signal on the estimated historical change point.
+
+// =============================================================================
+// 1. INPUTS
+// =============================================================================
+
+groupData = "1. Observations"
+source = input.source(close, "Price source", group = groupData)
+returnHorizon = input.int(5, "Log-return horizon", minval = 1, maxval = 20, group = groupData)
+windowLength = input.int(60, "Lepage window", minval = 40, maxval = 120, group = groupData)
+minimumSegment = input.int(10, "Minimum segment size", minval = 5, maxval = 20, group = groupData)
+
+groupValidation = "2. Validation"
+alpha = input.float(0.05, "Confirmed scan p-value", minval = 0.01, maxval = 0.10, step = 0.01, group = groupValidation)
+warningAlpha = input.float(0.15, "Possible-break scan p-value", minval = 0.05, maxval = 0.30, step = 0.01, group = groupValidation)
+maximumBreakAge = input.int(10, "Maximum actionable break age", minval = 1, maxval = 30, group = groupValidation)
+minimumLocationEffect = input.float(0.25, "Minimum location shift", minval = 0.05, maxval = 2.00, step = 0.05, group = groupValidation, tooltip = "Minimum median shift measured in robust sigma units.")
+minimumScaleChange = input.float(25.0, "Minimum scale-ratio change (%)", minval = 5.0, maxval = 200.0, step = 5.0, group = groupValidation, tooltip = "Minimum symmetric change between the pre-break and post-break median absolute deviations.")
+minimumComponentZ = input.float(1.00, "Minimum component Z", minval = 0.50, maxval = 3.00, step = 0.25, group = groupValidation, tooltip = "Prevents the regime label from being assigned to a component that contributed too little to the combined Lepage statistic.")
+confirmAtClose = input.bool(true, "Confirm signals at bar close", group = groupValidation)
+
+groupDisplay = "3. Display"
+showBackground = input.bool(true, "Color the detected regime", group = groupDisplay)
+showSignals = input.bool(true, "Show confirmed-break labels", group = groupDisplay)
+showPossibleBreaks = input.bool(true, "Show possible-break markers", group = groupDisplay)
+showDashboard = input.bool(true, "Show statistical dashboard", group = groupDisplay)
+
+// =============================================================================
+// 2. ARRAY HELPERS
+// =============================================================================
+
+f_median(array<float> data) =>
+    array<float> sortedData = array.copy(data)
+    array.sort(sortedData, order.ascending)
+
+    int dataSize = array.size(sortedData)
+    int middle = int(math.floor(dataSize / 2.0))
+    float result = na
+
+    if dataSize > 0
+        result := dataSize % 2 == 1 ? array.get(sortedData, middle) : (array.get(sortedData, middle - 1) + array.get(sortedData, middle)) / 2.0
+
+    result
+
+f_mad(array<float> data, float center) =>
+    int dataSize = array.size(data)
+    array<float> deviations = array.new<float>(dataSize, na)
+
+    if dataSize > 0
+        for i = 0 to dataSize - 1
+            array.set(deviations, i, math.abs(array.get(data, i) - center))
+
+    f_median(deviations)
+
+// Returns:
+// [maximum Lepage statistic, chronological split index, scan-adjusted p-value,
+//  location Z, scale Z, median before, median after, MAD before, MAD after,
+//  MAD across the complete window]
+f_lepage(float src, int length, int minSegment) =>
+    float maximumStatistic = na
+    int bestSplit = na
+    float adjustedPValue = na
+    float bestLocationZ = na
+    float bestScaleZ = na
+    float medianBefore = na
+    float medianAfter = na
+    float madBefore = na
+    float madAfter = na
+    float overallMad = na
+
+    if not na(src[length - 1])
+        array<float> values = array.new<float>(length, na)
+        array<float> ranks = array.new<float>(length, na)
+        array<float> scaleScores = array.new<float>(length, na)
+        bool allValuesAvailable = true
+
+        // Store observations chronologically, from oldest to newest.
+        for i = 0 to length - 1
+            float historicalValue = src[length - 1 - i]
+            array.set(values, i, historicalValue)
+            allValuesAvailable := allValuesAvailable and not na(historicalValue)
+
+        if allValuesAvailable
+            array<int> sortedIndices = array.sort_indices(values, order.ascending)
+            int sortedPosition = 0
+
+            // Assign average Wilcoxon ranks and average Ansari-Bradley scores
+            // to tied values. The AB score at pooled position p is
+            // min(p, N - p + 1), producing symmetric center-weighted scores.
+            while sortedPosition < length
+                int tieEnd = sortedPosition
+                int firstOriginalIndex = array.get(sortedIndices, sortedPosition)
+                float tiedValue = array.get(values, firstOriginalIndex)
+
+                while tieEnd + 1 < length and array.get(values, array.get(sortedIndices, tieEnd + 1)) == tiedValue
+                    tieEnd += 1
+
+                float averageRank = (float(sortedPosition + 1) + float(tieEnd + 1)) / 2.0
+                float scaleScoreSum = 0.0
+
+                for scorePosition = sortedPosition to tieEnd
+                    int oneBasedPosition = scorePosition + 1
+                    scaleScoreSum += math.min(float(oneBasedPosition), float(length - oneBasedPosition + 1))
+
+                float averageScaleScore = scaleScoreSum / float(tieEnd - sortedPosition + 1)
+
+                for scorePosition = sortedPosition to tieEnd
+                    int originalIndex = array.get(sortedIndices, scorePosition)
+                    array.set(ranks, originalIndex, averageRank)
+                    array.set(scaleScores, originalIndex, averageScaleScore)
+
+                sortedPosition := tieEnd + 1
+
+            float rankMean = array.avg(ranks)
+            float scaleScoreMean = array.avg(scaleScores)
+            float rankSquaredDeviationSum = 0.0
+            float scaleSquaredDeviationSum = 0.0
+
+            // Empirical score variances preserve the usual no-tie formulas
+            // while remaining usable when equal observations occur.
+            for i = 0 to length - 1
+                float rankDeviation = array.get(ranks, i) - rankMean
+                float scaleDeviation = array.get(scaleScores, i) - scaleScoreMean
+                rankSquaredDeviationSum += math.pow(rankDeviation, 2.0)
+                scaleSquaredDeviationSum += math.pow(scaleDeviation, 2.0)
+
+            float cumulativeRank = 0.0
+            float cumulativeScaleScore = 0.0
+            float bestStatistic = -1.0
+            float sampleSize = float(length)
+            int admissibleSplitCount = length - 2 * minSegment + 1
+
+            for i = 0 to length - 1
+                cumulativeRank += array.get(ranks, i)
+                cumulativeScaleScore += array.get(scaleScores, i)
+                int splitCandidate = i + 1
+
+                if splitCandidate >= minSegment and splitCandidate <= length - minSegment
+                    float firstSize = float(splitCandidate)
+                    float secondSize = sampleSize - firstSize
+                    float finitePopulationFactor = firstSize * secondSize / (sampleSize * (sampleSize - 1.0))
+                    float rankVariance = finitePopulationFactor * rankSquaredDeviationSum
+                    float scaleVariance = finitePopulationFactor * scaleSquaredDeviationSum
+
+                    if rankVariance > 0.0 and scaleVariance > 0.0
+                        float rawLocationZ = (cumulativeRank - firstSize * rankMean) / math.sqrt(rankVariance)
+                        // Invert the first-segment rank-sum sign so that a
+                        // positive displayed Z means the later segment shifted up.
+                        float directionalLocationZ = -rawLocationZ
+                        float scaleZ = (cumulativeScaleScore - firstSize * scaleScoreMean) / math.sqrt(scaleVariance)
+                        float candidateStatistic = math.pow(rawLocationZ, 2.0) + math.pow(scaleZ, 2.0)
+
+                        if candidateStatistic > bestStatistic
+                            bestStatistic := candidateStatistic
+                            bestSplit := splitCandidate
+                            bestLocationZ := directionalLocationZ
+                            bestScaleZ := scaleZ
+
+            if not na(bestSplit)
+                maximumStatistic := bestStatistic
+
+                // A fixed-split Lepage statistic is asymptotically chi-square
+                // with two degrees of freedom, whose survival function is
+                // exp(-L/2). Bonferroni adjusts for scanning many split points.
+                float fixedSplitPValue = math.exp(-maximumStatistic / 2.0)
+                adjustedPValue := math.min(1.0, float(admissibleSplitCount) * fixedSplitPValue)
+
+                array<float> beforeValues = array.new<float>(bestSplit, na)
+                array<float> afterValues = array.new<float>(length - bestSplit, na)
+
+                for i = 0 to bestSplit - 1
+                    array.set(beforeValues, i, array.get(values, i))
+
+                for i = bestSplit to length - 1
+                    array.set(afterValues, i - bestSplit, array.get(values, i))
+
+                medianBefore := f_median(beforeValues)
+                medianAfter := f_median(afterValues)
+                madBefore := f_mad(beforeValues, medianBefore)
+                madAfter := f_mad(afterValues, medianAfter)
+
+                float overallMedian = f_median(values)
+                overallMad := f_mad(values, overallMedian)
+
+    [maximumStatistic, bestSplit, adjustedPValue, bestLocationZ, bestScaleZ, medianBefore, medianAfter, madBefore, madAfter, overallMad]
+
+// =============================================================================
+// 3. ROLLING LEPAGE TEST
+// =============================================================================
+
+observation = source > 0.0 and source[returnHorizon] > 0.0 ? 100.0 * math.log(source / source[returnHorizon]) : na
+
+[lepageStatistic, splitIndex, pValue, locationZ, scaleZ, preBreakMedian, postBreakMedian, preBreakMad, postBreakMad, windowMad] = f_lepage(observation, windowLength, minimumSegment)
+
+medianShift = postBreakMedian - preBreakMedian
+standardDeviation = ta.stdev(observation, windowLength)
+robustSigma = 1.4826 * windowMad
+locationDenominator = robustSigma > 0.0 ? robustSigma : standardDeviation
+locationEffect = locationDenominator > 0.0 ? medianShift / locationDenominator : 0.0
+
+scaleFloor = math.max(nz(windowMad) * 0.001, 0.0000000001)
+scaleRatio = (postBreakMad + scaleFloor) / (preBreakMad + scaleFloor)
+scaleChangePercent = 100.0 * (scaleRatio - 1.0)
+scaleMagnitudePercent = 100.0 * (math.max(scaleRatio, 1.0 / scaleRatio) - 1.0)
+breakAge = not na(splitIndex) ? windowLength - splitIndex : na
+
+barConfirmed = not confirmAtClose or barstate.isconfirmed
+effectiveWarningAlpha = math.max(alpha, warningAlpha)
+
+validTest = not na(pValue) and not na(breakAge) and not na(locationZ) and not na(scaleZ)
+recentBreak = validTest and breakAge <= maximumBreakAge
+confirmedStatistic = recentBreak and pValue <= alpha
+possibleStatistic = recentBreak and pValue > alpha and pValue <= effectiveWarningAlpha
+
+locationEffectIsMeaningful = math.abs(locationEffect) >= minimumLocationEffect and math.abs(locationZ) >= minimumComponentZ
+scaleEffectIsMeaningful = scaleMagnitudePercent >= minimumScaleChange and math.abs(scaleZ) >= minimumComponentZ
+possibleLocationEffect = math.abs(locationEffect) >= minimumLocationEffect * 0.5 and math.abs(locationZ) >= minimumComponentZ * 0.5
+possibleScaleEffect = scaleMagnitudePercent >= minimumScaleChange * 0.5 and math.abs(scaleZ) >= minimumComponentZ * 0.5
+
+mixedBreakCondition = confirmedStatistic and locationEffectIsMeaningful and scaleEffectIsMeaningful
+bullishLocationCondition = confirmedStatistic and locationEffectIsMeaningful and not scaleEffectIsMeaningful and medianShift > 0.0
+bearishLocationCondition = confirmedStatistic and locationEffectIsMeaningful and not scaleEffectIsMeaningful and medianShift < 0.0
+scaleExpansionCondition = confirmedStatistic and scaleEffectIsMeaningful and not locationEffectIsMeaningful and scaleRatio > 1.0
+scaleCompressionCondition = confirmedStatistic and scaleEffectIsMeaningful and not locationEffectIsMeaningful and scaleRatio < 1.0
+possibleBreakCondition = possibleStatistic and (possibleLocationEffect or possibleScaleEffect)
+
+confirmedBreak = mixedBreakCondition or bullishLocationCondition or bearishLocationCondition or scaleExpansionCondition or scaleCompressionCondition
+
+stateCode = mixedBreakCondition ? 4 : scaleExpansionCondition ? 3 : bullishLocationCondition ? 2 : possibleBreakCondition ? 1 : bearishLocationCondition ? -2 : scaleCompressionCondition ? -3 : 0
+
+newConfirmedBreak = barConfirmed and confirmedBreak and (not confirmedBreak[1] or stateCode != stateCode[1] or breakAge < breakAge[1])
+newPossibleBreak = barConfirmed and possibleBreakCondition and (not possibleBreakCondition[1] or breakAge < breakAge[1])
+
+newMixedBreak = newConfirmedBreak and mixedBreakCondition
+newScaleExpansion = newConfirmedBreak and scaleExpansionCondition
+newBullishLocation = newConfirmedBreak and bullishLocationCondition
+newBearishLocation = newConfirmedBreak and bearishLocationCondition
+newScaleCompression = newConfirmedBreak and scaleCompressionCondition
+
+// =============================================================================
+// 4. REGIME DISPLAY
+// =============================================================================
+
+confidence = validTest ? 100.0 * (1.0 - pValue) : na
+confirmedConfidenceLevel = 100.0 * (1.0 - alpha)
+possibleConfidenceLevel = 100.0 * (1.0 - effectiveWarningAlpha)
+
+confirmedLine = hline(confirmedConfidenceLevel, "Confirmed boundary", color = color.new(color.green, 20), linestyle = hline.style_dashed)
+possibleLine = hline(possibleConfidenceLevel, "Possible boundary", color = color.new(color.orange, 30), linestyle = hline.style_dotted)
+zeroLine = hline(0.0, "Minimum confidence", color = color.new(color.gray, 75))
+maximumLine = hline(100.0, "Maximum confidence", color = color.new(color.gray, 70))
+
+fill(maximumLine, confirmedLine, color = color.new(color.green, 92), title = "Confirmed statistical zone")
+fill(confirmedLine, possibleLine, color = color.new(color.orange, 93), title = "Possible statistical zone")
+
+purple = color.rgb(156, 39, 176)
+blue = color.rgb(33, 150, 243)
+yellow = color.rgb(255, 193, 7)
+
+color regimeColor = mixedBreakCondition ? color.orange : scaleExpansionCondition ? purple : bullishLocationCondition ? color.lime : bearishLocationCondition ? color.red : scaleCompressionCondition ? blue : possibleBreakCondition ? yellow : color.gray
+
+plot(confidence, "Scan-adjusted confidence", color = regimeColor, linewidth = 3)
+
+plotshape(
+     showSignals and newBullishLocation,
+     title = "Positive location shift",
+     style = shape.labelup,
+     location = location.bottom,
+     color = color.green,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "LEVEL +"
+)
+
+plotshape(
+     showSignals and newBearishLocation,
+     title = "Negative location shift",
+     style = shape.labeldown,
+     location = location.top,
+     color = color.red,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "LEVEL -"
+)
+
+plotshape(
+     showSignals and newScaleExpansion,
+     title = "Scale expansion",
+     style = shape.labeldown,
+     location = location.top,
+     color = purple,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "VOL +"
+)
+
+plotshape(
+     showSignals and newScaleCompression,
+     title = "Scale compression",
+     style = shape.labelup,
+     location = location.bottom,
+     color = blue,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "VOL -"
+)
+
+plotshape(
+     showSignals and newMixedBreak,
+     title = "Mixed location-scale shift",
+     style = shape.labeldown,
+     location = location.top,
+     color = color.orange,
+     textcolor = color.white,
+     size = size.tiny,
+     text = "MIXED"
+)
+
+plotshape(
+     showPossibleBreaks and newPossibleBreak,
+     title = "Possible location-scale break",
+     style = shape.triangleup,
+     location = location.bottom,
+     color = yellow,
+     size = size.tiny,
+     text = "?"
+)
+
+color regimeBackground = confirmedBreak ? color.new(regimeColor, 91) : possibleBreakCondition ? color.new(yellow, 93) : na
+bgcolor(showBackground ? regimeBackground : na, title = "Dual-regime state")
+
+// =============================================================================
+// 5. DASHBOARD AND DATA WINDOW
+// =============================================================================
+
+filteredBreak = confirmedStatistic and not confirmedBreak
+oldBreak = validTest and pValue <= alpha and not recentBreak
+
+string stateText = mixedBreakCondition ? "MIXED BREAK" : scaleExpansionCondition ? "VOLATILITY EXPANSION" : bullishLocationCondition ? "POSITIVE LEVEL SHIFT" : bearishLocationCondition ? "NEGATIVE LEVEL SHIFT" : scaleCompressionCondition ? "VOLATILITY COMPRESSION" : possibleBreakCondition ? "POSSIBLE BREAK" : filteredBreak ? "FILTERED BREAK" : oldBreak ? "OLD BREAK" : "STABLE REGIME"
+
+color stateColor = mixedBreakCondition ? color.orange : scaleExpansionCondition ? purple : bullishLocationCondition ? color.green : bearishLocationCondition ? color.red : scaleCompressionCondition ? blue : possibleBreakCondition ? yellow : color.gray
+
+string pValueText = not validTest ? "N/A" : pValue < 0.001 ? "<0.001" : str.tostring(pValue, "#.###")
+string breakAgeText = not validTest ? "N/A" : str.tostring(breakAge)
+string locationZText = not validTest ? "N/A" : str.tostring(locationZ, "#.##")
+string scaleZText = not validTest ? "N/A" : str.tostring(scaleZ, "#.##")
+string medianShiftText = not validTest ? "N/A" : str.tostring(medianShift, "#.###") + " pp"
+string locationEffectText = not validTest ? "N/A" : str.tostring(locationEffect, "#.##") + " sigma"
+string scaleChangeText = not validTest ? "N/A" : str.tostring(scaleChangePercent, "#.1") + "%"
+
+var table dashboard = table.new(
+     position.top_right,
+     2,
+     8,
+     border_width = 1,
+     border_color = color.new(color.gray, 50)
+)
+
+if barstate.islast and showDashboard
+    table.cell(dashboard, 0, 0, "LEPAGE STATE", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 0, stateText, bgcolor = stateColor, text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 1, "SCAN-ADJ P", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 1, pValueText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 2, "BREAK AGE", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 2, breakAgeText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 3, "LOCATION Z", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 3, locationZText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 4, "SCALE Z", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 4, scaleZText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 5, "MEDIAN SHIFT", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 5, medianShiftText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 6, "LOCATION EFFECT", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 6, locationEffectText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 0, 7, "MAD SCALE SHIFT", bgcolor = color.new(color.black, 10), text_color = color.white, text_size = size.tiny)
+    table.cell(dashboard, 1, 7, scaleChangeText, bgcolor = color.new(stateColor, 65), text_color = color.white, text_size = size.tiny)
+
+plot(stateCode, "State code", color = color.new(color.white, 100), display = display.data_window)
+plot(pValue, "Scan-adjusted p-value", color = color.new(color.white, 100), display = display.data_window)
+plot(breakAge, "Estimated break age", color = color.new(color.white, 100), display = display.data_window)
+plot(locationZ, "Location Z component", color = color.new(color.white, 100), display = display.data_window)
+plot(scaleZ, "Scale Z component", color = color.new(color.white, 100), display = display.data_window)
+plot(medianShift, "Median shift in percentage points", color = color.new(color.white, 100), display = display.data_window)
+plot(locationEffect, "Robust location effect", color = color.new(color.white, 100), display = display.data_window)
+plot(scaleChangePercent, "MAD scale change percent", color = color.new(color.white, 100), display = display.data_window)
+plot(lepageStatistic, "Lepage statistic", color = color.new(color.white, 100), display = display.data_window)
+
+// =============================================================================
+// 6. ALERTS
+// =============================================================================
+
+alertcondition(newPossibleBreak, "Lepage - Possible break", "Possible location-scale regime break detected on {{ticker}} ({{interval}}). Statistical confirmation is incomplete.")
+alertcondition(newBullishLocation, "Lepage - Positive level shift", "Confirmed positive return-level shift detected on {{ticker}} ({{interval}}).")
+alertcondition(newBearishLocation, "Lepage - Negative level shift", "Confirmed negative return-level shift detected on {{ticker}} ({{interval}}).")
+alertcondition(newScaleExpansion, "Lepage - Volatility expansion", "Confirmed return-scale expansion detected on {{ticker}} ({{interval}}).")
+alertcondition(newScaleCompression, "Lepage - Volatility compression", "Confirmed return-scale compression detected on {{ticker}} ({{interval}}).")
+alertcondition(newMixedBreak, "Lepage - Mixed regime break", "Confirmed combined location-scale regime break detected on {{ticker}} ({{interval}}).")
+

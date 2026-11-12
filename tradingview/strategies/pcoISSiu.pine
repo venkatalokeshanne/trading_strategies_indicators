@@ -1,0 +1,215 @@
+//@version=5
+strategy("EMA50 + BOS + Fibonacci Pullback PRO", overlay=true, initial_capital=100, default_qty_type=strategy.cash, default_qty_value=25, pyramiding=1, calc_on_order_fills=true, process_orders_on_close=true)
+
+// INPUTS
+groupTrend = "1. Tendencia y estructura"
+emaLen = input.int(50, "EMA principal", minval=1, group=groupTrend)
+pivotLeft = input.int(3, "Pivot izquierda", minval=1, group=groupTrend)
+pivotRight = input.int(3, "Pivot derecha", minval=1, group=groupTrend)
+bosBufferPct = input.float(0.05, "Buffer ruptura (%)", step=0.01, group=groupTrend)
+minBarsAfterBos = input.int(1, "Esperar mínimo barras tras BOS", minval=0, group=groupTrend)
+maxBarsAfterBos = input.int(20, "Máximo barras válidas tras BOS", minval=1, group=groupTrend)
+cooldownBars = input.int(5, "Cooldown entre entradas", minval=0, group=groupTrend)
+
+groupFib = "2. Fibonacci"
+useFib50 = input.bool(true, "Usar 0.5", group=groupFib)
+useFib618 = input.bool(true, "Usar 0.618", group=groupFib)
+useFib65 = input.bool(true, "Usar 0.65", group=groupFib)
+requireTouch618Or65 = input.bool(true, "Exigir toque en 0.618 o 0.65", group=groupFib)
+
+groupFilters = "3. Filtros de entrada"
+atrLen = input.int(14, "ATR", minval=1, group=groupFilters)
+maxDistanceFromEMA = input.float(2.0, "Máx distancia desde EMA en ATR", step=0.1, group=groupFilters)
+minBodyPct = input.float(0.45, "Cuerpo mínimo vela (% del rango)", step=0.05, group=groupFilters)
+maxOppWickPct = input.float(0.30, "Máx mecha contraria (% del rango)", step=0.05, group=groupFilters)
+requireBreakPrevHigh = input.bool(true, "Long: cierre > máximo vela previa", group=groupFilters)
+requireBreakPrevLow = input.bool(true, "Short: cierre < mínimo vela previa", group=groupFilters)
+avoidEntryIfHugeBar = input.bool(true, "Evitar vela de entrada exagerada", group=groupFilters)
+hugeBarATRMultiple = input.float(1.8, "Máx tamaño vela en ATR", step=0.1, group=groupFilters)
+
+groupRisk = "4. Gestión de riesgo"
+orderUSDT = input.float(25.0, "Tamaño orden USDT", step=1.0, minval=1.0, group=groupRisk)
+slATRBuffer = input.float(0.20, "Buffer SL en ATR", step=0.05, group=groupRisk)
+rr = input.float(2.0, "Risk Reward", step=0.1, minval=0.5, group=groupRisk)
+partialTP = input.bool(false, "Activar TP parcial", group=groupRisk)
+partialPct = input.float(50, "Cerrar % en TP1", step=5, minval=1, maxval=99, group=groupRisk)
+partialRR = input.float(1.0, "RR de TP1", step=0.1, minval=0.2, group=groupRisk)
+
+groupVisual = "5. Visual"
+showFibs = input.bool(true, "Mostrar fibs activas", group=groupVisual)
+showLabels = input.bool(true, "Mostrar etiquetas BOS / setup", group=groupVisual)
+
+// BASE
+ema50 = ta.ema(close, emaLen)
+atr = ta.atr(atrLen)
+
+plot(ema50, title="EMA 50", color=color.orange, linewidth=2)
+
+rangeBar = high - low
+bodySize = math.abs(close - open)
+bodyPct = rangeBar > 0 ? bodySize / rangeBar : 0.0
+upperWickPct = rangeBar > 0 ? (high - math.max(open, close)) / rangeBar : 0.0
+lowerWickPct = rangeBar > 0 ? (math.min(open, close) - low) / rangeBar : 0.0
+barSizeInATR = atr > 0 ? rangeBar / atr : 0.0
+
+bullTrend = close > ema50 and ema50 > ema50[1]
+bearTrend = close < ema50 and ema50 < ema50[1]
+
+farFromEMA = atr > 0 ? math.abs(close - ema50) > atr * maxDistanceFromEMA : false
+hugeBar = avoidEntryIfHugeBar ? (barSizeInATR > hugeBarATRMultiple) : false
+
+// SWINGS
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+
+if not na(ph)
+    lastSwingHigh := ph
+    lastSwingHighBar := bar_index - pivotRight
+
+if not na(pl)
+    lastSwingLow := pl
+    lastSwingLowBar := bar_index - pivotRight
+
+plot(lastSwingHigh, title="Ultimo Swing High", color=color.new(color.red, 35), linewidth=1, style=plot.style_linebr)
+plot(lastSwingLow, title="Ultimo Swing Low", color=color.new(color.green, 35), linewidth=1, style=plot.style_linebr)
+
+// BOS
+bosBuffer = bosBufferPct / 100.0
+
+validBullStructure = not na(lastSwingHigh) and not na(lastSwingLow) and lastSwingLowBar < lastSwingHighBar
+validBearStructure = not na(lastSwingHigh) and not na(lastSwingLow) and lastSwingHighBar < lastSwingLowBar
+
+bullBos = validBullStructure and bullTrend and close > lastSwingHigh * (1 + bosBuffer)
+bearBos = validBearStructure and bearTrend and close < lastSwingLow * (1 - bosBuffer)
+
+// GUARDAR IMPULSO
+var bool bullSetupActive = false
+var bool bearSetupActive = false
+var int bullBosBar = na
+var int bearBosBar = na
+
+var float bullImpulseLow = na
+var float bullImpulseHigh = na
+var float bearImpulseHigh = na
+var float bearImpulseLow = na
+
+if bullBos
+    bullSetupActive := true
+    bearSetupActive := false
+    bullBosBar := bar_index
+    bullImpulseLow := lastSwingLow
+    bullImpulseHigh := math.max(close, lastSwingHigh)
+    if showLabels
+        label.new(bar_index, high, "BOS LONG", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+
+if bearBos
+    bearSetupActive := true
+    bullSetupActive := false
+    bearBosBar := bar_index
+    bearImpulseHigh := lastSwingHigh
+    bearImpulseLow := math.min(close, lastSwingLow)
+    if showLabels
+        label.new(bar_index, low, "BOS SHORT", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+if bullSetupActive and not na(bullBosBar) and bar_index - bullBosBar > maxBarsAfterBos
+    bullSetupActive := false
+
+if bearSetupActive and not na(bearBosBar) and bar_index - bearBosBar > maxBarsAfterBos
+    bearSetupActive := false
+
+// FIBONACCI
+bullRange = bullImpulseHigh - bullImpulseLow
+bearRange = bearImpulseHigh - bearImpulseLow
+
+bullFib50 = bullImpulseHigh - bullRange * 0.500
+bullFib618 = bullImpulseHigh - bullRange * 0.618
+bullFib65 = bullImpulseHigh - bullRange * 0.650
+
+bearFib50 = bearImpulseLow + bearRange * 0.500
+bearFib618 = bearImpulseLow + bearRange * 0.618
+bearFib65 = bearImpulseLow + bearRange * 0.650
+
+bullZoneTop = useFib50 ? bullFib50 : math.max(bullFib618, bullFib65)
+bullZoneBot = useFib65 ? bullFib65 : bullFib618
+
+bearZoneBot = useFib50 ? bearFib50 : math.min(bearFib618, bearFib65)
+bearZoneTop = useFib65 ? bearFib65 : bearFib618
+
+plot(showFibs and bullSetupActive ? bullFib50 : na, title="Bull Fib 0.5", color=color.aqua, linewidth=1, style=plot.style_linebr)
+plot(showFibs and bullSetupActive ? bullFib618 : na, title="Bull Fib 0.618", color=color.blue, linewidth=1, style=plot.style_linebr)
+plot(showFibs and bullSetupActive ? bullFib65 : na, title="Bull Fib 0.65", color=color.navy, linewidth=1, style=plot.style_linebr)
+
+plot(showFibs and bearSetupActive ? bearFib50 : na, title="Bear Fib 0.5", color=color.yellow, linewidth=1, style=plot.style_linebr)
+plot(showFibs and bearSetupActive ? bearFib618 : na, title="Bear Fib 0.618", color=color.orange, linewidth=1, style=plot.style_linebr)
+plot(showFibs and bearSetupActive ? bearFib65 : na, title="Bear Fib 0.65", color=color.red, linewidth=1, style=plot.style_linebr)
+
+// TOQUE EN ZONA
+bullTouchedZone = bullSetupActive and not na(bullZoneTop) and not na(bullZoneBot) and low <= bullZoneTop and high >= bullZoneBot
+bearTouchedZone = bearSetupActive and not na(bearZoneTop) and not na(bearZoneBot) and high >= bearZoneBot and low <= bearZoneTop
+
+bullTouchedDeep = bullSetupActive and ((useFib618 and low <= bullFib618) or (useFib65 and low <= bullFib65))
+bearTouchedDeep = bearSetupActive and ((useFib618 and high >= bearFib618) or (useFib65 and high >= bearFib65))
+
+// CONFIRMACION DE VELA
+bullConfirmCandle = close > open and bodyPct >= minBodyPct and lowerWickPct <= maxOppWickPct and (not requireBreakPrevHigh or close > high[1])
+bearConfirmCandle = close < open and bodyPct >= minBodyPct and upperWickPct <= maxOppWickPct and (not requireBreakPrevLow or close < low[1])
+
+// TIMING
+bullTimingOk = bullSetupActive and not na(bullBosBar) and (bar_index - bullBosBar >= minBarsAfterBos) and (bar_index - bullBosBar <= maxBarsAfterBos)
+bearTimingOk = bearSetupActive and not na(bearBosBar) and (bar_index - bearBosBar >= minBarsAfterBos) and (bar_index - bearBosBar <= maxBarsAfterBos)
+
+var int lastEntryBar = na
+cooldownOk = na(lastEntryBar) or (bar_index - lastEntryBar > cooldownBars)
+
+// CONDICIONES
+longCondition = bullTimingOk and bullTrend and bullTouchedZone and (not requireTouch618Or65 or bullTouchedDeep) and bullConfirmCandle and not farFromEMA and not hugeBar and cooldownOk and strategy.position_size <= 0
+shortCondition = bearTimingOk and bearTrend and bearTouchedZone and (not requireTouch618Or65 or bearTouchedDeep) and bearConfirmCandle and not farFromEMA and not hugeBar and cooldownOk and strategy.position_size >= 0
+
+plotshape(longCondition, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="LONG")
+plotshape(shortCondition, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SHORT")
+
+// RISK
+longStop = bullImpulseLow - atr * slATRBuffer
+longRisk = close - longStop
+longTP1 = close + longRisk * partialRR
+longTP2 = close + longRisk * rr
+
+shortStop = bearImpulseHigh + atr * slATRBuffer
+shortRisk = shortStop - close
+shortTP1 = close - shortRisk * partialRR
+shortTP2 = close - shortRisk * rr
+
+validLongRisk = longRisk > syminfo.mintick
+validShortRisk = shortRisk > syminfo.mintick
+
+// ENTRADAS Y SALIDAS
+if longCondition and validLongRisk
+    strategy.entry("Long", strategy.long, qty=orderUSDT)
+    if partialTP
+        strategy.exit("Long TP1", from_entry="Long", stop=longStop, limit=longTP1, qty_percent=partialPct)
+        strategy.exit("Long TP2", from_entry="Long", stop=longStop, limit=longTP2)
+    else
+        strategy.exit("Long Exit", from_entry="Long", stop=longStop, limit=longTP2)
+    lastEntryBar := bar_index
+    bullSetupActive := false
+
+if shortCondition and validShortRisk
+    strategy.entry("Short", strategy.short, qty=orderUSDT)
+    if partialTP
+        strategy.exit("Short TP1", from_entry="Short", stop=shortStop, limit=shortTP1, qty_percent=partialPct)
+        strategy.exit("Short TP2", from_entry="Short", stop=shortStop, limit=shortTP2)
+    else
+        strategy.exit("Short Exit", from_entry="Short", stop=shortStop, limit=shortTP2)
+    lastEntryBar := bar_index
+    bearSetupActive := false
+
+if strategy.position_size > 0 and bearBos
+    strategy.close("Long")
+
+if strategy.position_size < 0 and bullBos
+    strategy.close("Short")

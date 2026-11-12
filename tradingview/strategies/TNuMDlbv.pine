@@ -1,0 +1,495 @@
+//@version=6
+strategy("📊 Gold Strategy v10 – XAUUSD",
+     overlay           = true,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 2,
+     commission_type   = strategy.commission.cash_per_order,
+     commission_value  = 0.5,
+     slippage          = 2,
+     max_labels_count  = 500,
+     max_boxes_count   = 500,
+     max_lines_count   = 500)
+
+// ══════════════════════════════════════════════════════════════════
+//  ⚙️  INPUTS
+// ══════════════════════════════════════════════════════════════════
+i_rr     = input.float(2.0,  "R:R Take Profit (×Risk)",      group="⚙️ Général", minval=0.5, step=0.5)
+i_flat   = input.float(0.03, "Seuil MM200 plate (%)",         group="⚙️ Général", minval=0.0, step=0.01)
+i_capital= input.float(10000,"Capital ($)",                   group="⚙️ Général", minval=100)
+i_risk   = input.float(1.0,  "Risque / trade (% du capital)", group="⚙️ Général", minval=0.1, step=0.1)
+
+// ── AMENDEMENT 1 : Buffer SL séparé FVG vs BB ─────────────────
+// FVG : SL au-dessus/en-dessous de la mèche B ± buffer
+// BB  : SL au-dessus/en-dessous de la mèche de la bougie signal ± buffer
+i_buf_fvg = input.float(5.0, "Buffer SL FVG (points)",  group="⚙️ Général", minval=0.1, step=1.0,
+     tooltip="SL placé sur la mèche de la bougie B ± ce buffer. 5pts = conservateur, 10pts = plus de marge")
+i_buf_bb  = input.float(7.0, "Buffer SL BB (points)",   group="⚙️ Général", minval=0.1, step=1.0,
+     tooltip="SL placé sur la mèche de la bougie signal ± ce buffer")
+
+// ── AMENDEMENT 3 : Distance MM200 ─────────────────────────────
+i_mm200_max_dist = input.float(2.0, "Distance max MM200 (%)",  group="⚙️ Général", minval=0.0, step=0.1,
+     tooltip="Au-delà de ce %, le biais MM200 est ignoré — contre-tendance autorisée si signal fort. 0 = désactivé")
+
+// ── Stratégies actives ─────────────────────────────────────────
+i_fvg    = input.bool(true,  "🟩 FVG",              group="📊 Stratégies")
+i_bb     = input.bool(true,  "〰️ Bollinger",         group="📊 Stratégies")
+i_allow_l = input.bool(true, "📈 Activer LONG",  group="📊 Stratégies")
+i_allow_s = input.bool(true, "📉 Activer SHORT", group="📊 Stratégies")
+
+// ── Bollinger ─────────────────────────────────────────────────
+i_bbl    = input.int  (20,  "Longueur BB",   group="〰️ Bollinger", minval=2)
+i_bbs    = input.float(2.0, "Écart-type BB", group="〰️ Bollinger", minval=0.1)
+
+// ── AMENDEMENT 5 : Filtres corps bougie BB ────────────────────
+// Corps minimum pour éviter les dojis et petites bougies ambiguës
+i_bb_min_body = input.float(3.0, "Corps min bougie BB (points)", group="〰️ Bollinger", minval=0.0, step=0.5,
+     tooltip="Corps (|open-close|) minimum requis pour valider un signal BB. Élimine les dojis et micro-bougies")
+// Confirmation : la mèche ne doit pas rentrer profondément dans la bande (ratio mèche/corps)
+i_bb_wick_ratio = input.float(2.0, "Ratio max mèche/corps BB", group="〰️ Bollinger", minval=0.5, step=0.5,
+     tooltip="Si la mèche haute/basse dépasse N fois le corps, le signal est rejeté (bougie trop indécise)")
+
+// ── AMENDEMENT 7 : Cible MM20 pour les BB ─────────────────────
+i_bb_target_mm20 = input.bool(true, "Cible MM20 pour BB (si plus proche que R:R)",
+     group="〰️ Bollinger",
+     tooltip="Les BB sont des trades de retour à la moyenne. Si la MM20 est plus proche que le TP fixe, elle devient la cible")
+
+// ── Zones HTF ─────────────────────────────────────────────────
+i_piv    = input.int(5, "Longueur Pivot (zones HTF)", group="📦 Zones HTF", minval=2)
+
+// ── AMENDEMENT 6 : Trailing Stop en POINTS (plus précis) ──────
+i_be     = input.bool (true,  "Activer Breakeven",           group="🔒 Gestion position")
+i_be_r   = input.float(1.0,   "BE — déclenchement (×Risk)",  group="🔒 Gestion position", minval=0.1)
+i_trail  = input.bool (false, "Activer Trailing Stop",       group="🔒 Gestion position")
+// Remplacement des paramètres R-based par des points explicites
+i_trail_trigger = input.float(30.0, "Trail — déclenchement (points de profit)", group="🔒 Gestion position", minval=1.0, step=5.0,
+     tooltip="Le trailing stop s'active quand le trade est en profit de ce nombre de points. Ex: 30 pts = ~0.30$")
+i_trail_pts     = input.float(15.0, "Trail — recul SL (points)",                group="🔒 Gestion position", minval=1.0, step=5.0,
+     tooltip="Le SL suit le prix en maintenant cette distance en points. Ex: 15 pts = SL à 15 points du plus haut atteint")
+
+// ── Session ───────────────────────────────────────────────────
+i_sess   = input.bool(true, "Activer le filtre horaire", group="🕐 Session")
+i_hd     = input.int (2,    "Heure début",  group="🕐 Session", minval=0, maxval=23)
+i_md     = input.int (0,    "Minute début", group="🕐 Session", minval=0, maxval=59)
+i_hf     = input.int (16,   "Heure fin",    group="🕐 Session", minval=0, maxval=23)
+i_mf     = input.int (0,    "Minute fin",   group="🕐 Session", minval=0, maxval=59)
+i_lun    = input.bool(true, "Lun", group="🕐 Session", inline="days")
+i_mar    = input.bool(true, "Mar", group="🕐 Session", inline="days")
+i_mer    = input.bool(true, "Mer", group="🕐 Session", inline="days")
+i_jeu    = input.bool(true, "Jeu", group="🕐 Session", inline="days")
+i_ven    = input.bool(true, "Ven", group="🕐 Session", inline="days")
+
+// ── Affichage ─────────────────────────────────────────────────
+i_box_tp  = input.bool(true,  "Box TP",                   group="🎨 Affichage")
+i_box_sl  = input.bool(true,  "Box SL",                   group="🎨 Affichage")
+i_line_e  = input.bool(true,  "Ligne d'entrée",           group="🎨 Affichage")
+i_labels  = input.bool(true,  "Labels prix",              group="🎨 Affichage")
+i_box_w   = input.int (30,    "Largeur boxes (barres)",   group="🎨 Affichage", minval=5)
+i_panel   = input.bool(true,  "Panneau trade actif",      group="🎨 Affichage")
+i_bg_flat = input.bool(false, "Fond orange — MM200 plate",group="🎨 Affichage")
+i_bg_sess = input.bool(false, "Fond gris — hors session", group="🎨 Affichage")
+i_show_dist = input.bool(true,"Afficher distance MM200",  group="🎨 Affichage")
+i_vis     = input.string("Tout afficher", "Mode d'affichage",
+     options=["Tout afficher","TP seulement","SL seulement","BE seulement","TP + SL","TP + BE","SL + BE","Tout masquer"],
+     group="🎨 Affichage")
+
+// ── Visibilité des tableaux ────────────────────────────────────
+i_show_journal = input.bool(true, "✅ Afficher tableau JOURNAL (droite)",     group="📺 TABLEAUX ON/OFF")
+i_show_panel   = input.bool(true, "✅ Afficher panneau TRADE ACTIF (gauche)", group="📺 TABLEAUX ON/OFF")
+
+show_tp = i_vis == "Tout afficher" or i_vis == "TP seulement" or i_vis == "TP + SL" or i_vis == "TP + BE"
+show_sl = i_vis == "Tout afficher" or i_vis == "SL seulement" or i_vis == "TP + SL" or i_vis == "SL + BE"
+show_be = i_vis == "Tout afficher" or i_vis == "BE seulement" or i_vis == "TP + BE" or i_vis == "SL + BE"
+
+// ══════════════════════════════════════════════════════════════════
+//  🕐  SESSION
+// ══════════════════════════════════════════════════════════════════
+dow     = dayofweek
+day_ok  = (dow==dayofweek.monday and i_lun) or (dow==dayofweek.tuesday and i_mar)
+       or (dow==dayofweek.wednesday and i_mer) or (dow==dayofweek.thursday and i_jeu)
+       or (dow==dayofweek.friday and i_ven)
+t_now   = hour * 60 + minute
+t_start = i_hd * 60 + i_md
+t_end   = i_hf * 60 + i_mf
+sess_ok = not i_sess or (day_ok and t_now >= t_start and t_now < t_end)
+bgcolor(i_bg_sess and i_sess and not sess_ok ? color.new(color.gray,93) : na, title="Hors session")
+
+// ══════════════════════════════════════════════════════════════════
+//  📈  MM200 — BIAIS + AMENDEMENT 3 (distance max)
+// ══════════════════════════════════════════════════════════════════
+ma200      = ta.sma(close, 200)
+slope      = (ma200 - ma200[20]) / ma200[20] * 100
+flat       = math.abs(slope) < i_flat
+dist_pct   = math.abs(close - ma200) / ma200 * 100   // distance en % entre prix et MM200
+
+// AMENDEMENT 3 : si le prix est trop loin de la MM200, on peut autoriser les contre-tendances
+// Le biais normal (bull/bear) s'applique quand distance normale
+// Quand trop loin → le marché est en extension, des corrections importantes sont attendues
+too_far    = i_mm200_max_dist > 0 and dist_pct > i_mm200_max_dist
+bull_base  = close > ma200 and not flat
+bear_base  = close < ma200 and not flat
+
+// En extension excessive : on autorise aussi les signaux contre-tendance si FVG fort
+// (le biais reste là pour information mais ne bloque plus)
+bull = bull_base or (too_far and close > ma200)   // prix au-dessus MM200
+bear = bear_base or (too_far and close < ma200)   // prix en-dessous MM200
+
+// Pour les entrées on distingue biais "normal" vs "extension"
+bull_normal = bull_base and not too_far
+bear_normal = bear_base and not too_far
+
+plot(ma200, "MM200", color=bull_base?color.new(#00e5ff,0):bear_base?color.new(#ff5252,0):color.new(color.orange,0), linewidth=2)
+bgcolor(i_bg_flat and flat ? color.new(color.orange,88) : na, title="⚠️ MM200 Plate")
+
+// Affichage distance MM200
+var label lbl_dist = na
+if barstate.islast and i_show_dist
+    label.delete(lbl_dist)
+    dist_txt = "MM200: " + str.tostring(math.round(dist_pct, 2)) + "%"
+              + (too_far ? " ⚠️ EXT" : "")
+    lbl_dist := label.new(bar_index+2, ma200, dist_txt,
+         color=too_far?color.new(color.orange,30):color.new(color.gray,60),
+         textcolor=color.white, style=label.style_label_left, size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════════
+//  〰️  BOLLINGER BANDS + MM20
+// ══════════════════════════════════════════════════════════════════
+[bbm, bbh, bbl_] = ta.bb(close, i_bbl, i_bbs)
+// bbm = MM20 (moyenne mobile 20 periods = ligne médiane des BB)
+p_bbh = plot(bbh,  "BB Sup", color.new(#00bcd4,60), 1)
+plot(bbm, "BB Mid / MM20", color.new(#00bcd4,30), 1, plot.style_line)
+p_bbl = plot(bbl_, "BB Inf", color.new(#00bcd4,60), 1)
+fill(p_bbh, p_bbl, color.new(#00bcd4,93))
+
+// ── AMENDEMENT 5 : Validation qualité bougie BB ───────────────
+// Corps de la bougie
+body_size  = math.abs(close - open)
+upper_wick = high - math.max(open, close)
+lower_wick = math.min(open, close) - low
+
+// Validation BB Long : corps suffisant + mèche haute pas trop longue
+bb_body_ok_l = body_size >= i_bb_min_body * syminfo.mintick * 10 and (body_size > 0 ? upper_wick / body_size <= i_bb_wick_ratio : false)
+
+// Validation BB Short : corps suffisant + mèche basse pas trop longue
+bb_body_ok_s = body_size >= i_bb_min_body * syminfo.mintick * 10 and (body_size > 0 ? lower_wick / body_size <= i_bb_wick_ratio : false)
+
+// ══════════════════════════════════════════════════════════════════
+//  🟩  FVG — FAIR VALUE GAP
+//
+//  Règle 1 : gap entre bougie 1 (high[2]) et bougie 3 (low[0])
+//  Règle 2 : entrée au retour dans la zone — peu importe la bougie,
+//            jamais à l'ouverture de la bougie 4
+//  Règle 3 : un nouveau FVG annule l'ancien (un seul actif à la fois)
+// ══════════════════════════════════════════════════════════════════
+
+// Règle 1 — Détection formation
+fvg_up = high[2] < low[0]
+fvg_dn = low[2]  > high[0]
+
+// Règle 2 + 3 — Mémoire persistante du FVG actif
+var float fvg_bull_low  = na    // bas du gap haussier  = high[2] à la formation
+var float fvg_bull_high = na    // haut du gap haussier = low[0]  à la formation
+var int   fvg_bull_bar  = -99   // bar_index de formation
+
+var float fvg_bear_low  = na    // bas du gap baissier  = high[0] à la formation
+var float fvg_bear_high = na    // haut du gap baissier = low[2]  à la formation
+var int   fvg_bear_bar  = -99
+
+// Boîtes visuelles
+if fvg_up and bull
+    box.new(bar_index-2, low[0], bar_index+i_box_w, high[2],
+         border_color=color.new(#69f0ae,30), bgcolor=color.new(#69f0ae,88))
+if fvg_dn and bear
+    box.new(bar_index-2, low[2], bar_index+i_box_w, high[0],
+         border_color=color.new(#ff5252,30), bgcolor=color.new(#ff5252,88))
+
+// Règle 3 : nouveau FVG haussier → mémorise + annule baissier
+if fvg_up and bull
+    fvg_bull_low  := high[2]
+    fvg_bull_high := low[0]
+    fvg_bull_bar  := bar_index
+    fvg_bear_low  := na
+    fvg_bear_high := na
+
+// Règle 3 : nouveau FVG baissier → mémorise + annule haussier
+if fvg_dn and bear
+    fvg_bear_low  := high[0]
+    fvg_bear_high := low[2]
+    fvg_bear_bar  := bar_index
+    fvg_bull_low  := na
+    fvg_bull_high := na
+
+// Règle 2 : entrée quand le prix revient dans la zone, après la bougie 4
+fvg_e_l = not na(fvg_bull_low) and bar_index > fvg_bull_bar + 1 and low <= fvg_bull_high and bull
+fvg_e_s = not na(fvg_bear_low) and bar_index > fvg_bear_bar + 1 and high >= fvg_bear_low and bear
+
+// ══════════════════════════════════════════════════════════════════
+//  ÉTAT DU TRADE
+// ══════════════════════════════════════════════════════════════════
+var float  entry_p  = na
+var float  sl_p     = na
+var float  tp_p     = na
+var string variant  = na
+var string last_hr  = "—"
+var int    last_bar = -99
+
+// ══════════════════════════════════════════════════════════════════
+//  JOURNAL — COMPTEURS
+// ══════════════════════════════════════════════════════════════════
+var int fvg_tot=0, fvg_win=0
+var float fvg_gp=0.0, fvg_gl=0.0
+var int bb_tot=0, bb_win=0
+var float bb_gp=0.0, bb_gl=0.0
+
+// ══════════════════════════════════════════════════════════════════
+//  SIGNAUX
+// ══════════════════════════════════════════════════════════════════
+free = strategy.position_size==0 and sess_ok and bar_index!=last_bar
+
+s_fvg_l = i_fvg and i_allow_l and free and bull and fvg_e_l
+s_fvg_s = i_fvg and i_allow_s and free and bear and fvg_e_s
+
+s_bb_l  = i_bb and i_allow_l and free and bull and open < bbl_ and close < bbl_ and bb_body_ok_l and not s_fvg_l
+s_bb_s  = i_bb and i_allow_s and free and bear and open > bbh  and close > bbh  and bb_body_ok_s and not s_fvg_s
+
+long_sig  = s_fvg_l or s_bb_l
+short_sig = s_fvg_s or s_bb_s
+
+// ══════════════════════════════════════════════════════════════════
+//  ENTRÉES LONG
+// ══════════════════════════════════════════════════════════════════
+if long_sig
+    vr  = s_fvg_l ? "FVG" : "BB"
+    en  = close
+
+    // FVG : SL sous la limite basse du gap (bas de la zone) − buffer
+    // BB  : SL sous la mèche basse de la bougie signal − buffer
+    sl  = s_fvg_l ? fvg_bull_low - i_buf_fvg * syminfo.mintick * 10 : low - i_buf_bb * syminfo.mintick * 10
+    rk  = en - sl
+
+    // FVG : TP = R:R fixe | BB : TP = toujours MM20
+    tp  = s_fvg_l ? en + rk * i_rr : bbm
+
+    lbl = "▲ " + vr + "\nRR " + str.tostring(math.round((tp-en)/(en-sl),2)) + "R" + (s_bb_l ? "\n⭐ MM20" : "")
+
+    entry_p  := en
+    sl_p     := sl
+    tp_p     := tp
+    variant  := vr
+    last_hr  := str.tostring(hour) + "h" + str.tostring(minute)
+    last_bar := bar_index
+
+    // Zone FVG consommée après entrée
+    if s_fvg_l
+        fvg_bull_low  := na
+        fvg_bull_high := na
+
+    strategy.entry("Long", strategy.long, comment="▲ "+vr)
+    strategy.exit("L-X", "Long", stop=sl, limit=tp, comment="TP",
+         trail_price  = i_trail ? en + i_trail_trigger * syminfo.mintick * 10 : na,
+         trail_offset = i_trail ? i_trail_pts     * syminfo.mintick * 10      : na)
+
+    if i_box_tp and show_tp
+        box.new(bar_index, en, bar_index+i_box_w, tp,
+             border_color=color.new(#69f0ae,20), bgcolor=color.new(#69f0ae,72), border_width=1)
+    if i_box_sl and show_sl
+        box.new(bar_index, en, bar_index+i_box_w, sl,
+             border_color=color.new(#ff5252,20), bgcolor=color.new(#ff5252,72), border_width=1)
+    if i_line_e
+        line.new(bar_index, en, bar_index+i_box_w, en,
+             color=color.white, width=1, style=line.style_dashed)
+    if i_labels
+        label.new(bar_index+i_box_w, (tp+sl)/2,
+             "TP "+str.tostring(math.round(tp,2))+"\nE  "+str.tostring(math.round(en,2))+"\nSL "+str.tostring(math.round(sl,2)),
+             color=color.new(#1a1f2e,10), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index, sl-rk*1.2, lbl,
+         color=color.new(#69f0ae,5), textcolor=color.black, style=label.style_label_up, size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════
+//  ENTRÉES SHORT
+// ══════════════════════════════════════════════════════════════════
+if short_sig
+    vr  = s_fvg_s ? "FVG" : "BB"
+    en  = close
+
+    // FVG : SL au-dessus de la limite haute du gap + buffer
+    // BB  : SL au-dessus de la mèche haute de la bougie signal + buffer
+    sl  = s_fvg_s ? fvg_bear_high + i_buf_fvg * syminfo.mintick * 10 : high + i_buf_bb * syminfo.mintick * 10
+    rk  = sl - en
+
+    // FVG : TP = R:R fixe | BB : TP = toujours MM20
+    tp  = s_fvg_s ? en - rk * i_rr : bbm
+
+    lbl = "▼ " + vr + "\nRR " + str.tostring(math.round((en-tp)/(sl-en),2)) + "R" + (s_bb_s ? "\n⭐ MM20" : "")
+
+    entry_p  := en
+    sl_p     := sl
+    tp_p     := tp
+    variant  := vr
+    last_hr  := str.tostring(hour) + "h" + str.tostring(minute)
+    last_bar := bar_index
+
+    // Zone FVG consommée après entrée
+    if s_fvg_s
+        fvg_bear_low  := na
+        fvg_bear_high := na
+
+    strategy.entry("Short", strategy.short, comment="▼ "+vr)
+    strategy.exit("S-X", "Short", stop=sl, limit=tp, comment="TP",
+         trail_price  = i_trail ? en - i_trail_trigger * syminfo.mintick * 10 : na,
+         trail_offset = i_trail ? i_trail_pts           * syminfo.mintick * 10 : na)
+
+    if i_box_tp and show_tp
+        box.new(bar_index, tp, bar_index+i_box_w, en,
+             border_color=color.new(#69f0ae,20), bgcolor=color.new(#69f0ae,72), border_width=1)
+    if i_box_sl and show_sl
+        box.new(bar_index, sl, bar_index+i_box_w, en,
+             border_color=color.new(#ff5252,20), bgcolor=color.new(#ff5252,72), border_width=1)
+    if i_line_e
+        line.new(bar_index, en, bar_index+i_box_w, en,
+             color=color.white, width=1, style=line.style_dashed)
+    if i_labels
+        label.new(bar_index+i_box_w, (tp+sl)/2,
+             "SL "+str.tostring(math.round(sl,2))+"\nE  "+str.tostring(math.round(en,2))+"\nTP "+str.tostring(math.round(tp,2)),
+             color=color.new(#1a1f2e,10), textcolor=color.white, style=label.style_label_left, size=size.small)
+    label.new(bar_index, sl+rk*1.2, lbl,
+         color=color.new(#ff5252,5), textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════
+//  JOURNAL — MISE À JOUR
+// ══════════════════════════════════════════════════════════════════
+if strategy.closedtrades > strategy.closedtrades[1]
+    idx = strategy.closedtrades - 1
+    pnl = strategy.closedtrades.profit(idx)
+    com = strategy.closedtrades.entry_comment(idx)
+    won = strategy.wintrades > strategy.wintrades[1]
+    if str.contains(com, "FVG")
+        fvg_tot += 1
+        if won
+            fvg_win += 1
+            fvg_gp  += pnl
+        else
+            fvg_gl  += math.abs(pnl)
+    else if str.contains(com, "BB")
+        bb_tot += 1
+        if won
+            bb_win += 1
+            bb_gp  += pnl
+        else
+            bb_gl  += math.abs(pnl)
+
+// ══════════════════════════════════════════════════════════════════
+//  STATS HELPERS
+// ══════════════════════════════════════════════════════════════════
+f_wr(w,t)    => t > 0 ? w / t * 100 : 0.0
+f_pf(g,l)    => l > 0 ? g / l : g > 0 ? 999.0 : 0.0
+f_esp(w,t,rr) =>
+    wr = t > 0 ? w / t : 0.0
+    wr * rr - (1 - wr) * 1.0
+f_col_pf(v)  => v >= 1.5 ? color.new(#1b5e20,10) : v >= 1.0 ? color.new(#1a237e,10) : color.new(#b71c1c,10)
+f_col_wr(v)  => v >= 55  ? color.new(#1b5e20,10) : v >= 45  ? color.new(#1a237e,10) : color.new(#b71c1c,10)
+f_col_esp(v) => v >= 0   ? color.new(#1b5e20,10) : color.new(#b71c1c,10)
+
+tot    = strategy.closedtrades
+w_tot  = strategy.wintrades
+l_tot  = strategy.losstrades
+gp_g   = strategy.grossprofit
+gl_g   = math.abs(strategy.grossloss)
+wr_g   = f_wr(w_tot, tot)
+pf_g   = f_pf(gp_g, gl_g)
+avg_w  = w_tot > 0 ? gp_g / w_tot : 0.0
+avg_l  = l_tot > 0 ? gl_g / l_tot : 0.0
+rr_g   = avg_l > 0 ? avg_w / avg_l : 0.0
+esp_g  = f_esp(w_tot, tot, rr_g)
+
+wr_fvg  = f_wr(fvg_win, fvg_tot)
+pf_fvg  = f_pf(fvg_gp, fvg_gl)
+rr_fvg  = fvg_gl > 0 and fvg_win > 0 ? (fvg_gp/fvg_win)/(fvg_gl/math.max(fvg_tot-fvg_win,1)) : 0.0
+esp_fvg = f_esp(fvg_win, fvg_tot, rr_fvg)
+wr_bb   = f_wr(bb_win, bb_tot)
+pf_bb   = f_pf(bb_gp, bb_gl)
+rr_bb   = bb_gl > 0 and bb_win > 0 ? (bb_gp/bb_win)/(bb_gl/math.max(bb_tot-bb_win,1)) : 0.0
+esp_bb  = f_esp(bb_win, bb_tot, rr_bb)
+
+// ══════════════════════════════════════════════════════════════════
+//  📊  TABLE JOURNAL
+// ══════════════════════════════════════════════════════════════════
+var table T = table.new(position.top_right, 2, 6,
+     bgcolor=color.new(#0d1117,20), border_color=color.new(#30363d,80),
+     border_width=1, frame_color=color.new(#58a6ff,40), frame_width=2)
+
+CW  = color.white
+CY  = color.new(#f0e68c,0)
+CDK = color.new(#0d1117,0)
+CH  = color.new(#161b22,0)
+CN  = color.new(#1f2937,0)
+CG  = color.new(#1b5e20,10)
+CR  = color.new(#b71c1c,10)
+
+if barstate.islast and i_show_journal
+    // ROW 0 — Titre
+    table.cell(T,0,0,"🏅 GOLD v10 — JOURNAL", text_color=CY, bgcolor=CDK, text_size=size.small)
+    table.cell(T,1,0,"",                       bgcolor=CDK)
+
+    // ROW 1 — En-têtes
+    table.cell(T,0,1,"VARIANTE", text_color=color.new(#8b949e,0), bgcolor=CH, text_size=size.tiny)
+    table.cell(T,1,1,"TRADES",   text_color=color.new(#8b949e,0), bgcolor=CH, text_size=size.tiny)
+
+    // ROW 2 — FVG
+    table.cell(T,0,2,"🟩 FVG",           text_color=CW, bgcolor=CN, text_size=size.small)
+    table.cell(T,1,2,str.tostring(fvg_tot), text_color=CW, bgcolor=CN, text_size=size.small)
+
+    // ROW 3 — BB
+    table.cell(T,0,3,"〰️ BB (→MM20)",   text_color=CW, bgcolor=CN, text_size=size.small)
+    table.cell(T,1,3,str.tostring(bb_tot),  text_color=CW, bgcolor=CN, text_size=size.small)
+
+    // ROW 4 — GLOBAL
+    table.cell(T,0,4,"🏆 GLOBAL",        text_color=CY, bgcolor=CH, text_size=size.small)
+    table.cell(T,1,4,str.tostring(tot),    text_color=CY, bgcolor=CH, text_size=size.small)
+
+    // ROW 5 — Net Profit
+    net     = strategy.netprofit
+    net_col = net >= 0 ? CG : CR
+    table.cell(T,0,5,"💰 Net Profit",                          text_color=CW, bgcolor=net_col, text_size=size.small)
+    table.cell(T,1,5,str.tostring(math.round(net))+" $",        text_color=CW, bgcolor=net_col, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════
+//  🖥️  PANNEAU TRADE ACTIF
+// ══════════════════════════════════════════════════════════════════
+var table P = table.new(position.top_left, 2, 8,
+     bgcolor=color.new(#0d1117,15), border_color=color.new(#30363d,60),
+     border_width=1, frame_color=color.new(#58a6ff,50), frame_width=2)
+
+if barstate.islast and i_panel and i_show_panel
+    in_pos  = strategy.position_size != 0
+    is_long = strategy.position_size > 0
+    dir_txt = is_long?"📈 LONG":not in_pos?"⬜ FLAT":"📉 SHORT"
+    dir_col = is_long?color.new(#1b5e20,10):not in_pos?color.new(#1a237e,10):color.new(#b71c1c,10)
+    var_col = variant=="FVG"?color.new(#1b5e20,10):variant=="BB"?color.new(#4a148c,10):color.new(#1a237e,10)
+    be_count = math.max(strategy.closedtrades - strategy.wintrades - strategy.losstrades, 0)
+
+    CW2=color.white
+    CY2=color.new(#f0e68c,0)
+    CDK2=color.new(#0d1117,0)
+    CH2=color.new(#161b22,0)
+
+    table.cell(P,0,0,"⏱ TRADE ACTIF",                      text_color=color.new(#8b949e,0),bgcolor=CDK2,text_size=size.tiny)
+    table.cell(P,1,0,dir_txt,                               text_color=CW2,bgcolor=dir_col,text_size=size.small)
+    table.cell(P,0,1,"Setup",                               text_color=color.new(#8b949e,0),bgcolor=CH2,text_size=size.tiny)
+    table.cell(P,1,1,not na(variant)?variant:"—",           text_color=CW2,bgcolor=var_col,text_size=size.small)
+    table.cell(P,0,2,"Entrée",                              text_color=color.new(#8b949e,0),bgcolor=CH2,text_size=size.tiny)
+    table.cell(P,1,2,in_pos and not na(entry_p)?str.tostring(math.round(entry_p,2)):"—", text_color=CW2,bgcolor=CH2,text_size=size.small)
+
+    tp_c = show_tp?color.new(#1b5e20,10):color.new(#37474f,10)
+    sl_c = show_sl?color.new(#b71c1c,10):color.new(#37474f,10)
+    be_c = show_be?color.new(#1a237e,10):color.new(#37474f,10)
+
+    table.cell(P,0,3,"✅ TP wins",  text_color=show_tp?CW2:color.new(#546e7a,0),bgcolor=tp_c,text_size=size.small)
+    table.cell(P,1,3,str.tostring(strategy.wintrades)+" ✅", text_color=show_tp?CW2:color.new(#546e7a,0),bgcolor=tp_c,text_size=size.small)
+    table.cell(P,0,4,"❌ SL hits",  text_color=show_sl?CW2:color.new(#546e7a,0),bgcolor=sl_c,text_size=size.small)
+    table.cell(P,1,4,str.tostring(strategy.losstrades)+" ❌",text_color=show_sl?CW2:color.new(#546e7a,0),bgcolor=sl_c,text_size=size.small)
+    table.cell(P,0,5,"🔒 BE exits", text_color=show_be?CY2:color.new(#546e7a,0),bgcolor=be_c,text_size=size.small)
+    table.cell(P,1,5,str.tostring(be_count)+" 🔒",           text_color=show_be?CY2:color.new(#546e7a,0),bgcolor=be_c,text_size=size.small)
+    table.cell(P,0,6,"R:R",         text_color=color.new(#8b949e,0),bgcolor=CDK2,text_size=size.tiny)
+    table.cell(P,1,6,"× "+str.tostring(i_rr),                text_color=CY2,bgcolor=CDK2,text_size=size.small)
+    table.cell(P,0,7,"MM200 dist",  text_color=color.new(#8b949e,0),bgcolor=CDK2,text_size=size.tiny)
+    table.cell(P,1,7,str.tostring(math.round(dist_pct,2))+"% "+(too_far?"⚡EXT":"✓"), text_color=too_far?color.new(#ff9800,0):CW2,bgcolor=CDK2,text_size=size.tiny)

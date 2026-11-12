@@ -1,0 +1,214 @@
+//@version=6
+indicator("Weinstein Stage 2 Score v2.1 🐤", shorttitle="WS2 Score 🐤", overlay=false)
+
+// =============================================================================
+// きうそ🐤 Weinstein Stage 2 Score
+// =============================================================================
+
+string G_STAGE = "① Stage判定"
+string G_BREAK = "② ブレイクアウト"
+string G_RS    = "③ RS（相対強度）"
+string G_VOL   = "④ 出来高"
+string G_VIEW  = "⑤ 表示"
+
+// ── Stage ────────────────────────────────────────────────────────────────────
+
+string analysisTf = input.timeframe("W", "分析時間足", group=G_STAGE, tooltip="ワインシュタインの基本に合わせて週足を推奨")
+int maLen = input.int(30, "移動平均線", minval=2, group=G_STAGE)
+int slopeLookback = input.int(4, "30週線の傾き判定期間", minval=1, group=G_STAGE)
+float slopeThreshold = input.float(0.40, "傾き閾値 %", minval=0.0, step=0.05, group=G_STAGE)
+float priceBand = input.float(1.0, "30週線からの価格バンド %", minval=0.0, step=0.1, group=G_STAGE)
+
+// ── Breakout ─────────────────────────────────────────────────────────────────
+
+int breakoutLen = input.int(26, "高値ブレイク判定期間（週）", minval=5, group=G_BREAK)
+int breakoutFresh = input.int(4, "ブレイクを初動扱いする期間（週）", minval=1, maxval=12, group=G_BREAK)
+float nearHighPct = input.float(3.0, "高値接近を評価する距離 %", minval=0.5, step=0.5, group=G_BREAK)
+
+// ── RS ───────────────────────────────────────────────────────────────────────
+
+string benchmarkMode = input.string("自動", "ベンチマーク選択", options=["自動", "カスタム"], group=G_RS, tooltip="自動：JPY銘柄はTOPIX連動ETF、それ以外はSPY。米小型株はカスタムでIWMへ変更")
+string customBenchmark = input.symbol("AMEX:IWM", "カスタム比較先", group=G_RS)
+int rsLookback = input.int(13, "RS比較期間（週）", minval=2, group=G_RS)
+
+string benchmark = benchmarkMode == "自動" ? (syminfo.currency == "JPY" ? "TSE:1306" : "AMEX:SPY") : customBenchmark
+
+// ── Volume ───────────────────────────────────────────────────────────────────
+
+int volLen = input.int(20, "平均出来高期間（週）", minval=2, group=G_VOL)
+float volStrong = input.float(1.50, "強い出来高倍率", minval=1.0, step=0.05, group=G_VOL)
+
+// ── View ─────────────────────────────────────────────────────────────────────
+
+bool showStageBg = input.bool(true, "背景をStage色にする", group=G_VIEW)
+bool showPanel = input.bool(true, "現在地パネル", group=G_VIEW)
+int panelTextSize = input.int(8, "テーブル文字サイズ", minval=6, maxval=14, group=G_VIEW, tooltip="6=かなり小さい / 8=極小 / 10=小 / 14=標準")
+int hotScore = input.int(80, "🔥判定スコア", minval=50, maxval=100, group=G_VIEW)
+
+// =============================================================================
+// Weekly calculations
+// =============================================================================
+
+f_stockData() =>
+    float ma = ta.sma(close, maLen)
+    float slopePct = na(ma[slopeLookback]) ? na : (ma / ma[slopeLookback] - 1.0) * 100.0
+    float distancePct = na(ma) ? na : (close / ma - 1.0) * 100.0
+
+    bool upTrend = not na(ma) and not na(slopePct) and close > ma * (1.0 + priceBand / 100.0) and slopePct > slopeThreshold
+    bool downTrend = not na(ma) and not na(slopePct) and close < ma * (1.0 - priceBand / 100.0) and slopePct < -slopeThreshold
+
+    var int st = 1
+
+    if upTrend
+        st := 2
+    else if downTrend
+        st := 4
+    else
+        st := st == 2 or st == 3 ? 3 : 1
+
+    float priorHigh = ta.highest(high[1], breakoutLen)
+    bool breakoutNow = not na(priorHigh) and close > priorHigh
+    int barsFromBreakout = ta.barssince(breakoutNow)
+    bool recentBreakout = not na(barsFromBreakout) and barsFromBreakout <= breakoutFresh
+    bool nearHigh = not na(priorHigh) and close >= priorHigh * (1.0 - nearHighPct / 100.0)
+
+    float avgVol = ta.sma(volume, volLen)
+    float volRatio = na(avgVol) or avgVol == 0.0 ? na : volume / avgVol
+    float stockPerf = na(close[rsLookback]) ? na : (close / close[rsLookback] - 1.0) * 100.0
+
+    [st, ma, slopePct, distancePct, priorHigh, breakoutNow, recentBreakout, nearHigh, volRatio, stockPerf]
+
+// =============================================================================
+// Weekly data
+// =============================================================================
+
+[stageRaw, ma30, maSlope, maDistance, priorHigh, breakoutNow, recentBreakout, nearHigh, volRatio, stockPerf] = request.security(syminfo.tickerid, analysisTf, f_stockData(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// =============================================================================
+// Benchmark
+// =============================================================================
+
+float benchPerf = request.security(benchmark, analysisTf, na(close[rsLookback]) ? na : (close / close[rsLookback] - 1.0) * 100.0, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+int stage = int(stageRaw)
+float rsEdge = na(stockPerf) or na(benchPerf) ? na : stockPerf - benchPerf
+bool rsStrong = not na(rsEdge) and rsEdge > 0.0
+
+// =============================================================================
+// Stage2初動スコア
+//
+// Stage        最大40点
+// Breakout     最大30点
+// RS           最大20点
+// Volume       最大10点
+// =============================================================================
+
+bool stageCandidate = stage == 1 or stage == 2
+
+int stagePts = stage == 2 ? 40 : stage == 1 ? 20 : 0
+int breakoutPts = recentBreakout ? 30 : nearHigh ? 15 : 0
+int rsPts = rsStrong ? 20 : 0
+int volPts = not na(volRatio) and volRatio >= volStrong ? 10 : not na(volRatio) and volRatio >= 1.0 ? 5 : 0
+
+int rawScore = stagePts + breakoutPts + rsPts + volPts
+int score = stageCandidate ? rawScore : 0
+
+// =============================================================================
+// Colors
+// =============================================================================
+
+color C_S1 = color.rgb(245, 196, 48)
+color C_S2 = color.rgb(0, 205, 120)
+color C_S3 = color.rgb(255, 145, 35)
+color C_S4 = color.rgb(220, 65, 75)
+
+color stageColor = switch stage
+    1 => C_S1
+    2 => C_S2
+    3 => C_S3
+    => C_S4
+
+color scoreColor = score >= hotScore ? color.rgb(0, 220, 120) : score >= 60 ? color.rgb(70, 175, 255) : score >= 40 ? color.rgb(245, 196, 48) : color.rgb(150, 155, 170)
+
+// =============================================================================
+// Subchart
+// =============================================================================
+
+bgcolor(showStageBg ? color.new(stageColor, 91) : na, title="Stage Background")
+
+hline(hotScore, "🔥 HOT", color=color.new(color.lime, 35), linestyle=hline.style_dashed)
+hline(60, "WATCH", color=color.new(color.aqua, 55), linestyle=hline.style_dotted)
+hline(40, "SETUP", color=color.new(color.yellow, 65), linestyle=hline.style_dotted)
+
+plot(score, "Stage2初動スコア", color=scoreColor, linewidth=4, style=plot.style_histogram, histbase=0)
+
+// =============================================================================
+// Signals
+// =============================================================================
+
+bool stage2Entry = stage == 2 and stage[1] != 2
+bool hotEntry = score >= hotScore and score[1] < hotScore
+
+plot(stage2Entry ? score : na, "Stage2 Entry 🔥", color=color.white, linewidth=4, style=plot.style_circles)
+plot(hotEntry ? score : na, "Score HOT 🔥", color=color.fuchsia, linewidth=5, style=plot.style_circles)
+
+// =============================================================================
+// Data Window
+// =============================================================================
+
+plot(stage, "Stage 1-4", display=display.data_window)
+plot(ma30, "30週移動平均線", display=display.data_window)
+plot(maSlope, "30週線 傾き%", display=display.data_window)
+plot(maDistance, "30週線 乖離%", display=display.data_window)
+plot(rsEdge, "RS ベンチマーク超過%", display=display.data_window)
+plot(volRatio, "出来高倍率", display=display.data_window)
+plot(priorHigh, "ブレイク基準高値", display=display.data_window)
+
+// =============================================================================
+// Dashboard
+// =============================================================================
+
+string stageName = switch stage
+    1 => "① 底固め"
+    2 => "② 上昇🔥"
+    3 => "③ 天井"
+    => "④ 下降"
+
+string breakoutText = recentBreakout ? "🔥 初動" : nearHigh ? "👀 高値接近" : "—"
+
+string rsText = rsStrong ? "強い +" + str.tostring(rsEdge, "#.##") + "%" : "弱い " + str.tostring(rsEdge, "#.##") + "%"
+
+string volText = na(volRatio) ? "N/A" : str.tostring(volRatio, "#.##") + "倍 +" + str.tostring(volPts) + "点"
+
+string scoreText = str.tostring(score) + "/100" + (score >= hotScore ? " 🔥" : "")
+
+var table panel = table.new(position.top_right, 2, 5, border_width=1)
+
+if barstate.islast
+    if showPanel
+        table.cell(panel, 0, 0, "STAGE", text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(28, 32, 42))
+        table.cell(panel, 1, 0, stageName, text_color=color.white, text_size=panelTextSize, bgcolor=stageColor)
+
+        table.cell(panel, 0, 1, "SCORE", text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(28, 32, 42))
+        table.cell(panel, 1, 1, scoreText, text_color=color.white, text_size=panelTextSize, bgcolor=scoreColor)
+
+        table.cell(panel, 0, 2, "BREAK", text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(28, 32, 42))
+        table.cell(panel, 1, 2, breakoutText, text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(45, 50, 64))
+
+        table.cell(panel, 0, 3, "RS", text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(28, 32, 42))
+        table.cell(panel, 1, 3, rsText, text_color=color.white, text_size=panelTextSize, bgcolor=rsStrong ? color.rgb(0, 145, 95) : color.rgb(75, 80, 95))
+
+        table.cell(panel, 0, 4, "出来高", text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(28, 32, 42))
+        table.cell(panel, 1, 4, volText, text_color=color.white, text_size=panelTextSize, bgcolor=color.rgb(45, 50, 64))
+    else
+        table.clear(panel, 0, 0, 1, 4)
+
+// =============================================================================
+// Alerts
+// =============================================================================
+
+alertcondition(stage2Entry, "🔥 Stage 2 Entry", "{{ticker}} がWeinstein Stage 2に入りました")
+
+alertcondition(hotEntry, "🔥 Stage2 Score HOT", "{{ticker}} のStage2初動スコアがHOT水準に入りました")
+
+alertcondition(recentBreakout and not recentBreakout[1], "🚀 Breakout", "{{ticker}} が高値をブレイクしました")

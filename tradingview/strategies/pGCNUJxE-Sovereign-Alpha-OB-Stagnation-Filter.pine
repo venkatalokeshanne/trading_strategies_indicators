@@ -1,0 +1,422 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © LuxAlgo & Sovereign Alpha Integration
+
+//@version=6
+strategy("Sovereign Alpha - OB Stagnation Filter", overlay = true, initial_capital=50000, margin_long=1, margin_short=1, calc_on_every_tick=true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Constants
+//---------------------------------------------------------------------------------------------------------------------{
+color BULL_COLOR      = #089981
+color BEAR_COLOR      = #f23645
+color HPZ_BULL        = #1de9b6
+color HPZ_BEAR        = #ff5252
+color NEUTRAL_COLOR   = color.gray
+
+// Table Constants
+DATA                  = #DBDBDB
+HEADERS                 = #808080
+BACKGROUND              = #161616
+BORDERS                 = #2E2E2E
+
+TOP_RIGHT               = 'Top Right'
+BOTTOM_RIGHT            = 'Bottom Right'
+BOTTOM_LEFT             = 'Bottom Left'
+
+TINY                    = 'Tiny'
+SMALL                   = 'Small'
+NORMAL                  = 'Normal'
+LARGE                   = 'Large'
+HUGE                    = 'Huge'
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Inputs
+//---------------------------------------------------------------------------------------------------------------------{
+RISK_GROUP              = "Risk Management & Automation"
+MACRO_GROUP             = "Macro HTF Regime Filter"
+DASHBOARD_GROUP         = "Dashboard"
+MS_GROUP                = "Market Structure"
+VISUALS_GROUP           = "Visuals"
+OB_GROUP                = "Order Blocks"
+SESSIONS_GROUP          = "Sessions"
+
+// Automation & Risk
+sizing_mode     = input.string("Fixed Micros", "Position Sizing Mode", options=["Geometric (%)", "Fixed Micros"], group=RISK_GROUP)
+risk_pct        = input.float(1.0, "Risk Per Trade (%)", group=RISK_GROUP, step=0.1)
+fixed_qty       = input.int(4, "Fixed Contracts (Micros)", group=RISK_GROUP)
+max_geo_qty     = input.int(20, "Max Contracts (Liquidity Ceiling)", group=RISK_GROUP)
+tp_pts          = input.float(100.0, "Target Profit (Points)", group=RISK_GROUP)
+stop_pts        = input.float(30.0, "Hard Stop (Points)", group=RISK_GROUP)
+be_pts          = input.float(15.0, "Break-Even Trigger (Points)", group=RISK_GROUP)
+webhook_secret  = input.string("MY_SECRET_TOKEN", "Webhook Secret", group=RISK_GROUP, tooltip="Must match SECRET in your server.js")
+
+// Stagnation & Secondary Strike
+use_stagnation  = input.bool(true, "Enable Stagnation Exit (Time Stop)", group=RISK_GROUP, tooltip="Cuts trade if price lingers inside the OB for too long.")
+linger_bars     = input.int(10, "Max Linger Bars inside OB", group=RISK_GROUP)
+
+// Macro HTF Regime Filter
+use_macro       = input.bool(true, "Enable Macro HTF Filter", group=MACRO_GROUP)
+req_monthly     = input.bool(false, "Require Monthly Alignment", group=MACRO_GROUP)
+req_weekly      = input.bool(true, "Require Weekly Alignment", group=MACRO_GROUP)
+req_daily       = input.bool(true, "Require Daily Alignment", group=MACRO_GROUP)
+
+// Dashboard Inputs
+showStatsInput          = input.bool(true, 'Show Advanced Analytics', group = DASHBOARD_GROUP)
+dashboardPositionInput  = input.string(TOP_RIGHT, 'Position', group = DASHBOARD_GROUP, options = [TOP_RIGHT,BOTTOM_RIGHT,BOTTOM_LEFT])
+dashboardSizeInput      = input.string(SMALL, 'Size', group = DASHBOARD_GROUP, options = [TINY,SMALL,NORMAL,LARGE,HUGE])
+
+// Market Structure
+pivotLenInput           = input.int(7, "Pivot Lookback", minval = 1, group = MS_GROUP)
+msbZScoreInput          = input.float(0.5, "MSB Momentum Z-Score", minval = 0.1, step = 0.1, group = MS_GROUP)
+
+// Visuals
+modeInput               = input.string("Historical", "Display Mode", options = ["Historical", "Present"], group = VISUALS_GROUP)
+
+// Order Blocks
+obCountInput            = input.int(10, "Max Active OBs", minval = 1, maxval = 100, group = OB_GROUP)
+extendBrokenInput       = input.bool(false, "Extend Broken OBs", group = OB_GROUP)
+hideOverlapsInput       = input.bool(false, "Hide Overlapping OBs", group = OB_GROUP)
+
+// Sessions
+showSessionsInput       = input.bool(true, "Show Session Ranges", group = SESSIONS_GROUP)
+showLondonInput         = input.bool(false, "London Session", group = SESSIONS_GROUP)
+londonSessInput         = input.session("0800-1700:1234567", "London Time", group = SESSIONS_GROUP)
+londonColInput          = input.color(#3b82f6, "London Color", group = SESSIONS_GROUP, inline = "London")
+showNYInput             = input.bool(false, "New York Session", group = SESSIONS_GROUP)
+nySessInput             = input.session("1300-2200:1234567", "New York Time", group = SESSIONS_GROUP)
+nyColInput              = input.color(#f97316, "New York Color", group = SESSIONS_GROUP, inline = "NY")
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Types & Collections
+//---------------------------------------------------------------------------------------------------------------------{
+type OrderBlock
+    box        boxId
+    label      labelId
+    line       pocLineId
+    float      qualityScore
+    float      top
+    float      bottom
+    bool       isBull
+    bool       isHPZ = false
+    bool       mitigated = false
+    int        mitigationBar = 0
+    bool       trade_taken = false
+
+var obArray = array.new<OrderBlock>()
+
+//---------------------------------------------------------------------------------------------------------------------}
+// User-Defined Functions
+//---------------------------------------------------------------------------------------------------------------------{
+var parsedDashboardPosition = switch dashboardPositionInput
+    TOP_RIGHT       => position.top_right
+    BOTTOM_RIGHT    => position.bottom_right
+    BOTTOM_LEFT     => position.bottom_left
+
+var parsedDashboardSize     = switch dashboardSizeInput
+    TINY            => size.tiny
+    SMALL           => size.small
+    NORMAL          => size.normal
+
+cell(table t_able, int column, int row, string data, color = #FFFFFF, align = text.align_right, color background = na, float height = 0) =>
+    t_able.cell(column,row,data,text_color = color, text_size = parsedDashboardSize, text_halign = align, bgcolor = background, height = height)
+
+divider(table t_able, int row, int lastColumn) =>
+    string rowDivider = '━━━━━━━━━━━━━━'
+    t_able.merge_cells(0,row,lastColumn,row)
+    cell(t_able,0,row,rowDivider,align = text.align_center, height = 0.5, color = BORDERS)
+
+drawSession(bool show, string sessStr, color col, string name) =>
+    var box   sBox   = na
+    var label sLabel = na
+    var float sHigh  = na
+    var float sLow   = na
+
+    inSession = not na(time(timeframe.period, sessStr))
+    isStart   = inSession and not inSession[1]
+
+    if show and inSession
+        if isStart
+            sHigh  := high
+            sLow   := low
+            sBox   := box.new(bar_index, sHigh, bar_index, sLow, border_color = col, border_style = line.style_dotted, bgcolor = color.new(col, 92))
+            sLabel := label.new(bar_index, sHigh, name, style = label.style_none, textcolor = col, size = size.small, textalign = text.align_center)
+        else
+            sHigh := math.max(sHigh, high)
+            sLow  := math.min(sLow, low)
+            sBox.set_top(sHigh)
+            sBox.set_bottom(sLow)
+            sBox.set_right(bar_index)
+            sLabel.set_xy(math.round(math.avg(sBox.get_left(), bar_index)), sHigh)
+    float(na)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// Core Calculations
+//---------------------------------------------------------------------------------------------------------------------{
+float priceChange = ta.change(close)
+float avgChange   = ta.sma(priceChange, 50)
+float stdChange   = ta.stdev(priceChange, 50)
+float momentumZ   = (priceChange - avgChange) / stdChange
+float volPercent  = ta.percentrank(volume, 100)
+
+float ph = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+float pl = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+
+var float lastPh = na
+var float lastPl = na
+var int lastPhIdx = na
+var int lastPlIdx = na
+
+if not na(ph)
+    lastPh := ph
+    lastPhIdx := bar_index - pivotLenInput
+if not na(pl)
+    lastPl := pl
+    lastPlIdx := bar_index - pivotLenInput
+
+if showSessionsInput
+    drawSession(showLondonInput, londonSessInput, londonColInput, "London")
+    drawSession(showNYInput,     nySessInput,     nyColInput,     "New York")
+
+bool isMSBBull = close > lastPh and close[1] <= lastPh and momentumZ > msbZScoreInput
+bool isMSBBear = close < lastPl and close[1] >= lastPl and momentumZ < -msbZScoreInput
+
+if isMSBBull
+    int mid = math.round(math.avg(lastPhIdx, bar_index))
+    line.new(lastPhIdx, lastPh, bar_index, lastPh, color = color.new(BULL_COLOR, 0), width = 1)
+
+if isMSBBear
+    int mid = math.round(math.avg(lastPlIdx, bar_index))
+    line.new(lastPlIdx, lastPl, bar_index, lastPl, color = color.new(BEAR_COLOR, 0), width = 1)
+
+if isMSBBull or isMSBBear
+    int obIdx = 0
+    for i = 1 to 10
+        if (isMSBBull and close[i] < open[i]) or (isMSBBear and close[i] > open[i])
+            obIdx := i
+            break
+
+    float obTop    = high[obIdx]
+    float obBottom = low[obIdx]
+    float obPOC    = math.avg(obTop, obBottom)
+
+    float score = math.min(100, (math.abs(momentumZ) * 20) + (volPercent * 0.5))
+    bool isHPZ = score > 80
+
+    color baseColor = isMSBBull ? BULL_COLOR : BEAR_COLOR
+    color hpzColor  = isMSBBull ? HPZ_BULL   : HPZ_BEAR
+
+    box   obBox = na
+    label obLabel = na
+    line  obPoc = na
+
+    bool overlapping = false
+    if hideOverlapsInput and obArray.size() > 0
+        for i = 0 to obArray.size() - 1
+            OrderBlock o = obArray.get(i)
+            if not o.mitigated and ((obTop <= o.top and obTop >= o.bottom) or (obBottom <= o.top and obBottom >= o.bottom))
+                overlapping := true
+                break
+
+    if not overlapping
+        if isHPZ
+            obBox := box.new(bar_index[obIdx], obTop, bar_index + 15, obBottom, border_color = color.new(hpzColor, 40), bgcolor = color.new(hpzColor, 80), border_width = 1, border_style = line.style_dashed)
+        else
+            obBox := box.new(bar_index[obIdx], obTop, bar_index + 15, obBottom, border_color = color.new(baseColor, 60), bgcolor = color.new(baseColor, 85), border_style = line.style_dashed, border_width = 1)
+
+        OrderBlock newOB = OrderBlock.new(obBox, obLabel, obPoc, score, obTop, obBottom, isMSBBull, isHPZ, false, 0, false)
+        obArray.push(newOB)
+
+    if isMSBBull
+        lastPh := na
+    else
+        lastPl := na
+
+var float totalMitigated = 0.0
+var float totalObs = 0.0
+
+if (isMSBBull or isMSBBear)
+    totalObs += 1
+
+if obArray.size() > 0
+    int mitCount = 0
+    for i = obArray.size() - 1 to 0
+        OrderBlock ob = obArray.get(i)
+        if not ob.mitigated
+            ob.boxId.set_right(bar_index + 15)
+
+            bool isMitigated = ob.isBull ? low < ob.bottom : high > ob.top
+            if isMitigated
+                ob.mitigated := true
+                ob.mitigationBar := bar_index
+                totalMitigated += 1
+                if modeInput == "Present"
+                    ob.boxId.delete()
+                else
+                    ob.boxId.set_bgcolor(color.new(NEUTRAL_COLOR, 90))
+                    ob.boxId.set_border_color(color.new(NEUTRAL_COLOR, 70))
+                    ob.boxId.set_right(bar_index)
+        else
+            mitCount += 1
+            bool shouldExtend = extendBrokenInput and mitCount <= 2 and (bar_index - ob.mitigationBar <= 50)
+
+            if modeInput == "Present"
+                ob.boxId.delete()
+            else if shouldExtend
+                ob.boxId.set_right(bar_index + 15)
+            else
+                ob.boxId.set_right(ob.mitigationBar)
+
+    if obArray.size() > obCountInput
+        OrderBlock oldOB = obArray.shift()
+        oldOB.boxId.delete()
+
+// ==========================================
+// THE MACRO HTF REGIME GATE
+// ==========================================
+m_c = request.security(syminfo.tickerid, "M", close)
+m_ema = request.security(syminfo.tickerid, "M", ta.ema(close, 10))
+w_c = request.security(syminfo.tickerid, "W", close)
+w_ema = request.security(syminfo.tickerid, "W", ta.ema(close, 20))
+d_c = request.security(syminfo.tickerid, "D", close)
+d_ema = request.security(syminfo.tickerid, "D", ta.ema(close, 50))
+
+bull_m = m_c > m_ema
+bear_m = m_c < m_ema
+bull_w = w_c > w_ema
+bear_w = w_c < w_ema
+bull_d = d_c > d_ema
+bear_d = d_c < d_ema
+
+macro_long_ok  = not use_macro or ((not req_monthly or bull_m) and (not req_weekly or bull_w) and (not req_daily or bull_d))
+macro_short_ok = not use_macro or ((not req_monthly or bear_m) and (not req_weekly or bear_w) and (not req_daily or bear_d))
+
+bgcolor(use_macro and macro_long_ok and not macro_short_ok ? color.new(color.green, 97) : na, title="Macro Bull")
+bgcolor(use_macro and macro_short_ok and not macro_long_ok ? color.new(color.red, 97) : na, title="Macro Bear")
+
+// ==========================================
+// WEBHOOK JSON MESSAGES
+// ==========================================
+enter_long_json  = '{"secret":"' + webhook_secret + '","action":"buy","symbol":"MNQ","qty":{{strategy.order.contracts}}}'
+enter_short_json = '{"secret":"' + webhook_secret + '","action":"sell","symbol":"MNQ","qty":{{strategy.order.contracts}}}'
+exit_long_json   = '{"secret":"' + webhook_secret + '","action":"close","symbol":"MNQ","position":"long"}'
+exit_short_json  = '{"secret":"' + webhook_secret + '","action":"close","symbol":"MNQ","position":"short"}'
+
+// ==========================================
+// STAGNATION & SECONDARY STRIKE ENGINE
+// ==========================================
+var bool enter_long = false
+var bool enter_short = false
+var float pending_top = na
+var float pending_bot = na
+
+enter_long := false
+enter_short := false
+
+// Scan for primary entries only if flat
+if strategy.position_size == 0
+    if obArray.size() > 0
+        for i = 0 to obArray.size() - 1
+            OrderBlock currentOB = obArray.get(i)
+
+            if currentOB.isBull and not currentOB.mitigated and not currentOB.trade_taken and macro_long_ok
+                if low <= currentOB.top and close > currentOB.bottom
+                    enter_long := true
+                    pending_top := currentOB.top
+                    pending_bot := currentOB.bottom
+                    currentOB.trade_taken := true
+                    break
+
+            if not currentOB.isBull and not currentOB.mitigated and not currentOB.trade_taken and macro_short_ok
+                if high >= currentOB.bottom and close < currentOB.top
+                    enter_short := true
+                    pending_top := currentOB.top
+                    pending_bot := currentOB.bottom
+                    currentOB.trade_taken := true
+                    break
+
+// Size Matrix
+usd_risk_per_contract = stop_pts * syminfo.pointvalue
+allowed_risk_usd = strategy.equity * (risk_pct / 100.0)
+raw_geo_qty = math.max(1, math.floor(allowed_risk_usd / usd_risk_per_contract))
+capped_geo_qty = math.min(raw_geo_qty, max_geo_qty)
+dynamic_qty = sizing_mode == "Geometric (%)" ? capped_geo_qty : fixed_qty
+
+// Memory State for Stagnation tracking
+var float track_ob_top = na
+var float track_ob_bot = na
+var int entry_bar = 0
+var int waiting_reentry_dir = 0 // 1 for Long, -1 for Short
+
+// Primary Execution
+if enter_long and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=dynamic_qty, comment="L-OB", alert_message=enter_long_json)
+    track_ob_top := pending_top
+    track_ob_bot := pending_bot
+    entry_bar := bar_index
+    waiting_reentry_dir := 0
+
+if enter_short and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=dynamic_qty, comment="S-OB", alert_message=enter_short_json)
+    track_ob_top := pending_top
+    track_ob_bot := pending_bot
+    entry_bar := bar_index
+    waiting_reentry_dir := 0
+
+// The Stagnation Guillotine (Time Stop)
+if use_stagnation
+    if strategy.position_size > 0 and (bar_index - entry_bar) >= linger_bars
+        if close <= track_ob_top and close >= track_ob_bot
+            strategy.close("Long", comment="L-Cut", alert_message=exit_long_json)
+            waiting_reentry_dir := 1
+
+    if strategy.position_size < 0 and (bar_index - entry_bar) >= linger_bars
+        if close <= track_ob_top and close >= track_ob_bot
+            strategy.close("Short", comment="S-Cut", alert_message=exit_short_json)
+            waiting_reentry_dir := -1
+
+// Invalidate Secondary Strike if OB is broken on the wrong side
+if waiting_reentry_dir == 1 and close < track_ob_bot
+    waiting_reentry_dir := 0 // Bull OB failed
+if waiting_reentry_dir == -1 and close > track_ob_top
+    waiting_reentry_dir := 0 // Bear OB failed
+
+// Secondary Strike Execution (Re-entry on Breakout)
+bool reentry_long = (waiting_reentry_dir == 1) and (close > track_ob_top)
+bool reentry_short = (waiting_reentry_dir == -1) and (close < track_ob_bot)
+
+if reentry_long and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=dynamic_qty, comment="RE-L", alert_message=enter_long_json)
+    entry_bar := bar_index
+    waiting_reentry_dir := 0
+
+if reentry_short and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=dynamic_qty, comment="RE-S", alert_message=enter_short_json)
+    entry_bar := bar_index
+    waiting_reentry_dir := 0
+
+// Dynamic ATR Trail & Exit Engine
+var float dynamic_stop = na
+atr = ta.atr(14)
+
+if strategy.position_size == 0
+    dynamic_stop := na
+
+if strategy.position_size > 0
+    entry_p = strategy.position_avg_price
+    trail_price = close - (atr * 2.5)
+    if close >= entry_p + be_pts
+        dynamic_stop := na(dynamic_stop) ? entry_p : math.max(dynamic_stop, trail_price)
+
+    hard_stop_price = entry_p - stop_pts
+    active_stop = na(dynamic_stop) ? hard_stop_price : math.max(hard_stop_price, dynamic_stop)
+    strategy.exit("Exit_L", "Long", limit=entry_p + tp_pts, stop=active_stop, alert_message=exit_long_json)
+
+if strategy.position_size < 0
+    entry_p = strategy.position_avg_price
+    trail_price = close + (atr * 2.5)
+    if close <= entry_p - be_pts
+        dynamic_stop := na(dynamic_stop) ? entry_p : math.min(dynamic_stop, trail_price)
+
+    hard_stop_price = entry_p + stop_pts
+    active_stop = na(dynamic_stop) ? hard_stop_price : math.min(hard_stop_price, dynamic_stop)
+    strategy.exit("Exit_S", "Short", limit=entry_p - tp_pts, stop=active_stop, alert_message=exit_short_json)

@@ -1,0 +1,176 @@
+//@version=6
+strategy("AVS VWAP EMA Pullback Pro", shorttitle="malai VWAP PRO", overlay=true, pyramiding=0, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.05, process_orders_on_close=true)
+
+// Inputs
+emaFastLen      = input.int(20, "Fast EMA", minval=1)
+emaSlowLen      = input.int(50, "Slow EMA", minval=1)
+rsiLen          = input.int(14, "RSI Length", minval=2)
+atrLen          = input.int(14, "ATR Length", minval=2)
+dmiLen          = input.int(14, "DMI Length", minval=2)
+adxSmooth       = input.int(14, "ADX Smoothing", minval=2)
+adxMin          = input.float(18, "Minimum ADX", step=0.5)
+pullbackPct     = input.float(0.25, "VWAP Pullback %", step=0.05)
+rsiBullLevel    = input.float(52, "RSI Long Level", step=0.5)
+rsiBearLevel    = input.float(48, "RSI Short Level", step=0.5)
+slAtrMult       = input.float(1.2, "SL ATR Multiplier", step=0.1)
+tp1RR           = input.float(1.0, "TP1 RR", step=0.1)
+tp2RR           = input.float(2.0, "TP2 RR", step=0.1)
+tradeSession    = input.session("0700-2000", "Trading Session")
+showTable       = input.bool(true, "Show Signal Table")
+
+// Helpers
+f_price(v) =>
+    na(v) ? "-" : str.tostring(v, format.mintick)
+
+f_rr(entry, sl, tp, isLong) =>
+    risk = isLong ? (entry - sl) : (sl - entry)
+    reward = isLong ? (tp - entry) : (entry - tp)
+    risk > 0 and reward > 0 ? str.tostring(reward / risk, "#.##") : "-"
+
+// Session logic
+inSession = not na(time(timeframe.period, tradeSession))
+
+// Core indicators
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+vwapVal = ta.vwap(hlc3)
+
+// DMI / ADX
+[plusDI, minusDI, adxVal] = ta.dmi(dmiLen, adxSmooth)
+
+// Trend conditions
+bullTrend = close > vwapVal and emaFast > emaSlow and plusDI > minusDI
+bearTrend = close < vwapVal and emaFast < emaSlow and minusDI > plusDI
+trendOk   = adxVal >= adxMin
+
+// Pullback logic
+pullLong  = bullTrend and low <= vwapVal * (1 + pullbackPct / 100)
+pullShort = bearTrend and high >= vwapVal * (1 - pullbackPct / 100)
+
+reclaimLong = close > vwapVal and close > emaFast
+rejectShort = close < vwapVal and close < emaFast
+
+rsiLongOk  = rsi > rsiBullLevel
+rsiShortOk = rsi < rsiBearLevel
+
+longSignal  = inSession and trendOk and pullLong and reclaimLong and rsiLongOk
+shortSignal = inSession and trendOk and pullShort and rejectShort and rsiShortOk
+
+enterLong  = longSignal and not shortSignal
+enterShort = shortSignal and not longSignal
+
+float longSL   = na
+float longTP1  = na
+float longTP2  = na
+float shortSL  = na
+float shortTP1 = na
+float shortTP2 = na
+
+if enterLong
+    longSL := math.min(vwapVal, emaSlow) - atr * slAtrMult
+    longRisk = close - longSL
+    if longRisk > 0
+        longTP1 := close + longRisk * tp1RR
+        longTP2 := close + longRisk * tp2RR
+
+if enterShort
+    shortSL := math.max(vwapVal, emaSlow) + atr * slAtrMult
+    shortRisk = shortSL - close
+    if shortRisk > 0
+        shortTP1 := close - shortRisk * tp1RR
+        shortTP2 := close - shortRisk * tp2RR
+
+if enterLong and strategy.position_size <= 0 and not na(longSL) and not na(longTP1) and not na(longTP2)
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP1", from_entry="Long", stop=longSL, limit=longTP1, qty_percent=50)
+    strategy.exit("Long TP2", from_entry="Long", stop=longSL, limit=longTP2, qty_percent=50)
+
+if enterShort and strategy.position_size >= 0 and not na(shortSL) and not na(shortTP1) and not na(shortTP2)
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP1", from_entry="Short", stop=shortSL, limit=shortTP1, qty_percent=50)
+    strategy.exit("Short TP2", from_entry="Short", stop=shortSL, limit=shortTP2, qty_percent=50)
+
+// Display (current bar)
+setupText = enterLong ? "LONG" : enterShort ? "SHORT" : bullTrend and trendOk ? "BULL WAIT" : bearTrend and trendOk ? "BEAR WAIT" : "NO TRADE"
+setupBg   = enterLong ? color.new(color.green, 0) : enterShort ? color.new(color.red, 0) : color.new(color.gray, 20)
+
+entry = enterLong or enterShort ? close : na
+sl    = enterLong ? longSL : enterShort ? shortSL : na
+tp1   = enterLong ? longTP1 : enterShort ? shortTP1 : na
+tp2   = enterLong ? longTP2 : enterShort ? shortTP2 : na
+rr1   = enterLong ? f_rr(close, longSL, longTP1, true) : enterShort ? f_rr(close, shortSL, shortTP1, false) : "-"
+rr2   = enterLong ? f_rr(close, longSL, longTP2, true) : enterShort ? f_rr(close, shortSL, shortTP2, false) : "-"
+
+trendText   = bullTrend ? "Above VWAP + EMA Bull" : bearTrend ? "Below VWAP + EMA Bear" : "Mixed"
+sessionText = inSession ? "ON" : "OFF"
+adxText     = str.tostring(adxVal, "#.0")
+
+// Persistent last-signal state
+var string lastSetupText = "NO SIGNAL"
+var color  lastSetupBg   = color.new(color.gray, 20)
+var float  lastEntry     = na
+var float  lastSL        = na
+var float  lastTP1       = na
+var float  lastTP2       = na
+var string lastRR1       = "-"
+var string lastRR2       = "-"
+
+// Update last signal when a new long/short fires
+if enterLong or enterShort
+    lastSetupText := setupText
+    lastSetupBg   := setupBg
+    lastEntry     := entry
+    lastSL        := sl
+    lastTP1       := tp1
+    lastTP2       := tp2
+    lastRR1       := rr1
+    lastRR2       := rr2
+
+// Table bottom-left, always showing last signal data
+var table sigTable = na
+if showTable and na(sigTable)
+    sigTable := table.new(position.bottom_left, 2, 12, bgcolor=color.new(color.black, 75),
+        frame_color=color.new(color.white, 70), frame_width=1, border_color=color.new(color.white, 85), border_width=1)
+
+if showTable
+    table.cell(sigTable, 0, 0, "AVS VWAP PRO", text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)
+    table.cell(sigTable, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=color.new(color.blue, 70), text_size=size.small)
+
+    table.cell(sigTable, 0, 1, "Trend", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 1, trendText, text_color=color.white,
+        bgcolor=bullTrend ? color.new(color.green, 0) : bearTrend ? color.new(color.red, 0) : color.new(color.gray, 20), text_size=size.small)
+
+    table.cell(sigTable, 0, 2, "Session", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 2, sessionText, text_color=color.white,
+        bgcolor=inSession ? color.new(color.green, 0) : color.new(color.red, 20), text_size=size.small)
+
+    table.cell(sigTable, 0, 3, "ADX", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 3, adxText, text_color=color.white,
+        bgcolor=trendOk ? color.new(color.green, 0) : color.new(color.orange, 20), text_size=size.small)
+
+    table.cell(sigTable, 0, 4, "Last Signal", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 4, lastSetupText, text_color=color.white, bgcolor=lastSetupBg, text_size=size.small)
+
+    table.cell(sigTable, 0, 5, "RSI / VWAP", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 5, str.tostring(rsi, "#.0") + " / " + f_price(vwapVal), text_color=color.white,
+        bgcolor=color.new(color.silver, 70), text_size=size.small)
+
+    table.cell(sigTable, 0, 6, "Entry", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 6, f_price(lastEntry), text_color=color.white, bgcolor=color.new(color.silver, 70), text_size=size.small)
+
+    table.cell(sigTable, 0, 7, "Stop Loss", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 7, f_price(lastSL), text_color=color.white, bgcolor=color.new(color.red, 70), text_size=size.small)
+
+    table.cell(sigTable, 0, 8, "TP1", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 8, f_price(lastTP1), text_color=color.white, bgcolor=color.new(color.green, 70), text_size=size.small)
+
+    table.cell(sigTable, 0, 9, "TP2", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 9, f_price(lastTP2), text_color=color.white, bgcolor=color.new(color.green, 82), text_size=size.small)
+
+    table.cell(sigTable, 0, 10, "RR TP1", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 10, lastRR1, text_color=color.white, bgcolor=color.new(color.teal, 65), text_size=size.small)
+
+    table.cell(sigTable, 0, 11, "RR TP2", text_color=color.white, bgcolor=color.new(color.gray, 75), text_size=size.small)
+    table.cell(sigTable, 1, 11, lastRR2, text_color=color.white, bgcolor=color.new(color.teal, 80), text_size=size.small)

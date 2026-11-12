@@ -1,0 +1,552 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Uncle_the_shooter
+
+//@version=6
+indicator("Flow Momentum Composite", shorttitle="FMC", overlay=false, precision=2)
+
+// SECTION 1 — INPUTS
+// Momentum Core
+groupCore   = "Momentum Core"
+srcCore     = input.source(close, "Source", group = groupCore, tooltip = "Price series used to calculate the Momentum Core and the Balance Line.")
+lenCore     = input.int(14, "Length", minval = 2, group = groupCore, tooltip = "Number of bars used to measure price change relative to ATR.")
+smoothCore  = input.int(5, "Smoothing", minval = 1, group = groupCore, tooltip = "Number of smoothing periods applied to the Momentum Core using the method selected in 'MA Method'. Higher values give a smoother line, lower values react faster.")
+maMethod    = input.string("EMA", "MA Method", options = ["EMA", "SMA", "RMA"], group = groupCore, tooltip = "Averaging method used across all modules of the indicator (Core, Balance, Flow).")
+scaleCore   = input.float(7.0, "Scaling Sensitivity", minval = 1.0, group = groupCore, tooltip = "The higher the value, the faster the core reaches the 0/100 extremes at the same volatility.")
+
+// Balance Line
+groupBal    = "Balance Line"
+lenBal      = input.int(14, "Length", minval = 2, group = groupBal, tooltip = "Calculation period of the Balance Line. Works on the same principle as the Momentum Core, typically with longer smoothing, allowing both lines to diverge during trends.")
+smoothBal   = input.int(7, "Smoothing", minval = 1, group = groupBal, tooltip = "Higher smoothing = slower reaction = greater distance from the Momentum Core during trends.")
+
+// Flow Pressure
+groupFlow   = "Flow Pressure"
+lenFlow     = input.int(25, "Length", minval = 2, group = groupFlow, tooltip = "Number of bars summed when calculating Flow Pressure.")
+smoothFlow  = input.int(10, "Smoothing", minval = 1, group = groupFlow, tooltip = "Smoothing of the Flow Pressure line using the method selected in 'MA Method' (Momentum Core section).")
+forceCandle = input.bool(false, "Force candle mode instead of volume", group = groupFlow, tooltip = "When enabled, pressure is always calculated from the candle range, even if the instrument has real volume data.")
+flowHeightScale   = input.float(0.5, "Flow Wave Height Scale", minval = 0.05, step = 0.05, group = groupFlow, tooltip = "Controls the height of the flow wave bulge above the OB line (bull) or below the OS line (bear).")
+flowExtremeLevel  = input.float(15.0, "Flow Extreme Threshold (raw points)", minval = 1.0, group = groupFlow, tooltip = "Above this value (before rescaling) the flow wave switches to a darker shade, signaling extreme pressure.")
+
+// KNN Bias
+groupKnn    = "KNN Bias"
+knnOn       = true
+knnK        = input.int(5, "Number of Neighbors (K)", minval = 3, maxval = 15, group = groupKnn, tooltip = "Number of nearest historical observations considered in the KNN vote.")
+knnWindow   = input.int(400, "Memory (bars)", minval = 30, maxval = 600, group = groupKnn, tooltip = "Maximum number of stored historical observations used by the KNN classifier.")
+
+// Structure / Trend
+groupTrend  = "Structure / Trend"
+trendLen    = input.int(50, "Trend Base Length", minval = 10, group = groupTrend, tooltip = "Period of the EMA and ATR used to define the structure/trend band.")
+trendMult   = input.float(1.5, "Band Multiplier (ATR)", minval = 0.5, step = 0.1, group = groupTrend, tooltip = "ATR multiplier defining the width of the structure band. Higher values mean less frequent trend direction changes.")
+barPaint    = input.bool(false, "Color bars by structure trend", group = groupTrend, tooltip = "Colors the price chart candles according to the direction of the Structure/Trend module.")
+
+// Composite Score
+groupScore  = "Composite Score"
+showScore   = input.bool(true, "Show Score Signals", group = groupScore, tooltip = "Enables the display of Buy/Sell signals derived from the Composite Score.")
+wMom        = input.float(20.0, "Momentum Weight", minval = 0.0, group = groupScore, tooltip = "Contribution of the Momentum Core to the Composite Score calculation. Counts only when Core is on the same side (bull/bear) as the current candle AND moving further that way. Maximum possible contribution from this module equals this weight.")
+wFlow       = input.float(20.0, "Flow Weight", minval = 0.0, group = groupScore, tooltip = "Contribution of Flow Pressure to the Composite Score calculation. Counts only when Flow Pressure's side (above/below 50) matches the current candle's color. Maximum possible contribution from this module equals this weight.")
+wTrend      = input.float(20.0, "Structure Weight", minval = 0.0, group = groupScore, tooltip = "Contribution of the Structure/Trend module to the Composite Score calculation. Counts only when the trend direction matches the current candle's color. Maximum possible contribution from this module equals this weight.")
+wKnn        = input.float(20.0, "KNN Weight", minval = 0.0, group = groupScore, tooltip = "Contribution of KNN Bias to the Composite Score calculation. Counts only when KNN's vote (above 60% / below 40%) matches the current candle's color. Maximum possible contribution from this module equals this weight.")
+wWave       = input.float(20.0, "Tension Waves Weight", minval = 0.0, group = groupScore, tooltip = "Contribution of the Tension Waves module to the Composite Score calculation. Counts only when the current Core↔Balance tension wave is deepening in the direction that matches the current candle's color. Maximum possible contribution from this module equals this weight.")
+scoreThresh = input.float(80.0, "Signal Threshold (% of max score)", minval = 1.0, maxval = 100.0, group = groupScore, tooltip = "Minimum percentage of the maximum possible score (0% = neutral, 100% = every enabled component maxed out and matching the candle's color) required to generate a Buy or Sell signal. Symmetric: applies equally to bullish and bearish candles.")
+oneSignalPerWave = input.bool(true, "One signal per momentum wave", group = groupScore, tooltip = "A 'wave' is defined as the stretch between consecutive crossings of the 50 level by the Momentum Core. When enabled, only one Score signal (Buy or Sell) can appear within a single wave — the same signal unlocks again only after the Momentum Core crosses the 50 level (start of a new wave).")
+
+// Tension Waves (Core ↔ Balance tension histogram)
+groupWaves     = "Tension Waves"
+showABWaves    = input.bool(true, "Show Tension Waves", group = groupWaves, tooltip = "Histogram of the tension between the Momentum Core and the Balance Line. Shows how far apart the two lines are — the deeper the histogram, the stronger the divergence between them. Useful for gauging trend exhaustion. A deepening wave (excluding its first bar) also feeds the Composite Score via the 'Tension Waves Weight'.")
+waveBaseTransp = input.int(60, "Tension Wave Transparency", minval = 0, maxval = 100, group = groupWaves, tooltip = "Base transparency of the Tension Wave histogram. Strengthening (deepening) waves render slightly more opaque than this value, while weakening waves render slightly more transparent, so momentum shifts remain visually distinguishable.")
+
+// INTERNAL PARAMETERS
+waveMultiplier   = 2.0
+waveTranspOffset = 15
+
+// OB/OS Zones
+groupZone   = "OB/OS Zones"
+obLevel     = input.float(70.0, "Overbought", minval = 51.0, maxval = 99.0, group = groupZone, tooltip = "Momentum Core level considered overbought.")
+osLevel     = input.float(30.0, "Oversold", minval = 1.0, maxval = 49.0, group = groupZone, tooltip = "Momentum Core level considered oversold.")
+
+// Contrarian Signals
+groupContra      = "Contrarian Signals"
+showContrarian   = input.bool(true, "Show Contrarian Signals", group = groupContra, tooltip = "Momentum Core returning from an OS/OB extreme (classic contrarian signal).")
+
+// Divergences
+groupDiv       = "Divergences"
+showDivergence = input.bool(true, "Show Divergences on Momentum Core", group = groupDiv, tooltip = "Enables detection and marking of divergences between price and the Momentum Core.")
+pivotLength    = input.int(2, "Pivot Lookback (left/right)", minval = 1, group = groupDiv, tooltip = "Number of bars on each side of a peak/trough required to confirm a pivot.")
+
+// Colors & Transparency
+groupColors   = "Colors & Transparency"
+colBullMain   = input.color(color.rgb(6, 162, 47), "Bullish Color", group = groupColors, tooltip = "Main bullish color used across all modules: Core/Balance, Oversold line, OS zone, gradients, KNN, Composite Score, Barometer, Bullish Divergence.")
+colBearMain   = input.color(color.rgb(207, 23, 23), "Bearish Color", group = groupColors, tooltip = "Main bearish color used across all modules: Core/Balance, Overbought line, OB zone, gradients, KNN, Composite Score, Barometer, Bearish Divergence.")
+colNeutral    = input.color(color.gray, "Neutral Color", group = groupColors, tooltip = "Used in the table and KNN panel when the signal is neutral.")
+zeroLineColor = input.color(color.gray, "Zero Line Color (50)", group = groupColors, tooltip = "Color of the horizontal center line (level 50).")
+textColor     = input.color(color.white, "Text Color (labels)", group = groupColors, tooltip = "Color of the table header text and the text inside divergence labels.")
+
+flowGradientTransp = input.int(50, "Flow Wave Transparency", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of the Flow Pressure wave fill.")
+
+useDynamicLevels = input.bool(true, "Dynamic OB/OS Lines", group = groupColors, tooltip = "OB/OS line transparency depends on the Momentum Core's distance from the level.")
+obosCloseTransp  = input.int(30, "OB/OS Transparency — Near Level", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of the OB/OS lines when the Momentum Core is close to or crossing the given level (0 = fully opaque, 100 = invisible).")
+obosFarTransp    = input.int(90, "OB/OS Transparency — Far From Level", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of the OB/OS lines when the Momentum Core is far from the given level. For a constant, uniform OB/OS line transparency (no gradient), set this parameter and 'Near Level' to the same value, e.g. 100 and 100, to hide it completely.")
+levelLineWidth   = input.int(4, "OB/OS Line Width", minval = 1, maxval = 6, group = groupColors, tooltip = "Width of the Overbought and Oversold lines.")
+
+centerGradTransp = input.int(60, "Transparency: Core→Center Gradient", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of the gradient right at the Momentum Core; the gradient always fades to fully transparent at the 50 line.")
+coreBalTransp    = input.int(30, "Transparency: Core↔Balance Gradient", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of the fill between the Momentum Core and the Balance Line.")
+divLineTransp    = input.int(40, "Divergence Line Transparency", minval = 0, maxval = 100, group = groupColors, tooltip = "Transparency of divergence lines and labels (0 = fully opaque, 100 = invisible).")
+
+// Panel
+groupPanel  = "Panel"
+showTable   = input.bool(true, "Show Table", group = groupPanel, tooltip = "Enables the summary table display.")
+tablePos    = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"], group = groupPanel, tooltip = "Position of the table on the chart.")
+tableSize   = input.string("small", "Text Size", options = ["tiny", "small", "normal"], group = groupPanel, tooltip = "Text size in the table.")
+
+// Alerts
+groupAl        = "Alerts"
+alScoreBuyOn   = input.bool(true,  "Score — Buy",  group = groupAl, tooltip = "Sends an alert on a Composite Score Buy signal.")
+alScoreSellOn  = input.bool(true,  "Score — Sell", group = groupAl, tooltip = "Sends an alert on a Composite Score Sell signal.")
+alKnnOn        = input.bool(false, "KNN Direction Change", group = groupAl, tooltip = "Sends an alert when the KNN Bias direction changes.")
+alContraBuyOn  = input.bool(false, "Contrarian — Long",  group = groupAl, tooltip = "Sends an alert on a contrarian Long signal (return from Oversold).")
+alContraSellOn = input.bool(false, "Contrarian — Short", group = groupAl, tooltip = "Sends an alert on a contrarian Short signal (return from Overbought).")
+alDivBullOn    = input.bool(false, "Divergence — Bullish", group = groupAl, tooltip = "Sends an alert when a bullish divergence is detected.")
+alDivBearOn    = input.bool(false, "Divergence — Bearish", group = groupAl, tooltip = "Sends an alert when a bearish divergence is detected.")
+alBaroOn       = input.bool(false, "Barometer — Direction Change", group = groupAl, tooltip = "Sends an alert when the Signal Confluence Barometer changes direction (candle color flips with a non-zero score).")
+
+
+// SECTION 2 — HELPER FUNCTIONS
+
+f_ma(series float s, simple int len, simple string method) =>
+    switch method
+        "EMA" => ta.ema(s, len)
+        "SMA" => ta.sma(s, len)
+        "RMA" => ta.rma(s, len)
+        =>       ta.ema(s, len)
+
+f_clamp(float v, float mn, float mx) => math.max(mn, math.min(mx, v))
+
+f_remap(float val, float inMin, float inMax, float outMin, float outMax) =>
+    outMin + (val - inMin) * (outMax - outMin) / (inMax - inMin)
+
+f_darken(color col, float factor) =>
+    color.rgb(color.r(col) * factor, color.g(col) * factor, color.b(col) * factor, color.t(col))
+
+// Momentum core: price change normalized by ATR, rescaled to 0-100.
+
+f_coreEngine(series float s, simple int len, simple int smooth, simple string method, simple float scale) =>
+    float delta   = s - s[len]
+    float rangeAt = ta.atr(len)
+    float normD   = rangeAt > 0 ? delta / rangeAt : 0.0
+    float raw     = f_clamp(50.0 + normD * scale, 0.0, 100.0)
+    f_ma(raw, smooth, method)
+
+// Text block histogram bar
+f_histBar(float pct) =>
+    int blocks = math.max(0, math.min(10, int(math.round(pct / 10))))
+    string histStr = ""
+    for i = 1 to 10
+        histStr += i <= blocks ? "█" : "░"
+    histStr + " " + str.tostring(math.round(pct, 0)) + "%"
+
+
+// SECTION 3 — CORE CALCULATIONS
+
+float coreVal = f_coreEngine(srcCore, lenCore, smoothCore, maMethod, scaleCore)
+float balVal  = f_coreEngine(srcCore, lenBal,  smoothBal,  maMethod, scaleCore)
+
+// ── Real volume detection
+float volStdev  = ta.stdev(volume, 20)
+bool  hasVolume = not na(volume) and volStdev > 0 and not forceCandle
+
+float candleRng = high - low
+float flowRawVal = hasVolume ? (close > open ? volume : close < open ? -volume : 0.0) : (candleRng > 0 ? (close - open) / candleRng : 0.0)
+float flowWeight = hasVolume ? volume : 1.0
+
+float flowCum    = math.sum(flowRawVal, lenFlow)
+float flowWSum   = math.sum(flowWeight, lenFlow)
+float flowPctRaw = flowWSum != 0 ? flowCum / flowWSum * 50.0 + 50.0 : 50.0
+float flowVal    = f_ma(flowPctRaw, smoothFlow, maMethod)
+
+// ── OB/OS Zones
+float obLvlF = obLevel
+float osLvlF = osLevel
+
+// Structure / Trend — Keltner band with directional flip
+float trendBasis = ta.ema(close, trendLen)
+float trendBand  = ta.atr(trendLen) * trendMult
+float trendUpper = trendBasis + trendBand
+float trendLower = trendBasis - trendBand
+
+var bool trendUp = true
+if trendUp and close < trendLower
+    trendUp := false
+else if not trendUp and close > trendUpper
+    trendUp := true
+
+int trendState = trendUp ? 1 : -1
+
+// ── Tension Waves — Momentum Core ↔ Balance Line tension
+float histAB     = coreVal - balVal
+bool  isBullWave = histAB > 0
+
+// Wave-deepening confirmation: requires the same wave as the previous bar
+bool bullWaveConfirm = not na(histAB[1]) and isBullWave and isBullWave[1] and (histAB > histAB[1])
+bool bearWaveConfirm = not na(histAB[1]) and not isBullWave and not isBullWave[1] and (histAB < histAB[1])
+
+
+// SECTION 4 — KNN BIAS
+
+var array<float> memMom   = array.new<float>()
+var array<float> memFlow  = array.new<float>()
+var array<float> memTrend = array.new<float>()
+var array<int>   memLabel = array.new<int>()
+
+var array<float> pendMom   = array.new<float>()
+var array<float> pendFlow  = array.new<float>()
+var array<float> pendTrend = array.new<float>()
+
+float featMom   = coreVal / 100.0
+float featFlow  = flowVal / 100.0
+float featTrend = (trendState + 1) / 2.0
+
+if knnOn and array.size(pendMom) > 0
+    int lbl = close > close[1] ? 1 : 0
+    array.push(memMom,   array.shift(pendMom))
+    array.push(memFlow,  array.shift(pendFlow))
+    array.push(memTrend, array.shift(pendTrend))
+    array.push(memLabel, lbl)
+    if array.size(memMom) > knnWindow
+        array.shift(memMom)
+        array.shift(memFlow)
+        array.shift(memTrend)
+        array.shift(memLabel)
+
+float knnVote = 50.0
+int   memN    = array.size(memMom)
+float knnAvgDist = na
+
+if knnOn and memN >= knnK
+    var array<float> distArr = array.new<float>()
+    array.clear(distArr)
+    for i = 0 to memN - 1
+        float dd = math.sqrt(math.pow(featMom - array.get(memMom, i), 2) + math.pow(featFlow - array.get(memFlow, i), 2) + math.pow(featTrend - array.get(memTrend, i), 2))
+        array.push(distArr, dd)
+
+    float wSumV = 0.0
+    float wTot  = 0.0
+    float dSum  = 0.0
+    for k = 0 to knnK - 1
+        int bestIdx = array.indexof(distArr, array.min(distArr))
+        float d = array.get(distArr, bestIdx)
+        float w = 1.0 / (d + 0.05)
+        wSumV += array.get(memLabel, bestIdx) * w
+        wTot  += w
+        dSum  += d
+        array.set(distArr, bestIdx, 999.0)
+
+    knnVote    := wTot > 0 ? wSumV / wTot * 100.0 : 50.0
+    knnAvgDist := dSum / knnK
+
+if knnOn and bar_index > 1
+    array.push(pendMom,   featMom)
+    array.push(pendFlow,  featFlow)
+    array.push(pendTrend, featTrend)
+
+
+float knnConfDistMax = 0.6
+if knnOn and not na(knnAvgDist) and knnAvgDist > knnConfDistMax
+    knnVote := 50.0
+
+int   knnBias = knnVote >= 60.0 ? 1 : knnVote <= 40.0 ? -1 : 0
+color knnCol  = knnBias == 1 ? colBullMain : knnBias == -1 ? colBearMain : colNeutral
+
+
+// SECTION 4B — DIVERGENCES
+
+float pivotHighCore = ta.pivothigh(coreVal, pivotLength, pivotLength)
+float pivotLowCore  = ta.pivotlow(coreVal, pivotLength, pivotLength)
+
+var bool plFound = false
+var bool phFound = false
+var bool bullCond = false
+var bool bearCond = false
+
+float core_at_pivot = coreVal[pivotLength]
+
+if showDivergence
+    plFound := not na(pivotLowCore)
+    bool oscHigherLow  = core_at_pivot > ta.valuewhen(plFound, core_at_pivot, 1)
+    bool priceLowerLow = low[pivotLength] < ta.valuewhen(plFound, low[pivotLength], 1)
+    bullCond := priceLowerLow and oscHigherLow and plFound
+
+    phFound := not na(pivotHighCore)
+    bool oscLowerHigh    = core_at_pivot < ta.valuewhen(phFound, core_at_pivot, 1)
+    bool priceHigherHigh = high[pivotLength] > ta.valuewhen(phFound, high[pivotLength], 1)
+    bearCond := priceHigherHigh and oscLowerHigh and phFound
+
+
+// SECTION 4C — CONTRARIAN SIGNALS
+
+bool crossOverOS  = ta.crossover(coreVal, osLvlF)
+bool crossUnderOB = ta.crossunder(coreVal, obLvlF)
+
+bool longContrarian  = showContrarian and crossOverOS
+bool shortContrarian = showContrarian and crossUnderOB
+
+
+// SECTION 5 — COMPOSITE SCORE
+
+bool isBullCandle = close > open
+bool isBearCandle = close < open
+
+bool  coreRising  = coreVal > coreVal[1]
+bool  coreFalling = coreVal < coreVal[1]
+
+bool momBull  = coreVal  > 50.0 and coreRising
+bool momBear  = coreVal  < 50.0 and coreFalling
+bool flowBull = flowVal  > 50.0
+bool flowBear = flowVal  < 50.0
+bool trendBullM = trendState == 1
+bool trendBearM = trendState == -1
+bool knnBullM   = knnVote > 60.0
+bool knnBearM   = knnVote < 40.0
+bool waveBullM  = bullWaveConfirm
+bool waveBearM  = bearWaveConfirm
+
+// How many of the 5 modules agree with the current candle's color (used by Score AND Confluence)
+int matchCount = isBullCandle ? (momBull ? 1:0) + (flowBull ? 1:0) + (trendBullM ? 1:0) + (knnBullM ? 1:0) + (waveBullM ? 1:0) :
+     isBearCandle ? (momBear ? 1:0) + (flowBear ? 1:0) + (trendBearM ? 1:0) + (knnBearM ? 1:0) + (waveBearM ? 1:0) : 0
+
+float pointsEarned = isBullCandle ? (momBull ? wMom:0.0) + (flowBull ? wFlow:0.0) + (trendBullM ? wTrend:0.0) + (knnBullM ? wKnn:0.0) + (waveBullM ? wWave:0.0) :
+     isBearCandle ? (momBear ? wMom:0.0) + (flowBear ? wFlow:0.0) + (trendBearM ? wTrend:0.0) + (knnBearM ? wKnn:0.0) + (waveBearM ? wWave:0.0) : 0.0
+
+float pointsPossible = wMom + wFlow + wTrend + wKnn + wWave
+
+int   scoreDir = isBullCandle ? 1 : isBearCandle ? -1 : 0
+float scorePct = pointsPossible > 0 ? pointsEarned / pointsPossible * 100.0 : 0.0
+
+bool scoreIsBull = scoreDir == 1 and scorePct >= 51.0
+bool scoreIsBear = scoreDir == -1 and scorePct >= 51.0
+
+string compTier = scoreIsBull and scorePct >= 80 ? "STRONG BULL" : scoreIsBull ? "BULL" : scoreIsBear and scorePct >= 80 ? "STRONG BEAR" : scoreIsBear ? "BEAR" : "NEUTRAL"
+color  compCol  = scoreIsBull ? colBullMain : scoreIsBear ? colBearMain : colNeutral
+
+bool midCross = (coreVal > 50.0 and coreVal[1] <= 50.0) or (coreVal < 50.0 and coreVal[1] >= 50.0)
+
+var bool waveBuyUsed  = false
+var bool waveSellUsed = false
+if midCross
+    waveBuyUsed  := false
+    waveSellUsed := false
+
+bool rawBuySignal  = showScore and isBullCandle and scorePct >= scoreThresh
+bool rawSellSignal = showScore and isBearCandle and scorePct >= scoreThresh
+
+bool buySignal  = rawBuySignal  and (not oneSignalPerWave or not waveBuyUsed)
+bool sellSignal = rawSellSignal and (not oneSignalPerWave or not waveSellUsed)
+
+if oneSignalPerWave and buySignal
+    waveBuyUsed := true
+if oneSignalPerWave and sellSignal
+    waveSellUsed := true
+
+
+// SECTION 5B — SIGNAL CONFLUENCE BAROMETER
+
+int   baroDispCount = matchCount
+float baroDispPct   = baroDispCount / 5.0 * 100.0
+bool  baroSideBull  = isBullCandle
+color baroCol       = scoreDir == 1 ? colBullMain : scoreDir == -1 ? colBearMain : colNeutral
+
+bool baroDirFlip = (scoreDir == 1 and scoreDir[1] == -1) or (scoreDir == -1 and scoreDir[1] == 1)
+
+// SECTION 6 — PLOTTING (dynamic OB/OS levels, gradients)
+
+getDynamicOBColor() =>
+    if not useDynamicLevels
+        color.new(colBearMain, obosCloseTransp)
+    else
+        float rawDist = obLvlF - coreVal
+        float maxDist = obLvlF - 50.0
+        float clamped = f_clamp(rawDist, 0.0, maxDist)
+        int   transp  = int(math.round(f_remap(clamped, 0.0, maxDist, obosCloseTransp, obosFarTransp)))
+        color.new(colBearMain, transp)
+
+getDynamicOSColor() =>
+    if not useDynamicLevels
+        color.new(colBullMain, obosCloseTransp)
+    else
+        float rawDist = coreVal - osLvlF
+        float maxDist = 50.0 - osLvlF
+        float clamped = f_clamp(rawDist, 0.0, maxDist)
+        int   transp  = int(math.round(f_remap(clamped, 0.0, maxDist, obosCloseTransp, obosFarTransp)))
+        color.new(colBullMain, transp)
+
+hline(50, "Center", color.new(zeroLineColor, 60), hline.style_dashed)
+
+color coreBalCol = coreVal >= balVal ? colBullMain : colBearMain
+
+plot(obLvlF, "Overbought", color = getDynamicOBColor(), linewidth = math.max(1, levelLineWidth))
+plot(osLvlF, "Oversold",   color = getDynamicOSColor(), linewidth = math.max(1, levelLineWidth))
+plot(coreVal, "Momentum Core", coreBalCol, linewidth = 2)
+plot(balVal,  "Balance Line",  coreBalCol, linewidth = 1)
+
+// Tension Waves — Momentum Core ↔ Balance Line tension histogram (bullish wave above 50, bearish wave below 50)
+
+float waveHist = f_clamp(50.0 + histAB * waveMultiplier, 0.0, 100.0)
+
+bool isStrengthening = bullWaveConfirm or bearWaveConfirm
+
+int finalWaveTransp = isStrengthening ? int(f_clamp(waveBaseTransp - waveTranspOffset, 0.0, 100.0)) : int(f_clamp(waveBaseTransp + waveTranspOffset, 0.0, 100.0))
+
+color waveCol = color.new(isBullWave ? colBullMain : colBearMain, finalWaveTransp)
+plot(showABWaves ? waveHist : na, title = "Tension Waves", style = plot.style_columns, color = waveCol, histbase = 50.0)
+
+c_bull_peak = color.new(colBullMain, centerGradTransp)
+c_bear_peak = color.new(colBearMain, centerGradTransp)
+c_bull_zero = color.new(colBullMain, 100)
+c_bear_zero = color.new(colBearMain, 100)
+
+pCore = plot(coreVal, color = na, display = display.none)
+pMid  = plot(50,      color = na, display = display.none)
+pBal  = plot(balVal,  color = na, display = display.none)
+
+fill(pCore, pMid, top_value = coreVal > 50 ? coreVal : na, bottom_value = coreVal > 50 ? 50.0 : na, top_color = coreVal > 50 ? c_bull_peak : na, bottom_color = coreVal > 50 ? c_bull_zero : na)
+fill(pMid, pCore, top_value = coreVal < 50 ? 50.0 : na, bottom_value = coreVal < 50 ? coreVal : na, top_color = coreVal < 50 ? c_bear_zero : na, bottom_color = coreVal < 50 ? c_bear_peak : na)
+
+fill(pCore, pBal, color = color.new(coreBalCol, coreBalTransp), title = "Core vs Balance")
+
+plotshape(buySignal ? osLvlF - 6 : na, "Score Buy", shape.diamond, location.absolute, colBullMain, size = size.tiny)
+plotshape(sellSignal ? obLvlF + 6 : na, "Score Sell", shape.diamond, location.absolute, colBearMain, size = size.tiny)
+
+// Contrarian signals
+float triangleOffsetFMC = 6.0
+
+plotshape(longContrarian  ? osLvlF - triangleOffsetFMC : na, "Contr. Long",  shape.triangleup,   location.absolute, colBullMain, size = size.tiny)
+plotshape(shortContrarian ? obLvlF + triangleOffsetFMC : na, "Contr. Short", shape.triangledown, location.absolute, colBearMain, size = size.tiny)
+
+// Divergences
+color divBullCol = color.new(colBullMain, divLineTransp)
+color divBearCol = color.new(colBearMain, divLineTransp)
+
+plot(showDivergence and plFound ? core_at_pivot : na, offset = -pivotLength, title = "Bull Div Point", color = bullCond ? divBullCol : color.new(color.white, 100), linewidth = 2)
+plot(showDivergence and phFound ? core_at_pivot : na, offset = -pivotLength, title = "Bear Div Point", color = bearCond ? divBearCol : color.new(color.white, 100), linewidth = 2)
+
+plotshape(showDivergence and bullCond ? core_at_pivot : na, offset = -pivotLength, title = "Bull Divergence", text = "Bull Div", style = shape.labelup, location = location.absolute, color = color.new(colBullMain, 40), textcolor = textColor, size = size.tiny)
+plotshape(showDivergence and bearCond ? core_at_pivot : na, offset = -pivotLength, title = "Bear Divergence", text = "Bear Div", style = shape.labeldown, location = location.absolute, color = color.new(colBearMain, 40), textcolor = textColor, size = size.tiny)
+
+barcolor(barPaint ? (trendState == 1 ? color.new(colBullMain, 0) : color.new(colBearMain, 0)) : na)
+
+// Flow Pressure
+float flowSigned     = flowVal - 50.0
+float flowExtremeVal = flowExtremeLevel * flowHeightScale
+
+float flowBullValRaw = flowSigned > 0 ? flowSigned * flowHeightScale : 0.0
+float flowBearValRaw = flowSigned < 0 ? flowSigned * flowHeightScale : 0.0
+
+float flowBullNormal = math.min(flowBullValRaw, flowExtremeVal)
+float flowBearNormal = math.max(flowBearValRaw, -flowExtremeVal)
+
+pFlowBase1   = plot(obLvlF, "Flow Bull Base", display = display.none)
+pFlowBase2   = plot(osLvlF, "Flow Bear Base", display = display.none)
+pFlowBullMid = plot(obLvlF + flowBullNormal, "Flow Bull Mid", display = display.none)
+pFlowBearMid = plot(osLvlF + flowBearNormal, "Flow Bear Mid", display = display.none)
+pFlowBullTop = plot(obLvlF + flowBullValRaw, "Flow Bull Top",    display = display.none)
+pFlowBearBot = plot(osLvlF + flowBearValRaw, "Flow Bear Bottom", display = display.none)
+
+color colFlowBullDark = f_darken(colBullMain, 0.55)
+color colFlowBearDark = f_darken(colBearMain, 0.55)
+
+fill(pFlowBase1, pFlowBullMid, color = color.new(colBullMain, flowGradientTransp), title = "Flow Bull (normal)")
+fill(pFlowBullMid, pFlowBullTop, color = color.new(colFlowBullDark, flowGradientTransp), title = "Flow Bull (extreme)")
+fill(pFlowBase2, pFlowBearMid, color = color.new(colBearMain, flowGradientTransp), title = "Flow Bear (normal)")
+fill(pFlowBearMid, pFlowBearBot, color = color.new(colFlowBearDark, flowGradientTransp), title = "Flow Bear (extreme)")
+
+
+// SECTION 7 — TABLE
+
+posOf(string p) =>
+    switch p
+        "Top Right"    => position.top_right
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        "Middle Right" => position.middle_right
+        =>                position.middle_left
+
+szOf(string s) =>
+    switch s
+        "tiny"   => size.tiny
+        "small"  => size.small
+        =>          size.normal
+
+var table panel = na
+if showTable and barstate.islast
+    if na(panel)
+        panel := table.new(posOf(tablePos), 2, 9, bgcolor = color.new(#1a1a1a, 10), border_width = 1, border_color = color.new(color.gray, 60))
+    string tsz = szOf(tableSize)
+
+    table.cell(panel, 0, 0, "Core", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 0, str.tostring(math.round(coreVal, 1)), text_color = coreVal >= 50 ? colBullMain : colBearMain, text_size = tsz, text_halign = text.align_right)
+
+    table.cell(panel, 0, 1, "Flow", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 1, flowVal >= 50 ? "BULL" : "BEAR", text_color = flowVal >= 50 ? colBullMain : colBearMain, text_size = tsz, text_halign = text.align_right)
+
+    string trendTxt = trendState == 1 ? "Bullish" : "Bearish"
+    table.cell(panel, 0, 2, "Structure", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 2, trendTxt, text_color = trendState == 1 ? colBullMain : colBearMain, text_size = tsz, text_halign = text.align_right)
+
+    string knnTxt = knnBias == 1 ? "BULL" : knnBias == -1 ? "BEAR" : "NEUTRAL"
+    table.cell(panel, 0, 3, "KNN (K=" + str.tostring(knnK) + ")", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 3, knnTxt + " " + str.tostring(math.round(knnVote)) + "%", text_color = knnCol, text_size = tsz, text_halign = text.align_right)
+
+    string waveTxt    = bullWaveConfirm ? "BULL +" : bearWaveConfirm ? "BEAR -" : "—"
+    color  waveCellCol = bullWaveConfirm ? colBullMain : bearWaveConfirm ? colBearMain : colNeutral
+    table.cell(panel, 0, 4, "Tension Wave", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 4, waveTxt, text_color = waveCellCol, text_size = tsz, text_halign = text.align_right)
+
+    string volSrcTxt = hasVolume ? "Volume" : "Candles (auto)"
+    table.cell(panel, 0, 5, "Data Source", text_color = color.white, text_size = tsz)
+    table.cell(panel, 1, 5, volSrcTxt, text_color = color.gray, text_size = tsz, text_halign = text.align_right)
+
+    color summaryBg = color.new(compCol, 80)
+    string scorePtsTxt = str.tostring(math.round(pointsEarned, 1)) + "/" + str.tostring(math.round(pointsPossible, 1)) + " pts"
+    table.cell(panel, 0, 6, "Score", text_color = color.white, text_size = tsz, bgcolor = summaryBg)
+    table.cell(panel, 1, 6, compTier + " " + str.tostring(math.round(scorePct)) + "%  (" + scorePtsTxt + ")", text_color = compCol, text_size = tsz, bgcolor = summaryBg, text_halign = text.align_right)
+
+
+    color baroBg = color.new(baroCol, 80)
+    table.cell(panel, 0, 7, "Confluence", text_color = color.white, text_size = tsz, bgcolor = baroBg)
+    table.cell(panel, 1, 7, str.tostring(baroDispCount) + "/5  (" + str.tostring(math.round(baroDispPct)) + "%)", text_color = color.white, text_size = tsz, bgcolor = baroBg, text_halign = text.align_right)
+
+    table.cell(panel, 0, 8, "Barometer", text_color = color.white, text_size = tsz, bgcolor = baroBg)
+    table.cell(panel, 1, 8, f_histBar(baroDispPct), text_color = color.white, text_size = tsz, bgcolor = baroBg, text_halign = text.align_right)
+
+// SECTION 8 — SIGNAL VARIANTS FOR BACKTESTING
+// score
+bool buy1  = buySignal
+bool sell1 = sellSignal
+
+// contrarian
+bool buy2  = longContrarian
+bool sell2 = shortContrarian
+
+plot(buy1  ? 1 : na, "bt_buy_score",  display = display.none)
+plot(sell1 ? 1 : na, "bt_sell_score", display = display.none)
+
+plot(buy2  ? 1 : na, "bt_buy_contrarian",  display = display.none)
+plot(sell2 ? 1 : na, "bt_sell_contrarian", display = display.none)
+
+// SECTION 9 — ALERTS
+
+if alScoreBuyOn and buySignal
+    alert("Flow Momentum Composite — BUY Score | " + syminfo.tickerid + " | TF: " + timeframe.period, alert.freq_once_per_bar_close)
+if alScoreSellOn and sellSignal
+    alert("Flow Momentum Composite — SELL Score | " + syminfo.tickerid + " | TF: " + timeframe.period, alert.freq_once_per_bar_close)
+if alKnnOn and knnBias != knnBias[1]
+    alert("Flow Momentum Composite — KNN Bias Change: " + (knnBias == 1 ? "BULL" : knnBias == -1 ? "BEAR" : "NEUTRAL"), alert.freq_once_per_bar_close)
+if alContraBuyOn and longContrarian
+    alert("Flow Momentum Composite — Contrarian LONG (return from Oversold) | " + syminfo.tickerid + " | TF: " + timeframe.period, alert.freq_once_per_bar_close)
+if alContraSellOn and shortContrarian
+    alert("Flow Momentum Composite — Contrarian SHORT (return from Overbought) | " + syminfo.tickerid + " | TF: " + timeframe.period, alert.freq_once_per_bar_close)
+if alDivBullOn and showDivergence and bullCond
+    alert("Flow Momentum Composite — Bullish Divergence on Momentum Core", alert.freq_once_per_bar_close)
+if alDivBearOn and showDivergence and bearCond
+    alert("Flow Momentum Composite — Bearish Divergence on Momentum Core", alert.freq_once_per_bar_close)
+if alBaroOn and baroDirFlip
+    alert("Flow Momentum Composite — Signal Confluence Barometer changed direction: " + (scoreDir == 1 ? "Bullish" : "Bearish") + " | " + syminfo.tickerid + " | TF: " + timeframe.period, alert.freq_once_per_bar_close)

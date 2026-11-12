@@ -1,0 +1,100 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Assistant
+
+//@version=6
+indicator("ROIC vs WACC (Value Creation)", shorttitle="ROIC / WACC", overlay=false, format=format.percent, precision=2)
+
+// ============================================================================
+// USER INPUTS
+// ============================================================================
+grp_main = "General Settings"
+period   = input.string("FY", "Financial Period", options=["FY", "FQ", "TTM"], group=grp_main)
+mode     = input.string("Estimated", title="WACC Mode", options=["Estimated", "Manual"], group=grp_main, tooltip="Estimated computes dynamic WACC using financials & CAPM. Manual uses a fixed rate.")
+manualW  = input.float(8.0, title="Manual WACC (%)", step=0.5, group=grp_main)
+
+grp_wacc = "Estimated WACC Parameters (CAPM)"
+rfTicker = input.symbol("US10Y", title="Risk-Free Rate Ticker", group=grp_wacc, tooltip="Proxy for the risk-free rate.")
+bench    = input.symbol("SPY", title="Market Benchmark", group=grp_wacc, tooltip="Used to calculate Beta.")
+erpInput = input.float(5.5, title="Equity Risk Premium (%)", group=grp_wacc, tooltip="The expected return of the market above the risk-free rate.")
+betaLen  = input.int(252, title="Beta Lookback (Bars)", group=grp_wacc, tooltip="Number of bars for Beta calculation. 252 represents 1 trading year on a daily chart.")
+
+// ============================================================================
+// FINANCIAL DATA FETCHING
+// ============================================================================
+// Target metric: ROIC
+roic = request.financial(syminfo.tickerid, "RETURN_ON_INVESTED_CAPITAL", period)
+
+// Debt & Interest for Cost of Debt
+int_exp_raw  = request.financial(syminfo.tickerid, "INTEREST_EXPENSE_ON_DEBT", period)
+tot_debt_raw = request.financial(syminfo.tickerid, "TOTAL_DEBT", period)
+
+// Taxes & Income for Tax Rate
+inc_tax_raw = request.financial(syminfo.tickerid, "INCOME_TAX", period)
+net_inc_raw = request.financial(syminfo.tickerid, "NET_INCOME", period)
+
+// Shares Outstanding for Market Cap
+shares_raw = request.financial(syminfo.tickerid, "TOTAL_SHARES_OUTSTANDING", period)
+
+// ============================================================================
+// COST OF EQUITY (CAPM)
+// ============================================================================
+rf_rate = request.security(rfTicker, timeframe.period, close)
+
+// Beta Calculation (Timeframe dependent - use 1D chart for daily Beta)
+sym_ret = ta.change(close) / close[1]
+b_close = request.security(bench, timeframe.period, close)
+b_ret   = ta.change(b_close) / b_close[1]
+
+// Calculate Beta using Correlation and Standard Deviation
+corr      = ta.correlation(sym_ret, b_ret, betaLen)
+stdev_sym = ta.stdev(sym_ret, betaLen)
+stdev_b   = ta.stdev(b_ret, betaLen)
+
+// Fallback to market average beta (1.0) if missing data or division by zero
+beta = (stdev_b > 0 and not na(corr)) ? corr * (stdev_sym / stdev_b) : 1.0
+
+ke = rf_rate + (beta * erpInput)
+
+// ============================================================================
+// COST OF DEBT & TAX RATE
+// ============================================================================
+int_exp  = math.abs(nz(int_exp_raw, 0.0))
+tot_debt = math.max(nz(tot_debt_raw, 0.0), 0.0)
+kd       = tot_debt > 0 ? (int_exp / tot_debt) * 100 : 0.0
+
+inc_tax       = math.abs(nz(inc_tax_raw, 0.0))
+net_inc       = nz(net_inc_raw, 0.0)
+pre_tax_inc   = net_inc + inc_tax
+tax_rate_calc = pre_tax_inc > 0 ? (inc_tax / pre_tax_inc) : 0.21
+tax_rate      = math.max(0.0, math.min(tax_rate_calc, 0.40)) // Cap tax rate between 0% and 40%
+
+// ============================================================================
+// CAPITAL WEIGHTS & WACC
+// ============================================================================
+shares_out = nz(shares_raw, 0.0)
+market_cap = shares_out * close
+V = market_cap + tot_debt
+
+// Calculate capital weights; default to 100% equity if data is missing
+we = V > 0 ? market_cap / V : 1.0
+wd = V > 0 ? tot_debt / V : 0.0
+
+est_wacc = (we * ke) + (wd * kd * (1 - tax_rate))
+wacc = mode == "Estimated" ? est_wacc : manualW
+
+// ============================================================================
+// PLOTTING
+// ============================================================================
+spread = roic - wacc
+is_creating_value = spread > 0
+
+// Histogram for the Economic Spread
+c_spread = is_creating_value ? color.new(color.teal, 30) : color.new(color.red, 30)
+plot(spread, title="Economic Spread (ROIC - WACC)", style=plot.style_columns, color=c_spread)
+
+// Main metric lines
+plot(roic, title="ROIC", color=color.new(color.blue, 0), linewidth=2)
+plot(wacc, title="WACC", color=color.new(color.orange, 0), linewidth=2)
+
+// Zero line baseline
+hline(0, "Zero Line", color=color.gray, linestyle=hline.style_dashed)

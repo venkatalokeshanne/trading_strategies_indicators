@@ -1,0 +1,195 @@
+//@version=6
+indicator("Macro Optics Relative Performance", overlay=true, precision=2)
+
+// ============================================================================
+// 1. INPUTS & HELPERS
+// ============================================================================
+bm1_sym      = input.symbol("TVC:DXY", "Benchmark Symbol", group="Benchmark Settings")
+base_green   = input.float(3.0, "1W Strong Move Threshold (%)", minval=0.5, step=0.5, group="Heatmap Calibration")
+vol_mult     = input.float(1.5, "1W Noise Sensitivity (ATR Multiplier)", minval=0.5, step=0.25, group="Volatility Calibration")
+buffer_input = input.float(15.0, "Neutral Band Hysteresis Buffer (%)", minval=5.0, maxval=30.0, step=5.0, group="Volatility Calibration", tooltip="Enter 15 for 15%. Creates a neutral zone around the noise threshold to prevent flipping.")
+
+buffer_pct   = buffer_input / 100.0
+clean_symbol_name(sym) => array.get(str.split(sym, ":"), array.size(str.split(sym, ":")) - 1)
+format_val(val)        => na(val) ? "N/A" : (val > 0 ? "+" : "") + str.tostring(val, "#.##") + "%"
+calc_roc(c_curr, c_past) => (not na(c_curr) and not na(c_past) and c_past != 0) ? ((c_curr - c_past) / c_past) * 100.0 : na
+
+// Heatmap Color Generator
+get_heatmap_color(val, len) =>
+    if na(val)
+        color.new(color.black, 90)
+    else
+        float scale = math.sqrt(len / 5.0)
+        float t_high = base_green * scale, float t_med = (base_green / 2.0) * scale
+        val >= t_high ? color.new(color.rgb(0, 200, 83), 30) : val >= t_med ? color.new(color.rgb(76, 175, 80), 50) : val > 0 ? color.new(color.rgb(129, 199, 132), 70) : val <= -t_high ? color.new(color.rgb(213, 0, 0), 30) : val <= -t_med ? color.new(color.rgb(244, 67, 54), 50) : color.new(color.rgb(229, 115, 115), 70)
+
+// ============================================================================
+// 2. CONSOLIDATED NATIVE DATA REQUESTS
+// ============================================================================
+l_1w = 5, l_1m = 17, l_3m = 45, s_look = 3
+
+// A. Live Display Data
+[a0, a5, a17, a45]     = request.security(syminfo.tickerid, "D", [close, close[l_1w], close[l_1m], close[l_3m]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+[bm0, bm5, bm17, bm45] = request.security(bm1_sym, "D", [close, close[l_1w], close[l_1m], close[l_3m]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// B. Confirmed Daily Close Data (For Persistent Momentum & Noise Engine)
+[c_a0, c_a5, c_a17, c_a45, c_a_atr] = request.security(syminfo.tickerid, "D", [close[1], close[l_1w + 1], close[l_1m + 1], close[l_3m + 1], ta.atr(20)[1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+[c_bm0, c_bm5, c_bm17, c_bm45]       = request.security(bm1_sym, "D", [close[1], close[l_1w + 1], close[l_1m + 1], close[l_3m + 1]], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// C. True Daily Relative Volatility Engine
+c_vs_vol_std = request.security(syminfo.tickerid, "D", ta.stdev(calc_roc(close[1], close[l_1w + 1]) - calc_roc(request.security(bm1_sym, "D", close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), request.security(bm1_sym, "D", close[l_1w + 1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)), 20), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+c_asset_base_thresh  = -1.0 * vol_mult * ((c_a_atr / c_a0) * 100.0) * math.sqrt(5.0)
+c_asset_thresh_upper = c_asset_base_thresh * (1.0 - buffer_pct), c_asset_thresh_lower = c_asset_base_thresh * (1.0 + buffer_pct)
+
+c_vs_base_thresh   = -1.0 * vol_mult * c_vs_vol_std
+c_vs_thresh_upper  = c_vs_base_thresh * (1.0 - buffer_pct), c_vs_thresh_lower  = c_vs_base_thresh * (1.0 + buffer_pct)
+
+// D. True Daily Price Correlation Engine
+[corr15_bm1, corr30_bm1, sc15_bm1, sc30_bm1] = request.security(syminfo.tickerid, "D", [
+    ta.correlation(close[1], request.security(bm1_sym, "D", close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 15),
+    ta.correlation(close[1], request.security(bm1_sym, "D", close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 30),
+    ta.correlation(close[1], request.security(bm1_sym, "D", close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 15) - ta.correlation(close[s_look + 1], request.security(bm1_sym, "D", close[s_look + 1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 15),
+    ta.correlation(close[1], request.security(bm1_sym, "D", close[1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 30) - ta.correlation(close[s_look + 1], request.security(bm1_sym, "D", close[s_look + 1], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on), 30)
+], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+// ============================================================================
+// 3. RETURN CALCULATIONS (LIVE DISPLAY & CONFIRMED)
+// ============================================================================
+a_r5  = calc_roc(a0, a5),   a_r17  = calc_roc(a0, a17),   a_r45  = calc_roc(a0, a45)
+bm_r5 = calc_roc(bm0, bm5), bm_r17 = calc_roc(bm0, bm17), bm_r45 = calc_roc(bm0, bm45)
+vs_bm1_5 = a_r5 - bm_r5, vs_bm1_17 = a_r17 - bm_r17, vs_bm1_45 = a_r45 - bm_r45
+
+c_a_r5  = calc_roc(c_a0, c_a5),   c_a_r17  = calc_roc(c_a0, c_a17),   c_a_r45  = calc_roc(c_a0, c_a45)
+c_bm_r5 = calc_roc(c_bm0, c_bm5), c_bm_r17 = calc_roc(c_bm0, c_bm17), c_bm_r45 = calc_roc(c_bm0, c_bm45)
+c_vs_5  = c_a_r5 - c_bm_r5, c_vs_17 = c_a_r17 - c_bm_r17, c_vs_45 = c_a_r45 - c_bm_r45
+
+// ============================================================================
+// 4. STREAMLINED HYSTERESIS & PERSISTENCE ENGINE
+// ============================================================================
+eval_raw_state(r5, r17, r45, t_upper, t_lower, prev_state) =>
+    if na(r5) or na(r17) or na(r45)
+        "N/A"
+    else if r45 >= 0
+        r17 >= 0 ? (prev_state == "Accelerating" ? (r5 < t_lower ? "Decelerating" : "Accelerating") : (r5 > t_upper ? "Accelerating" : "Decelerating")) : "Decelerating"
+    else
+        r17 <= 0 ? (prev_state == "Weakening" ? (r5 > math.abs(t_lower) ? "Strengthening" : "Weakening") : (r5 < math.abs(t_upper) ? "Weakening" : "Strengthening")) : "Strengthening"
+
+manage_persistent_momentum(r5, r17, r45, t_upper, t_lower, p_state, p_count, prev_r17, prev_r45, is_new_day) =>
+    string state = p_state
+    int count = p_count
+    string raw = eval_raw_state(r5, r17, r45, t_upper, t_lower, p_state)
+    
+    if is_new_day
+        bool regime_changed = (r17 >= 0 and prev_r17 < 0) or (r17 < 0 and prev_r17 >= 0) or (r45 >= 0 and prev_r45 < 0) or (r45 < 0 and prev_r45 >= 0)
+        if regime_changed
+            state := raw, count := 0
+        else if raw != p_state
+            count := count + 1
+            if count >= 2
+                state := raw, count := 0
+        else
+            count := 0
+    [state, count, raw]
+
+bool is_new_day = ta.change(time("D")) != 0
+
+var string p_asset_state = "N/A", var int p_asset_count = 0, var float prev_c_a_r17 = na, var float prev_c_a_r45 = na
+[act_asset_state, act_asset_cnt, raw_a] = manage_persistent_momentum(c_a_r5, c_a_r17, c_a_r45, c_asset_thresh_upper, c_asset_thresh_lower, p_asset_state, p_asset_count, prev_c_a_r17, prev_c_a_r45, is_new_day)
+p_asset_state := act_asset_state, p_asset_count := act_asset_cnt
+if is_new_day
+    prev_c_a_r17 := c_a_r17, prev_c_a_r45 := c_a_r45
+
+var string p_vs_state = "N/A", var int p_vs_count = 0, var float prev_c_vs_17 = na, var float prev_c_vs_45 = na
+[act_vs_state, act_vs_cnt, raw_v] = manage_persistent_momentum(c_vs_5, c_vs_17, c_vs_45, c_vs_thresh_upper, c_vs_thresh_lower, p_vs_state, p_vs_count, prev_c_vs_17, prev_c_vs_45, is_new_day)
+p_vs_state := act_vs_state, p_vs_count := act_vs_cnt
+if is_new_day
+    prev_c_vs_17 := c_vs_17, prev_c_vs_45 := c_vs_45
+
+// Display Properties & Tooltip Generator
+get_mom_properties(state, r5, r17, r45) =>
+    color bg = color.new(color.gray, 60)
+    string text_desc = "Evaluating Momentum..."
+    if state == "Accelerating"
+        bg := color.new(color.green, 30), text_desc := "Positive momentum remains intact"
+    else if state == "Decelerating"
+        bg := color.new(color.orange, 40), text_desc := "Positive momentum is losing strength"
+    else if state == "Weakening"
+        bg := color.new(color.red, 30), text_desc := "Negative momentum remains intact"
+    else if state == "Strengthening"
+        bg := color.new(color.rgb(129, 199, 132), 40), text_desc := "Negative momentum is beginning to improve"
+
+    string tip = text_desc + "\n----------------------------------------\n1W: " + str.tostring(r5, "#.##") + "%\n1M: " + str.tostring(r17, "#.##") + "%\n3M: " + str.tostring(r45, "#.##") + "%"
+    [bg, tip]
+
+[mom_asset_bg, mom_asset_tip] = get_mom_properties(p_asset_state, a_r5, a_r17, a_r45)
+[mom_bm1_bg, mom_bm1_tip]     = get_mom_properties(p_vs_state, vs_bm1_5, vs_bm1_17, vs_bm1_45)
+
+// Unified Correlation Classifier (Cleaned If/Else Structure)
+classify_unified_corr(c15, c30, sc15, sc30) =>
+    string tip = "15D Corr: " + (c15 > 0 ? "+" : "") + str.tostring(c15, "#.##") + "\n30D Corr: " + (c30 > 0 ? "+" : "") + str.tostring(c30, "#.##") + "\n----------------------------------------\n15D 3D Trend: " + str.tostring(sc15, "#.###") + "\n30D 3D Trend: " + str.tostring(sc30, "#.###")
+    if na(c15) or na(c30) or na(sc15) or na(sc30)
+        ["N/A", color.new(color.gray, 60), tip]
+    else if c30 >= 0
+        if c15 >= 0
+            if sc15 < 0
+                color bg = sc30 < 0 ? color.rgb(255, 160, 0, 25) : color.rgb(255, 213, 79, 45)
+                ["Positive Weakening", bg, tip]
+            else
+                color bg = sc30 >= 0 ? color.rgb(76, 175, 80, 20) : color.rgb(129, 199, 132, 40)
+                ["Positive", bg, tip]
+        else
+            color bg = sc30 < 0 ? color.rgb(230, 81, 0, 20) : color.rgb(255, 112, 67, 45)
+            ["Turning Negative", bg, tip]
+    else
+        if c15 < 0
+            if sc15 > 0
+                color bg = sc30 > 0 ? color.rgb(245, 124, 0, 25) : color.rgb(255, 183, 77, 45)
+                ["Negative Weakening", bg, tip]
+            else
+                color bg = sc30 <= 0 ? color.rgb(123, 31, 162, 25) : color.rgb(186, 104, 200, 45)
+                ["Negative", bg, tip]
+        else
+            color bg = sc30 > 0 ? color.rgb(0, 150, 136, 20) : color.rgb(77, 182, 172, 45)
+            ["Turning Positive", bg, tip]
+
+[corr_bm1_str, corr_bm1_bg, corr_bm1_tip] = classify_unified_corr(corr15_bm1, corr30_bm1, sc15_bm1, sc30_bm1)
+
+// ============================================================================
+// 5. CONCISE TABLE RENDERING ENGINE (6 COLUMNS x 3 ROWS @ BOTTOM RIGHT)
+// ============================================================================
+var table perfTable = table.new(position.bottom_right, 6, 3, border_width=1, border_color=color.new(color.gray, 80))
+bool is_invalid_tf  = timeframe.in_seconds() > timeframe.in_seconds("1D")
+
+if barstate.islast
+    string sym_label = syminfo.ticker, string bm1_label = "Vs " + clean_symbol_name(bm1_sym)
+    
+    // Table Headers
+    table.cell(perfTable, 0, 0, "Symbol",      bgcolor=color.black, text_color=color.white)
+    table.cell(perfTable, 1, 0, "1W",          bgcolor=color.black, text_color=color.white)
+    table.cell(perfTable, 2, 0, "1M",          bgcolor=color.black, text_color=color.white)
+    table.cell(perfTable, 3, 0, "3M",          bgcolor=color.black, text_color=color.white)
+    table.cell(perfTable, 4, 0, "Momentum",    bgcolor=color.black, text_color=color.white, tooltip="Evaluates multi-horizon momentum structure:\n• Accelerating: Positive momentum remains intact\n• Decelerating: Positive momentum is losing strength\n• Weakening: Negative momentum remains intact\n• Strengthening: Negative momentum is beginning to improve")
+    table.cell(perfTable, 5, 0, "Correlation", bgcolor=color.black, text_color=color.white, tooltip="Evaluates 15D/30D daily price co-movement trajectory vs Benchmark:\n• Positive / Positive Weakening\n• Turning Negative / Turning Positive\n• Negative / Negative Weakening\n• Hover over cell for exact 15D/30D snapshot numbers.")
+
+    if is_invalid_tf
+        for row_idx = 1 to 2
+            table.cell(perfTable, 0, row_idx, row_idx == 1 ? sym_label : bm1_label, text_color=color.white, bgcolor=color.new(color.black, 50))
+            for col_idx = 1 to 5
+                table.cell(perfTable, col_idx, row_idx, "Use Daily or Lower TF", text_color=color.white, bgcolor=color.new(color.red, 30))
+    else
+        // Row 1: Absolute Chart Asset Metrics
+        table.cell(perfTable, 0, 1, sym_label, text_color=color.white, bgcolor=color.new(color.black, 50))
+        table.cell(perfTable, 1, 1, format_val(a_r5), text_color=color.white, bgcolor=get_heatmap_color(a_r5, l_1w))
+        table.cell(perfTable, 2, 1, format_val(a_r17), text_color=color.white, bgcolor=get_heatmap_color(a_r17, l_1m))
+        table.cell(perfTable, 3, 1, format_val(a_r45), text_color=color.white, bgcolor=get_heatmap_color(a_r45, l_3m))
+        table.cell(perfTable, 4, 1, p_asset_state, text_color=color.white, bgcolor=mom_asset_bg, tooltip=mom_asset_tip)
+        table.cell(perfTable, 5, 1, "—", text_color=color.white, bgcolor=color.new(color.black, 50))
+
+        // Row 2: Relative / Benchmark Metrics
+        table.cell(perfTable, 0, 2, bm1_label, text_color=color.white, bgcolor=color.new(color.black, 50))
+        table.cell(perfTable, 1, 2, format_val(vs_bm1_5), text_color=color.white, bgcolor=get_heatmap_color(vs_bm1_5, l_1w))
+        table.cell(perfTable, 2, 2, format_val(vs_bm1_17), text_color=color.white, bgcolor=get_heatmap_color(vs_bm1_17, l_1m))
+        table.cell(perfTable, 3, 2, format_val(vs_bm1_45), text_color=color.white, bgcolor=get_heatmap_color(vs_bm1_45, l_3m))
+        table.cell(perfTable, 4, 2, p_vs_state, text_color=color.white, bgcolor=mom_bm1_bg, tooltip=mom_bm1_tip)
+        table.cell(perfTable, 5, 2, corr_bm1_str, text_color=color.white, bgcolor=corr_bm1_bg, tooltip=corr_bm1_tip)

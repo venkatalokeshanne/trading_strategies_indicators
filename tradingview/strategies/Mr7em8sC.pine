@@ -1,0 +1,1033 @@
+// ══════════════════════════════════════════════════════════════════════════════
+//  Y(4.0) — Akıllı Dip & Tepe STRATEJİSİ
+//  Pine Script v5
+// ──────────────────────────────────────────────────────────────────────────────
+//  v4.0 Yenilikler (v3.0 üzerine):
+//    ★ 8 Bileşenli Çoğunluk Oylama Sistemi (Majority Voting)
+//    ★ 3 Katmanlı Mimari: Oylama / Destek Çarpanı / Trend Filtresi
+//    ★ Yeni bileşenler: CCI, Williams %R, MFI, ADX/DI
+//    ★ Mum Yapısı → Williams %R ile değiştirildi
+//    ★ Hacim → MFI ile değiştirildi (hacim destek çarpanı oldu)
+//    ★ EMA Trend → ADX/DI oylama, EMA filtre katmanına taşındı
+//    ★ Diverjans artık tam oylama bileşeni (bonus değil)
+//    ★ Çoğunluk kuralı: N/8 aktif bileşen + toplam puan eşiği
+//    ★ Çıkış sadeleştirildi: Trail(skor+ATR) / SL / Breakeven
+//    ★ Asimetrik ve Acil çıkış kaldırıldı
+//    ★ RE-Entry v3: her çıkış tipinden sonra aktif, basit teyit
+//    ★ Pullback v2: ADX güçlü trend + EMA sekme
+// ──────────────────────────────────────────────────────────────────────────────
+//  Çıkış Önceliği:
+//    1. Karşı sinyal (çoğunluk) → Kapat + karşı aç
+//    2. Dinamik trail (skor+ATR entegre) → Kapat
+//    3. SL / Breakeven → Kapat
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=5
+strategy("Y(4.0) Strateji", overlay=true, max_bars_back=500,
+     max_labels_count=200, pyramiding=0,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.12,
+     slippage=4,
+     calc_on_every_tick=false)
+
+// ─────────────────────────────────────────────
+//  GRUP TANIMLARI
+// ─────────────────────────────────────────────
+G_RSI   = "1. RSI"
+G_ST    = "2. Stochastic"
+G_BB    = "3. Bollinger Bands"
+G_CCI   = "4. CCI"
+G_WR    = "5. Williams %R"
+G_MFI   = "6. MFI"
+G_ADX   = "7. ADX / DI"
+G_DIV   = "8. Diverjans"
+G_SIG   = "━━ Sinyal ve Esik ━━"
+G_VOL   = "━━ Hacim Carpani ━━"
+G_TREND = "━━ Trend Filtresi ━━"
+G_SL    = "━━ Stop Loss ━━"
+G_TRAIL = "━━ Dinamik Trail ━━"
+G_BE    = "━━ Breakeven Koruma ━━"
+G_RE    = "━━ Re-Entry v3 ━━"
+G_PB    = "━━ Pullback v2 ━━"
+G_ALARM = "━━ Webhook Alarm ━━"
+G_VIS   = "━━ Gorsel Ayarlar ━━"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Çoğunluk Eşikleri ────────────────────────
+minVoters = input.int(5, "Min Aktif Bilesen (N/8)", group=G_SIG, minval=2, maxval=8,
+     tooltip="8 bilesenden en az kaci >= 1 puan vermeli.")
+minTotalScore = input.int(10, "Min Toplam Puan", group=G_SIG, minval=4, maxval=24,
+     tooltip="Aktif bilesenlerin toplam puani bu esigi gecmeli.")
+tradeDir = input.string("Her Ikisi", "Islem Yonu",
+     options=["Her Ikisi", "Sadece Long", "Sadece Short"], group=G_SIG)
+filterRepaint = input.bool(true, "Bar Kapanisi Bekle", group=G_SIG)
+
+// ── 1. RSI ───────────────────────────────────
+rsiLen   = input.int(14, "RSI Periyodu",      group=G_RSI, minval=2)
+rsiOS    = input.int(30, "Asiri Satim Esigi", group=G_RSI, minval=5,  maxval=49)
+rsiOB    = input.int(70, "Asiri Alim Esigi",  group=G_RSI, minval=51, maxval=95)
+rsiWarn  = input.int(8,  "Tampon Bolgesi",    group=G_RSI, minval=1,  maxval=20)
+rsiDeep  = input.int(8,  "Derin Bolge",       group=G_RSI, minval=2,  maxval=20)
+
+// ── 2. Stochastic ────────────────────────────
+stK      = input.int(14, "%K Periyodu", group=G_ST, minval=1)
+stD      = input.int(3,  "%D Periyodu", group=G_ST, minval=1)
+stSmooth = input.int(3,  "Smoothing",   group=G_ST, minval=1)
+stOS     = input.int(20, "Asiri Satim", group=G_ST, minval=1,  maxval=49)
+stOB     = input.int(80, "Asiri Alim",  group=G_ST, minval=51, maxval=99)
+stDeep   = input.int(8,  "Derin Bolge", group=G_ST, minval=2,  maxval=20)
+
+// ── 3. Bollinger Bands ───────────────────────
+bbLen     = input.int(20,    "BB Periyodu",       group=G_BB, minval=2)
+bbMult    = input.float(2.0, "StdDev Carpani",    group=G_BB, minval=0.5, step=0.1)
+bbDeepPct = input.float(0.15,"Derin Band Orani",  group=G_BB, minval=0.05, maxval=0.50, step=0.05)
+showBB    = input.bool(true, "Bantlari Goster",   group=G_BB)
+
+// ── 4. CCI ───────────────────────────────────
+cciLen    = input.int(20,  "CCI Periyodu",    group=G_CCI, minval=2)
+cciDeep   = input.int(200, "Derin Esik",      group=G_CCI, minval=100, maxval=400)
+cciMid    = input.int(100, "Orta Esik",       group=G_CCI, minval=50,  maxval=200)
+cciLight  = input.int(50,  "Hafif Esik",      group=G_CCI, minval=20,  maxval=100)
+
+// ── 5. Williams %R ───────────────────────────
+wrLen     = input.int(14, "Williams %R Periyodu", group=G_WR, minval=2)
+wrDeep    = input.int(95, "Derin Esik",           group=G_WR, minval=85, maxval=99)
+wrMid     = input.int(80, "Orta Esik",            group=G_WR, minval=60, maxval=95)
+wrLight   = input.int(65, "Hafif Esik",           group=G_WR, minval=50, maxval=80)
+
+// ── 6. MFI ───────────────────────────────────
+mfiLen    = input.int(14, "MFI Periyodu",   group=G_MFI, minval=2)
+mfiDeep   = input.int(15, "Derin Esik",     group=G_MFI, minval=5,  maxval=25)
+mfiMid    = input.int(20, "Orta Esik",      group=G_MFI, minval=10, maxval=35)
+mfiLight  = input.int(30, "Hafif Esik",     group=G_MFI, minval=15, maxval=45)
+
+// ── 7. ADX / DI ──────────────────────────────
+adxLen       = input.int(14, "ADX Periyodu",       group=G_ADX, minval=2)
+adxStrong    = input.int(25, "Guclu Trend Esigi",  group=G_ADX, minval=15, maxval=50)
+adxRising    = input.int(3,  "ADX Yukselis Bari",  group=G_ADX, minval=1,  maxval=10,
+     tooltip="ADX'in son N barda yukselmesi → trend gucleniyor.")
+
+// ── 8. Diverjans ─────────────────────────────
+useDivFilter = input.bool(true, "Diverjans Aktif",      group=G_DIV)
+divLookback  = input.int(5,     "Pivot Lookback",       group=G_DIV, minval=2, maxval=20)
+divExpiry    = input.int(8,     "Gecerlilik (bar)",      group=G_DIV, minval=2, maxval=30)
+divFreshBar  = input.int(3,     "Taze Div Bari",        group=G_DIV, minval=1, maxval=10,
+     tooltip="3p icin: div son bu kadar bar icinde tespit edilmis olmali.")
+
+// ── Hacim Destek Çarpanı ─────────────────────
+volLen        = input.int(20,    "Hacim Ort. Periyodu",  group=G_VOL, minval=2)
+volSpikeMult  = input.float(1.5, "Spike Carpani",        group=G_VOL, minval=1.0, step=0.1)
+volStrongMult = input.float(2.5, "Guclu Spike Carpani",  group=G_VOL, minval=1.5, step=0.1)
+volBoostWeak  = input.float(1.15,"Zayif Spike Carpani",  group=G_VOL, minval=1.0, maxval=1.5, step=0.05)
+volBoostStrong= input.float(1.25,"Guclu Spike Carpani",  group=G_VOL, minval=1.1, maxval=2.0, step=0.05)
+
+// ── Trend Filtresi (Opsiyonel) ───────────────
+useTrendFilter = input.bool(false, "Trend Filtresi Aktif", group=G_TREND,
+     tooltip="Aktifken: trend yukari ise short veto, trend asagi ise long veto.")
+emaFastLen     = input.int(8,  "Hizli EMA",    group=G_TREND, minval=1)
+emaSlowLen     = input.int(21, "Yavas EMA",    group=G_TREND, minval=2)
+emaTrendLen    = input.int(50, "Trend EMA",    group=G_TREND, minval=10)
+showEMA        = input.bool(true, "EMA Goster", group=G_TREND)
+
+// ── Stop Loss ────────────────────────────────
+useSL       = input.bool(true,  "Stop Loss Aktif", group=G_SL)
+slPercent   = input.float(2.0, "Stop Loss (%)",    group=G_SL, minval=0.1, maxval=50.0, step=0.1)
+
+// ── Trailing Stop (Skor + ATR Entegre) ───────
+useTrailing      = input.bool(true,  "Trailing Stop Aktif",    group=G_TRAIL)
+trailActivation  = input.float(1.5,  "Temel Aktivasyon Kar (%)", group=G_TRAIL, minval=0.1, maxval=50.0, step=0.1)
+trailPercent     = input.float(0.7,  "Temel Geri Donus (%)",    group=G_TRAIL, minval=0.1, maxval=50.0, step=0.1)
+trailTightenRate = input.float(0.5,  "Skor Sikilastirma",      group=G_TRAIL, minval=0.0, maxval=1.0, step=0.1)
+trailLoosenRate  = input.float(0.2,  "Skor Gevsetme",          group=G_TRAIL, minval=0.0, maxval=0.5, step=0.1)
+trailATRlen      = input.int(14,     "ATR Periyodu",            group=G_TRAIL, minval=5, maxval=50)
+trailATRweight   = input.float(0.3,  "ATR Agirlik",            group=G_TRAIL, minval=0.0, maxval=1.0, step=0.1,
+     tooltip="0=ATR etkisiz, 1=ATR tam etkili. Trail parametreleri ATR'ye gore ayarlanir.")
+
+// ── Breakeven Koruma ─────────────────────────
+useBreakeven = input.bool(true, "Breakeven Koruma Aktif", group=G_BE)
+bePhase2pct  = input.float(0.5, "Faz 2: BE Aktivasyon (%)",     group=G_BE, minval=0.1, maxval=5.0, step=0.1)
+bePhase3pct  = input.float(1.0, "Faz 3: Garanti Aktivasyon (%)", group=G_BE, minval=0.3, maxval=10.0, step=0.1)
+bePhase3lock = input.float(0.3, "Faz 3: Kilitli Kar (%)",        group=G_BE, minval=0.1, maxval=5.0, step=0.1)
+
+// ── Re-Entry v3 ──────────────────────────────
+useReEntry       = input.bool(true,  "Re-Entry Aktif",               group=G_RE)
+reCooldownBars   = input.int(5,      "Bekleme Suresi (bar)",         group=G_RE, minval=1,  maxval=30)
+rePullbackPct    = input.float(0.5,  "Min Pullback Derinligi (%)",   group=G_RE, minval=0.1, maxval=5.0, step=0.1)
+reMaxEntries     = input.int(3,      "Max Re-Entry Sayisi",          group=G_RE, minval=1,  maxval=5)
+reMinVoters      = input.int(3,      "Min Aktif Bilesen (RE)",       group=G_RE, minval=1,  maxval=8,
+     tooltip="RE girisi icin gereken minimum aktif bilesen sayisi.")
+reMaxBarsWindow  = input.int(80,     "Zaman Asimi (bar)",            group=G_RE, minval=10, maxval=300)
+
+// ── Pullback v2 ──────────────────────────────
+usePullbackEntry = input.bool(false, "Pullback Girisi Aktif",    group=G_PB)
+pbMinVoters      = input.int(2,      "Min Aktif Bilesen (PB)",   group=G_PB, minval=1, maxval=8)
+pbBounceBar      = input.int(2,      "Bounce Teyit Bari",        group=G_PB, minval=1, maxval=5)
+pbMaxDist        = input.float(0.3,  "Max EMA Mesafesi (%)",     group=G_PB, minval=0.05, maxval=2.0, step=0.05)
+pbSLratio        = input.float(0.65, "SL Sikistirma Orani",     group=G_PB, minval=0.3, maxval=1.0, step=0.05,
+     tooltip="PB girisi icin SL = normal SL * bu oran. 0.65 = %35 daha siki.")
+
+// ── Webhook ──────────────────────────────────
+useWebhook = input.bool(false, "Webhook Alarm Aktif", group=G_ALARM)
+
+// ── Görsel ───────────────────────────────────
+showTable     = input.bool(true,  "Canli Skor Tablosu", group=G_VIS)
+showLabels    = input.bool(true,  "Skor Etiketleri",    group=G_VIS)
+showBGColor   = input.bool(true,  "Arka Plan Rengi",    group=G_VIS)
+showTrailLine = input.bool(true,  "Trail Cizgisi",      group=G_VIS)
+showSLLine    = input.bool(true,  "SL Cizgisi",         group=G_VIS)
+tablePos      = input.string("Sag Ust", "Tablo Konumu", group=G_VIS,
+     options=["Sag Ust","Sag Alt","Sol Ust","Sol Alt"])
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HESAPLAMALAR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. RSI ───────────────────────────────────
+rsiVal = ta.rsi(close, rsiLen)
+
+// ── 2. Stochastic ────────────────────────────
+stKRaw    = ta.stoch(close, high, low, stK)
+stKVal    = ta.sma(stKRaw, stSmooth)
+stDVal    = ta.sma(stKVal, stD)
+stCrossUp = ta.crossover(stKVal, stDVal)
+stCrossDn = ta.crossunder(stKVal, stDVal)
+
+// ── 3. Bollinger Bands ───────────────────────
+[bbUpper, bbMid, bbLower] = ta.bb(close, bbLen, bbMult)
+bbLowerZone  = bbLower + (bbMid - bbLower) * 0.30
+bbUpperZone  = bbUpper - (bbUpper - bbMid) * 0.30
+bbDeepOffset = (bbUpper - bbLower) * bbDeepPct
+
+// ── 4. CCI ───────────────────────────────────
+cciVal = ta.cci(close, cciLen)
+
+// ── 5. Williams %R ───────────────────────────
+wrVal = ta.percentrank(close, wrLen) - 100
+// Pine'da ta.wpr yoktur, ta.percentrank kullanarak manual hesaplayalim
+wrHigh = ta.highest(high, wrLen)
+wrLow  = ta.lowest(low, wrLen)
+wrCalc = wrHigh != wrLow ? -100 * (wrHigh - close) / (wrHigh - wrLow) : -50.0
+
+// ── 6. MFI ───────────────────────────────────
+mfiVal = ta.mfi(hlc3, mfiLen)
+
+// ── 7. ADX / DI ──────────────────────────────
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+diCrossUp  = ta.crossover(diPlus, diMinus)
+diCrossDn  = ta.crossunder(diPlus, diMinus)
+adxRisingOk = adxVal > adxVal[adxRising]
+
+// ── 8. Diverjans ─────────────────────────────
+pivotLow  = ta.pivotlow(low,  divLookback, divLookback)
+pivotHigh = ta.pivothigh(high, divLookback, divLookback)
+
+var float prevPriceLow = na
+var float prevRsiLow   = na
+var int   bullDivBar   = -9999
+
+bullDivNow = false
+if not na(pivotLow)
+    if not na(prevPriceLow) and not na(prevRsiLow)
+        if low[divLookback] < prevPriceLow and rsiVal[divLookback] > prevRsiLow and rsiVal[divLookback] < 50
+            bullDivNow := true
+            bullDivBar := bar_index
+    prevPriceLow := low[divLookback]
+    prevRsiLow   := rsiVal[divLookback]
+
+bullDivActive = useDivFilter and (bar_index - bullDivBar) <= divExpiry
+bullDivFresh  = useDivFilter and (bar_index - bullDivBar) <= divFreshBar
+
+var float prevPriceHigh = na
+var float prevRsiHigh   = na
+var int   bearDivBar    = -9999
+
+bearDivNow = false
+if not na(pivotHigh)
+    if not na(prevPriceHigh) and not na(prevRsiHigh)
+        if high[divLookback] > prevPriceHigh and rsiVal[divLookback] < prevRsiHigh and rsiVal[divLookback] > 50
+            bearDivNow := true
+            bearDivBar := bar_index
+    prevPriceHigh := high[divLookback]
+    prevRsiHigh   := rsiVal[divLookback]
+
+bearDivActive = useDivFilter and (bar_index - bearDivBar) <= divExpiry
+bearDivFresh  = useDivFilter and (bar_index - bearDivBar) <= divFreshBar
+
+// ── Hacim Çarpanı ────────────────────────────
+volAvg   = ta.sma(volume, volLen)
+volRatio = nz(volume / volAvg, 0.0)
+float volMultiplier = 1.0
+if volRatio >= volStrongMult
+    volMultiplier := volBoostStrong
+else if volRatio >= volSpikeMult
+    volMultiplier := volBoostWeak
+
+// ── Trend EMA (filtre için) ──────────────────
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+trendBull = close > emaTrend
+trendBear = close < emaTrend
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SKORLAMA — DIP (8 bileşen × 0-3 puan)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. RSI (0-3) ─────────────────────────────
+int rsiDipPts = 0
+if rsiVal <= (rsiOS - rsiDeep)
+    rsiDipPts := 3
+else if rsiVal <= rsiOS
+    rsiDipPts := 2
+else if rsiVal <= (rsiOS + rsiWarn)
+    rsiDipPts := 1
+
+// ── 2. Stochastic (0-3) ─────────────────────
+int stDipPts = 0
+if stCrossUp and stKVal <= (stOS - stDeep)
+    stDipPts := 3
+else if stCrossUp and stKVal <= stOS
+    stDipPts := 2
+else if stCrossUp and stKVal <= (stOS + 15)
+    stDipPts := 1
+else if stKVal <= stOS and stDVal <= stOS
+    stDipPts := 1
+else if stKVal <= stOS
+    stDipPts := 1
+
+// ── 3. Bollinger (0-3) ──────────────────────
+int bbDipPts = 0
+if close <= (bbLower - bbDeepOffset)
+    bbDipPts := 3
+else if close <= bbLower
+    bbDipPts := 2
+else if close <= bbLowerZone
+    bbDipPts := 1
+
+// ── 4. CCI (0-3) ────────────────────────────
+int cciDipPts = 0
+if cciVal <= -cciDeep
+    cciDipPts := 3
+else if cciVal <= -cciMid
+    cciDipPts := 2
+else if cciVal <= -cciLight
+    cciDipPts := 1
+
+// ── 5. Williams %R (0-3) ────────────────────
+int wrDipPts = 0
+if wrCalc <= -wrDeep
+    wrDipPts := 3
+else if wrCalc <= -wrMid
+    wrDipPts := 2
+else if wrCalc <= -wrLight
+    wrDipPts := 1
+
+// ── 6. MFI (0-3) ────────────────────────────
+int mfiDipPts = 0
+if mfiVal <= mfiDeep
+    mfiDipPts := 3
+else if mfiVal <= mfiMid
+    mfiDipPts := 2
+else if mfiVal <= mfiLight
+    mfiDipPts := 1
+
+// ── 7. ADX/DI (0-3) ─────────────────────────
+int adxDipPts = 0
+if diCrossUp and adxVal >= adxStrong
+    adxDipPts := 3
+else if diPlus > diMinus and adxRisingOk
+    adxDipPts := 2
+else if diPlus > diMinus
+    adxDipPts := 1
+
+// ── 8. Diverjans (0-3) ──────────────────────
+int divDipPts = 0
+if bullDivFresh
+    divDipPts := 3
+else if bullDivActive
+    divDipPts := 2
+else if useDivFilter and (bar_index - bullDivBar) <= (divExpiry + 5)
+    divDipPts := 1
+
+// ── DIP Toplam ──────────────────────────────
+int dipRaw = rsiDipPts + stDipPts + bbDipPts + cciDipPts + wrDipPts + mfiDipPts + adxDipPts + divDipPts
+int dipVoters = (rsiDipPts >= 1 ? 1 : 0) + (stDipPts >= 1 ? 1 : 0) + (bbDipPts >= 1 ? 1 : 0) +
+     (cciDipPts >= 1 ? 1 : 0) + (wrDipPts >= 1 ? 1 : 0) + (mfiDipPts >= 1 ? 1 : 0) +
+     (adxDipPts >= 1 ? 1 : 0) + (divDipPts >= 1 ? 1 : 0)
+float dipScoreEff = dipRaw * volMultiplier
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SKORLAMA — TEPE (8 bileşen × 0-3 puan)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 1. RSI (0-3) ─────────────────────────────
+int rsiPeakPts = 0
+if rsiVal >= (rsiOB + rsiDeep)
+    rsiPeakPts := 3
+else if rsiVal >= rsiOB
+    rsiPeakPts := 2
+else if rsiVal >= (rsiOB - rsiWarn)
+    rsiPeakPts := 1
+
+// ── 2. Stochastic (0-3) ─────────────────────
+int stPeakPts = 0
+if stCrossDn and stKVal >= (stOB + stDeep)
+    stPeakPts := 3
+else if stCrossDn and stKVal >= stOB
+    stPeakPts := 2
+else if stCrossDn and stKVal >= (stOB - 15)
+    stPeakPts := 1
+else if stKVal >= stOB and stDVal >= stOB
+    stPeakPts := 1
+else if stKVal >= stOB
+    stPeakPts := 1
+
+// ── 3. Bollinger (0-3) ──────────────────────
+int bbPeakPts = 0
+if close >= (bbUpper + bbDeepOffset)
+    bbPeakPts := 3
+else if close >= bbUpper
+    bbPeakPts := 2
+else if close >= bbUpperZone
+    bbPeakPts := 1
+
+// ── 4. CCI (0-3) ────────────────────────────
+int cciPeakPts = 0
+if cciVal >= cciDeep
+    cciPeakPts := 3
+else if cciVal >= cciMid
+    cciPeakPts := 2
+else if cciVal >= cciLight
+    cciPeakPts := 1
+
+// ── 5. Williams %R (0-3) ────────────────────
+int wrPeakPts = 0
+if wrCalc >= -(100 - wrDeep)
+    wrPeakPts := 3
+else if wrCalc >= -(100 - wrMid)
+    wrPeakPts := 2
+else if wrCalc >= -(100 - wrLight)
+    wrPeakPts := 1
+
+// ── 6. MFI (0-3) ────────────────────────────
+int mfiPeakPts = 0
+if mfiVal >= (100 - mfiDeep)
+    mfiPeakPts := 3
+else if mfiVal >= (100 - mfiMid)
+    mfiPeakPts := 2
+else if mfiVal >= (100 - mfiLight)
+    mfiPeakPts := 1
+
+// ── 7. ADX/DI (0-3) ─────────────────────────
+int adxPeakPts = 0
+if diCrossDn and adxVal >= adxStrong
+    adxPeakPts := 3
+else if diMinus > diPlus and adxRisingOk
+    adxPeakPts := 2
+else if diMinus > diPlus
+    adxPeakPts := 1
+
+// ── 8. Diverjans (0-3) ──────────────────────
+int divPeakPts = 0
+if bearDivFresh
+    divPeakPts := 3
+else if bearDivActive
+    divPeakPts := 2
+else if useDivFilter and (bar_index - bearDivBar) <= (divExpiry + 5)
+    divPeakPts := 1
+
+// ── TEPE Toplam ─────────────────────────────
+int peakRaw = rsiPeakPts + stPeakPts + bbPeakPts + cciPeakPts + wrPeakPts + mfiPeakPts + adxPeakPts + divPeakPts
+int peakVoters = (rsiPeakPts >= 1 ? 1 : 0) + (stPeakPts >= 1 ? 1 : 0) + (bbPeakPts >= 1 ? 1 : 0) +
+     (cciPeakPts >= 1 ? 1 : 0) + (wrPeakPts >= 1 ? 1 : 0) + (mfiPeakPts >= 1 ? 1 : 0) +
+     (adxPeakPts >= 1 ? 1 : 0) + (divPeakPts >= 1 ? 1 : 0)
+float peakScoreEff = peakRaw * volMultiplier
+
+int maxScore = 24  // 8 × 3
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ATR-ENTEGRE TRAIL HESABI
+// ═══════════════════════════════════════════════════════════════════════════════
+float trailATR     = ta.atr(trailATRlen)
+float trailATRavg  = ta.sma(trailATR, 50)
+float atrScale     = trailATRavg > 0 ? trailATR / trailATRavg : 1.0
+float atrClamped   = math.max(0.5, math.min(2.0, atrScale))
+float atrFactor    = 1.0 + (atrClamped - 1.0) * trailATRweight  // ATR ağırlığına göre blend
+
+float baseTrailAct = trailActivation * atrFactor
+float baseTrailPct = trailPercent * atrFactor
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE MACHINE
+// ═══════════════════════════════════════════════════════════════════════════════
+var int   posDir            = 0
+var float entryPrice        = na
+var float highestSinceEntry = na
+var float lowestSinceEntry  = na
+var float trailStopPrice    = na
+var bool  trailActive       = false
+var float slPrice           = na
+var int   barsSinceEntry    = 0
+
+// RE-Entry v3 state
+var int   lastExitDir        = 0
+var int   barsSinceExit      = 0
+var float lastHighAfterExit  = na
+var float lastLowAfterExit   = na
+var int   reEntryCount       = 0
+var bool  reExitOccurred     = false
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SİNYAL ÜRETİMİ — ÇOĞUNLUK KURALI
+// ═══════════════════════════════════════════════════════════════════════════════
+barConfirmed = not filterRepaint or barstate.isconfirmed
+
+bool rawDipSignal  = dipVoters >= minVoters and dipScoreEff >= minTotalScore and barConfirmed
+bool rawPeakSignal = peakVoters >= minVoters and peakScoreEff >= minTotalScore and barConfirmed
+
+// Trend filtresi (opsiyonel veto)
+if useTrendFilter and rawDipSignal and trendBear
+    rawDipSignal := false
+if useTrendFilter and rawPeakSignal and trendBull
+    rawPeakSignal := false
+
+bool dipWarn  = not rawDipSignal  and dipVoters >= (minVoters - 1) and dipScoreEff >= (minTotalScore - 3) and barConfirmed
+bool peakWarn = not rawPeakSignal and peakVoters >= (minVoters - 1) and peakScoreEff >= (minTotalScore - 3) and barConfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RE-ENTRY v3
+// ═══════════════════════════════════════════════════════════════════════════════
+if posDir == 0 and reExitOccurred
+    barsSinceExit += 1
+
+// Zaman aşımı
+if posDir == 0 and reExitOccurred and barsSinceExit > reMaxBarsWindow
+    reExitOccurred    := false
+    lastHighAfterExit := na
+    lastLowAfterExit  := na
+
+// Çekilme takibi
+if posDir == 0 and reExitOccurred
+    lastHighAfterExit := na(lastHighAfterExit) ? high : math.max(lastHighAfterExit, high)
+    lastLowAfterExit  := na(lastLowAfterExit)  ? low  : math.min(lastLowAfterExit, low)
+
+// Pullback + EMA dönüş teyidi
+bool reDrawdownOkL = false
+bool reDrawdownOkS = false
+bool reTrendOkL    = false
+bool reTrendOkS    = false
+
+if posDir == 0 and useReEntry and reExitOccurred and barsSinceExit >= reCooldownBars and reEntryCount < reMaxEntries
+    if lastExitDir == 1 and not na(lastHighAfterExit) and lastHighAfterExit > 0
+        float dd = (lastHighAfterExit - low) / lastHighAfterExit * 100
+        reDrawdownOkL := dd >= rePullbackPct
+        reTrendOkL    := close > emaFast and close > emaSlow  // EMA geri geçiş teyidi
+    if lastExitDir == -1 and not na(lastLowAfterExit) and lastLowAfterExit > 0
+        float du = (high - lastLowAfterExit) / lastLowAfterExit * 100
+        reDrawdownOkS := du >= rePullbackPct
+        reTrendOkS    := close < emaFast and close < emaSlow
+
+bool reEntryLong = reDrawdownOkL and reTrendOkL and dipVoters >= reMinVoters and barConfirmed
+bool reEntryShort = reDrawdownOkS and reTrendOkS and peakVoters >= reMinVoters and barConfirmed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PULLBACK v2
+// ═══════════════════════════════════════════════════════════════════════════════
+float pbDist    = emaSlow > 0 ? math.abs(close - emaSlow) / emaSlow * 100 : 999.0
+bool  pbNearEMA = pbDist <= pbMaxDist
+
+bool pbBounceLong  = true
+bool pbBounceShort = true
+for i = 0 to pbBounceBar - 1
+    if not (close[i] > open[i])
+        pbBounceLong := false
+    if not (close[i] < open[i])
+        pbBounceShort := false
+
+bool pbTouched = false
+for i = 0 to pbBounceBar + 2
+    if emaSlow > 0 and math.abs(low[i] - emaSlow) / emaSlow * 100 <= pbMaxDist * 1.5
+        pbTouched := true
+    if emaSlow > 0 and math.abs(high[i] - emaSlow) / emaSlow * 100 <= pbMaxDist * 1.5
+        pbTouched := true
+
+// ADX güçlü trend zorunlu
+bool pbTrendStrong = adxVal >= adxStrong
+
+bool pullbackLongSig = usePullbackEntry and posDir != 1 and barConfirmed
+     and trendBull and diPlus > diMinus and pbTrendStrong
+     and dipVoters >= pbMinVoters
+     and pbTouched and pbBounceLong and close > emaSlow
+
+bool pullbackShortSig = usePullbackEntry and posDir != -1 and barConfirmed
+     and trendBear and diMinus > diPlus and pbTrendStrong
+     and peakVoters >= pbMinVoters
+     and pbTouched and pbBounceShort and close < emaSlow
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  BİRLEŞİK GİRİŞ KARARI
+// ═══════════════════════════════════════════════════════════════════════════════
+bool normalDipSig  = rawDipSignal  and posDir != 1
+bool normalPeakSig = rawPeakSignal and posDir != -1
+
+bool goLong  = (normalDipSig  or reEntryLong  or pullbackLongSig)  and tradeDir != "Sadece Short"
+bool goShort = (normalPeakSig or reEntryShort or pullbackShortSig) and tradeDir != "Sadece Long"
+
+// Sadece Long/Short modunda karşı sinyal ile kapatma
+bool counterCloseLong  = goShort and posDir == 1
+bool counterCloseShort = goLong  and posDir == -1
+
+if tradeDir == "Sadece Long" and rawPeakSignal and posDir == 1
+    goShort := false
+if tradeDir == "Sadece Short" and rawDipSignal and posDir == -1
+    goLong := false
+
+bool isRElong  = reEntryLong       and goLong  and not normalDipSig
+bool isREshort = reEntryShort      and goShort and not normalPeakSig
+bool isPBlong  = pullbackLongSig   and goLong  and not normalDipSig  and not reEntryLong
+bool isPBshort = pullbackShortSig  and goShort and not normalPeakSig and not reEntryShort
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SKOR-ENTEGRE TRAIL
+// ═══════════════════════════════════════════════════════════════════════════════
+float counterScoreNorm = 0.0
+float ownScoreNorm     = 0.0
+if posDir == 1
+    counterScoreNorm := peakRaw / maxScore
+    ownScoreNorm     := dipRaw / maxScore
+else if posDir == -1
+    counterScoreNorm := dipRaw / maxScore
+    ownScoreNorm     := peakRaw / maxScore
+
+float scoreFactor = 1.0 - counterScoreNorm * trailTightenRate + ownScoreNorm * trailLoosenRate
+scoreFactor := math.max(0.15, math.min(1.5, scoreFactor))
+
+float effTrailAct = baseTrailAct
+float effTrailPct = baseTrailPct * scoreFactor
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ÇIKIŞ TESPİTİ
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Trail
+bool trailHitL = useTrailing and posDir == 1  and trailActive and not na(trailStopPrice) and low <= trailStopPrice
+bool trailHitS = useTrailing and posDir == -1 and trailActive and not na(trailStopPrice) and high >= trailStopPrice
+
+// SL
+bool slHitL = useSL and posDir == 1  and not na(slPrice) and low <= slPrice
+bool slHitS = useSL and posDir == -1 and not na(slPrice) and high >= slPrice
+
+// Öncelik: karşı sinyal > trail > SL
+bool slExitL    = slHitL    and not goShort
+bool slExitS    = slHitS    and not goLong
+bool trailExitL = trailHitL and not goShort and not slExitL
+bool trailExitS = trailHitS and not goLong  and not slExitS
+
+bool closeLongSignal  = counterCloseLong  or trailExitL or slExitL
+bool closeShortSignal = counterCloseShort or trailExitS or slExitS
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STATE GÜNCELLEME
+// ═══════════════════════════════════════════════════════════════════════════════
+if goLong
+    posDir            := 1
+    entryPrice        := close
+    highestSinceEntry := close
+    lowestSinceEntry  := close
+    trailStopPrice    := na
+    trailActive       := false
+    barsSinceEntry    := 0
+    float riskAmt = close * slPercent / 100
+    float slPctUse = isPBlong ? slPercent * pbSLratio : slPercent
+    float riskAmtUse = close * slPctUse / 100
+    slPrice := useSL ? close - riskAmtUse : na
+    if isRElong
+        reEntryCount += 1
+    else
+        reEntryCount := 0
+    reExitOccurred    := false
+    barsSinceExit     := 0
+    lastHighAfterExit := na
+    lastLowAfterExit  := na
+
+else if goShort
+    posDir            := -1
+    entryPrice        := close
+    highestSinceEntry := close
+    lowestSinceEntry  := close
+    trailStopPrice    := na
+    trailActive       := false
+    barsSinceEntry    := 0
+    float slPctUse = isPBshort ? slPercent * pbSLratio : slPercent
+    float riskAmtUse = close * slPctUse / 100
+    slPrice := useSL ? close + riskAmtUse : na
+    if isREshort
+        reEntryCount += 1
+    else
+        reEntryCount := 0
+    reExitOccurred    := false
+    barsSinceExit     := 0
+    lastHighAfterExit := na
+    lastLowAfterExit  := na
+
+else if closeLongSignal or closeShortSignal
+    // Çıkış kaydet
+    if posDir == 1
+        lastExitDir := 1
+    else if posDir == -1
+        lastExitDir := -1
+    reExitOccurred    := true
+    barsSinceExit     := 0
+    lastHighAfterExit := na
+    lastLowAfterExit  := na
+    posDir         := 0
+    trailStopPrice := na
+    trailActive    := false
+    slPrice        := na
+
+else
+    barsSinceEntry += 1
+    if posDir == 1
+        highestSinceEntry := math.max(nz(highestSinceEntry, close), high)
+        if useTrailing and not na(entryPrice) and entryPrice > 0
+            float profitPct = (highestSinceEntry - entryPrice) / entryPrice * 100
+            if profitPct >= effTrailAct
+                trailActive    := true
+                trailStopPrice := highestSinceEntry * (1 - effTrailPct / 100)
+        if useBreakeven and useSL and not na(entryPrice) and entryPrice > 0
+            float curProfit = (close - entryPrice) / entryPrice * 100
+            if curProfit >= bePhase3pct
+                float p3SL = entryPrice * (1 + bePhase3lock / 100)
+                if na(slPrice) or p3SL > slPrice
+                    slPrice := p3SL
+            else if curProfit >= bePhase2pct
+                if na(slPrice) or entryPrice > slPrice
+                    slPrice := entryPrice
+
+    else if posDir == -1
+        lowestSinceEntry := math.min(nz(lowestSinceEntry, close), low)
+        if useTrailing and not na(entryPrice) and entryPrice > 0
+            float profitPct = (entryPrice - lowestSinceEntry) / entryPrice * 100
+            if profitPct >= effTrailAct
+                trailActive    := true
+                trailStopPrice := lowestSinceEntry * (1 + effTrailPct / 100)
+        if useBreakeven and useSL and not na(entryPrice) and entryPrice > 0
+            float curProfit = (entryPrice - close) / entryPrice * 100
+            if curProfit >= bePhase3pct
+                float p3SL = entryPrice * (1 - bePhase3lock / 100)
+                if na(slPrice) or p3SL < slPrice
+                    slPrice := p3SL
+            else if curProfit >= bePhase2pct
+                if na(slPrice) or entryPrice < slPrice
+                    slPrice := entryPrice
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  WEBHOOK JSON
+// ═══════════════════════════════════════════════════════════════════════════════
+string openLongMsg   = '{"action":"open_long","ticker":"' + syminfo.ticker + '","price":"' + str.tostring(close) + '","score":"' + str.tostring(dipRaw) + '","voters":"' + str.tostring(dipVoters) + '"}'
+string closeLongMsg  = '{"action":"close_long","ticker":"' + syminfo.ticker + '","price":"' + str.tostring(close) + '"}'
+string openShortMsg  = '{"action":"open_short","ticker":"' + syminfo.ticker + '","price":"' + str.tostring(close) + '","score":"' + str.tostring(peakRaw) + '","voters":"' + str.tostring(peakVoters) + '"}'
+string closeShortMsg = '{"action":"close_short","ticker":"' + syminfo.ticker + '","price":"' + str.tostring(close) + '"}'
+string noMsg = ""
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  STRATEJİ EMİRLERİ
+// ═══════════════════════════════════════════════════════════════════════════════
+string longID  = isRElong ? "RE Long" : isPBlong ? "PB Long" : "LONG"
+string shortID = isREshort ? "RE Short" : isPBshort ? "PB Short" : "SHORT"
+
+// Giriş emirleri
+if goLong
+    if strategy.position_size < 0
+        strategy.close("SHORT",    comment="Karsi sinyal", alert_message=useWebhook ? closeShortMsg : noMsg)
+        strategy.close("RE Short", comment="Karsi sinyal", alert_message=useWebhook ? closeShortMsg : noMsg)
+        strategy.close("PB Short", comment="Karsi sinyal", alert_message=useWebhook ? closeShortMsg : noMsg)
+    string lCmt = longID + " V:" + str.tostring(dipVoters) + "/8 S:" + str.tostring(dipRaw)
+    strategy.entry(longID, strategy.long, comment=lCmt, alert_message=useWebhook ? openLongMsg : noMsg)
+    if useSL and not na(slPrice)
+        strategy.exit("SL_" + longID, from_entry=longID, stop=slPrice, alert_message=useWebhook ? closeLongMsg : noMsg)
+
+else if goShort
+    if strategy.position_size > 0
+        strategy.close("LONG",    comment="Karsi sinyal", alert_message=useWebhook ? closeLongMsg : noMsg)
+        strategy.close("RE Long", comment="Karsi sinyal", alert_message=useWebhook ? closeLongMsg : noMsg)
+        strategy.close("PB Long", comment="Karsi sinyal", alert_message=useWebhook ? closeLongMsg : noMsg)
+    string sCmt = shortID + " V:" + str.tostring(peakVoters) + "/8 S:" + str.tostring(peakRaw)
+    strategy.entry(shortID, strategy.short, comment=sCmt, alert_message=useWebhook ? openShortMsg : noMsg)
+    if useSL and not na(slPrice)
+        strategy.exit("SL_" + shortID, from_entry=shortID, stop=slPrice, alert_message=useWebhook ? closeShortMsg : noMsg)
+
+// SL çıkışları
+if slExitL
+    strategy.close("LONG",    comment="SL Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("RE Long", comment="SL Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("PB Long", comment="SL Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+if slExitS
+    strategy.close("SHORT",    comment="SL Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("RE Short", comment="SL Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("PB Short", comment="SL Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+
+// Trail çıkışları
+if trailExitL
+    strategy.close("LONG",    comment="Trail Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("RE Long", comment="Trail Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("PB Long", comment="Trail Long", alert_message=useWebhook ? closeLongMsg : noMsg)
+if trailExitS
+    strategy.close("SHORT",    comment="Trail Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("RE Short", comment="Trail Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("PB Short", comment="Trail Short", alert_message=useWebhook ? closeShortMsg : noMsg)
+
+// Sadece Long/Short modunda kapatma
+if tradeDir == "Sadece Long" and rawPeakSignal and barConfirmed and posDir == 1 and not goShort
+    strategy.close("LONG",    comment="TEPE-Kapat", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("RE Long", comment="TEPE-Kapat", alert_message=useWebhook ? closeLongMsg : noMsg)
+    strategy.close("PB Long", comment="TEPE-Kapat", alert_message=useWebhook ? closeLongMsg : noMsg)
+if tradeDir == "Sadece Short" and rawDipSignal and barConfirmed and posDir == -1 and not goLong
+    strategy.close("SHORT",    comment="DIP-Kapat", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("RE Short", comment="DIP-Kapat", alert_message=useWebhook ? closeShortMsg : noMsg)
+    strategy.close("PB Short", comment="DIP-Kapat", alert_message=useWebhook ? closeShortMsg : noMsg)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GÖRSELLEŞTİRME
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// BB
+pBBUp  = plot(showBB ? bbUpper : na, "BB Ust",  color=color.new(color.purple, 60), linewidth=1)
+pBBMid = plot(showBB ? bbMid   : na, "BB Orta", color=color.new(color.gray,   60), linewidth=1, style=plot.style_circles)
+pBBLo  = plot(showBB ? bbLower : na, "BB Alt",  color=color.new(color.purple, 60), linewidth=1)
+fill(pBBUp, pBBLo, color=color.new(color.purple, 93))
+
+// EMA
+plot(showEMA ? emaFast  : na, "Hizli EMA",  color=color.new(color.teal,   20), linewidth=2)
+plot(showEMA ? emaSlow  : na, "Yavas EMA",  color=color.new(color.orange, 20), linewidth=2)
+plot(showEMA ? emaTrend : na, "Trend EMA",  color=color.new(color.white,  40), linewidth=1, style=plot.style_stepline)
+
+// Trail & SL çizgileri
+trailPlotVal = showTrailLine and posDir != 0 and trailActive and not na(trailStopPrice) ? trailStopPrice : na
+slPlotVal    = showSLLine and posDir != 0 and not na(slPrice) ? slPrice : na
+plot(trailPlotVal, "Trail Stop", color=color.new(color.orange, 0), linewidth=2, style=plot.style_stepline)
+plot(slPlotVal, "SL", color=color.new(color.red, 20), linewidth=1, style=plot.style_cross)
+
+// Ana Sinyaller
+bool normalLongPlot  = goLong  and not isRElong  and not isPBlong
+bool normalShortPlot = goShort and not isREshort and not isPBshort
+plotshape(normalLongPlot,  title="DIP / Long Gir",  style=shape.labelup,   location=location.belowbar, color=color.new(color.lime, 0), textcolor=color.white, text="AL",  size=size.normal)
+plotshape(normalShortPlot, title="TEPE / Short Gir", style=shape.labeldown, location=location.abovebar, color=color.new(color.red,  0), textcolor=color.white, text="SAT", size=size.normal)
+plotshape(isRElong,  title="RE Long",  style=shape.labelup,   location=location.belowbar, color=color.new(#FF6B00, 0), textcolor=color.white, text="RE", size=size.small)
+plotshape(isREshort, title="RE Short", style=shape.labeldown, location=location.abovebar, color=color.new(#FF6B00, 0), textcolor=color.white, text="RE", size=size.small)
+plotshape(isPBlong,  title="PB Long",  style=shape.labelup,   location=location.belowbar, color=color.new(color.aqua, 0), textcolor=color.white, text="PB", size=size.small)
+plotshape(isPBshort, title="PB Short", style=shape.labeldown, location=location.abovebar, color=color.new(color.aqua, 0), textcolor=color.white, text="PB", size=size.small)
+
+// Uyarılar
+plotshape(dipWarn,  title="Dip Uyarisi",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.yellow, 20), size=size.tiny)
+plotshape(peakWarn, title="Tepe Uyarisi", style=shape.triangledown, location=location.abovebar, color=color.new(color.orange, 20), size=size.tiny)
+
+// Diverjans
+plotshape(bullDivActive and not goLong,  title="Bullish Div",  style=shape.diamond, location=location.belowbar, color=color.new(color.aqua,    0), size=size.tiny)
+plotshape(bearDivActive and not goShort, title="Bearish Div",  style=shape.diamond, location=location.abovebar, color=color.new(color.fuchsia, 0), size=size.tiny)
+
+// Arka plan rengi
+bgcolor(showBGColor and goLong  ? color.new(color.lime, 85) : showBGColor and goShort ? color.new(color.red, 85) : na)
+
+// Skor etiketleri
+if showLabels and goLong and not isRElong and not isPBlong
+    label.new(bar_index, low, "V:" + str.tostring(dipVoters) + " S:" + str.tostring(dipRaw), style=label.style_label_up, color=color.new(color.lime, 20), textcolor=color.white, size=size.tiny)
+if showLabels and goShort and not isREshort and not isPBshort
+    label.new(bar_index, high, "V:" + str.tostring(peakVoters) + " S:" + str.tostring(peakRaw), style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+
+// Skorlar (data window)
+plot(dipRaw,      "Dip Ham Skor",     display=display.none)
+plot(peakRaw,     "Tepe Ham Skor",    display=display.none)
+plot(dipVoters,   "Dip Aktif Bilesen", display=display.none)
+plot(peakVoters,  "Tepe Aktif Bilesen", display=display.none)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CANLI SKOR TABLOSU
+// ═══════════════════════════════════════════════════════════════════════════════
+var table t = na
+ptsClrDip(p)  => p >= 3 ? color.new(#00ff88, 0) : p >= 2 ? color.new(#00ff88, 40) : p >= 1 ? color.new(#ffdd00, 0) : color.gray
+ptsClrPeak(p) => p >= 3 ? color.new(#ff0000, 0) : p >= 2 ? color.new(#ff4444, 0) : p >= 1 ? color.new(#ff8c00, 0) : color.gray
+
+if showTable
+    tPos = tablePos == "Sag Ust" ? position.top_right : tablePos == "Sag Alt" ? position.bottom_right : tablePos == "Sol Ust" ? position.top_left : position.bottom_left
+    t := table.new(tPos, 4, 22, bgcolor=color.new(color.black, 20), border_width=1)
+
+    color clrHeader = color.new(#1a1a2e, 0)
+    color clrRowA   = color.new(#16213e, 0)
+    color clrRowB   = color.new(#0f3460, 0)
+    color clrWhite  = color.white
+    color clrGreen  = #00ff88
+    color clrRed    = #ff4444
+    color clrYellow = #ffdd00
+    color clrOrange = #ff8c00
+    color clrGray   = color.gray
+
+    // Başlık
+    table.cell(t, 0, 0, "Y(4.0)", text_color=clrOrange, bgcolor=clrHeader, text_size=size.small)
+    table.cell(t, 1, 0, "Durum", text_color=clrWhite, bgcolor=clrHeader, text_size=size.tiny)
+    table.cell(t, 2, 0, "DIP", text_color=clrGreen, bgcolor=clrHeader, text_size=size.tiny)
+    table.cell(t, 3, 0, "TEPE", text_color=clrRed, bgcolor=clrHeader, text_size=size.tiny)
+
+    // 8 Bileşen
+    table.cell(t, 0, 1, "RSI",    text_color=clrWhite, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 1, 1, str.tostring(rsiLen), text_color=clrGray, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 2, 1, str.tostring(rsiDipPts)  + "/3", text_color=ptsClrDip(rsiDipPts),  bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 3, 1, str.tostring(rsiPeakPts) + "/3", text_color=ptsClrPeak(rsiPeakPts), bgcolor=clrRowA, text_size=size.tiny)
+
+    table.cell(t, 0, 2, "Stoch",  text_color=clrWhite, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 1, 2, str.tostring(stK), text_color=clrGray, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 2, 2, str.tostring(stDipPts)  + "/3", text_color=ptsClrDip(stDipPts),  bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 3, 2, str.tostring(stPeakPts) + "/3", text_color=ptsClrPeak(stPeakPts), bgcolor=clrRowB, text_size=size.tiny)
+
+    table.cell(t, 0, 3, "BB",     text_color=clrWhite, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 1, 3, str.tostring(bbLen), text_color=clrGray, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 2, 3, str.tostring(bbDipPts)  + "/3", text_color=ptsClrDip(bbDipPts),  bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 3, 3, str.tostring(bbPeakPts) + "/3", text_color=ptsClrPeak(bbPeakPts), bgcolor=clrRowA, text_size=size.tiny)
+
+    table.cell(t, 0, 4, "CCI",    text_color=clrWhite, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 1, 4, str.tostring(cciLen), text_color=clrGray, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 2, 4, str.tostring(cciDipPts)  + "/3", text_color=ptsClrDip(cciDipPts),  bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 3, 4, str.tostring(cciPeakPts) + "/3", text_color=ptsClrPeak(cciPeakPts), bgcolor=clrRowB, text_size=size.tiny)
+
+    table.cell(t, 0, 5, "W%R",    text_color=clrWhite, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 1, 5, str.tostring(wrLen), text_color=clrGray, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 2, 5, str.tostring(wrDipPts)  + "/3", text_color=ptsClrDip(wrDipPts),  bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 3, 5, str.tostring(wrPeakPts) + "/3", text_color=ptsClrPeak(wrPeakPts), bgcolor=clrRowA, text_size=size.tiny)
+
+    table.cell(t, 0, 6, "MFI",    text_color=clrWhite, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 1, 6, str.tostring(mfiLen), text_color=clrGray, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 2, 6, str.tostring(mfiDipPts)  + "/3", text_color=ptsClrDip(mfiDipPts),  bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 3, 6, str.tostring(mfiPeakPts) + "/3", text_color=ptsClrPeak(mfiPeakPts), bgcolor=clrRowB, text_size=size.tiny)
+
+    table.cell(t, 0, 7, "ADX/DI", text_color=clrWhite, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 1, 7, str.tostring(adxLen), text_color=clrGray, bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 2, 7, str.tostring(adxDipPts)  + "/3", text_color=ptsClrDip(adxDipPts),  bgcolor=clrRowA, text_size=size.tiny)
+    table.cell(t, 3, 7, str.tostring(adxPeakPts) + "/3", text_color=ptsClrPeak(adxPeakPts), bgcolor=clrRowA, text_size=size.tiny)
+
+    table.cell(t, 0, 8, "Div",    text_color=clrWhite, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 1, 8, useDivFilter ? "Aktif" : "Kapali", text_color=useDivFilter ? clrGreen : clrGray, bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 2, 8, str.tostring(divDipPts)  + "/3", text_color=ptsClrDip(divDipPts),  bgcolor=clrRowB, text_size=size.tiny)
+    table.cell(t, 3, 8, str.tostring(divPeakPts) + "/3", text_color=ptsClrPeak(divPeakPts), bgcolor=clrRowB, text_size=size.tiny)
+
+    // Hacim çarpanı
+    table.cell(t, 0, 9, "Hacim", text_color=clrWhite, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+    table.cell(t, 1, 9, "x" + str.tostring(math.round(volMultiplier, 2)), text_color=volMultiplier > 1.0 ? clrYellow : clrGray, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+    table.cell(t, 2, 9, "", bgcolor=color.new(#2a1a0a, 0))
+    table.cell(t, 3, 9, "", bgcolor=color.new(#2a1a0a, 0))
+
+    // TOPLAM
+    string dipTotalTxt  = "V:" + str.tostring(dipVoters)  + " S:" + str.tostring(math.round(dipScoreEff, 1))
+    string peakTotalTxt = "V:" + str.tostring(peakVoters) + " S:" + str.tostring(math.round(peakScoreEff, 1))
+    color dipColor  = rawDipSignal  ? clrGreen  : dipWarn  ? clrYellow : clrGray
+    color peakColor = rawPeakSignal ? clrRed    : peakWarn ? clrYellow : clrGray
+    color dipBg     = rawDipSignal  ? color.new(color.lime, 75) : clrHeader
+    color peakBg    = rawPeakSignal ? color.new(color.red,  75) : clrHeader
+    table.cell(t, 0, 10, "TOPLAM", text_color=clrYellow, bgcolor=clrHeader, text_size=size.small)
+    table.cell(t, 1, 10, str.tostring(minVoters) + "/8", text_color=clrYellow, bgcolor=clrHeader, text_size=size.tiny)
+    table.cell(t, 2, 10, dipTotalTxt, text_color=dipColor, bgcolor=dipBg, text_size=size.tiny)
+    table.cell(t, 3, 10, peakTotalTxt, text_color=peakColor, bgcolor=peakBg, text_size=size.tiny)
+
+    // Pozisyon
+    string posLbl = posDir == 1 ? "LONG" : posDir == -1 ? "SHORT" : "Bos"
+    color posClr = posDir == 1 ? clrGreen : posDir == -1 ? clrRed : clrGray
+    color posBg  = posDir == 1 ? color.new(color.lime, 80) : posDir == -1 ? color.new(color.red, 80) : color.new(color.gray, 90)
+    table.cell(t, 0, 11, "POZ", text_color=clrWhite, bgcolor=clrHeader, text_size=size.tiny)
+    table.cell(t, 1, 11, posLbl, text_color=posClr, bgcolor=posBg, text_size=size.small)
+    float cPL = na
+    if posDir == 1 and not na(entryPrice) and entryPrice > 0
+        cPL := (close - entryPrice) / entryPrice * 100
+    else if posDir == -1 and not na(entryPrice) and entryPrice > 0
+        cPL := (entryPrice - close) / entryPrice * 100
+    color plClr = not na(cPL) ? (cPL >= 0 ? clrGreen : clrRed) : clrGray
+    string plTxt = not na(cPL) ? (cPL >= 0 ? "+" : "") + str.tostring(math.round(cPL, 2)) + "%" : "-"
+    table.cell(t, 2, 11, plTxt, text_color=plClr, bgcolor=posBg, text_size=size.tiny)
+    string epTxt = not na(entryPrice) and posDir != 0 ? str.tostring(math.round(entryPrice, 2)) : "-"
+    table.cell(t, 3, 11, epTxt, text_color=clrGray, bgcolor=posBg, text_size=size.tiny)
+
+    // SL
+    color slC = not useSL ? color.new(color.gray, 70) : posDir != 0 ? color.new(color.red, 40) : color.new(color.gray, 60)
+    string slLbl = not useSL ? "KAPALI" : posDir == 0 ? "-" : useBreakeven ? "BE" : "AKTIF"
+    string slVal = useSL and posDir != 0 and not na(slPrice) ? str.tostring(math.round(slPrice, 2)) : "-"
+    table.cell(t, 0, 12, "SL", text_color=clrWhite, bgcolor=slC, text_size=size.tiny)
+    table.cell(t, 1, 12, slLbl, text_color=clrWhite, bgcolor=slC, text_size=size.tiny)
+    table.cell(t, 2, 12, slVal, text_color=clrWhite, bgcolor=slC, text_size=size.tiny)
+    table.cell(t, 3, 12, "%" + str.tostring(slPercent), text_color=clrWhite, bgcolor=slC, text_size=size.tiny)
+
+    // Trail
+    color trC2 = not useTrailing ? color.new(color.gray, 70) : trailActive ? color.new(color.orange, 20) : color.new(color.gray, 60)
+    string trStat = not useTrailing ? "KAPALI" : posDir == 0 ? "-" : trailActive ? "AKTIF" : "BEKLE"
+    string trVal = trailActive and not na(trailStopPrice) ? str.tostring(math.round(trailStopPrice, 2)) : "-"
+    string trSF  = posDir != 0 ? "x" + str.tostring(math.round(scoreFactor, 2)) : "-"
+    table.cell(t, 0, 13, "Trail", text_color=clrWhite, bgcolor=trC2, text_size=size.tiny)
+    table.cell(t, 1, 13, trStat, text_color=clrWhite, bgcolor=trC2, text_size=size.tiny)
+    table.cell(t, 2, 13, trVal, text_color=clrWhite, bgcolor=trC2, text_size=size.tiny)
+    table.cell(t, 3, 13, trSF, text_color=clrWhite, bgcolor=trC2, text_size=size.tiny)
+
+    // RE
+    string reStatus = not useReEntry ? "KAPALI" : not reExitOccurred ? "---" : barsSinceExit < reCooldownBars ? "BEKLE" : barsSinceExit > reMaxBarsWindow ? "DOLDU" : "IZLE"
+    color reC = not useReEntry ? color.new(color.gray, 70) : reExitOccurred ? color.new(#FF6B00, 30) : color.new(color.gray, 60)
+    string reCount = useReEntry ? str.tostring(reEntryCount) + "/" + str.tostring(reMaxEntries) : "-"
+    table.cell(t, 0, 14, "RE v3", text_color=clrWhite, bgcolor=reC, text_size=size.tiny)
+    table.cell(t, 1, 14, reStatus, text_color=clrWhite, bgcolor=reC, text_size=size.tiny)
+    table.cell(t, 2, 14, reCount, text_color=clrWhite, bgcolor=reC, text_size=size.tiny)
+    table.cell(t, 3, 14, useReEntry and reExitOccurred ? "B:" + str.tostring(barsSinceExit) : "-", text_color=clrWhite, bgcolor=reC, text_size=size.tiny)
+
+    // PB
+    color pbC = not usePullbackEntry ? color.new(color.gray, 70) : color.new(color.aqua, 50)
+    table.cell(t, 0, 15, "PB v2", text_color=clrWhite, bgcolor=pbC, text_size=size.tiny)
+    table.cell(t, 1, 15, not usePullbackEntry ? "KAPALI" : "V:" + str.tostring(pbMinVoters), text_color=clrWhite, bgcolor=pbC, text_size=size.tiny)
+    table.cell(t, 2, 15, "", bgcolor=pbC)
+    table.cell(t, 3, 15, "", bgcolor=pbC)
+
+    // Trend Filtresi
+    color tfC = not useTrendFilter ? color.new(color.gray, 70) : trendBull ? color.new(color.green, 40) : color.new(color.red, 40)
+    string tfLbl = not useTrendFilter ? "KAPALI" : trendBull ? "YUKARI" : "ASAGI"
+    table.cell(t, 0, 16, "Trend F.", text_color=clrWhite, bgcolor=tfC, text_size=size.tiny)
+    table.cell(t, 1, 16, tfLbl, text_color=clrWhite, bgcolor=tfC, text_size=size.tiny)
+    table.cell(t, 2, 16, "", bgcolor=tfC)
+    table.cell(t, 3, 16, "", bgcolor=tfC)
+
+    // Durum
+    string statusText = "Bekleniyor"
+    if goLong
+        statusText := isRElong ? "RE AL" : isPBlong ? "PB AL" : "AL SINYALI"
+    else if goShort
+        statusText := isREshort ? "RE SAT" : isPBshort ? "PB SAT" : "SAT SINYALI"
+    else if slExitL or slExitS
+        statusText := "SL CIKIS"
+    else if trailExitL or trailExitS
+        statusText := "TRAIL CIKIS"
+    else if dipWarn
+        statusText := "AL YAKIN"
+    else if peakWarn
+        statusText := "SAT YAKIN"
+
+    color statusClr = goLong ? clrGreen : goShort ? clrRed : (slExitL or slExitS) ? clrRed : (trailExitL or trailExitS) ? clrOrange : (dipWarn or peakWarn) ? clrYellow : clrGray
+    color statusBg = goLong ? color.new(color.lime, 80) : goShort ? color.new(color.red, 80) : (dipWarn or peakWarn) ? color.new(color.yellow, 88) : color.new(color.gray, 90)
+    table.cell(t, 0, 17, "DURUM", text_color=clrWhite, bgcolor=clrHeader, text_size=size.tiny)
+    table.cell(t, 1, 17, statusText, text_color=statusClr, bgcolor=statusBg, text_size=size.small)
+    table.cell(t, 2, 17, "", bgcolor=statusBg)
+    table.cell(t, 3, 17, "", bgcolor=statusBg)
+
+    // Versiyon
+    int modCount = (useSL ? 1 : 0) + (useTrailing ? 1 : 0) + (useBreakeven ? 1 : 0) + (useReEntry ? 1 : 0) + (usePullbackEntry ? 1 : 0) + (useTrendFilter ? 1 : 0)
+    table.cell(t, 0, 18, "MOD", text_color=clrWhite, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+    table.cell(t, 1, 18, str.tostring(modCount) + "/6", text_color=clrWhite, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+    table.cell(t, 2, 18, tradeDir, text_color=clrYellow, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+    table.cell(t, 3, 18, "v4.0", text_color=clrOrange, bgcolor=color.new(#2a1a0a, 0), text_size=size.tiny)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALARMLAR
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(goLong,           title="Y4 LONG AC",     message='{"action":"open_long","ticker":"{{ticker}}","interval":"{{interval}}"}')
+alertcondition(closeLongSignal,  title="Y4 LONG KAPAT",  message='{"action":"close_long","ticker":"{{ticker}}","interval":"{{interval}}"}')
+alertcondition(goShort,          title="Y4 SHORT AC",    message='{"action":"open_short","ticker":"{{ticker}}","interval":"{{interval}}"}')
+alertcondition(closeShortSignal, title="Y4 SHORT KAPAT", message='{"action":"close_short","ticker":"{{ticker}}","interval":"{{interval}}"}')
+alertcondition(dipWarn,          title="Y4 Al Uyarisi",  message="AL yakin | {{ticker}} | {{interval}}")
+alertcondition(peakWarn,         title="Y4 Sat Uyarisi", message="SAT yakin | {{ticker}} | {{interval}}")
+// SON

@@ -1,0 +1,696 @@
+//@version=6
+// Sessions & Time Profile [FEELS]
+//
+// Draws the trading sessions, then measures what they actually did.
+//
+// The profile strip under price answers "where in the day does this symbol put its
+// high and its low" — but measured against chance, not raw. That distinction is the
+// whole point. Cut a random walk into days and its extremes pile up at the day
+// boundary all by themselves; a raw hour histogram shows that pile and calls it a
+// pattern. The baseline drawn out here is the arcsine law, which is exactly the
+// amount of clustering a coin flip would produce, so only what stands above it is
+// left on screen.
+//
+// Everything on the chart describes bars that have already closed. The day still
+// forming is marked provisional and is not counted into any statistic.
+
+indicator("Sessions & Killzones with Time Profile [FEELS]", "Sessions & Killzones [FEELS]", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 100, max_bars_back = 5000)
+
+// ─────────────────────────────────────────────────────────────── inputs ────
+grpS = "Sessions"
+grpP = "Time profile"
+grpN = "Notes"
+grpL = "Look"
+
+tzIn   = input.string("UTC", "Time zone", group = grpS,
+     options = ["UTC", "Exchange", "America/New_York", "Europe/London", "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney"],
+     tooltip = "Sessions, the day boundary and the profile hours are all read in this zone.")
+
+sessNote = "The four windows are arbitrary. The defaults are full trading sessions; narrow them to any killzone timing you use and switch the zone above — the statistics follow whatever windows you set."
+s1On   = input.bool(true,  "", inline = "s1", group = grpS, tooltip = sessNote)
+s1Txt  = input.session("0000-0700", "", inline = "s1", group = grpS)
+s1Name = input.string("Asia", "", inline = "s1", group = grpS)
+s1Col  = input.color(color.new(#5B8DB8, 0), "", inline = "s1", group = grpS)
+
+s2On   = input.bool(true,  "", inline = "s2", group = grpS)
+s2Txt  = input.session("0700-1300", "", inline = "s2", group = grpS)
+s2Name = input.string("London", "", inline = "s2", group = grpS)
+s2Col  = input.color(color.new(#C08A3E, 0), "", inline = "s2", group = grpS)
+
+s3On   = input.bool(true,  "", inline = "s3", group = grpS)
+s3Txt  = input.session("1300-2100", "", inline = "s3", group = grpS)
+s3Name = input.string("New York", "", inline = "s3", group = grpS)
+s3Col  = input.color(color.new(#6E9E6B, 0), "", inline = "s3", group = grpS)
+
+s4On   = input.bool(true,  "", inline = "s4", group = grpS)
+s4Txt  = input.session("2100-0000", "", inline = "s4", group = grpS)
+s4Name = input.string("Late", "", inline = "s4", group = grpS)
+s4Col  = input.color(color.new(#8E7CA8, 0), "", inline = "s4", group = grpS)
+
+showBox  = input.bool(true, "Draw session ranges", group = grpS)
+boxDays  = input.int(25, "Days of session boxes", minval = 1, maxval = 100, group = grpS,
+     tooltip = "Session boxes are drawing objects and TradingView allows a limited number of them. Older ones are removed.")
+
+// The profile is two dozen numbers. Stated in words it is two lines, which is why the
+// panel is the default; the two drawn forms are there for people who want the shape.
+profPanel = input.bool(true,  "Profile: in the panel, as words", group = grpP,
+     tooltip = "Two lines naming the hours that hold the day's high and low most and least often, measured against chance.")
+profStrip = input.bool(false, "Profile: strip under price", group = grpP,
+     tooltip = "Repeats the same profile under every day. Reads best on lower timeframes, where several bars share one hour.")
+profBlock = input.bool(false, "Profile: block in the right margin", group = grpP,
+     tooltip = "Draws the whole day once, to the right of the last bar. Widen the chart's right margin if it is cut off.")
+stripUp   = input.color(color.new(#2E8B60, 10), "Highs cluster here", group = grpP)
+stripDn   = input.color(color.new(#B4503B, 10), "Lows cluster here", group = grpP)
+blockSize = input.float(1.0, "Block height", minval = 0.2, maxval = 4.0, step = 0.1, group = grpP)
+stripSize = input.float(1.0, "Strip height and distance from price", minval = 0.2, maxval = 4.0, step = 0.1, group = grpP,
+     tooltip = "Scales the strip and how far below price it sits. Lower it to pull the strip up and close the empty band under the candles.")
+blockW    = input.int(2, "Block column width, bars", minval = 1, maxval = 6, group = grpP,
+     tooltip = "The block is drawn in the empty margin to the right of the last bar. Widen the chart's right margin if it is cut off.")
+minDays   = input.int(60, "Minimum days before showing statistics", minval = 10, maxval = 2000, group = grpP,
+     tooltip = "Below this the sample is too thin to draw anything. Load more history if the strip stays empty.")
+showCols  = input.bool(false, "Tint whole columns on crowded hours", group = grpP,
+     tooltip = "Off by default. Paints the full bar column on hours whose excess clears the threshold below.")
+colMin    = input.float(1.5, "Column threshold, points over chance", minval = 0.2, maxval = 10.0, step = 0.1, group = grpP)
+
+showTag  = input.bool(true, "Label what each session did", group = grpN)
+tagDays  = input.int(45, "Days of labels", minval = 1, maxval = 220, group = grpN,
+     tooltip = "Each day adds two labels, so this is a real day count. TradingView allows 500 labels in total.")
+tagGap   = input.int(12, "Minimum bars between labels", minval = 0, maxval = 60, group = grpN,
+     tooltip = "Stops labels overlapping on symbols that print few bars per day. Lower it for denser labelling.")
+showPnl  = input.bool(true, "Show notes panel", group = grpN)
+pnlSize  = input.string("Small", "Panel text size", options = ["Tiny", "Small", "Normal", "Large"], group = grpN)
+nLines   = input.int(3, "Notes per day", minval = 1, maxval = 5, group = grpN)
+pnlPos   = input.string("Bottom right", "Panel position", options = ["Top right", "Bottom right", "Bottom left", "Top left"], group = grpN)
+
+txtCol   = input.color(color.new(#20242A, 0), "Text", group = grpL)
+tagSize  = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = grpL)
+
+NS = 4
+i_sizeOf(string s) => s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Large" ? size.large : size.normal
+
+// ────────────────────────────────────────────────────── session plumbing ────
+tz = tzIn == "Exchange" ? syminfo.timezone : tzIn
+
+f_in(string spec, bool on) => on and not na(time(timeframe.period, spec, tz))
+
+var bool[] inS = array.new_bool(NS, false)
+array.set(inS, 0, f_in(s1Txt, s1On))
+array.set(inS, 1, f_in(s2Txt, s2On))
+array.set(inS, 2, f_in(s3Txt, s3On))
+array.set(inS, 3, f_in(s4Txt, s4On))
+
+f_sName(int i) => i == 0 ? s1Name : i == 1 ? s2Name : i == 2 ? s3Name : s4Name
+f_sCol(int i)  => i == 0 ? s1Col  : i == 1 ? s2Col  : i == 2 ? s3Col  : s4Col
+
+// The first session the bar belongs to. Overlapping definitions resolve to the earlier
+// one so that every bar is attributed exactly once and the counts stay honest.
+curS = -1
+for i = 0 to NS - 1
+    if curS == -1 and array.get(inS, i)
+        curS := i
+
+hr     = hour(time, tz)
+dom    = dayofmonth(time, tz)
+newDay = ta.change(dom) != 0
+
+// ───────────────────────────────────────────────────────── persistent stats ────
+var float[] obsHi = array.new_float(24, 0.0)   // days whose high landed on this hour
+var float[] obsLo = array.new_float(24, 0.0)
+var float[] expHi = array.new_float(24, 0.0)   // what chance alone would have put there
+var float[] expLo = array.new_float(24, 0.0)
+var int     nDays = 0
+
+var float[] sBars = array.new_float(NS, 0.0)   // bars ever attributed to this session
+var float   totBars = 0.0
+var float[] sHi  = array.new_float(NS, 0.0)    // days this session held the day's high
+var float[] sLo  = array.new_float(NS, 0.0)
+var float[] sExp = array.new_float(NS, 0.0)    // chance share of the day owned by this session
+
+// rolling log ranges, one window per session, for "wider / quieter than usual"
+var float[] dHis = array.new_float(0)   // last 20 daily highs, for placing the strip
+var float[] dLos = array.new_float(0)
+var float[] r0 = array.new_float(0)
+var float[] r1 = array.new_float(0)
+var float[] r2 = array.new_float(0)
+var float[] r3 = array.new_float(0)
+var float[] rD = array.new_float(0)
+RWIN = 60
+
+// how often each note has ever fired here, so rarity can rank them
+NT = 16
+var float[] tplCnt = array.new_float(NT, 0.0)
+var int     tplDay = 0
+
+// ─────────────────────────────────────────────────────── day accumulator ────
+var int[]   dHour = array.new_int(0)
+var int[]   dSess = array.new_int(0)
+var float   dHi   = na
+var float   dLo   = na
+var int     dHiIx = na          // bar_index of the bar holding the day's high
+var int     dLoIx = na
+var int     dHiJ  = 0           // its position inside the day
+var int     dLoJ  = 0
+var float[] ssHi  = array.new_float(NS, na)
+var float[] ssLo  = array.new_float(NS, na)
+var float[] ssOp  = array.new_float(NS, na)
+var float[] ssCl  = array.new_float(NS, na)
+var int[]   ssN   = array.new_int(NS, 0)
+
+// Only the arrays are reset here. Pine does not let a function assign to a global
+// scalar, so dHi / dLo / the index trackers are cleared at the call site.
+f_clearArrays() =>
+    array.clear(dHour)
+    array.clear(dSess)
+    for i = 0 to NS - 1
+        array.set(ssHi, i, na)
+        array.set(ssLo, i, na)
+        array.set(ssOp, i, na)
+        array.set(ssCl, i, na)
+        array.set(ssN,  i, 0)
+
+// Chance baseline for a day of B bars: the discrete arcsine law.
+// a[0]=1, a[k]=a[k-1]*(2k-1)/(2k), p[j]=a[j]*a[n-j] with n=B-1.
+// Checked against 400 permutations of real data: worst error 0.93 points.
+f_arcw(int B) =>
+    float[] p = array.new_float(B, 0.0)
+    if B >= 2
+        n = B - 1
+        float[] a = array.new_float(n + 1, 0.0)
+        array.set(a, 0, 1.0)
+        if n >= 1
+            for k = 1 to n
+                array.set(a, k, array.get(a, k - 1) * (2.0 * k - 1.0) / (2.0 * k))
+        for j = 0 to n
+            array.set(p, j, array.get(a, j) * array.get(a, n - j))
+    p
+
+f_push(float[] arr, float v) =>
+    array.push(arr, v)
+    if array.size(arr) > RWIN
+        array.shift(arr)
+
+f_med(float[] arr) => array.size(arr) < 20 ? na : array.median(arr)
+
+f_rng(int i) => i == 0 ? r0 : i == 1 ? r1 : i == 2 ? r2 : r3
+
+// A stock or an index CFD only prints bars inside one session, so "New York held the
+// high on 100% of days, chance 100%" is arithmetically right and completely empty.
+// Detect that and drop the session layer, keeping the hour profile, which stays
+// informative there (NVDA: +17pp over chance at 13:00).
+topShare = 0.0
+if totBars > 0
+    for i = 0 to NS - 1
+        topShare := math.max(topShare, array.get(sBars, i) / totBars)
+degen = topShare > 0.9
+
+// ─────────────────────────────────────────────── notes produced at day close ────
+var string[] noteTxt = array.new_string(0)
+var string   noteHdr = ""
+
+f_fmt(float v, string f) => str.tostring(v, f)
+
+// A note is ranked by how RARE it is on this symbol, not by how big its raw number is.
+// Mixing units (points of edge, log range ratios) made whichever family had the largest
+// raw values lead every single day. Rarity puts the unusual thing on top instead.
+f_add(float[] sc, string[] tx, int[] tp, float[] cnt, int seenDays, int tpl, float mag, string txt) =>
+    seen = array.get(cnt, tpl)
+    pr   = math.min(0.95, math.max(1.0 / (seenDays + 2), (seen + 0.5) / (seenDays + 1)))
+    rar  = -math.log(pr) / math.log(2)
+    array.push(sc, rar + math.max(0.0, math.min(1.5, mag)))
+    array.push(tx, txt)
+    array.push(tp, tpl)
+
+f_pad2(int v) => (v < 10 ? "0" : "") + str.tostring(v)
+
+// ───────────────────────────────────────────────────────── main accumulate ────
+var bool aSweep = false
+var bool aCrowd = false
+var int lastHiTag = -100000
+var int lastLoTag = -100000
+var box[]   boxes = array.new<box>()
+var label[] tags  = array.new<label>()
+
+f_trimBox() =>
+    while array.size(boxes) > boxDays * NS
+        box.delete(array.shift(boxes))
+f_trimTag() =>
+    while array.size(tags) > tagDays * 2
+        label.delete(array.shift(tags))
+
+aSweep := false
+aCrowd := false
+
+if barstate.isconfirmed
+    // close out the previous day before starting the new one
+    if newDay and array.size(dHour) >= 4
+        B = array.size(dHour)
+        float[] w = f_arcw(B)
+
+        for j = 0 to B - 1
+            h = array.get(dHour, j)
+            pj = array.get(w, j)
+            array.set(expHi, h, array.get(expHi, h) + pj)
+            array.set(expLo, h, array.get(expLo, h) + pj)
+            si = array.get(dSess, j)
+            if si >= 0
+                array.set(sExp, si, array.get(sExp, si) + pj)
+
+        array.set(obsHi, array.get(dHour, dHiJ), array.get(obsHi, array.get(dHour, dHiJ)) + 1)
+        array.set(obsLo, array.get(dHour, dLoJ), array.get(obsLo, array.get(dHour, dLoJ)) + 1)
+        nDays += 1
+
+        hiS = array.get(dSess, dHiJ)
+        loS = array.get(dSess, dLoJ)
+        if hiS >= 0
+            array.set(sHi, hiS, array.get(sHi, hiS) + 1)
+        if loS >= 0
+            array.set(sLo, loS, array.get(sLo, loS) + 1)
+
+        // ── build this day's notes, each one a measured statement ──
+        float[] fSc = array.new_float(0)
+        string[] fTx = array.new_string(0)
+        int[]    fTp = array.new_int(0)
+
+        // which session held the extreme, with its rate against chance
+        if hiS >= 0 and nDays >= minDays and not degen
+            pH = array.get(sHi, hiS) / nDays * 100
+            bH = array.get(sExp, hiS) / nDays * 100
+            f_add(fSc, fTx, fTp, tplCnt, tplDay, 0, math.abs(pH - bH) / 20,
+                 f_sName(hiS) + " made the day's high. It does that on " + f_fmt(pH, "#") +
+                 "% of days here; chance alone gives " + f_fmt(bH, "#") + "% (n=" + str.tostring(nDays) + ").")
+        if loS >= 0 and nDays >= minDays and not degen
+            pL = array.get(sLo, loS) / nDays * 100
+            bL = array.get(sExp, loS) / nDays * 100
+            f_add(fSc, fTx, fTp, tplCnt, tplDay, 1, math.abs(pL - bL) / 20,
+                 f_sName(loS) + " made the day's low — " + f_fmt(pL, "#") + "% of days here against " +
+                 f_fmt(bL, "#") + "% from chance (n=" + str.tostring(nDays) + ").")
+        if hiS >= 0 and hiS == loS and not degen
+            f_add(fSc, fTx, fTp, tplCnt, tplDay, 2, 0.5, f_sName(hiS) + " produced both the high and the low of the day — the whole day's range was set inside one session.")
+        if hiS >= 0 and loS >= 0 and math.abs(hiS - loS) >= 2 and not degen
+            f_add(fSc, fTx, fTp, tplCnt, tplDay, 3, 0.4, "High and low sat at opposite ends of the day — " + f_sName(hiS) + " against " + f_sName(loS) + ".")
+
+        // what each session did to the one before it
+        for i = 1 to NS - 1
+            pv = -1
+            for k = i - 1 to 0
+                if pv == -1 and array.get(ssN, k) > 0
+                    pv := k
+            if pv >= 0 and array.get(ssN, i) > 0
+                sh = array.get(ssHi, i)
+                sl = array.get(ssLo, i)
+                sc = array.get(ssCl, i)
+                ph = array.get(ssHi, pv)
+                pl = array.get(ssLo, pv)
+                if sh > ph and sc < ph
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 4, 0.8, f_sName(i) + " took " + f_sName(pv) + "'s high and closed back below it.")
+                else if sh > ph
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 5, 0.3, f_sName(i) + " broke " + f_sName(pv) + "'s high and held above it into the close.")
+                if sl < pl and sc > pl
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 6, 0.8, f_sName(i) + " took " + f_sName(pv) + "'s low and closed back above it.")
+                else if sl < pl
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 7, 0.3, f_sName(i) + " broke " + f_sName(pv) + "'s low and stayed below into the close.")
+                if sh <= ph and sl >= pl
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 8, 0.4, f_sName(i) + " stayed entirely inside " + f_sName(pv) + "'s range.")
+                if sh > ph or sl < pl
+                    aSweep := true
+
+        // range against this session's own recent history, in log terms so a
+        // symbol that has tripled in price does not read as permanently explosive
+        for i = 0 to NS - 1
+            if array.get(ssN, i) > 0
+                lo_ = array.get(ssLo, i)
+                hi_ = array.get(ssHi, i)
+                if lo_ > 0 and hi_ > 0
+                    lr = math.log(hi_ / lo_)
+                    md = f_med(f_rng(i))
+                    if not na(md) and md > 0
+                        rt = lr / md
+                        if rt > 2.0
+                            f_add(fSc, fTx, fTp, tplCnt, tplDay, 9, math.log(rt) / math.log(2),
+                                 f_sName(i) + "'s range was " + f_fmt(rt, "#.0") + "x its usual size (median of the last " +
+                                 str.tostring(array.size(f_rng(i))) + " " + f_sName(i) + " sessions).")
+                        else if rt < 0.45
+                            f_add(fSc, fTx, fTp, tplCnt, tplDay, 10, math.log(1 / rt) / math.log(2),
+                                 f_sName(i) + " was unusually quiet — " + f_fmt(rt * 100, "#") + "% of its typical range (n=" +
+                                 str.tostring(array.size(f_rng(i))) + ").")
+
+        // the hour the extreme landed on, against chance for that hour
+        if nDays >= minDays
+            hh = array.get(dHour, dHiJ)
+            hl = array.get(dHour, dLoJ)
+            exH = (array.get(obsHi, hh) - array.get(expHi, hh)) / nDays * 100
+            exL = (array.get(obsLo, hl) - array.get(expLo, hl)) / nDays * 100
+            if math.abs(exH) > 2.5 or math.abs(exL) > 2.5
+                aCrowd := true
+            if exH > 2.5
+                f_add(fSc, fTx, fTp, tplCnt, tplDay, 11, exH / 4, "The high landed at " + f_pad2(hh) +
+                     ":00, one of this symbol's crowded hours for highs (+" + f_fmt(exH, "#.0") + "pp over chance, n=" + str.tostring(nDays) + ").")
+            else if exH < -2.5
+                f_add(fSc, fTx, fTp, tplCnt, tplDay, 12, math.abs(exH) / 4, "The high landed at " + f_pad2(hh) +
+                     ":00, an hour that rarely holds them (" + f_fmt(exH, "#.0") + "pp against chance, n=" + str.tostring(nDays) + ").")
+            if exL > 2.5
+                f_add(fSc, fTx, fTp, tplCnt, tplDay, 13, exL / 4, "The low landed at " + f_pad2(hl) +
+                     ":00, a crowded hour for lows here (+" + f_fmt(exL, "#.0") + "pp over chance, n=" + str.tostring(nDays) + ").")
+
+        // the day itself against recent days
+        if dHi > 0 and dLo > 0
+            dl = math.log(dHi / dLo)
+            dm = f_med(rD)
+            if not na(dm) and dm > 0
+                dr = dl / dm
+                if dr > 2.0
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 14, math.log(dr) / math.log(2), "The day's range was " + f_fmt(dr, "#.0") +
+                         "x the median of the last " + str.tostring(array.size(rD)) + " days.")
+                else if dr < 0.4
+                    f_add(fSc, fTx, fTp, tplCnt, tplDay, 15, 0.8, "The narrowest kind of day here — " + f_fmt(dr * 100, "#") +
+                         "% of the median range of the last " + str.tostring(array.size(rD)) + " days.")
+
+        // record what fired, so rarity keeps learning
+        tplDay += 1
+        seenTpl = array.new_bool(NT, false)
+        if array.size(fTp) > 0
+            for k = 0 to array.size(fTp) - 1
+                t = array.get(fTp, k)
+                if not array.get(seenTpl, t)
+                    array.set(seenTpl, t, true)
+                    array.set(tplCnt, t, array.get(tplCnt, t) + 1)
+
+        // keep the top notes for the panel
+        array.clear(noteTxt)
+        cnt = math.min(nLines, array.size(fSc))
+        if cnt > 0
+            for k = 1 to cnt
+                bi = 0
+                for j = 0 to array.size(fSc) - 1
+                    if array.get(fSc, j) > array.get(fSc, bi)
+                        bi := j
+                array.push(noteTxt, array.get(fTx, bi))
+                array.set(fSc, bi, -1e9)
+
+        // headline stat for the panel
+        sessOn = false
+        for i = 0 to NS - 1
+            if array.get(sExp, i) > 0
+                sessOn := true
+        if nDays >= minDays and (degen or not sessOn)
+            bh = 0
+            be = -1e9
+            for h = 0 to 23
+                eh = (array.get(obsHi, h) - array.get(expHi, h)) / nDays * 100
+                if eh > be
+                    be := eh
+                    bh := h
+            oh = array.get(obsHi, bh) / nDays * 100
+            ch = array.get(expHi, bh) / nDays * 100
+            noteHdr := "Highs cluster at " + f_pad2(bh) + ":00 — " + f_fmt(oh, "#") +
+                 "% of days · chance " + f_fmt(ch, "#") + "% · n=" + str.tostring(nDays)
+        else if nDays >= minDays
+            bestI = 0
+            bestE = -1e9
+            for i = 0 to NS - 1
+                if array.get(sExp, i) > 0
+                    e = (array.get(sHi, i) - array.get(sExp, i)) / nDays * 100
+                    if e > bestE
+                        bestE := e
+                        bestI := i
+            phH = array.get(sHi, bestI) / nDays * 100
+            pbH = array.get(sExp, bestI) / nDays * 100
+            noteHdr := f_sName(bestI) + " holds the high on " + f_fmt(phH, "#") + "% of days · chance " +
+                 f_fmt(pbH, "#") + "% · n=" + str.tostring(nDays)
+
+        // labels naming what each session did
+        if showTag and bar_index > 50
+            if hiS >= 0 and not na(dHiIx) and dHiIx - lastHiTag >= tagGap
+                lastHiTag := dHiIx
+                tHi = degen ? "HIGH " + f_pad2(array.get(dHour, dHiJ)) + ":00" : f_sName(hiS) + " HIGH"
+                array.push(tags, label.new(dHiIx, dHi, tHi, xloc.bar_index, yloc.price,
+                     color.new(color.white, 100), label.style_label_down, f_sCol(hiS), i_sizeOf(tagSize)))
+            if loS >= 0 and not na(dLoIx) and dLoIx - lastLoTag >= tagGap
+                lastLoTag := dLoIx
+                tLo = degen ? "LOW " + f_pad2(array.get(dHour, dLoJ)) + ":00" : f_sName(loS) + " LOW"
+                array.push(tags, label.new(dLoIx, dLo, tLo, xloc.bar_index, yloc.price,
+                     color.new(color.white, 100), label.style_label_up, f_sCol(loS), i_sizeOf(tagSize)))
+            f_trimTag()
+
+        // roll the range windows forward
+        for i = 0 to NS - 1
+            if array.get(ssN, i) > 0
+                lo2 = array.get(ssLo, i)
+                hi2 = array.get(ssHi, i)
+                if lo2 > 0 and hi2 > 0
+                    f_push(f_rng(i), math.log(hi2 / lo2))
+        if dHi > 0 and dLo > 0
+            f_push(rD, math.log(dHi / dLo))
+        array.push(dHis, dHi)
+        array.push(dLos, dLo)
+        if array.size(dHis) > 20
+            array.shift(dHis)
+            array.shift(dLos)
+
+        f_clearArrays()
+        dHi   := na
+        dLo   := na
+        dHiIx := na
+        dLoIx := na
+        dHiJ  := 0
+        dLoJ  := 0
+    else if newDay
+        f_clearArrays()
+        dHi   := na
+        dLo   := na
+        dHiIx := na
+        dLoIx := na
+        dHiJ  := 0
+        dLoJ  := 0
+
+    // accumulate the bar into the day being built
+    j = array.size(dHour)
+    array.push(dHour, hr)
+    array.push(dSess, curS)
+    if na(dHi) or high > dHi
+        dHi   := high
+        dHiIx := bar_index
+        dHiJ  := j
+    if na(dLo) or low < dLo
+        dLo   := low
+        dLoIx := bar_index
+        dLoJ  := j
+    totBars += 1
+    if curS >= 0
+        array.set(sBars, curS, array.get(sBars, curS) + 1)
+    if curS >= 0
+        if array.get(ssN, curS) == 0
+            array.set(ssHi, curS, high)
+            array.set(ssLo, curS, low)
+            array.set(ssOp, curS, open)
+        else
+            array.set(ssHi, curS, math.max(array.get(ssHi, curS), high))
+            array.set(ssLo, curS, math.min(array.get(ssLo, curS), low))
+        array.set(ssCl, curS, close)
+        array.set(ssN, curS, array.get(ssN, curS) + 1)
+
+// ────────────────────────────────────────────────────────── session boxes ────
+var box   liveBox = na
+var int   liveS   = -2
+
+if showBox and barstate.isconfirmed and not timeframe.isdwm
+    if curS != liveS or newDay
+        liveS := curS
+        liveBox := na
+    if curS >= 0
+        if na(liveBox)
+            liveBox := box.new(bar_index, high, bar_index, low,
+                 border_color = color.new(f_sCol(curS), 35), border_width = 1,
+                 bgcolor = color.new(f_sCol(curS), 90))
+            array.push(boxes, liveBox)
+            f_trimBox()
+        else
+            box.set_right(liveBox, bar_index)
+            box.set_top(liveBox, math.max(box.get_top(liveBox), high))
+            box.set_bottom(liveBox, math.min(box.get_bottom(liveBox), low))
+
+// ─────────────────────────────────────────────────────────── profile strip ────
+ready = nDays >= minDays and not timeframe.isdwm
+
+exHnow = 0.0
+exLnow = 0.0
+mxAbs  = 0.0
+if ready
+    exHnow := (array.get(obsHi, hr) - array.get(expHi, hr)) / nDays * 100
+    exLnow := (array.get(obsLo, hr) - array.get(expLo, hr)) / nDays * 100
+    for h = 0 to 23
+        a1 = math.abs((array.get(obsHi, h) - array.get(expHi, h)) / nDays * 100)
+        a2 = math.abs((array.get(obsLo, h) - array.get(expLo, h)) / nDays * 100)
+        mxAbs := math.max(mxAbs, math.max(a1, a2))
+mxAbs := math.max(mxAbs, 0.5)
+
+lo20 = array.size(dLos) > 0 ? array.min(dLos) : ta.lowest(low, 100)
+hi20 = array.size(dHis) > 0 ? array.max(dHis) : ta.highest(high, 100)
+span = math.max(hi20 - lo20, syminfo.mintick * 10)
+
+// The profile is twenty-four numbers and it is identical under every day, so drawing it
+// across the chart added rhythm and no information — and nothing anchored to price
+// survives a long chart: it either trails price as a second curve or runs into the
+// candles. It is drawn once instead, in the empty margin right of the last bar, where
+// there are no candles to collide with and the whole day can be read at a glance.
+//
+// Two rows. Top row is where the day's HIGH lands, bottom row where the day's LOW lands.
+// A bar rising from a row's centre line means that hour holds more than chance would
+// give it; a grey bar hanging below means it holds fewer. The grey matters: the busiest
+// looking hour on a raw count is usually the emptiest once chance is taken out.
+
+var box[]   pBox = array.new<box>()
+var line[]  pLin = array.new<line>()
+var label[] pLab = array.new<label>()
+
+f_wipe() =>
+    if array.size(pBox) > 0
+        for i = 0 to array.size(pBox) - 1
+            box.delete(array.get(pBox, i))
+        array.clear(pBox)
+    if array.size(pLin) > 0
+        for i = 0 to array.size(pLin) - 1
+            line.delete(array.get(pLin, i))
+        array.clear(pLin)
+    if array.size(pLab) > 0
+        for i = 0 to array.size(pLab) - 1
+            label.delete(array.get(pLab, i))
+        array.clear(pLab)
+
+if barstate.islast
+    f_wipe()
+    if profBlock and ready
+        hHalf = span * 0.11 * blockSize          // half height of one row
+        rowGap = span * 0.07 * blockSize          // clear air between the two rows
+        midHi = close + rowGap + hHalf            // centre line of the highs row
+        midLo = close - rowGap - hHalf            // centre line of the lows row
+        x0 = bar_index + 4
+        wide = blockW > 1
+
+        for h = 0 to 23
+            eH = (array.get(obsHi, h) - array.get(expHi, h)) / nDays * 100
+            eL = (array.get(obsLo, h) - array.get(expLo, h)) / nDays * 100
+            xa = x0 + h * blockW
+            xb = xa + blockW - (wide ? 1 : 0)
+            live = h == hr
+
+            fH = math.max(-1.0, math.min(1.0, eH / mxAbs))
+            cH = fH >= 0 ? color.new(stripUp, 15 + math.round(55 * (1 - math.abs(fH)))) : color.new(color.gray, 55)
+            array.push(pBox, box.new(xa, midHi + hHalf * math.max(fH, 0.0), xb, midHi + hHalf * math.min(fH, 0.0),
+                 border_color = live ? txtCol : color.new(color.gray, 100), border_width = live ? 1 : 0, bgcolor = cH))
+
+            fL = math.max(-1.0, math.min(1.0, eL / mxAbs))
+            cL = fL >= 0 ? color.new(stripDn, 15 + math.round(55 * (1 - math.abs(fL)))) : color.new(color.gray, 55)
+            array.push(pBox, box.new(xa, midLo + hHalf * math.max(fL, 0.0), xb, midLo + hHalf * math.min(fL, 0.0),
+                 border_color = live ? txtCol : color.new(color.gray, 100), border_width = live ? 1 : 0, bgcolor = cL))
+
+        xEnd = x0 + 24 * blockW
+        array.push(pBox, box.new(x0, midHi + hHalf, xEnd, midHi - hHalf,
+             border_color = color.new(color.gray, 80), border_width = 1, bgcolor = color.new(color.gray, 94)))
+        array.push(pBox, box.new(x0, midLo + hHalf, xEnd, midLo - hHalf,
+             border_color = color.new(color.gray, 80), border_width = 1, bgcolor = color.new(color.gray, 94)))
+        array.push(pLin, line.new(x0, midHi, xEnd, midHi, color = color.new(txtCol, 60), width = 1))
+        array.push(pLin, line.new(x0, midLo, xEnd, midLo, color = color.new(txtCol, 60), width = 1))
+
+        array.push(pLab, label.new(x0, midHi + hHalf * 1.25, "WHERE THE DAY'S HIGH LANDS   n=" + str.tostring(nDays),
+             xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, txtCol, size.tiny))
+        array.push(pLab, label.new(x0, midLo + hHalf * 1.25, "WHERE THE DAY'S LOW LANDS",
+             xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_left, txtCol, size.tiny))
+
+        for h = 0 to 23
+            if h % 6 == 0
+                array.push(pLab, label.new(x0 + h * blockW, midLo - hHalf * 1.15, f_pad2(h),
+                     xloc.bar_index, yloc.price, color.new(color.white, 100), label.style_label_up,
+                     color.new(txtCol, 35), size.tiny))
+
+upFrac = ready ? math.max(0.0, math.min(1.0, exHnow / mxAbs)) : 0.0
+dnFrac = ready ? math.max(0.0, math.min(1.0, exLnow / mxAbs)) : 0.0
+onStrip = profStrip and ready
+sBase = ta.ema(lo20 - span * 0.24 * stripSize, 100)
+sHalf = span * 0.09 * stripSize
+
+sMid = plot(onStrip ? sBase : na, "profile base", color.new(color.gray, 70), 1)
+sTop = plot(onStrip ? sBase + sHalf * upFrac : na, "highs cluster", color.new(color.gray, 100), 1)
+sBot = plot(onStrip ? sBase - sHalf * dnFrac : na, "lows cluster",  color.new(color.gray, 100), 1)
+fill(sMid, sTop, color = color.new(stripUp, 20 + math.round(60 * (1 - upFrac))))
+fill(sMid, sBot, color = color.new(stripDn, 20 + math.round(60 * (1 - dnFrac))))
+
+bgcolor(showCols and ready and exHnow > colMin ? color.new(stripUp, 92) : na, title = "Crowded hour, highs")
+bgcolor(showCols and ready and exLnow > colMin ? color.new(stripDn, 92) : na, title = "Crowded hour, lows")
+
+// ──────────────────────────────────────────────────────────────── the panel ────
+f_pos(string p) =>
+    p == "Top right" ? position.top_right : p == "Bottom right" ? position.bottom_right :
+     p == "Bottom left" ? position.bottom_left : position.top_left
+
+var table pnl = table.new(f_pos(pnlPos), 1, 11, border_width = 1)
+
+intraday = not timeframe.isdwm
+
+if showPnl and barstate.islast
+    table.clear(pnl, 0, 0, 0, 10)
+    r = 0
+    hdrTxt = not intraday ? "Switch to an intraday timeframe — a daily bar has no time of day to profile." :
+         ready ? noteHdr :
+         "Profile needs " + str.tostring(minDays) + " closed days, " + str.tostring(nDays) +
+         " loaded. Sessions and notes below work anyway — for the profile use a higher timeframe."
+    table.cell(pnl, 0, r, hdrTxt,
+         text_color = txtCol, text_size = i_sizeOf(pnlSize), text_halign = text.align_left,
+         bgcolor = color.new(color.gray, 88))
+    r += 1
+    if ready and profPanel
+        hHot = 0
+        hCold = 0
+        lHot = 0
+        vHH = -1e9
+        vHC = 1e9
+        vLH = -1e9
+        for h = 0 to 23
+            eH = (array.get(obsHi, h) - array.get(expHi, h)) / nDays * 100
+            eL = (array.get(obsLo, h) - array.get(expLo, h)) / nDays * 100
+            if eH > vHH
+                vHH := eH
+                hHot := h
+            if eH < vHC
+                vHC := eH
+                hCold := h
+            if eL > vLH
+                vLH := eL
+                lHot := h
+        nTxt = " · n=" + str.tostring(nDays)
+        l1 = ""
+        l2 = ""
+        if degen
+            l1 := "Emptiest hour for highs " + f_pad2(hCold) + ":00 (" + f_fmt(vHC, "#.0") +
+                 "pp) · lows gather at " + f_pad2(lHot) + ":00 (+" + f_fmt(vLH, "#.0") + "pp)" + nTxt
+        else if hHot == lHot
+            l1 := "Highs and lows both gather at " + f_pad2(hHot) + ":00 (+" + f_fmt(vHH, "#.0") +
+                 "pp and +" + f_fmt(vLH, "#.0") + "pp over chance)" + nTxt
+            l2 := "Emptiest hour for highs " + f_pad2(hCold) + ":00 (" + f_fmt(vHC, "#.0") + "pp)" + nTxt
+        else
+            l1 := "Highs gather at " + f_pad2(hHot) + ":00 (+" + f_fmt(vHH, "#.0") +
+                 "pp over chance) · emptiest " + f_pad2(hCold) + ":00 (" + f_fmt(vHC, "#.0") + "pp)" + nTxt
+            l2 := "Lows gather at " + f_pad2(lHot) + ":00 (+" + f_fmt(vLH, "#.0") + "pp over chance)" + nTxt
+        table.cell(pnl, 0, r, l1, text_color = txtCol, text_size = i_sizeOf(pnlSize),
+             text_halign = text.align_left, bgcolor = color.new(color.gray, 94))
+        r += 1
+        if l2 != ""
+            table.cell(pnl, 0, r, l2, text_color = txtCol, text_size = i_sizeOf(pnlSize),
+                 text_halign = text.align_left, bgcolor = color.new(color.gray, 94))
+            r += 1
+    if array.size(noteTxt) > 0
+        for k = 0 to array.size(noteTxt) - 1
+            table.cell(pnl, 0, r, "• " + array.get(noteTxt, k), text_color = txtCol,
+                 text_size = i_sizeOf(pnlSize), text_halign = text.align_left, bgcolor = color.new(color.gray, 94))
+            r += 1
+    table.cell(pnl, 0, r, "Today is still open — it is not counted yet.", text_color = color.new(txtCol, 45),
+         text_size = pnlSize == "Tiny" ? size.tiny : size.small, text_halign = text.align_left,
+         bgcolor = color.new(color.gray, 94))
+
+// ──────────────────────────────────────────────────────────────────── alerts ────
+alertcondition(newDay, "Day closed", "A day closed and the session statistics were updated.")
+alertcondition(aSweep, "Session took the previous session's high or low",
+     "A session traded through the previous session's high or low.")
+alertcondition(aCrowd, "Day's extreme landed on a notable hour",
+     "The day's high or low formed in an hour that holds them far more, or far less, often than chance.")

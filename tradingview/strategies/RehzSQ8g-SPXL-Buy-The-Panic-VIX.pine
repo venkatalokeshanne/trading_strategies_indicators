@@ -1,0 +1,405 @@
+//@version=6
+strategy("SPXL - Buy The Panic V9",
+     overlay           = true,
+     initial_capital   = 10000,
+     default_qty_type  = strategy.fixed,
+     default_qty_value = 1,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.05,
+     slippage          = 2)
+
+// ══════════════════════════════════════════
+//  INPUTS
+// ══════════════════════════════════════════
+
+vix_source      = input.symbol("VIX",  "VIX Symbol",             group="VIX")
+vix_panic_enter = input.float(25.0,    "VIX Panic Buy Level",     group="VIX", step=0.5)
+vix_extreme     = input.float(32.0,    "VIX Extreme Buy Level",   group="VIX", step=0.5)
+vix_euphoria    = input.float(16.0,    "VIX Euphoria Sell Level", group="VIX", step=0.5)
+vix_peak_bars   = input.int(5,         "VIX Peak Lookback",       group="VIX", minval=1, maxval=15)
+vix_drop_pct    = input.float(8.0,     "VIX Drop From Peak %",    group="VIX", step=0.5)
+
+rsi_sell_level  = input.int(65,     "RSI Overbought Sell",   group="Sell")
+sell_ema_mult   = input.float(1.08, "Price Above EMA200 %",  group="Sell",     step=0.01)
+cooldown        = input.int(20,     "Cooldown Bars",         group="Settings", minval=5)
+max_dd_pct      = input.float(25.0, "Max DD Before Pause %", group="Risk",     step=1.0)
+
+// NEW — minimum bars VIX must stay below
+// euphoria level before sell triggers
+// Prevents false euphoria transitions
+euphoria_confirm = input.int(3, "Euphoria Confirm Bars", group="Sell", minval=1, maxval=10)
+
+// ══════════════════════════════════════════
+//  VIX
+// ══════════════════════════════════════════
+
+vix             = request.security(vix_source, timeframe.period, close)
+vix_peak        = ta.highest(vix, vix_peak_bars)
+vix_dropped     = vix < vix_peak * (1.0 - vix_drop_pct / 100.0)
+vix_in_panic    = vix >= vix_panic_enter and vix < vix_extreme
+vix_in_extreme  = vix >= vix_extreme
+vix_in_euphoria = vix <= vix_euphoria
+vix_was_panic   = ta.highest(vix, vix_peak_bars) >= vix_panic_enter
+vix_was_extreme = ta.highest(vix, vix_peak_bars) >= vix_extreme
+
+// NEW — VIX must be in euphoria for X bars
+// Prevents sell on brief VIX dips below level
+vix_confirmed_euphoria = ta.barssince(not vix_in_euphoria) >= euphoria_confirm
+
+// NEW — track euphoria events properly
+// Counts consecutive bars in euphoria
+// Sell only fires when counter equals confirm bars exactly
+// This means exactly ONE fire per euphoria event
+var int euphoria_bar_count = 0
+
+if vix_in_euphoria
+    euphoria_bar_count := euphoria_bar_count + 1
+else
+    euphoria_bar_count := 0
+
+// Fire sell on exactly the Nth bar of euphoria
+// Not on transition — on confirmed sustained euphoria
+// This fires once per euphoria event definitively
+sell_trigger = euphoria_bar_count == euphoria_confirm
+
+// ══════════════════════════════════════════
+//  INDICATORS
+// ══════════════════════════════════════════
+
+ema200          = ta.ema(close, 200)
+ema50           = ta.ema(close, 50)
+rsi             = ta.rsi(close, 14)
+price_stretched = close > ema200 * sell_ema_mult
+
+// ══════════════════════════════════════════
+//  STATE MACHINE
+// 0 = flat
+// 1 = first buy
+// 2 = second add
+// 3 = third add maxed
+// 4 = sold 50% holding core
+// 5 = reloaded from core
+// ══════════════════════════════════════════
+
+var int   state          = 0
+var float entry_price    = 0.0
+var int   bars_since_buy = 999
+var int   shares_held    = 0
+var int   cycle          = 0
+
+bars_since_buy := bars_since_buy + 1
+cooldown_ok     = bars_since_buy >= cooldown
+
+// FIXED — DD uses actual position avg price
+// not the old entry_price variable
+actual_entry    = strategy.position_avg_price
+current_dd      = actual_entry > 0 ? (close - actual_entry) / actual_entry * 100.0 : 0.0
+too_much_dd     = current_dd < -max_dd_pct
+
+// Available cash for reloads
+avail_cash      = strategy.equity - (strategy.position_size * close)
+
+// ══════════════════════════════════════════
+//  SHARE SIZING
+// ══════════════════════════════════════════
+
+shares_first    = math.max(1, math.floor(strategy.equity * 0.60 / close))
+shares_second   = math.max(1, math.floor(strategy.equity * 0.25 / close))
+shares_third    = math.max(1, math.floor(strategy.equity * 0.15 / close))
+shares_reload   = math.max(1, math.floor(avail_cash      * 0.80 / close))
+shares_sell     = math.max(1, math.floor(shares_held     * 0.50))
+
+// ══════════════════════════════════════════
+//  CONDITIONS
+// ══════════════════════════════════════════
+
+first_buy =
+     state == 0             and
+     (vix_was_panic or vix_was_extreme) and
+     vix_dropped            and
+     cooldown_ok
+
+second_buy =
+     state == 1             and
+     (vix_was_panic or vix_was_extreme) and
+     vix_dropped            and
+     cooldown_ok            and
+     not too_much_dd
+
+third_buy =
+     state == 2             and
+     vix_was_extreme        and
+     vix_dropped            and
+     cooldown_ok            and
+     not too_much_dd
+
+// FIXED — reload only from states 4
+// State 5 blocks second reload
+// Cooldown enforced strictly
+reload_buy =
+     state == 4             and
+     (vix_was_panic or vix_was_extreme) and
+     vix_dropped            and
+     cooldown_ok            and
+     avail_cash > close * 5
+
+// FIXED — sell uses euphoria_bar_count == confirm
+// Fires on exactly one specific bar
+// Cannot fire again until count resets and rebuilds
+can_sell =
+     sell_trigger           and
+     rsi > rsi_sell_level   and
+     price_stretched        and
+     close > ema200         and
+     (state == 1 or state == 2 or
+      state == 3 or state == 5)
+
+// ══════════════════════════════════════════
+//  EXECUTION
+// ══════════════════════════════════════════
+
+if first_buy
+    entry_price    := close
+    bars_since_buy := 0
+    shares_held    := shares_first
+    state          := 1
+    cycle          := cycle + 1
+    strategy.order("B" + str.tostring(cycle) + "a",
+         strategy.long,
+         qty     = shares_first,
+         comment = "1st BUY")
+
+if second_buy
+    bars_since_buy := 0
+    shares_held    := shares_held + shares_second
+    state          := 2
+    strategy.order("B" + str.tostring(cycle) + "b",
+         strategy.long,
+         qty     = shares_second,
+         comment = "2nd ADD")
+
+if third_buy
+    bars_since_buy := 0
+    shares_held    := shares_held + shares_third
+    state          := 3
+    strategy.order("B" + str.tostring(cycle) + "c",
+         strategy.long,
+         qty     = shares_third,
+         comment = "3rd ADD")
+
+if reload_buy
+    bars_since_buy := 0
+    shares_held    := shares_held + shares_reload
+    state          := 5
+    cycle          := cycle + 1
+    strategy.order("R" + str.tostring(cycle),
+         strategy.long,
+         qty     = shares_reload,
+         comment = "RELOAD")
+
+if can_sell
+    shares_held := shares_sell
+    state       := 4
+    strategy.order("S" + str.tostring(cycle),
+         strategy.short,
+         qty     = shares_sell,
+         comment = "SELL 50%")
+
+// Reset when flat
+if strategy.position_size == 0 and strategy.position_size[1] > 0
+    state          := 0
+    entry_price    := 0.0
+    shares_held    := 0
+    bars_since_buy := 999
+
+// ══════════════════════════════════════════
+//  VISUALS
+// ══════════════════════════════════════════
+
+plot(ema200, "EMA 200",
+     color     = color.new(color.white,  0),
+     linewidth = 2)
+
+plot(ema50,  "EMA 50",
+     color     = color.new(color.yellow, 0),
+     linewidth = 1)
+
+plot(strategy.position_size > 0 ? actual_entry : na,
+     "Avg Entry",
+     color     = color.new(color.aqua,   0),
+     linewidth = 1,
+     style     = plot.style_linebr)
+
+plot(strategy.position_size > 0 ? actual_entry * (1.0 - max_dd_pct / 100.0) : na,
+     "DD Pause",
+     color     = color.new(color.orange, 0),
+     linewidth = 1,
+     style     = plot.style_linebr)
+
+bgcolor(
+     vix_in_extreme  ? color.new(color.purple, 75) :
+     vix_in_panic    ? color.new(color.red,    82) :
+     vix_in_euphoria ? color.new(color.green,  85) : na,
+     title = "VIX Zone")
+
+plotshape(first_buy,
+     style     = shape.labelup,
+     location  = location.belowbar,
+     color     = color.red,
+     text      = "1st BUY",
+     textcolor = color.white,
+     size      = size.normal)
+
+plotshape(second_buy,
+     style     = shape.labelup,
+     location  = location.belowbar,
+     color     = color.orange,
+     text      = "2nd ADD",
+     textcolor = color.white,
+     size      = size.normal)
+
+plotshape(third_buy,
+     style     = shape.labelup,
+     location  = location.belowbar,
+     color     = color.purple,
+     text      = "3rd ADD",
+     textcolor = color.white,
+     size      = size.large)
+
+plotshape(reload_buy,
+     style     = shape.labelup,
+     location  = location.belowbar,
+     color     = color.blue,
+     text      = "RELOAD",
+     textcolor = color.white,
+     size      = size.large)
+
+plotshape(can_sell,
+     style     = shape.labeldown,
+     location  = location.abovebar,
+     color     = color.green,
+     text      = "SELL 50%",
+     textcolor = color.white,
+     size      = size.large)
+
+// ══════════════════════════════════════════
+//  TABLE
+// ══════════════════════════════════════════
+
+var table t = table.new(position.top_right, 2, 13,
+     bgcolor      = color.new(color.black, 70),
+     border_width = 1)
+
+state_label =
+     state == 0 ? "FLAT - WAITING" :
+     state == 1 ? "BOUGHT 60pct"   :
+     state == 2 ? "ADDED 85pct"    :
+     state == 3 ? "MAXED 100pct"   :
+     state == 4 ? "CORE HOLD"      :
+     state == 5 ? "RELOADED"       : "UNKNOWN"
+
+state_color =
+     state == 0 ? color.gray   :
+     state == 1 ? color.green  :
+     state == 2 ? color.orange :
+     state == 3 ? color.purple :
+     state == 4 ? color.aqua   :
+     state == 5 ? color.blue   : color.white
+
+if barstate.islast
+    table.cell(t, 0, 0,  "INDICATOR",
+         text_color = color.gray,  text_size = size.small)
+    table.cell(t, 1, 0,  "STATUS",
+         text_color = color.gray,  text_size = size.small)
+
+    table.cell(t, 0, 1,  "VIX Now",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 1,  str.tostring(math.round(vix, 2)),
+         text_color =
+             vix_in_extreme  ? color.purple :
+             vix_in_panic    ? color.red    :
+             vix_in_euphoria ? color.green  : color.white,
+         text_size = size.small)
+
+    table.cell(t, 0, 2,  "VIX Zone",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 2,
+         vix_in_extreme  ? "EXTREME PANIC" :
+         vix_in_panic    ? "PANIC ZONE"    :
+         vix_in_euphoria ? "EUPHORIA"      : "NORMAL",
+         text_color =
+             vix_in_extreme  ? color.purple :
+             vix_in_panic    ? color.red    :
+             vix_in_euphoria ? color.green  : color.gray,
+         text_size = size.small)
+
+    table.cell(t, 0, 3,  "Euphoria Bars",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 3,
+         str.tostring(euphoria_bar_count) + " of " + str.tostring(euphoria_confirm),
+         text_color =
+             euphoria_bar_count >= euphoria_confirm ? color.red : color.orange,
+         text_size = size.small)
+
+    table.cell(t, 0, 4,  "VIX Peak",
+         text_color = color.white,  text_size = size.small)
+    table.cell(t, 1, 4,  str.tostring(math.round(vix_peak, 1)),
+         text_color = color.orange, text_size = size.small)
+
+    table.cell(t, 0, 5,  "Drop From Peak",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 5,
+         str.tostring(math.round((vix / vix_peak - 1.0) * 100.0, 1)) + "%",
+         text_color = vix_dropped ? color.green : color.red,
+         text_size  = size.small)
+
+    table.cell(t, 0, 6,  "State",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 6,  state_label,
+         text_color = state_color, text_size = size.small)
+
+    table.cell(t, 0, 7,  "Cycle",
+         text_color = color.white,  text_size = size.small)
+    table.cell(t, 1, 7,  str.tostring(cycle),
+         text_color = color.yellow, text_size = size.small)
+
+    table.cell(t, 0, 8,  "Avg Entry",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 8,
+         actual_entry > 0 ? str.tostring(math.round(actual_entry, 2)) : "none",
+         text_color = color.aqua,  text_size = size.small)
+
+    table.cell(t, 0, 9,  "DD From Entry",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 9,
+         actual_entry > 0 ? str.tostring(math.round(current_dd, 1)) + "%" : "none",
+         text_color = too_much_dd ? color.red : color.green,
+         text_size  = size.small)
+
+    table.cell(t, 0, 10, "Shares Held",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 10, str.tostring(shares_held),
+         text_color = shares_held > 0 ? color.green : color.gray,
+         text_size  = size.small)
+
+    table.cell(t, 0, 11, "Avail Cash",
+         text_color = color.white,  text_size = size.small)
+    table.cell(t, 1, 11, "$" + str.tostring(math.round(avail_cash, 0)),
+         text_color = color.yellow, text_size = size.small)
+
+    table.cell(t, 0, 12, "Next Signal",
+         text_color = color.white, text_size = size.small)
+    table.cell(t, 1, 12,
+         first_buy  ? "BUY NOW"    :
+         second_buy ? "ADD NOW"    :
+         third_buy  ? "MAX ADD"    :
+         reload_buy ? "RELOAD NOW" :
+         can_sell   ? "SELL 50%"   :
+         state == 4 ? "WATCH PANIC": "HOLD",
+         text_color =
+             first_buy  ? color.red    :
+             second_buy ? color.orange :
+             third_buy  ? color.purple :
+             reload_buy ? color.blue   :
+             can_sell   ? color.green  : color.gray,
+         text_size = size.small)

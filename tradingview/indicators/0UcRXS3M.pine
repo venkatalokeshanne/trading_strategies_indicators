@@ -1,0 +1,510 @@
+//@version=6
+indicator("Smart Money Intraday Lite", shorttitle="SMC Lite", overlay=true, max_labels_count=500)
+
+// Smart Money Lite: sweep, BOS, momentum, FVG, BUY and SELL.
+
+groupSignal = "1. Signals"
+
+mode = input.string(
+     "Balanced",
+     "Signal mode",
+     options=["Conservative", "Balanced", "Aggressive"],
+     group=groupSignal)
+
+pivotBase = input.int(
+     3,
+     "Pivot length",
+     minval=1,
+     maxval=10,
+     group=groupSignal)
+
+cooldownBars = input.int(
+     8,
+     "Bars between signals",
+     minval=0,
+     maxval=100,
+     group=groupSignal)
+
+confirmClose = input.bool(
+     true,
+     "Confirm at candle close",
+     group=groupSignal)
+
+// AUTOMATIC BIAS
+groupBias = "2. Trend filter"
+
+useAutoBias = input.bool(
+     true,
+     "Automatic bias timeframe",
+     group=groupBias)
+
+manualBiasTf = input.timeframe(
+     "60",
+     "Manual bias timeframe",
+     group=groupBias)
+
+emaFastLen = input.int(
+     20,
+     "Fast EMA",
+     minval=2,
+     group=groupBias)
+
+emaSlowLen = input.int(
+     50,
+     "Slow EMA",
+     minval=5,
+     group=groupBias)
+
+useBias = input.bool(
+     true,
+     "Use trend filter",
+     group=groupBias)
+
+// M1-M5 uses H1.
+// M15 uses H4.
+// M30-H1 uses H4.
+// H4 and higher use Daily.
+autoBiasTf = timeframe.isminutes and timeframe.multiplier <= 5 ? "60" : timeframe.isminutes and timeframe.multiplier <= 15 ? "240" : timeframe.isminutes and timeframe.multiplier <= 60 ? "240" : "D"
+
+biasTf = useAutoBias ? autoBiasTf : manualBiasTf
+
+// SESSIONS
+groupSession = "3. Sessions"
+
+useSessions = input.bool(
+     true,
+     "Use Asia London and New York",
+     group=groupSession)
+
+sessionZone = input.string(
+     "Europe/Rome",
+     "Timezone",
+     group=groupSession)
+
+asiaSession = input.session(
+     "0100-0800",
+     "Asia",
+     group=groupSession)
+
+londonSession = input.session(
+     "0800-1200",
+     "London",
+     group=groupSession)
+
+newYorkSession = input.session(
+     "1400-1800",
+     "New York",
+     group=groupSession)
+
+// RISK
+groupRisk = "4. Risk"
+
+atrLen = input.int(
+     14,
+     "ATR length",
+     minval=2,
+     group=groupRisk)
+
+slAtr = input.float(
+     0.20,
+     "Stop ATR buffer",
+     minval=0.0,
+     step=0.05,
+     group=groupRisk)
+
+tp1R = input.float(
+     1.0,
+     "TP1 R",
+     minval=0.25,
+     step=0.25,
+     group=groupRisk)
+
+tp2R = input.float(
+     2.0,
+     "TP2 R",
+     minval=0.50,
+     step=0.25,
+     group=groupRisk)
+
+// HIGHER TIMEFRAME TREND
+htfFast = request.security(
+     syminfo.tickerid,
+     biasTf,
+     ta.ema(close, emaFastLen)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+htfSlow = request.security(
+     syminfo.tickerid,
+     biasTf,
+     ta.ema(close, emaSlowLen)[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+htfClose = request.security(
+     syminfo.tickerid,
+     biasTf,
+     close[1],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+bullBias = htfFast > htfSlow and htfClose >= htfFast
+bearBias = htfFast < htfSlow and htfClose <= htfFast
+
+// SESSION CONTROL
+inAsia = not na(
+     time(
+         timeframe.period,
+         asiaSession,
+         sessionZone))
+
+inLondon = not na(
+     time(
+         timeframe.period,
+         londonSession,
+         sessionZone))
+
+inNewYork = not na(
+     time(
+         timeframe.period,
+         newYorkSession,
+         sessionZone))
+
+sessionOk = not useSessions or inAsia or inLondon or inNewYork or mode == "Aggressive"
+
+// SESSION COLORS
+bgcolor(
+     useSessions and inAsia
+     ? color.new(color.purple, 94)
+     : na,
+     title="Asia")
+
+bgcolor(
+     useSessions and inLondon
+     ? color.new(color.blue, 94)
+     : na,
+     title="London")
+
+bgcolor(
+     useSessions and inNewYork
+     ? color.new(color.green, 94)
+     : na,
+     title="New York")
+
+// MARKET STRUCTURE
+pivotLen = mode == "Conservative" ? pivotBase + 1 : mode == "Aggressive" ? math.max(1, pivotBase - 1) : pivotBase
+
+atr = ta.atr(atrLen)
+
+pivotHigh = ta.pivothigh(
+     high,
+     pivotLen,
+     pivotLen)
+
+pivotLow = ta.pivotlow(
+     low,
+     pivotLen,
+     pivotLen)
+
+lastHigh = ta.valuewhen(
+     not na(pivotHigh),
+     pivotHigh,
+     0)
+
+lastLow = ta.valuewhen(
+     not na(pivotLow),
+     pivotLow,
+     0)
+
+// LIQUIDITY SWEEP
+bullSweep = not na(lastLow) and low < lastLow and close > lastLow
+
+bearSweep = not na(lastHigh) and high > lastHigh and close < lastHigh
+
+var bool buyArmed = false
+var bool sellArmed = false
+
+var int armedBar = na
+
+var float sweepLow = na
+var float sweepHigh = na
+
+var float breakHigh = na
+var float breakLow = na
+
+// BUY SETUP
+if bullSweep and (not useBias or bullBias or mode == "Aggressive")
+    buyArmed := true
+    sellArmed := false
+    armedBar := bar_index
+    sweepLow := low
+    breakHigh := lastHigh
+
+// SELL SETUP
+if bearSweep and (not useBias or bearBias or mode == "Aggressive")
+    sellArmed := true
+    buyArmed := false
+    armedBar := bar_index
+    sweepHigh := high
+    breakLow := lastLow
+
+// BOS AND MOMENTUM
+bullBos = buyArmed and not na(breakHigh) and close > breakHigh
+
+bearBos = sellArmed and not na(breakLow) and close < breakLow
+
+bullMomentum = buyArmed and close > open and close > high[1] and math.abs(close - open) >= atr * 0.30
+
+bearMomentum = sellArmed and close < open and close < low[1] and math.abs(close - open) >= atr * 0.30
+
+// FAIR VALUE GAP
+bullFvg = low > high[2]
+bearFvg = high < low[2]
+
+var float bullFvgTop = na
+var float bullFvgBottom = na
+
+var float bearFvgTop = na
+var float bearFvgBottom = na
+
+var bool bullFvgActive = false
+var bool bearFvgActive = false
+
+if bullFvg
+    bullFvgTop := low
+    bullFvgBottom := high[2]
+    bullFvgActive := true
+
+if bearFvg
+    bearFvgTop := low[2]
+    bearFvgBottom := high
+    bearFvgActive := true
+
+if bullFvgActive and close < bullFvgBottom
+    bullFvgActive := false
+
+if bearFvgActive and close > bearFvgTop
+    bearFvgActive := false
+
+// FVG RETEST
+bullRetest = bullFvgActive and low <= bullFvgTop and close > bullFvgBottom
+
+bearRetest = bearFvgActive and high >= bearFvgBottom and close < bearFvgTop
+
+// SIGNAL CONFIRMATION
+bullConfirm = mode == "Conservative" ? bullBos and bullRetest : mode == "Balanced" ? (bullBos or bullMomentum) and (bullFvg or bullRetest) : bullBos or bullMomentum
+
+bearConfirm = mode == "Conservative" ? bearBos and bearRetest : mode == "Balanced" ? (bearBos or bearMomentum) and (bearFvg or bearRetest) : bearBos or bearMomentum
+
+// SETUP EXPIRATION
+maxSetupBars = mode == "Conservative" ? 30 : mode == "Balanced" ? 40 : 55
+
+if (buyArmed or sellArmed) and not na(armedBar) and bar_index - armedBar > maxSetupBars
+    buyArmed := false
+    sellArmed := false
+
+var int lastSignalBar = na
+
+cooldownOk = na(lastSignalBar) or bar_index - lastSignalBar > cooldownBars
+
+barCloseOk = not confirmClose or barstate.isconfirmed
+
+// FINAL SIGNALS
+buySignal = buyArmed and bullConfirm and (not useBias or bullBias or mode == "Aggressive") and sessionOk and cooldownOk and barCloseOk
+
+sellSignal = sellArmed and bearConfirm and (not useBias or bearBias or mode == "Aggressive") and sessionOk and cooldownOk and barCloseOk
+
+// ENTRY, STOP LOSS AND TARGETS
+var float entryPrice = na
+var float stopPrice = na
+var float tp1Price = na
+var float tp2Price = na
+
+var int direction = 0
+
+if buySignal
+    entryPrice := close
+
+    stopPrice := math.min(
+         nz(sweepLow, low),
+         nz(lastLow, low)) - atr * slAtr
+
+    buyRisk = math.max(
+         entryPrice - stopPrice,
+         syminfo.mintick)
+
+    tp1Price := entryPrice + buyRisk * tp1R
+    tp2Price := entryPrice + buyRisk * tp2R
+
+    direction := 1
+    lastSignalBar := bar_index
+    buyArmed := false
+
+if sellSignal
+    entryPrice := close
+
+    stopPrice := math.max(
+         nz(sweepHigh, high),
+         nz(lastHigh, high)) + atr * slAtr
+
+    sellRisk = math.max(
+         stopPrice - entryPrice,
+         syminfo.mintick)
+
+    tp1Price := entryPrice - sellRisk * tp1R
+    tp2Price := entryPrice - sellRisk * tp2R
+
+    direction := -1
+    lastSignalBar := bar_index
+    sellArmed := false
+
+// ONLY BUY AND SELL LABELS
+plotshape(
+     buySignal,
+     title="BUY signal",
+     text="BUY",
+     style=shape.labelup,
+     location=location.belowbar,
+     color=color.lime,
+     textcolor=color.black,
+     size=size.small)
+
+plotshape(
+     sellSignal,
+     title="SELL signal",
+     text="SELL",
+     style=shape.labeldown,
+     location=location.abovebar,
+     color=color.red,
+     textcolor=color.white,
+     size=size.small)
+
+// ALERTS
+alertcondition(
+     buySignal,
+     "Smart Money BUY",
+     "SMC BUY {{ticker}} {{interval}} at {{close}}")
+
+alertcondition(
+     sellSignal,
+     "Smart Money SELL",
+     "SMC SELL {{ticker}} {{interval}} at {{close}}")
+
+// PRICE FORMAT
+priceText(value) =>
+    na(value) ? "-" : str.tostring(value, format.mintick)
+
+// DASHBOARD
+var table dashboard = table.new(
+     position.top_right,
+     2,
+     11,
+     border_width=1)
+
+if barstate.islast
+    table.cell(
+         dashboard,
+         0,
+         0,
+         "SMART MONEY",
+         bgcolor=color.black,
+         text_color=color.white)
+
+    table.cell(
+         dashboard,
+         1,
+         0,
+         "LITE",
+         bgcolor=color.black,
+         text_color=color.yellow)
+
+    table.cell(dashboard, 0, 1, "Chart TF")
+    table.cell(dashboard, 1, 1, timeframe.period)
+
+    table.cell(dashboard, 0, 2, "Bias TF")
+    table.cell(dashboard, 1, 2, biasTf)
+
+    table.cell(dashboard, 0, 3, "Mode")
+    table.cell(dashboard, 1, 3, mode)
+
+    table.cell(dashboard, 0, 4, "Session")
+
+    table.cell(
+         dashboard,
+         1,
+         4,
+         inAsia ? "ASIA" : inLondon ? "LONDON" : inNewYork ? "NEW YORK" : "OFF")
+
+    table.cell(dashboard, 0, 5, "Bias")
+
+    table.cell(
+         dashboard,
+         1,
+         5,
+         bullBias ? "BULL" : bearBias ? "BEAR" : "NEUTRAL",
+         text_color=bullBias ? color.lime : bearBias ? color.red : color.orange)
+
+    table.cell(dashboard, 0, 6, "Signal")
+
+    table.cell(
+         dashboard,
+         1,
+         6,
+         direction == 1 ? "BUY" : direction == -1 ? "SELL" : "WAIT",
+         text_color=direction == 1 ? color.lime : direction == -1 ? color.red : color.orange)
+
+    table.cell(
+         dashboard,
+         0,
+         7,
+         "ENTRY",
+         text_color=color.yellow)
+
+    table.cell(
+         dashboard,
+         1,
+         7,
+         priceText(entryPrice),
+         text_color=color.yellow)
+
+    table.cell(
+         dashboard,
+         0,
+         8,
+         "STOP LOSS",
+         text_color=color.red)
+
+    table.cell(
+         dashboard,
+         1,
+         8,
+         priceText(stopPrice),
+         text_color=color.red)
+
+    table.cell(
+         dashboard,
+         0,
+         9,
+         "TP1",
+         text_color=color.aqua)
+
+    table.cell(
+         dashboard,
+         1,
+         9,
+         priceText(tp1Price),
+         text_color=color.aqua)
+
+    table.cell(
+         dashboard,
+         0,
+         10,
+         "TP2",
+         text_color=color.lime)
+
+    table.cell(
+         dashboard,
+         1,
+         10,
+         priceText(tp2Price),
+         text_color=color.lime)

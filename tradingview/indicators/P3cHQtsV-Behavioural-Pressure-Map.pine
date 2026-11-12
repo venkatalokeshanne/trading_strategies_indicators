@@ -1,0 +1,420 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// © Market_Logic_India                                                                    MPL-2.0
+// BEHAVIOURAL PRESSURE MAP                                                                    v1.2
+// ────────────────────────────────────────────────────────────────────────────────────────────
+// OVERVIEW
+//   A map of where the market's HOLDERS sit, and what behavioural finance says they will do there.
+//   Every past bar is a cohort that bought around its price on its volume; each cohort's UNREALISED
+//   profit/loss is run through the Kahneman-Tversky prospect-theory value function, and the
+//   disposition effect (sell winners, hold losers) turns that into real supply and demand:
+//     • Trapped LOSERS above price wait to get back to break-even → BEHAVIOURAL RESISTANCE
+//       (loss-aversion λ makes it sticky).
+//     • In-profit cohorts below price mark high-volume DEMAND nodes the market defends → SUPPORT.
+//     • The recency-weighted average cost is a reference-point MAGNET price gravitates toward.
+//   The pane plots the NET behavioural pressure (−100 heavy overhead supply … +100 clean, in-profit
+//   float); the price chart is annotated with the strongest support / resistance cost-basis nodes
+//   and the magnet. It is a map of positioning pressure, not a buy/sell signal.
+//
+// WHAT MAKES IT DIFFERENT
+//   Volume profiles show WHERE volume traded. This adds WHY it matters: it weights each price level
+//   by the unrealised P&L of the people who own it and by how loss-aversion and the disposition
+//   effect make them act. A level with heavy TRAPPED-LONG volume above is stronger resistance than a
+//   same-size node of comfortable winners — prospect theory, not raw volume, sizes the pressure.
+//
+// HOW IT WORKS
+//   1. Over a lookback, each bar is a cohort: cost basis ≈ HLC3, size = volume × recency-decay.
+//   2. Cohort unrealised return g = (price − cost)/cost → value v(g) = g^α (gain) or −λ·(−g)^β (loss).
+//   3. Demand (profit nodes below) and loss-averse supply (trapped above) are summed; the oscillator
+//      is their balance, 100·(Demand − Supply)/(Demand + Supply).
+//   4. The cohorts are binned to find the strongest support/resistance nodes and the % of float in
+//      profit; a forward calibration harness checks whether node rejections actually paid.
+//
+// HOW TO USE
+//   Read the pane for pressure (green/above 0 = supportive, in-profit float; red/below 0 = overhead
+//   supply). On price, red lines are behavioural resistance (trapped longs), green lines support
+//   (defended profit nodes), the yellow line is the magnet. Triangles mark a node rejection with
+//   supportive pressure. % in profit is a sentiment gauge — very high can mean euphoria/distribution
+//   risk, very low can mean capitulation. Context, never a standalone trigger.
+//
+// UNIVERSAL / SOURCES
+//   Lookback, recency half-life, bin count and the prospect-theory parameters are all inputs. Needs
+//   volume; works on any symbol/timeframe. Defaults suit liquid index/futures behaviour — widen the
+//   lookback or shorten the half-life to retune for slower or faster instruments.
+//
+// CONCEPT CREDIT
+//   Prospect theory & the value function — Daniel Kahneman & Amos Tversky (1979). Disposition effect
+//   — Hersh Shefrin & Meir Statman (1985); Terrance Odean (1998). Reference-point / cost-basis
+//   dynamics — Grinblatt & Han (2005). Sample-uniqueness weighting & out-of-sample evaluation —
+//   Marcos López de Prado (2018). Original implementation; not affiliated with any third party.
+//
+// HONESTY / LIMITATIONS
+//   Cost basis is APPROXIMATED by each bar's HLC3 and volume — it is not real holder data. The value
+//   function is a model of behaviour, not a law. The pressure and nodes are descriptive positioning
+//   context; the Edge row (in-sample and out-of-sample) is what tells you if node rejections have
+//   paid on THIS symbol. Nothing here predicts price.
+//
+// DISCLAIMER
+//   Research and educational tool only. NOT financial advice and NO guarantee of profitability or
+//   accuracy. Trading carries risk of loss. Test out-of-sample and make your own decisions.
+//
+// Non-repaint: cohorts use closed bars; the calibration resolves on confirmed bars only.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+indicator("Behavioural Pressure Map", "BehavPress", overlay = false, max_bars_back = 600, max_lines_count = 100, max_labels_count = 60)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                          INPUTS
+// ═════════════════════════════════════════════════════════════════════════════════════════
+g1 = "01 · Data & window"
+lookN   = input.int(240, "Cohort lookback (bars)", minval = 30, maxval = 500, group = g1, tooltip = "How many past bars are treated as holder cohorts. Longer = more of the float, heavier compute.")
+recHL   = input.float(120.0, "Recency half-life (bars)", minval = 5.0, maxval = 1000.0, step = 5.0, group = g1, tooltip = "Older cohorts decay: a cohort this many bars back counts half as much as today's. Smaller = only the recent float matters.")
+nBins   = input.int(50, "Price bins (nodes)", minval = 10, maxval = 100, group = g1, tooltip = "Resolution of the cost-basis distribution used to locate support / resistance nodes.")
+
+g2 = "02 · Prospect theory"
+alphaG  = input.float(0.88, "Value curvature α (gains)", minval = 0.3, maxval = 1.0, step = 0.01, group = g2, tooltip = "Kahneman-Tversky diminishing sensitivity to gains. 0.88 = original estimate.")
+betaG   = input.float(0.88, "Value curvature β (losses)", minval = 0.3, maxval = 1.0, step = 0.01, group = g2)
+lamL    = input.float(2.25, "Loss aversion λ", minval = 1.0, maxval = 4.0, step = 0.05, group = g2, tooltip = "How much more a loss weighs than an equal gain. 2.25 = original estimate; higher = stickier break-even resistance.")
+
+g3 = "03 · Nodes & signals"
+maxNodes= input.int(6, "Max nodes drawn per side", minval = 1, maxval = 20, group = g3)
+nodeFrac= input.float(0.35, "Node strength threshold (× peak)", minval = 0.1, maxval = 0.9, step = 0.05, group = g3, tooltip = "Draw a level only if its cohort weight is at least this fraction of the strongest node.")
+pThr    = input.float(20.0, "Pressure threshold", minval = 0.0, maxval = 90.0, step = 5.0, group = g3, tooltip = "Net pressure beyond ± this is a decisive supply/demand imbalance (tints, gates signals).")
+proxATR = input.float(0.5, "Node proximity (× ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = g3, tooltip = "How close price must tag a node to count as a rejection.")
+sigGap  = input.int(10, "Min bars between signals", minval = 1, maxval = 200, group = g3)
+showSig = input.bool(true, "Mark node-rejection signals", group = g3)
+confirmSig = input.bool(true, "Non-repaint: confirm signals on bar close", group = g3, tooltip = "ON (default): a node-rejection signal, its alert and its marker are settled on the CLOSED bar, so what you see matches what the Edge harness measures and nothing repaints intrabar. OFF: signals form live on the current bar (they may flicker until close).")
+
+g4 = "04 · Calibration harness"
+calcCal = input.bool(true, "Measure Edge", group = g4, tooltip = "Log each node-rejection signal and, a horizon later, check whether price moved ≥ k×ATR the signalled way vs a random bar.")
+calHor  = input.int(10, "Forward horizon (bars)", minval = 2, maxval = 100, group = g4)
+calMove = input.float(0.8, "Move threshold (× ATR)", minval = 0.1, step = 0.1, group = g4)
+atrLen  = input.int(14, "ATR length", minval = 1, group = g4)
+trainN  = input.int(30, "In-sample events (then OOS)", minval = 10, group = g4, tooltip = "First N resolved events train; later ones are scored out-of-sample. The OOS edge is the trustworthy one.")
+nTests  = input.int(3, "Edge significance · N tests (deflation)", minval = 1, maxval = 10, group = g4)
+
+g5 = "05 · Regime (optional)"
+useRegime = input.bool(false, "Consume external regime (EXP_Regime)", group = g5, tooltip = "Link to the Market Regime Classifier's EXP_Regime (−2…+2); support bounces need regime ≥ 0, resistance rejections need ≤ 0.")
+regSrc    = input.source(close, "Regime source (link to EXP_Regime)", group = g5)
+
+g6 = "06 · Visual & theme"
+visStyle = input.string("Gradient area + glow", "Oscillator style", options = ["Gradient area + glow","Histogram","Line"], group = g6)
+showNodes= input.bool(true, "Draw cost-basis nodes on price", group = g6)
+showMag  = input.bool(true, "Draw break-even magnet on price", group = g6)
+showTint = input.bool(true, "Background pressure tint", group = g6)
+showDash = input.bool(true, "Show dashboard", group = g6)
+dashMode = input.string("Compact", "Dashboard detail", options = ["Compact","Pro"], group = g6, tooltip = "Compact = verdict, pressure, % in profit, the two nearest cost-basis nodes and the out-of-sample edge. Pro = the full calibration + magnet + eff-N breakdown.")
+dashPos  = input.string("Top Right", "Dashboard position", options = ["Top Right","Top Left","Bottom Right","Bottom Left","Middle Right"], group = g6)
+themeOpt = input.string("Auto (match chart)", "Theme", options = ["Auto (match chart)","Dark","Light"], group = g6)
+colSup   = input.color(#2ebd85, "Support / in-profit", group = g6)
+colRes   = input.color(#f6465d, "Resistance / overhang", group = g6)
+colMagI  = input.color(#f7c948, "Magnet / midline", group = g6)
+
+gZ = "Z · Identity & exports"
+showId  = input.bool(true, "Show identity strip", group = gZ)
+showEXP = input.bool(true, "Emit EXP_* exports", group = gZ)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                       THEME / HELPERS
+// ═════════════════════════════════════════════════════════════════════════════════════════
+f_lum(color cc) => na(cc) ? 0.0 : 0.299 * color.r(cc) + 0.587 * color.g(cc) + 0.114 * color.b(cc)
+bool  uiDark  = themeOpt == "Dark" ? true : themeOpt == "Light" ? false : f_lum(chart.bg_color) < 140
+color panelBg = uiDark ? color.rgb(17, 22, 28)    : color.rgb(244, 246, 248)
+color rowAlt  = uiDark ? color.rgb(25, 31, 39)    : color.rgb(232, 236, 240)
+color txtMain = uiDark ? color.white              : color.rgb(16, 20, 24)
+color txtSub  = uiDark ? color.rgb(154, 166, 178) : color.rgb(74, 82, 91)
+color txtMut  = uiDark ? color.rgb(110, 120, 132) : color.rgb(140, 148, 156)
+color frameC  = uiDark ? color.rgb(58, 70, 84)    : color.rgb(196, 204, 212)
+color cSup    = uiDark ? colSup : color.rgb(14, 124, 90)
+color cRes    = uiDark ? colRes : color.rgb(198, 40, 40)
+f_txtOn(color cc) => f_lum(cc) > 140 ? color.rgb(10, 10, 10) : color.white
+f_pos(string s) => s == "Top Left" ? position.top_left : s == "Bottom Right" ? position.bottom_right : s == "Bottom Left" ? position.bottom_left : s == "Middle Right" ? position.middle_right : position.top_right
+
+float atr   = ta.atr(atrLen)
+float decay = math.pow(0.5, 1.0 / recHL)                      // recency decay per bar
+float pLo   = ta.lowest(low, lookN)
+float pHi   = ta.highest(high, lookN)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                   ENGINE · cohort pressure + cost-basis binning (one pass)
+// ═════════════════════════════════════════════════════════════════════════════════════════
+int   L = math.min(lookN, bar_index)
+float P = close
+
+var array<float> binVol = array.new<float>(nBins, 0.0)        // reused each bar (cleared below)
+float binW = (pHi > pLo) ? (pHi - pLo) / nBins : na
+
+float dem = 0.0                                               // demand below (in-profit nodes)
+float sup = 0.0                                               // loss-averse supply overhang above
+float sumW = 0.0
+float magNum = 0.0
+float profW = 0.0
+if not na(binW) and binW > 0.0 and L > 5
+    for b = 0 to nBins - 1
+        array.set(binVol, b, 0.0)
+    // Recency weight decays geometrically with age j. Carrying it forward as a
+    // running product (decayPow *= decay) replaces one math.pow() per cohort per
+    // bar with a single multiply — the largest per-bar saving in the engine, and
+    // numerically identical to math.pow(decay, j).
+    float decayPow = 1.0
+    for j = 0 to L - 1
+        float c = hlc3[j]
+        float vv = nz(volume[j])
+        float wj = vv * decayPow
+        if wj > 0.0 and c > 0.0
+            float g = (P - c) / c
+            sumW += wj
+            magNum += wj * c
+            if c < P
+                dem += wj * math.pow(math.abs(g), alphaG)
+                profW += wj
+            else if c > P
+                sup += wj * lamL * math.pow(math.abs(g), betaG)
+            int bi = math.max(0, math.min(nBins - 1, int((c - pLo) / binW)))
+            array.set(binVol, bi, array.get(binVol, bi) + wj)
+        decayPow *= decay
+
+float netPressure = (dem + sup) > 0.0 ? 100.0 * (dem - sup) / (dem + sup) : na
+float magnet      = sumW > 0.0 ? magNum / sumW : na
+float pctProfit   = sumW > 0.0 ? 100.0 * profW / sumW : na
+
+// strongest support node (below P) and resistance node (above P), plus the peak weight
+float peakW = 0.0
+if not na(binW)
+    for b = 0 to nBins - 1
+        peakW := math.max(peakW, array.get(binVol, b))
+float nearSup = na
+float supStr  = 0.0
+float nearRes = na
+float resStr  = 0.0
+if not na(binW) and peakW > 0.0
+    for b = 0 to nBins - 1
+        float bc = pLo + (b + 0.5) * binW
+        float bw = array.get(binVol, b)
+        if bc < P and bw > supStr
+            supStr := bw
+            nearSup := bc
+        if bc > P and bw > resStr
+            resStr := bw
+            nearRes := bc
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                        SIGNALS
+// ═════════════════════════════════════════════════════════════════════════════════════════
+int  regId    = (useRegime and not na(regSrc) and math.abs(regSrc) <= 2.5) ? int(math.round(regSrc)) : na
+bool regBull  = not useRegime or (not na(regId) and regId >= 0)
+bool regBear  = not useRegime or (not na(regId) and regId <= 0)
+bool atSup = not na(nearSup) and not na(atr) and low <= nearSup + proxATR * atr and close > nearSup
+bool atRes = not na(nearRes) and not na(atr) and high >= nearRes - proxATR * atr and close < nearRes
+var int lastSigBar = na
+bool cooled = na(lastSigBar) or (bar_index - lastSigBar) >= sigGap
+bool sigOK = (not confirmSig) or barstate.isconfirmed   // non-repaint gate: settle on close
+bool bull = showSig and sigOK and atSup and not na(netPressure) and netPressure > pThr and regBull and cooled
+bool bear = showSig and sigOK and atRes and not na(netPressure) and netPressure < -pThr and regBear and cooled
+if bull or bear
+    lastSigBar := bar_index
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                              CALIBRATION HARNESS (HARNESS+)
+// ═════════════════════════════════════════════════════════════════════════════════════════
+f_wilson(float w, float n, float zc) =>
+    float r = na
+    if n > 0.0
+        float pp = w / n
+        float den = 1.0 + zc * zc / n
+        r := zc * math.sqrt(pp * (1.0 - pp) / n + zc * zc / (4.0 * n * n)) / den
+    r
+
+var array<int>   cDir  = array.new<int>()
+var array<int>   cBar  = array.new<int>()
+var array<float> cEnt  = array.new<float>()
+var array<float> cAtr  = array.new<float>()
+var array<float> cUniq = array.new<float>()
+var int   hits    = 0
+var int   tot     = 0
+var float hitsW   = 0.0
+var float totW    = 0.0
+var int   isHits  = 0
+var int   isTot   = 0
+var int   oosHits = 0
+var int   oosTot  = 0
+var int   resolvedC = 0
+var int   baseTot = 0
+var int   baseUp  = 0
+var int   baseDn  = 0
+float fwdMv  = close - close[calHor]
+float fwdAtr = atr[calHor]
+
+if calcCal and barstate.isconfirmed and not na(atr) and atr > 0.0
+    if bull
+        cDir.push(1),  cBar.push(bar_index), cEnt.push(close), cAtr.push(atr), cUniq.push(1.0 / (1.0 + cBar.size()))
+    if bear
+        cDir.push(-1), cBar.push(bar_index), cEnt.push(close), cAtr.push(atr), cUniq.push(1.0 / (1.0 + cBar.size()))
+    if bar_index > calHor and not na(fwdAtr) and fwdAtr > 0.0
+        baseTot += 1
+        if fwdMv >= calMove * fwdAtr
+            baseUp += 1
+        if -fwdMv >= calMove * fwdAtr
+            baseDn += 1
+    if cBar.size() > 0
+        for i = cBar.size() - 1 to 0
+            if bar_index - cBar.get(i) >= calHor
+                int   d = cDir.get(i)
+                float fav = (close - cEnt.get(i)) * d
+                bool  win = fav >= calMove * cAtr.get(i)
+                float w = cUniq.get(i)
+                tot += 1
+                totW += w
+                hits := win ? hits + 1 : hits
+                hitsW := win ? hitsW + w : hitsW
+                if resolvedC < trainN
+                    isTot += 1
+                    isHits := win ? isHits + 1 : isHits
+                else
+                    oosTot += 1
+                    oosHits := win ? oosHits + 1 : oosHits
+                resolvedC += 1
+                cDir.remove(i), cBar.remove(i), cEnt.remove(i), cAtr.remove(i), cUniq.remove(i)
+
+float baseP   = baseTot > 0 ? (baseUp + baseDn) * 100.0 / (2.0 * baseTot) : na
+float hitP    = tot > 0 ? hits * 100.0 / tot : na
+float edge    = (not na(hitP) and not na(baseP)) ? hitP - baseP : na
+float zDefl   = nTests <= 1 ? 1.96 : nTests == 2 ? 2.24 : nTests == 3 ? 2.39 : nTests == 4 ? 2.50 : 2.58
+float effN    = totW
+float oosHitP = oosTot > 0 ? oosHits * 100.0 / oosTot : na
+float oosEdge = (not na(oosHitP) and not na(baseP)) ? oosHitP - baseP : na
+float oosCi   = f_wilson(oosHits, oosTot, zDefl) * 100.0
+bool  oosStar = oosTot >= 10 and not na(oosHitP) and not na(baseP) and (oosHitP - oosCi) > baseP
+
+// verdict
+int vCode = na(netPressure) ? -1 : netPressure > pThr ? 2 : netPressure < -pThr ? 0 : 1
+string vTxt = vCode == -1 ? "warming up…" : vCode == 2 ? "support base · clean overhead" : vCode == 0 ? "supply overhang · capped" : "balanced positioning"
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                          PLOTS (pane)
+// ═════════════════════════════════════════════════════════════════════════════════════════
+bool isArea = visStyle == "Gradient area + glow"
+bool isHist = visStyle == "Histogram"
+bool showGlow = not isHist
+color oscCol = na(netPressure) ? color.gray : netPressure >= 0 ? cSup : cRes
+float intensity = math.min(1.0, math.abs(nz(netPressure)) / 100.0)
+
+bgcolor(showTint and not na(netPressure) and netPressure >= pThr ? color.new(cSup, 90) : showTint and not na(netPressure) and netPressure <= -pThr ? color.new(cRes, 90) : na, title = "Pressure tint")
+
+plot(0.0, "Mid glow", color = color.new(colMagI, 80), linewidth = 6, display = display.pane)
+hline(0, "Zero", color = color.new(colMagI, 0), linestyle = hline.style_solid)
+plot(pThr,  "Demand band", color = color.new(cSup, 60), linewidth = 1, display = display.pane, editable = false)
+plot(-pThr, "Supply band", color = color.new(cRes, 60), linewidth = 1, display = display.pane, editable = false)
+
+// Glow brightens with pressure magnitude, so a decisive supply/demand imbalance
+// visibly radiates while balanced positioning stays faint — the strength of the
+// move reads at a glance from the halo, not just the line's height.
+int glowOuterT = 82 - int(28 * intensity)
+int glowInnerT = 55 - int(25 * intensity)
+plot(showGlow ? netPressure : na, "glow outer", color = color.new(oscCol, glowOuterT), linewidth = 8, display = display.pane)
+plot(showGlow ? netPressure : na, "glow inner", color = color.new(oscCol, glowInnerT), linewidth = 4, display = display.pane)
+pMain = plot(showGlow ? netPressure : na, "Net pressure", color = oscCol, linewidth = 2, display = display.pane)
+plot(isHist ? netPressure : na, "Histogram", color = color.new(oscCol, 20), style = plot.style_columns, display = display.pane)
+pBase = plot(isArea ? 0.0 : na, "base", color = na, display = display.none, editable = false)
+fill(pMain, pBase, color = isArea ? color.new(oscCol, 90 - int(45 * intensity)) : na, title = "Area")
+
+// pane rejection marks + PRICE overlay triangles
+plotshape(bull, "Support bounce", shape.triangleup,   location.bottom, color = cSup, size = size.tiny)
+plotshape(bear, "Resistance reject", shape.triangledown, location.top,  color = cRes, size = size.tiny)
+plotshape(bull, "Support bounce (overlay)",   shape.triangleup,   location.belowbar, color = cSup, size = size.tiny, force_overlay = true)
+plotshape(bear, "Resistance reject (overlay)", shape.triangledown, location.abovebar, color = cRes, size = size.tiny, force_overlay = true)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                       COST-BASIS NODES + MAGNET on price (last bar)
+// ═════════════════════════════════════════════════════════════════════════════════════════
+var array<line> nodeLines = array.new<line>()
+var line magLine = na
+if barstate.islast and not na(binW) and peakW > 0.0
+    if nodeLines.size() > 0
+        for i = 0 to nodeLines.size() - 1
+            line.delete(nodeLines.get(i))
+    nodeLines.clear()
+    if not na(magLine)
+        line.delete(magLine)
+    int drawnUp = 0
+    int drawnDn = 0
+    if showNodes
+        for b = nBins - 1 to 0
+            float bw = array.get(binVol, b)
+            if bw >= nodeFrac * peakW
+                float bc = pLo + (b + 0.5) * binW
+                bool above = bc > P
+                bool ok = above ? drawnUp < maxNodes : drawnDn < maxNodes
+                if ok
+                    color lc = above ? cRes : cSup
+                    int tp = math.min(90, 40 + int(50.0 * (1.0 - bw / peakW)))
+                    // Width also tracks node strength, so the heaviest cost-basis
+                    // walls are the boldest lines, not just the least transparent.
+                    float strRatio = bw / peakW
+                    int nw = strRatio >= 0.66 ? 3 : strRatio >= 0.4 ? 2 : 1
+                    line ln = line.new(bar_index - L, bc, bar_index, bc, color = color.new(lc, tp), width = nw, extend = extend.right, force_overlay = true)
+                    nodeLines.push(ln)
+                    if above
+                        drawnUp += 1
+                    else
+                        drawnDn += 1
+    if showMag and not na(magnet)
+        magLine := line.new(bar_index - L, magnet, bar_index, magnet, color = color.new(colMagI, 20), width = 1, style = line.style_dashed, extend = extend.right, force_overlay = true)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                        DASHBOARD
+// ═════════════════════════════════════════════════════════════════════════════════════════
+int dRows = dashMode == "Pro" ? 11 : 6
+var table dash = table.new(f_pos(dashPos), 2, dRows, frame_color = frameC, frame_width = 1, border_color = frameC, border_width = 1)
+f_cell(int r, string k, string v, color vc, color bg) =>
+    table.cell(dash, 0, r, k, text_color = txtSub, text_size = size.tiny, text_halign = text.align_left,  bgcolor = bg)
+    table.cell(dash, 1, r, v, text_color = vc,     text_size = size.tiny, text_halign = text.align_right, bgcolor = bg)
+
+if showDash and barstate.islast
+    table.set_bgcolor(dash, panelBg)
+    color vCol = vCode == 2 ? cSup : vCode == 0 ? cRes : txtMut
+    color hdr  = color.new(vCode == 2 ? cSup : vCode == 0 ? cRes : color.gray, 0)
+    table.cell(dash, 0, 0, dashMode == "Pro" ? "BEHAV PRESSURE" : "BEHAV PRESS", text_color = f_txtOn(hdr), bgcolor = hdr, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(dash, 1, 0, vTxt, text_color = f_txtOn(hdr), bgcolor = hdr, text_size = size.tiny)
+    if dashMode == "Pro"
+        f_cell(1, "Net pressure", na(netPressure) ? "-" : str.tostring(netPressure, "0"), vCol, rowAlt)
+        f_cell(2, "% float in profit", na(pctProfit) ? "-" : str.tostring(pctProfit, "0") + "%", pctProfit > 80 ? cRes : pctProfit < 20 ? cSup : txtMain, panelBg)
+        f_cell(3, "Magnet (break-even)", na(magnet) ? "-" : str.tostring(magnet, format.mintick), txtMain, rowAlt)
+        f_cell(4, "Resistance node", na(nearRes) ? "-" : str.tostring(nearRes, format.mintick), cRes, panelBg)
+        f_cell(5, "Support node", na(nearSup) ? "-" : str.tostring(nearSup, format.mintick), cSup, rowAlt)
+        f_cell(6, "Signals (n)", str.tostring(tot), txtMain, panelBg)
+        f_cell(7, "Hit % (edge)", na(hitP) ? "warming" : str.tostring(hitP, "0") + "%  " + (na(edge) ? "" : (edge >= 0 ? "+" : "") + str.tostring(edge, "0.0")), na(edge) ? txtMut : edge > 0 ? cSup : cRes, rowAlt)
+        f_cell(8, "Base %", na(baseP) ? "-" : str.tostring(baseP, "0") + "%", txtMut, panelBg)
+        f_cell(9, "Edge (OOS)", na(oosEdge) ? "warming" : (oosStar ? "★ " : "") + (oosEdge >= 0 ? "+" : "") + str.tostring(oosEdge, "0.0"), na(oosEdge) ? txtMut : oosEdge > 0 ? cSup : cRes, rowAlt)
+        f_cell(10, "Eff-N (IS/OOS)", str.tostring(effN, "0.0") + " (" + str.tostring(isTot) + "/" + str.tostring(oosTot) + ")", txtMain, panelBg)
+    else
+        f_cell(1, "Net pressure", na(netPressure) ? "-" : str.tostring(netPressure, "0"), vCol, rowAlt)
+        f_cell(2, "% float in profit", na(pctProfit) ? "-" : str.tostring(pctProfit, "0") + "%", pctProfit > 80 ? cRes : pctProfit < 20 ? cSup : txtMain, panelBg)
+        f_cell(3, "Resistance node", na(nearRes) ? "-" : str.tostring(nearRes, format.mintick), cRes, rowAlt)
+        f_cell(4, "Support node", na(nearSup) ? "-" : str.tostring(nearSup, format.mintick), cSup, panelBg)
+        f_cell(5, "Edge (OOS)", na(oosEdge) ? "warming" : (oosStar ? "★ " : "") + (oosEdge >= 0 ? "+" : "") + str.tostring(oosEdge, "0.0"), na(oosEdge) ? txtMut : oosEdge > 0 ? cSup : cRes, rowAlt)
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                    IDENTITY STRIP
+// ═════════════════════════════════════════════════════════════════════════════════════════
+var table idT = table.new(position.bottom_center, 1, 1, force_overlay = true)
+if showId and barstate.islast
+    table.cell(idT, 0, 0, "Behavioural Pressure Map   -   " + syminfo.ticker + "   -   " + timeframe.period, text_color = uiDark ? color.new(#c8d0da, 10) : color.new(#2a2f37, 10), text_size = size.small, text_halign = text.align_center, bgcolor = color.new(color.gray, 100))
+
+// ═════════════════════════════════════════════════════════════════════════════════════════
+//                                    ALERTS + EXPORTS
+// ═════════════════════════════════════════════════════════════════════════════════════════
+alertcondition(bull, "Support bounce", "Behavioural Pressure: price rejected a support cost-basis node with demand pressure.")
+alertcondition(bear, "Resistance reject", "Behavioural Pressure: price rejected a resistance cost-basis node with supply pressure.")
+alertcondition(ta.crossover(nz(netPressure), pThr)   and sigOK, "Demand takes over", "Behavioural Pressure: net pressure turned decisively supportive.")
+alertcondition(ta.crossunder(nz(netPressure), -pThr) and sigOK, "Supply takes over", "Behavioural Pressure: net pressure turned decisively overhead-supply.")
+
+color exC_ = color.new(color.gray, 100)
+plot(showEXP ? netPressure : na, "EXP_Pressure",  color = exC_, display = display.data_window)
+plot(showEXP ? magnet      : na, "EXP_Magnet",    color = exC_, display = display.data_window)
+plot(showEXP ? nearRes     : na, "EXP_ResLevel",  color = exC_, display = display.data_window)
+plot(showEXP ? nearSup     : na, "EXP_SupLevel",  color = exC_, display = display.data_window)
+plot(showEXP ? pctProfit   : na, "EXP_PctProfit", color = exC_, display = display.data_window)
+plot(showEXP ? (bull ? 1 : bear ? -1 : 0) : na, "EXP_Signal", color = exC_, display = display.data_window)
+plot(showEXP ? oosEdge     : na, "EXP_EdgeOOS",   color = exC_, display = display.data_window)
+plot(showEXP ? effN        : na, "EXP_EffN",      color = exC_, display = display.data_window)

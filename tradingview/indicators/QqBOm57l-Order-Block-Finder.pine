@@ -1,0 +1,222 @@
+//@version=6
+indicator("Order Block Finder", shorttitle="Best Order Block Finder", overlay=true, max_boxes_count=200, max_labels_count=200)
+
+// Order Block Finder — Enhanced
+// Developed by the Xcelerate Trade team.
+// Rules-based bullish / bearish OB zones (OB candle + consecutive confirmation).
+
+// === INPUTS ===
+colors = input.string("DARK", "Color Scheme", options=["DARK", "BRIGHT"])
+periods = input.int(5, "Relevant Periods to identify OB", minval=2, maxval=20)
+threshold = input.float(0.0, "Min. Percent move to identify OB", step=0.1, minval=0.0, maxval=10.0)
+
+max_obs_total = input.int(20, "Maximum Order Blocks to show (total)", minval=5, maxval=100, tooltip="Total OB boxes (bull + bear combined). Old default behavior ≈ 20 total (10 bull + 10 bear).")
+ob_transp = input.int(80, "Order Block Transparency", minval=0, maxval=100)
+ob_length = input.int(5, "Order Block Length (bars)", minval=1, maxval=50, tooltip="Fixed width of each OB box at the formation bar(s). Default 5 = local mark only.")
+extendRight = input.bool(false, "Extend zone right until mitigated", tooltip="Off (default): short fixed box at formation. On: zone grows to the current bar until mitigated or invalidated.")
+
+zoneMode = input.string("Open→Wick", "Order Block Zone", options=["Open→Wick", "Body", "Full Wick"], tooltip="Open→Wick matches the original script: bullish uses open-to-low, bearish uses high-to-open. Body: open-to-close. Full Wick: high-to-low.")
+
+mitigationMode = input.string("Off", "Mitigation", options=["Off", "Touch", "Close inside"], tooltip="Touch: mitigated when price touches the zone. Close inside: mitigated on close inside the zone.")
+invalidationMode = input.string("Off", "Invalidation", options=["Off", "Touch beyond", "Close beyond"], tooltip="Beyond means through the opposite side of the zone (bull: below bottom, bear: above top).")
+mitigatedStyle = input.string("Keep", "After mitigation", options=["Keep", "Fade", "Delete"], tooltip="What to do after mitigation.")
+
+alertOnMitigation = input.bool(false, "Alert on mitigation", tooltip="Adds alertconditions for mitigated OBs.")
+
+// === COLORS ===
+bullcolor = colors == "DARK" ? color.green : color.blue
+bearcolor = colors == "DARK" ? color.red : color.orange
+label_text_color = colors == "DARK" ? color.white : color.black
+
+// === CORE VARS ===
+ob_period_conf = periods + 1
+absmove_conf = close[ob_period_conf] != 0 ? (math.abs(close[ob_period_conf] - close[1]) / close[ob_period_conf]) * 100 : 0.0
+relmove_conf = absmove_conf >= threshold
+
+// === ARRAYS ===
+var box[] ob_boxes = array.new_box()
+var bool[] ob_isBull = array.new_bool()
+var bool[] ob_mitigated = array.new_bool()
+var label[] ob_labels = array.new_label()
+var int[] ob_left = array.new_int()
+var float[] ob_movePct = array.new_float()
+
+// === HELPERS ===
+f_zone(isBull, o, h, l, c) =>
+    float top = na
+    float bot = na
+    if zoneMode == "Open→Wick"
+        if isBull
+            top := o
+            bot := l
+        else
+            top := h
+            bot := o
+    else if zoneMode == "Body"
+        top := math.max(o, c)
+        bot := math.min(o, c)
+    else
+        top := h
+        bot := l
+    [top, bot]
+
+f_obLabelText(isBull, movePct, mitigated) =>
+    base = (isBull ? "Bull OB" : "Bear OB") + "\n" + str.tostring(movePct, "#.#") + "%"
+    mitigated ? base + "\nMitigated" : base
+
+f_setBoxStyle(b, isBull, mitigated) =>
+    col = isBull ? bullcolor : bearcolor
+    if mitigated and mitigatedStyle == "Fade"
+        box.set_bgcolor(b, color.new(col, math.min(95, ob_transp + 10)))
+        box.set_border_color(b, color.new(col, 60))
+    else
+        box.set_bgcolor(b, color.new(col, ob_transp))
+        box.set_border_color(b, col)
+    box.set_border_width(b, 1)
+
+f_boxRight(leftIdx) =>
+    leftIdx + ob_length
+
+f_deleteAt(idx) =>
+    box.delete(array.get(ob_boxes, idx))
+    label.delete(array.get(ob_labels, idx))
+    array.remove(ob_boxes, idx)
+    array.remove(ob_isBull, idx)
+    array.remove(ob_mitigated, idx)
+    array.remove(ob_labels, idx)
+    array.remove(ob_left, idx)
+    array.remove(ob_movePct, idx)
+
+f_findByLeft(leftIdx, isBull) =>
+    found = -1
+    if array.size(ob_left) == array.size(ob_boxes)
+        j = array.size(ob_boxes) - 1
+        while j >= 0
+            if array.get(ob_left, j) == leftIdx and array.get(ob_isBull, j) == isBull
+                found := j
+                j := -1
+            else
+                j -= 1
+    found
+
+// === OB DETECTION (CONFIRMED) ===
+bullishOB_conf = close[ob_period_conf] < open[ob_period_conf]
+bearishOB_conf = close[ob_period_conf] > open[ob_period_conf]
+
+bullSequence = true
+bearSequence = true
+for i = 1 to periods
+    if close[i] < open[i]
+        bullSequence := false
+    if close[i] > open[i]
+        bearSequence := false
+
+OB_bull = bullishOB_conf and bullSequence and relmove_conf
+OB_bear = bearishOB_conf and bearSequence and relmove_conf
+
+if OB_bull or OB_bear
+    isBull = OB_bull
+    o = open[ob_period_conf]
+    h = high[ob_period_conf]
+    l = low[ob_period_conf]
+    c = close[ob_period_conf]
+    [zTop, zBot] = f_zone(isBull, o, h, l, c)
+
+    leftIdx = bar_index - ob_period_conf
+    rightIdx = f_boxRight(leftIdx)
+
+    existing = array.size(ob_boxes) > 0 and array.size(ob_left) == array.size(ob_boxes) ? f_findByLeft(leftIdx, isBull) : -1
+    if existing == -1
+        b = box.new(left=leftIdx, top=zTop, right=rightIdx, bottom=zBot, bgcolor=color.new(isBull ? bullcolor : bearcolor, ob_transp), border_color=isBull ? bullcolor : bearcolor)
+        f_setBoxStyle(b, isBull, false)
+        txt = f_obLabelText(isBull, absmove_conf, false)
+        y = isBull ? zBot : zTop
+        style = isBull ? label.style_label_up : label.style_label_down
+        col = isBull ? bullcolor : bearcolor
+        lb = label.new(leftIdx, y, txt, style=style, color=col, textcolor=label_text_color, size=size.small)
+        array.push(ob_boxes, b)
+        array.push(ob_isBull, isBull)
+        array.push(ob_mitigated, false)
+        array.push(ob_labels, lb)
+        array.push(ob_left, leftIdx)
+        array.push(ob_movePct, absmove_conf)
+
+    while array.size(ob_boxes) > max_obs_total
+        f_deleteAt(0)
+
+// site message (fixed — not in Settings; mid-script so it is not at file end)
+showSitePromo = true
+promoIntervalMin = 7
+promoHighlightSec = 30
+promoMsg = "For more indicators & strategies\nvisit trading.xcelerate.trade"
+promoIntervalMs = promoIntervalMin * 60 * 1000
+promoVisibleMs = promoHighlightSec * 1000
+var table sitePromoTbl = na
+varip int promoHiddenAnchorMs = -1
+varip int promoVisibleAnchorMs = -1
+if showSitePromo and barstate.islast
+    if na(sitePromoTbl)
+        sitePromoTbl := table.new(position.middle_center, 1, 1, border_width=0, frame_color=color.new(color.black, 100), bgcolor=color.new(color.black, 100))
+    nowMs = na(timenow) ? time_close : timenow
+    if promoHiddenAnchorMs < 0 and promoVisibleAnchorMs < 0
+        promoHiddenAnchorMs := nowMs
+    if promoVisibleAnchorMs >= 0
+        if nowMs - promoVisibleAnchorMs >= promoVisibleMs
+            promoHiddenAnchorMs := nowMs
+            promoVisibleAnchorMs := -1
+    else if promoHiddenAnchorMs >= 0 and nowMs - promoHiddenAnchorMs >= promoIntervalMs
+        promoVisibleAnchorMs := nowMs
+    showPromoNow = promoVisibleAnchorMs >= 0 and nowMs - promoVisibleAnchorMs < promoVisibleMs
+    if showPromoNow
+        table.cell(sitePromoTbl, 0, 0, promoMsg, text_color=color.white, text_size=size.large, bgcolor=color.new(color.black, 25), text_halign=text.align_center)
+    else
+        table.cell(sitePromoTbl, 0, 0, "", bgcolor=color.new(color.black, 100), text_color=color.new(color.white, 100), text_size=size.large)
+
+// === MITIGATION / INVALIDATION UPDATE LOOP ===
+mitBull = false
+mitBear = false
+idx = array.size(ob_boxes) - 1
+while idx >= 0
+    b = array.get(ob_boxes, idx)
+    isBull = array.get(ob_isBull, idx)
+    wasMit = array.get(ob_mitigated, idx)
+    leftIdx = array.get(ob_left, idx)
+    movePct = array.get(ob_movePct, idx)
+    lb = array.get(ob_labels, idx)
+
+    top = box.get_top(b)
+    bot = box.get_bottom(b)
+
+    touchInside = low <= top and high >= bot
+    closeInside = close <= top and close >= bot
+
+    doMit = mitigationMode == "Touch" ? touchInside : mitigationMode == "Close inside" ? closeInside : false
+
+    beyond = isBull ? (invalidationMode == "Touch beyond" ? low < bot : invalidationMode == "Close beyond" ? close < bot : false) : (invalidationMode == "Touch beyond" ? high > top : invalidationMode == "Close beyond" ? close > top : false)
+
+    deleted = false
+    if not wasMit and doMit and mitigationMode != "Off"
+        array.set(ob_mitigated, idx, true)
+        f_setBoxStyle(b, isBull, true)
+        label.set_text(lb, f_obLabelText(isBull, movePct, true))
+        if isBull
+            mitBull := true
+        else
+            mitBear := true
+        if mitigatedStyle == "Delete"
+            f_deleteAt(idx)
+            deleted := true
+    else if beyond and invalidationMode != "Off"
+        f_deleteAt(idx)
+        deleted := true
+
+    if not deleted
+        if extendRight and not array.get(ob_mitigated, idx)
+            box.set_right(b, math.max(leftIdx + ob_length, bar_index))
+        idx -= 1
+
+// === ALERTS ===
+alertcondition(OB_bull, title="New Bullish OB detected", message="New Bullish Order Block detected on {{ticker}} ({{interval}})")
+alertcondition(OB_bear, title="New Bearish OB detected", message="New Bearish Order Block detected on {{ticker}} ({{interval}})")
+alertcondition(alertOnMitigation and mitBull, title="Bullish OB mitigated", message="Bullish Order Block mitigated on {{ticker}} ({{interval}})")
+alertcondition(alertOnMitigation and mitBear, title="Bearish OB mitigated", message="Bearish Order Block mitigated on {{ticker}} ({{interval}})")

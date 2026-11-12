@@ -1,0 +1,247 @@
+//@version=5
+strategy("VWAP Mean Reversion Strategy", overlay=true, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=0)
+
+// ===== Inputs =====
+lookback = input.int(20, "High/Low Lookback Length", minval=2)
+bodyPercentSS = input.float(0.3, "Max Body % (SS/Hammer)", step=0.05)
+upperWickMultiple = input.float(2.0, "Upper Wick to Body Multiple (SS)", step=0.1)
+lowerWickMultiple = input.float(2.0, "Lower Wick to Body Multiple (Hammer)", step=0.1)
+dojiBodyPercent = input.float(0.2, "Max Body % of Range (Doji)", step=0.02)
+closePercent = input.float(0.30, "Close Position % (Top/Bottom of Range)", step=0.05)
+
+// ===== ATR & Risk =====
+useAdaptiveATR = input.bool(true, "Use Adaptive ATR")
+baseATRLength = input.int(10, "Base ATR Length (on target TF)")
+targetTF = input.timeframe("Chart", "Target Timeframe for ATR")
+atrMultiplier = input.float(1.5, "Max Candle Size (x ATR)", step=0.1)
+riskPerc = input.float(1.0, "Risk % per Trade", step=0.1)/100
+stopATR = input.float(0.2, "Stop Loss (x ATR)")
+takeProfitRiskMultiplier = input.float(2.0, "Take Profit (x Risk)", step=0.1)
+
+// ===== Options =====
+enableCloseOpposite = input.bool(true, "Enable Close Opposite Signal")
+entryType = input.string("Close of Confirmation", "Entry Type", options=["Stop", "Close of Confirmation"])
+closeEntryBufferPerc = input.float(0.01, "Close Entry Buffer %", step=0.001)
+engulfingOnly = input.bool(false, "Engulfing Candles Only for Entries")
+
+// ===== Spread =====
+spreadPoints = input.float(0.09, "Broker Spread (in price units)", step=0.01)
+
+// ===== VWAP =====
+showVWAP = input.bool(true, "Show VWAP")
+useVWAPFilter = input.bool(true, "Require Price Outside 1σ")
+useMeanReversion = input.bool(true, "Enable Mean Reversion Logic")
+
+// ===== Timeframe conversion =====
+tfInMinutes(tf) =>
+    switch tf
+        "1"   => 1
+        "3"   => 3
+        "5"   => 5
+        "15"  => 15
+        "30"  => 30
+        "45"  => 45
+        "60"  => 60
+        "120" => 120
+        "180" => 180
+        "240" => 240
+        "D"   => 1440
+        "W"   => 10080
+        "M"   => 43200
+        => 1440
+
+chartTFmin = tfInMinutes(timeframe.period)
+targetTFmin = tfInMinutes(targetTF)
+adaptiveATRLength = math.max(1, math.round(baseATRLength * (targetTFmin / chartTFmin)))
+
+// ===== VWAP calculation =====
+newSession = ta.change(time("D"))
+var float cumVol = na
+var float cumPV  = na
+var float cumPV2 = na
+cumVol := newSession ? volume : cumVol + volume
+cumPV  := newSession ? hlc3 * volume : cumPV + hlc3 * volume
+cumPV2 := newSession ? (hlc3 * hlc3) * volume : cumPV2 + (hlc3 * hlc3) * volume
+vwap = cumPV / cumVol
+variance = (cumPV2 / cumVol) - math.pow(vwap, 2)
+stdev = math.sqrt(math.max(variance, 0))
+upperBand = vwap + stdev
+lowerBand = vwap - stdev
+
+priceAboveUpper = close[1] > upperBand
+priceBelowLower = close[1] < lowerBand
+
+outsideForShort = priceAboveUpper
+outsideForLong  = priceBelowLower
+
+meanRevShort = priceAboveUpper
+meanRevLong  = priceBelowLower
+
+// ===== ATR =====
+atr = useAdaptiveATR ? ta.atr(adaptiveATRLength) : ta.atr(baseATRLength)
+
+// ===== Candle Patterns =====
+body = math.abs(close - open)
+candle = high - low
+upperWick = high - math.max(open, close)
+lowerWick = math.min(open, close) - low
+validRange = candle > 0
+atrValid = candle <= (atr * atrMultiplier)
+closePos = validRange ? (close - low) / candle : 0.0
+
+smallBodySS = validRange and body <= candle * bodyPercentSS
+longUpperWick = validRange and upperWick >= body * upperWickMultiple
+smallLowerWick = validRange and lowerWick <= body
+shootingStar = smallBodySS and longUpperWick and smallLowerWick
+
+smallBodyHammer = validRange and body <= candle * bodyPercentSS
+longLowerWick = validRange and lowerWick >= body * lowerWickMultiple
+smallUpperWickHammer = validRange and upperWick <= body
+hammer = smallBodyHammer and longLowerWick and smallUpperWickHammer
+
+dojiCandle = validRange and body <= candle * dojiBodyPercent
+
+twentyHigh = ta.highest(high, lookback)
+twentyLow  = ta.lowest(low, lookback)
+
+bearishSetupBar = (shootingStar or dojiCandle) and high >= twentyHigh
+bullishSetupBar = (hammer or dojiCandle) and low <= twentyLow
+
+bearishEngulfing = close < open and close[1] > open[1] and open >= close[1] and close <= open[1]
+bullishEngulfing = close > open and close[1] < open[1] and open <= close[1] and close >= open[1]
+
+lowerHighAndCloseBelowlow = high < high[1] and close < low[1]
+higherLowAndCloseAbovehigh = low > low[1] and close > high[1]
+
+bullishCloseValid = closePos >= (1 - closePercent)
+bearishCloseValid = closePos <= closePercent
+
+// ===== Confirmed Signals =====
+bearBase = bearishSetupBar[1] and bearishCloseValid and atrValid
+bullBase = bullishSetupBar[1] and bullishCloseValid and atrValid
+
+// Engulfing-only toggle
+if engulfingOnly
+    bearBase := bearBase and bearishEngulfing
+    bullBase := bullBase and bullishEngulfing
+else
+    bearBase := bearBase and (bearishEngulfing or lowerHighAndCloseBelowlow)
+    bullBase := bullBase and (bullishEngulfing or higherLowAndCloseAbovehigh)
+
+bearishConfirmed = bearBase
+bullishConfirmed = bullBase
+
+if useVWAPFilter
+    bearishConfirmed := bearishConfirmed and outsideForShort
+    bullishConfirmed := bullishConfirmed and outsideForLong
+
+if useMeanReversion
+    bearishConfirmed := bearishConfirmed and meanRevShort
+    bullishConfirmed := bullishConfirmed and meanRevLong
+
+// ===== Entry Signals =====
+longSignalOnce  = bullishConfirmed and not bullishConfirmed[1]
+shortSignalOnce = bearishConfirmed and not bearishConfirmed[1]
+
+// ===== ATR Buffer & Risk Setup =====
+atrBufferPerc = input.float(0.01, "ATR Buffer %", step=0.001)
+atrBuffer = atr * atrBufferPerc
+closeEntryBuffer = atr * closeEntryBufferPerc
+
+// ===== Global variables for entries & exits =====
+var float longStopStored = na
+var float longTargetStored = na
+var float shortStopStored = na
+var float shortTargetStored = na
+
+var float longEntry = na
+var float shortEntry = na
+
+var float longRisk = na
+var float shortRisk = na
+
+var float longQty = na
+var float shortQty = na
+
+var int longSignalBar = na
+var int shortSignalBar = na
+
+// ===== Global variables for spread-adjusted entries =====
+var float effectiveLongEntry = na
+var float effectiveShortEntry = na
+
+// ===== Entries =====
+if longSignalOnce
+    longSignalBar := bar_index
+    longStopStored   := low - atrBuffer
+    longEntry        := high + atrBuffer
+    longRisk         := math.max(longEntry - longStopStored, atr * stopATR)
+    longTargetStored := longEntry + (longRisk * takeProfitRiskMultiplier)
+    longQty          := longRisk > 0 ? math.floor((strategy.equity * riskPerc) / longRisk) : 0
+
+    // Update global variable
+    effectiveLongEntry := entryType == "Stop" ? longEntry + spreadPoints : close + closeEntryBuffer + spreadPoints
+
+    if entryType == "Stop"
+        strategy.entry("Long", strategy.long, qty=longQty, stop=effectiveLongEntry)
+    else
+        strategy.entry("Long", strategy.long, qty=longQty, limit=effectiveLongEntry)
+
+if shortSignalOnce
+    shortSignalBar := bar_index
+    shortStopStored   := high + atrBuffer
+    shortEntry        := low - atrBuffer
+    shortRisk         := math.max(shortStopStored - shortEntry, atr * stopATR)
+    shortTargetStored := shortEntry - (shortRisk * takeProfitRiskMultiplier)
+    shortQty          := shortRisk > 0 ? math.floor((strategy.equity * riskPerc) / shortRisk) : 0
+
+    // Update global variable
+    effectiveShortEntry := entryType == "Stop" ? shortEntry - spreadPoints : close - closeEntryBuffer - spreadPoints
+
+    if entryType == "Stop"
+        strategy.entry("Short", strategy.short, qty=shortQty, stop=effectiveShortEntry)
+    else
+        strategy.entry("Short", strategy.short, qty=shortQty, limit=effectiveShortEntry)
+
+// ===== Cancel Stop Orders after 2 Bars =====
+if entryType == "Stop"
+    if not na(longSignalBar) and bar_index - longSignalBar > 2
+        strategy.cancel("Long")
+        longSignalBar := na
+    if not na(shortSignalBar) and bar_index - shortSignalBar > 2
+        strategy.cancel("Short")
+        shortSignalBar := na
+
+// ===== Exits =====
+strategy.exit("Long Exit", from_entry="Long", stop=longStopStored - spreadPoints, limit=longTargetStored - spreadPoints)
+strategy.exit("Short Exit", from_entry="Short", stop=shortStopStored + spreadPoints, limit=shortTargetStored + spreadPoints)
+
+// ===== Close Opposite (Optional) =====
+if enableCloseOpposite
+    if longSignalOnce
+        strategy.close("Short")
+    if shortSignalOnce
+        strategy.close("Long")
+
+// ===== Spread-Adjusted P/L Display =====
+var float lastLongPL = na
+var float lastShortPL = na
+var float cumLongPL = 0.0
+var float cumShortPL = 0.0
+var float cumPL = 0.0
+
+// Per-bar P/L
+if strategy.position_size > 0 and not na(effectiveLongEntry)
+    lastLongPL := (close - effectiveLongEntry - spreadPoints) * strategy.position_size
+if strategy.position_size < 0 and not na(effectiveShortEntry)
+    lastShortPL := (effectiveShortEntry - close - spreadPoints) * math.abs(strategy.position_size)
+
+
+// ===== Plots =====
+plotshape(bearishSetupBar, title="Bearish Setup Candle", location=location.abovebar, style=shape.circle, color=color.rgb(234, 95, 21), size=size.tiny)
+plotshape(bullishSetupBar, title="Bullish Setup Candle", location=location.belowbar, style=shape.circle, color=color.rgb(9, 133, 32), size=size.tiny)
+plotshape(longSignalOnce, style=shape.triangleup, color=color.rgb(6, 169, 11), size=size.small, location=location.belowbar, title="Long Signal")
+plotshape(shortSignalOnce, style=shape.triangledown, color=color.rgb(242, 17, 17), size=size.small, location=location.abovebar, title="Short Signal")
+plot(showVWAP ? vwap : na, title="VWAP", color=color.rgb(153, 14, 228), linewidth=2)
+plot(showVWAP ? upperBand : na, title="+1 Std Dev", color=color.rgb(94, 109, 122), linewidth=1)
+plot(showVWAP ? lowerBand : na, title="-1 Std Dev", color=color.rgb(87, 110, 128), linewidth=1)

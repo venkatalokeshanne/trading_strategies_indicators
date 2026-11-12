@@ -1,0 +1,548 @@
+//@version=6
+//@strategy_alert_message {{strategy.order.alert_message}}
+strategy("REVERSAL CLEAN MTF v1 - M15 Setup / M5 Entry",
+     overlay=true,
+     pyramiding=0,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     process_orders_on_close=true)
+
+// ============================================================
+// REVERSAL CLEAN MTF
+// ------------------------------------------------------------
+// v2 VISUAL: etichette e pannello ad alto contrasto per sfondo nero.
+// ------------------------------------------------------------
+// IDEA:
+// M15 = analisi del contesto e della zona.
+// M5  = conferma dell'ingresso.
+//
+// NON mostra tutti gli swing sul grafico.
+// Mostra solo:
+// 1) zona M15
+// 2) setup valido
+// 3) ENTRY M5
+// 4) SL / TP
+//
+// La logica cerca:
+// - una zona di massimo/minimo M15;
+// - almeno 2 test della zona;
+// - un nuovo attacco senza vera estensione;
+// - rifiuto della zona;
+// - su M5 una micro-rottura nella direzione dell'inversione;
+// - un solo ingresso per setup.
+//
+// È una struttura pensata per GBPUSD e XAUUSD, ma i parametri
+// ATR sono adattivi e possono essere ottimizzati per strumento.
+// ============================================================
+
+// -------------------------
+// INPUT M15
+// -------------------------
+g1 = "01 - SETUP M15"
+
+m15Pivot = input.int(4, "Pivot M15", minval=2, maxval=10, group=g1)
+minTests = input.int(2, "Test minimi zona", minval=2, maxval=5, group=g1)
+zoneATR = input.float(0.35, "Ampiezza zona x ATR", minval=0.05, maxval=2.0, step=0.05, group=g1)
+maxExtensionATR = input.float(0.55, "Massima estensione oltre zona x ATR", minval=0.05, maxval=3.0, step=0.05, group=g1)
+setupBarsM15 = input.int(16, "Durata massima setup M15", minval=4, maxval=60, group=g1)
+
+// -------------------------
+// INPUT M5
+// -------------------------
+g2 = "02 - CONFERMA M5"
+
+m5Pivot = input.int(2, "Micro swing M5", minval=1, maxval=5, group=g2)
+confirmBars = input.int(8, "Barre M5 massime per conferma", minval=1, maxval=30, group=g2)
+minBodyATR = input.float(0.12, "Body minimo candela x ATR", minval=0.0, maxval=1.0, step=0.01, group=g2)
+requireCloseDirection = input.bool(true, "Richiedi chiusura nella direzione", group=g2)
+
+// -------------------------
+// FILTRI
+// -------------------------
+g3 = "03 - FILTRI"
+
+useEMA = input.bool(false, "Filtro EMA M15", group=g3)
+emaLen = input.int(50, "EMA M15", minval=10, maxval=300, group=g3)
+
+useHTF = input.bool(false, "Filtro trend H1", group=g3)
+htfEmaLen = input.int(50, "EMA H1", minval=10, maxval=300, group=g3)
+
+useSession = input.bool(false, "Filtro orario", group=g3)
+sessionInput = input.session("0700-1800", "Sessione", group=g3)
+
+// -------------------------
+// RISK
+// -------------------------
+g4 = "04 - RISK MANAGEMENT"
+
+rr = input.float(3.0, "Risk / Reward", minval=1.0, maxval=8.0, step=0.5, group=g4)
+slBufferATR = input.float(0.25, "Buffer SL x ATR M5", minval=0.0, maxval=2.0, step=0.05, group=g4)
+qty = input.float(1.0, "Quantità / contratti", minval=0.01, maxval=100, step=0.01, group=g4)
+maxTradeBars = input.int(0, "Uscita dopo N barre M5 (0=off)", minval=0, maxval=500, group=g4)
+
+// -------------------------
+// VISUAL
+// -------------------------
+g5 = "05 - VISUAL"
+
+showZone = input.bool(true, "Mostra zona M15", group=g5)
+showSetup = input.bool(true, "Mostra setup", group=g5)
+showEntry = input.bool(true, "Mostra ENTRY / SL / TP", group=g5)
+showInfoTable = input.bool(true, "Mostra pannello informazioni", group=g5)
+labelSizeInput = input.string("Grande", "Dimensione scritte", options=["Piccola", "Normale", "Grande", "Enorme"], group=g5)
+showSetupLabel = input.bool(true, "Mostra scritta SETUP", group=g5)
+showEntryLabel = input.bool(true, "Mostra scritta LONG/SHORT", group=g5)
+
+// ============================================================
+// TIMEFRAME CHECK
+// ============================================================
+
+isM5 = timeframe.isminutes and timeframe.multiplier == 5
+
+// ============================================================
+// DATI M15
+// ============================================================
+
+m15High = request.security(syminfo.tickerid, "15", high, lookahead=barmerge.lookahead_off)
+m15Low = request.security(syminfo.tickerid, "15", low, lookahead=barmerge.lookahead_off)
+m15Close = request.security(syminfo.tickerid, "15", close, lookahead=barmerge.lookahead_off)
+m15ATR = request.security(syminfo.tickerid, "15", ta.atr(14), lookahead=barmerge.lookahead_off)
+
+m15PH = request.security(syminfo.tickerid, "15", ta.pivothigh(high, m15Pivot, m15Pivot), lookahead=barmerge.lookahead_off)
+m15PL = request.security(syminfo.tickerid, "15", ta.pivotlow(low, m15Pivot, m15Pivot), lookahead=barmerge.lookahead_off)
+
+m15EMA = request.security(syminfo.tickerid, "15", ta.ema(close, emaLen), lookahead=barmerge.lookahead_off)
+h1Close = request.security(syminfo.tickerid, "60", close, lookahead=barmerge.lookahead_off)
+h1EMA = request.security(syminfo.tickerid, "60", ta.ema(close, htfEmaLen), lookahead=barmerge.lookahead_off)
+
+// ============================================================
+// ZONE M15
+// ============================================================
+
+var float resistance = na
+var float support = na
+var float resistanceTop = na
+var float resistanceBottom = na
+var float supportTop = na
+var float supportBottom = na
+
+var int resistanceTests = 0
+var int supportTests = 0
+
+var int lastResistanceTest = na
+var int lastSupportTest = na
+
+var int lastM15PivotBar = na
+
+newM15PivotHigh = not na(m15PH) and (na(lastM15PivotBar) or m15PH != resistance)
+newM15PivotLow = not na(m15PL) and (na(lastM15PivotBar) or m15PL != support)
+
+// Nuova resistenza: aggiorniamo la zona solo quando nasce un pivot
+// significativamente diverso da quello precedente.
+if newM15PivotHigh
+    resistance := m15PH
+    resistanceTop := resistance + m15ATR * zoneATR
+    resistanceBottom := resistance - m15ATR * zoneATR
+    resistanceTests := 1
+    lastResistanceTest := bar_index
+    lastM15PivotBar := bar_index
+
+if newM15PivotLow
+    support := m15PL
+    supportTop := support + m15ATR * zoneATR
+    supportBottom := support - m15ATR * zoneATR
+    supportTests := 1
+    lastSupportTest := bar_index
+
+// Test della zona: non contiamo ogni candela.
+// Serve un intervallo minimo per evitare 10 segnali nello stesso laterale.
+testCooldown = 6
+
+resTestNow = not na(resistance) and
+     high >= resistanceBottom and
+     high <= resistanceTop + m15ATR * maxExtensionATR and
+     bar_index > nz(lastResistanceTest, -100000) + testCooldown
+
+supTestNow = not na(support) and
+     low <= supportTop and
+     low >= supportBottom - m15ATR * maxExtensionATR and
+     bar_index > nz(lastSupportTest, -100000) + testCooldown
+
+if resTestNow
+    resistanceTests += 1
+    lastResistanceTest := bar_index
+
+if supTestNow
+    supportTests += 1
+    lastSupportTest := bar_index
+
+// ============================================================
+// M15 REJECTION
+// ============================================================
+
+m15BearReject = request.security(
+     syminfo.tickerid, "15",
+     high >= ta.highest(high, 5)[1] and close < open,
+     lookahead=barmerge.lookahead_off)
+
+m15BullReject = request.security(
+     syminfo.tickerid, "15",
+     low <= ta.lowest(low, 5)[1] and close > open,
+     lookahead=barmerge.lookahead_off)
+
+m15BearCloseBackInside = not na(resistance) and m15Close < resistanceTop
+m15BullCloseBackInside = not na(support) and m15Close > supportBottom
+
+bearishSetupRaw =
+     not na(resistance) and
+     resistanceTests >= minTests and
+     m15BearCloseBackInside and
+     m15BearReject
+
+bullishSetupRaw =
+     not na(support) and
+     supportTests >= minTests and
+     m15BullCloseBackInside and
+     m15BullReject
+
+// ============================================================
+// SETUP STATE
+// ============================================================
+
+var bool shortSetup = false
+var bool longSetup = false
+
+var int shortSetupStart = na
+var int longSetupStart = na
+
+var float setupResistance = na
+var float setupSupport = na
+
+var float setupFailureHigh = na
+var float setupFailureLow = na
+
+// Nuovo setup solo alla chiusura di una nuova candela M15.
+// In questo modo non ripetiamo il segnale su ogni barra M5.
+newM15Bar = ta.change(time("15")) != 0
+
+if newM15Bar
+    if bearishSetupRaw
+        shortSetup := true
+        longSetup := false
+        shortSetupStart := bar_index
+        setupResistance := resistance
+        setupFailureHigh := m15High
+
+    if bullishSetupRaw
+        longSetup := true
+        shortSetup := false
+        longSetupStart := bar_index
+        setupSupport := support
+        setupFailureLow := m15Low
+
+// Scadenza setup
+if shortSetup and bar_index - nz(shortSetupStart) > setupBarsM15 * 3
+    shortSetup := false
+
+if longSetup and bar_index - nz(longSetupStart) > setupBarsM15 * 3
+    longSetup := false
+
+// ============================================================
+// FILTRI
+// ============================================================
+
+sessionOK = not useSession or not na(time(timeframe.period, sessionInput))
+
+shortFilter =
+     sessionOK and
+     (not useEMA or m15Close < m15EMA) and
+     (not useHTF or h1Close < h1EMA)
+
+longFilter =
+     sessionOK and
+     (not useEMA or m15Close > m15EMA) and
+     (not useHTF or h1Close > h1EMA)
+
+// ============================================================
+// MICRO STRUTTURA M5
+// ============================================================
+
+m5ATR = ta.atr(14)
+
+m5PH = ta.pivothigh(high, m5Pivot, m5Pivot)
+m5PL = ta.pivotlow(low, m5Pivot, m5Pivot)
+
+var float lastM5High = na
+var float lastM5Low = na
+
+if not na(m5PH)
+    lastM5High := m5PH
+
+if not na(m5PL)
+    lastM5Low := m5PL
+
+bearBodyOK = math.abs(close - open) >= m5ATR * minBodyATR
+bullBodyOK = math.abs(close - open) >= m5ATR * minBodyATR
+
+bearCandleOK = close < open and (not requireCloseDirection or bearBodyOK)
+bullCandleOK = close > open and (not requireCloseDirection or bullBodyOK)
+
+// Conferma:
+// SHORT = rompe l'ultimo micro swing low M5.
+// LONG  = rompe l'ultimo micro swing high M5.
+shortConfirm =
+     shortSetup and
+     shortFilter and
+     not na(lastM5Low) and
+     close < lastM5Low and
+     bearCandleOK
+
+longConfirm =
+     longSetup and
+     longFilter and
+     not na(lastM5High) and
+     close > lastM5High and
+     bullCandleOK
+
+// ============================================================
+// ONE SHOT
+// ============================================================
+
+var bool setupAlreadyTraded = false
+
+if not shortSetup and not longSetup
+    setupAlreadyTraded := false
+
+// ============================================================
+// ENTRIES
+// ============================================================
+
+var float activeEntry = na
+var float activeSL = na
+var float activeTP = na
+var int tradeStartBar = na
+
+if shortConfirm and not setupAlreadyTraded and strategy.position_size == 0
+    entry = close
+    sl = math.max(setupFailureHigh, setupResistance) + m5ATR * slBufferATR
+    risk = sl - entry
+
+    if risk > syminfo.mintick
+        tp = entry - risk * rr
+
+        activeEntry := entry
+        activeSL := sl
+        activeTP := tp
+        tradeStartBar := bar_index
+        setupAlreadyTraded := true
+        shortSetup := false
+
+        strategy.entry(
+             "SHORT",
+             strategy.short,
+             qty=qty,
+             alert_message="REVERSAL CLEAN SHORT | " + syminfo.ticker +
+             " | Entry " + str.tostring(entry, format.mintick) +
+             " | SL " + str.tostring(sl, format.mintick) +
+             " | TP " + str.tostring(tp, format.mintick))
+
+        strategy.exit(
+             "SHORT EXIT",
+             "SHORT",
+             stop=sl,
+             limit=tp,
+             alert_message="REVERSAL CLEAN SHORT EXIT | " + syminfo.ticker)
+
+if longConfirm and not setupAlreadyTraded and strategy.position_size == 0
+    entry = close
+    sl = math.min(setupFailureLow, setupSupport) - m5ATR * slBufferATR
+    risk = entry - sl
+
+    if risk > syminfo.mintick
+        tp = entry + risk * rr
+
+        activeEntry := entry
+        activeSL := sl
+        activeTP := tp
+        tradeStartBar := bar_index
+        setupAlreadyTraded := true
+        longSetup := false
+
+        strategy.entry(
+             "LONG",
+             strategy.long,
+             qty=qty,
+             alert_message="REVERSAL CLEAN LONG | " + syminfo.ticker +
+             " | Entry " + str.tostring(entry, format.mintick) +
+             " | SL " + str.tostring(sl, format.mintick) +
+             " | TP " + str.tostring(tp, format.mintick))
+
+        strategy.exit(
+             "LONG EXIT",
+             "LONG",
+             stop=sl,
+             limit=tp,
+             alert_message="REVERSAL CLEAN LONG EXIT | " + syminfo.ticker)
+
+// ============================================================
+// TIME EXIT
+// ============================================================
+
+if maxTradeBars > 0 and strategy.position_size != 0 and not na(tradeStartBar)
+    if bar_index - tradeStartBar >= maxTradeBars
+        if strategy.position_size > 0
+            strategy.close("LONG", comment="TIME EXIT")
+        else
+            strategy.close("SHORT", comment="TIME EXIT")
+
+// ============================================================
+// VISUAL: SOLO SEGNALI PULITI
+// ============================================================
+
+plot(
+     showZone ? resistanceTop : na,
+     "M15 Resistance Top",
+     color=color.yellow,
+     linewidth=1)
+
+plot(
+     showZone ? resistanceBottom : na,
+     "M15 Resistance Bottom",
+     color=color.yellow,
+     linewidth=2)
+
+plot(
+     showZone ? supportTop : na,
+     "M15 Support Top",
+     color=color.aqua,
+     linewidth=1)
+
+plot(
+     showZone ? supportBottom : na,
+     "M15 Support Bottom",
+     color=color.aqua,
+     linewidth=2)
+
+// ------------------------------------------------------------
+// LABELS LEGGIBILI
+// Usiamo label.new invece di plotshape per rendere le scritte
+// molto più visibili sullo sfondo nero di TradingView.
+// ------------------------------------------------------------
+
+labelSize =
+     labelSizeInput == "Piccola" ? size.small :
+     labelSizeInput == "Normale" ? size.normal :
+     labelSizeInput == "Grande" ? size.large : size.huge
+
+if showSetup and showSetupLabel and newM15Bar and bearishSetupRaw
+    label.new(
+         bar_index,
+         high + m15ATR * 0.30,
+         "SETUP SHORT\nM15",
+         style=label.style_label_down,
+         color=color.rgb(210, 55, 55),
+         textcolor=color.white,
+         size=labelSize)
+
+if showSetup and showSetupLabel and newM15Bar and bullishSetupRaw
+    label.new(
+         bar_index,
+         low - m15ATR * 0.30,
+         "SETUP LONG\nM15",
+         style=label.style_label_up,
+         color=color.rgb(40, 150, 75),
+         textcolor=color.white,
+         size=labelSize)
+
+// ENTRY: solo il segnale principale, con testo grande e contrastato.
+if showEntry and showEntryLabel and shortConfirm and not setupAlreadyTraded
+    label.new(
+         bar_index,
+         high + m5ATR * 0.80,
+         "▼ SHORT\nM5 ENTRY",
+         style=label.style_label_down,
+         color=color.rgb(190, 30, 30),
+         textcolor=color.white,
+         size=labelSize)
+
+if showEntry and showEntryLabel and longConfirm and not setupAlreadyTraded
+    label.new(
+         bar_index,
+         low - m5ATR * 0.80,
+         "▲ LONG\nM5 ENTRY",
+         style=label.style_label_up,
+         color=color.rgb(20, 145, 65),
+         textcolor=color.white,
+         size=labelSize)
+
+plot(
+     showEntry and strategy.position_size != 0 ? activeEntry : na,
+     "ENTRY",
+     color=color.white,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showEntry and strategy.position_size != 0 ? activeSL : na,
+     "SL",
+     color=color.red,
+     linewidth=2,
+     style=plot.style_linebr)
+
+plot(
+     showEntry and strategy.position_size != 0 ? activeTP : na,
+     "TP",
+     color=color.lime,
+     linewidth=2,
+     style=plot.style_linebr)
+
+// ============================================================
+// INFO TABLE
+// ============================================================
+
+var table t = table.new(position.top_right, 2, 7, border_width=2)
+
+if barstate.islast and showInfoTable
+    table.cell(t, 0, 0, "REVERSAL CLEAN", text_color=color.white, text_size=size.large, bgcolor=color.rgb(35, 35, 35))
+    table.cell(t, 1, 0, "M15 → M5", text_color=color.white, text_size=size.large, bgcolor=color.rgb(35, 35, 35))
+    table.cell(t, 0, 1, "Test RES", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 1, str.tostring(resistanceTests), text_color=color.yellow, text_size=size.normal)
+    table.cell(t, 0, 2, "Test SUP", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 2, str.tostring(supportTests), text_color=color.aqua, text_size=size.normal)
+    table.cell(t, 0, 3, "SETUP", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 3, shortSetup ? "SHORT" : longSetup ? "LONG" : "-", text_color=shortSetup ? color.red : longSetup ? color.lime : color.white, text_size=size.normal)
+    table.cell(t, 0, 4, "R:R", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 4, str.tostring(rr, "#.0"), text_color=color.white, text_size=size.normal)
+    table.cell(t, 0, 5, "TF", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 5, isM5 ? "M5 ✓" : "METTI M5", text_color=isM5 ? color.lime : color.orange, text_size=size.normal)
+    table.cell(t, 0, 6, "LOGICA", text_color=color.white, text_size=size.normal)
+    table.cell(t, 1, 6, "2 test + rifiuto + BOS", text_color=color.white, text_size=size.normal)
+
+// ============================================================
+// ALERT
+// ============================================================
+
+if barstate.isrealtime and barstate.isconfirmed
+    if shortConfirm and not setupAlreadyTraded
+        alert(
+             "REVERSAL CLEAN SHORT | " + syminfo.ticker +
+             " | M15 setup / M5 entry | " +
+             str.tostring(close, format.mintick),
+             alert.freq_once_per_bar_close)
+
+    if longConfirm and not setupAlreadyTraded
+        alert(
+             "REVERSAL CLEAN LONG | " + syminfo.ticker +
+             " | M15 setup / M5 entry | " +
+             str.tostring(close, format.mintick),
+             alert.freq_once_per_bar_close)
+
+// ============================================================
+// NOTA:
+// Il backtest va eseguito sul grafico M5.
+// Il codice usa M15 come timeframe di analisi.
+// Per M3 si può creare una variante successiva:
+// M15 setup -> M3 entry.
+// ============================================================
+

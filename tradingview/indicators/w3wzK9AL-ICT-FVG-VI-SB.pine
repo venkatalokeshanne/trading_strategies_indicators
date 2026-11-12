@@ -1,0 +1,728 @@
+//@version=6
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// ICT FVG + VI + SB  (Fair Value Gaps + Volume Imbalances + Suspension Blocks)
+// Version: 07/08/2026
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// DESCRIPTION:
+// Maps three ICT price inefficiencies across multiple timeframes at once:
+//   • Fair Value Gaps (FVG) — a 3-candle, wick-based gap (shades of orange).
+//     Optionally include the related Volume Imbalances at the FVG's edges: the
+//     single FVG box simply grows to swallow them into one continuous zone.
+//   • Pure Volume Imbalances (VI) — a 2-candle, body-based gap where the wicks
+//     still overlap, that is NOT part of an FVG (shades of blue).
+//   • Full Gaps — a 2-candle gap with no overlap at all, not even the wicks
+//     (shades of red).
+//   • Suspension Blocks (SB) — an FVG with a Volume Imbalance on BOTH sides,
+//     optionally separated out and highlighted (shades of purple).
+// Each element is detected independently on every enabled timeframe. The
+// shorter the timeframe, the darker the shade.
+//
+// FEATURES:
+//   • Multi-timeframe: Daily/Weekly/Monthly, Hourly (1/2/4h), Minute
+//     (1/2/3/5/15/30/90m) — plotted together, each shaded by its timeframe
+//   • Higher-timeframe detection via request.security on CONFIRMED candles
+//     (no repainting); timeframes below the chart timeframe are skipped
+//   • Zones persist until price fully fills (mitigates) them, then are removed
+//     (or, optionally, kept in light grey once filled — on any timeframe)
+//   • Optional partial-fill shading: the consumed part of a gap greys as price
+//     trades into it while the untouched part keeps its element colour
+//   • Per-timeframe zone cap to stay within drawing limits
+//   • Configurable base color per element with automatic per-timeframe darkening
+//   • Optional midline (50%) on all zones; quarter and eighth level lines on the
+//     Daily/Weekly/Monthly zones; borders; global and per-element min-size
+//
+// TECHNICAL NOTES:
+//   • One request.security per timeframe returns its last four closed candles.
+//     VIs and full gaps are settled on the newest closed pair, so they print as
+//     soon as their second candle closes (no wait for a following candle). A VI
+//     that an FVG absorbs (FVGs shown + Include VIs on) is not double-drawn: the
+//     FVG suppresses its right-junction VI and removes its left-junction VI.
+//   • Boxes are time-anchored (xloc.bar_time) so they land on the correct
+//     candles regardless of the chart timeframe
+//   • Mitigation is checked against chart price; a zone is removed on full fill
+//     (or kept grey). A gap pushed out of the per-timeframe draw cap while still
+//     open is un-drawn but kept tracked, so it still turns grey if price later
+//     fills it — filled gaps are not lost just because they aged past the cap.
+//
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// AUTHOR: (@username)
+//
+// ══════════════════════════════════════════════════════════════════════════════
+
+indicator("ICT FVG + VI + SB", overlay=true, max_boxes_count=500, max_lines_count=500)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Elements
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpEl = "Elements"
+
+showFVG = input.bool(true, "Fair Value Gaps",
+     group=grpEl,
+     tooltip="3-candle wick gaps. Drawn in shades of the FVG base color.")
+
+includeVI = input.bool(true, "  ↳ Include related Volume Imbalances",
+     group=grpEl,
+     tooltip="Extend each FVG box to include the volume imbalances at its edges, as one continuous zone. When off, the FVG box is the bare wick gap.")
+
+highlightSuspension = input.bool(true, "  ↳ Highlight Suspension Blocks",
+     group=grpEl,
+     tooltip="A Suspension Block is an FVG with a Volume Imbalance on BOTH sides (both junctions). When on, these are drawn in their own purple colour and labelled SB. When off, they are treated as plain FVGs.")
+
+showVI = input.bool(true, "Pure Volume Imbalances",
+     group=grpEl,
+     tooltip="2-candle body gaps (wicks still overlap) that are NOT part of an FVG. Shades of the VI base color.")
+
+showGap = input.bool(true, "Full Gaps",
+     group=grpEl,
+     tooltip="2-candle gaps with no overlap at all (not even the wicks). Shades of the Full Gap base color.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Timeframes
+// Enabled timeframes are detected and plotted together. A timeframe below the
+// chart timeframe cannot be computed and is silently skipped.
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpTF  = "Timeframes"
+grpHTF = "HTF (High Time Frame)"
+grpHr  = "Hours"
+grpMin = "Minutes"
+
+alwaysCurrentTF = input.bool(true, "Always show current timeframe",
+     group=grpTF,
+     tooltip="Always detect gaps on the chart's own timeframe, even if its box below is unchecked. You almost always want to see the current timeframe's gaps.")
+
+// HTF — one row
+tfMN = input.bool(false, "1M", inline="htf", group=grpHTF, tooltip="Detect gaps on monthly candles.")
+tfW  = input.bool(false, "1W", inline="htf", group=grpHTF, tooltip="Detect gaps on weekly candles.")
+tfD  = input.bool(false, "1D", inline="htf", group=grpHTF, tooltip="Detect gaps on daily candles.")
+
+// Hours — one row
+tf4h = input.bool(false, "4h", inline="hr", group=grpHr, tooltip="Detect gaps on 4-hour candles.")
+tf2h = input.bool(false, "2h", inline="hr", group=grpHr, tooltip="Detect gaps on 2-hour candles.")
+tf1h = input.bool(false, "1h", inline="hr", group=grpHr, tooltip="Detect gaps on 1-hour candles.")
+
+// Minutes — two rows
+tf90 = input.bool(false, "90m", inline="min1", group=grpMin, tooltip="Detect gaps on 90-minute candles.")
+tf30 = input.bool(false, "30m", inline="min1", group=grpMin, tooltip="Detect gaps on 30-minute candles.")
+tf15 = input.bool(false, "15m", inline="min1", group=grpMin, tooltip="Detect gaps on 15-minute candles.")
+tf5  = input.bool(false, "5m",  inline="min1", group=grpMin, tooltip="Detect gaps on 5-minute candles.")
+tf3  = input.bool(false, "3m",  inline="min2", group=grpMin, tooltip="Detect gaps on 3-minute candles.")
+tf2  = input.bool(false, "2m",  inline="min2", group=grpMin, tooltip="Detect gaps on 2-minute candles.")
+tf1  = input.bool(false, "1m",  inline="min2", group=grpMin, tooltip="Detect gaps on 1-minute candles.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Colors
+// One base color per element; shorter timeframes render darker (more opaque).
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpC = "Colors"
+
+fvgColor = input.color(color.new(#FF8C00, 90), "FVG Base Color (orange)",
+     group=grpC,
+     tooltip="Base color for Fair Value Gaps. Shorter timeframes are drawn darker.")
+
+suspColor = input.color(color.new(#B39DDB, 82), "Suspension Block Color (purple)",
+     group=grpC,
+     tooltip="Base color for Suspension Blocks (an FVG with VIs on both sides), when 'Highlight Suspension Blocks' is on. Shorter timeframes are drawn darker.")
+
+viColor = input.color(color.new(#2F80ED, 90), "Volume Imbalance Base Color (blue)",
+     group=grpC,
+     tooltip="Base color for pure Volume Imbalances. Shorter timeframes are drawn darker.")
+
+gapColor = input.color(color.new(#E5484D, 90), "Full Gap Base Color (red)",
+     group=grpC,
+     tooltip="Base color for Full Gaps. Shorter timeframes are drawn darker.")
+
+darkenStep = input.int(4, "Darken per shorter timeframe",
+     minval=0, maxval=8,
+     group=grpC,
+     tooltip="Transparency reduction per timeframe rank — higher makes the gradient between timeframes stronger.")
+
+showBorder = input.bool(false, "Show Borders",
+     group=grpC,
+     tooltip="Draw a border on each zone, derived from its fill color.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Display
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpD = "Display"
+
+extendBars = input.int(2, "Extend Right (bars)",
+     minval=0, maxval=100,
+     group=grpD,
+     tooltip="How far past the current bar unfilled zones extend.")
+
+showLabels = input.bool(true, "Label Gaps",
+     group=grpD,
+     tooltip="Label each zone with its element and timeframe, e.g. 'FVG 1min' or 'VI 1h'.")
+
+labelSide = input.string("Right", "Label Side",
+     options=["Left", "Right"],
+     group=grpD,
+     tooltip="Place each gap label on the left (formation) side or the right (extended) side of its zone.")
+
+maxPerTF = input.int(10, "Max Open Gaps per Timeframe",
+     minval=1, maxval=50,
+     group=grpD,
+     tooltip="How many open (unfilled) gaps to keep coloured per timeframe, shared across all element types (FVGs, VIs, full gaps). All open gaps up to this many show in their element colour; the oldest open one is dropped when exceeded, regardless of type. Raise to see more open gaps (bounded by TradingView's drawing limit).")
+
+useMitigation = input.bool(true, "Remove on Fill (mitigation)",
+     group=grpD,
+     tooltip="Remove a zone once price fully trades back through it. When off, zones stay until the per-timeframe cap drops them.")
+
+showMitigated = input.bool(true, "Show Filled Gaps (grey)",
+     group=grpD,
+     tooltip="After a gap fully fills, keep it in light grey (right edge frozen at the fill) instead of removing it — on every timeframe, not just the chart's. Grey always means filled; open gaps stay in their element colour. Up to the count below (per timeframe). Requires 'Remove on Fill'.")
+
+partialFill = input.bool(true, "Partially Fill Gaps (grey)",
+     group=grpD,
+     tooltip="Shade the consumed part of a gap grey as price trades into it: a bullish gap fills from its top down to the lowest low reached, a bearish gap from its bottom up to the highest high. The untouched part keeps its element colour. Works for FVGs, VIs and full gaps alike.")
+
+maxMitigated = input.int(10, "Max Filled Gaps per Timeframe",
+     minval=1, maxval=100,
+     group=grpD,
+     tooltip="How many filled gaps to keep visible in grey, per timeframe. The most recent ones by time are kept; raising this extends the grey history further back in time. The chart's own timeframe uses its own limit below.")
+
+maxMitigatedCur = input.int(50, "Max Filled Gaps (Current TF)",
+     minval=1, maxval=200,
+     group=grpD,
+     tooltip="Separate filled-gap limit for the chart's own timeframe, which usually accumulates the most gaps. The current timeframe keeps this many grey filled gaps; every other timeframe uses 'Max Filled Gaps per Timeframe' above.")
+
+minAll = input.float(5.0, "Min Size — All Gaps",
+     minval=0.0,
+     group=grpD,
+     tooltip="Global minimum height (price units) applied to every element. Acts as a floor — the per-element filters below can only make it stricter. 0 shows all.")
+
+minFVG = input.float(0.0, "Min FVG Height",
+     minval=0.0,
+     group=grpD,
+     tooltip="Ignore FVGs shorter than this height (price units). 0 shows all.")
+
+minVI = input.float(0.0, "Min VI Height",
+     minval=0.0,
+     group=grpD,
+     tooltip="Ignore Volume Imbalances shorter than this height (price units). 0 shows all.")
+
+minGap = input.float(0.0, "Min Full Gap Height",
+     minval=0.0,
+     group=grpD,
+     tooltip="Ignore Full Gaps shorter than this height (price units). 0 shows all.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS - Level Lines
+// Internal level lines drawn inside each zone.
+// ══════════════════════════════════════════════════════════════════════════════
+
+grpLvl = "Level Lines"
+
+showMidline = input.bool(true, "Show Midline (50%)",
+     group=grpLvl,
+     tooltip="Draw the 50% (consequent encroachment) line inside every zone, across all three element groups.")
+
+showQuartersDWM = input.bool(false, "Show Quarters on Daily/Weekly/Monthly (25%, 75%)",
+     group=grpLvl,
+     tooltip="Draw 25% and 75% lines inside Daily, Weekly, and Monthly zones only.")
+
+showEighthsDWM = input.bool(false, "Show Eighths on Daily/Weekly/Monthly",
+     group=grpLvl,
+     tooltip="Draw 12.5%, 37.5%, 62.5%, and 87.5% lines inside Daily, Weekly, and Monthly zones only.")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CUSTOM TYPE - Zone
+// One inefficiency (FVG / FVG-VI / pure VI / full gap) on some timeframe.
+// ══════════════════════════════════════════════════════════════════════════════
+
+type Zone
+    box         bx        // Zone box (for an FVG with included VIs, the full extended box)
+    array<line> lines     // Internal level lines (midline / quarters / eighths)
+    box         lbl       // Invisible label box, e.g. "FVG 1min" (na when labels are off)
+    int         kind      // 0=FVG, 2=pure VI, 3=full gap, 4=suspension block
+    int         dir       // 1=bullish (fills from below), -1=bearish (fills from above)
+    float       top       // Upper price boundary
+    float       bottom    // Lower price boundary
+    int         tfMin     // Timeframe in minutes (for shading rank and per-TF cap)
+    int         doneTime  // Formation candle's close time — fills only count after this
+    box         fillBox   // Grey overlay for the consumed part (partial fill; na when unused)
+    float       fillLvl   // Deepest penetration price so far (na = untouched)
+    int         leftTime  // Formation left time (kept so a hidden zone can be redrawn grey on fill)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE
+// ══════════════════════════════════════════════════════════════════════════════
+
+var array<Zone> zones    = array.new<Zone>()   // active (unfilled) zones
+var array<Zone> mitZones = array.new<Zone>()   // filled zones kept in grey (chart TF only)
+
+// Light-grey styling for mitigated (filled) gaps
+color mitFill    = color.new(color.gray, 88)
+color mitBorder  = color.new(color.gray, 60)
+color mitText    = color.new(color.gray, 25)
+color mitLine    = color.new(color.gray, 50)
+// Light grey for the consumed part of a partially-filled gap (overlays the fill)
+color partFill   = color.new(color.gray, 74)
+
+// Chart timeframe in minutes — timeframes below this are skipped
+int chartMin = math.max(1, timeframe.in_seconds() / 60)
+int barMs    = math.max(1, timeframe.in_seconds()) * 1000
+
+// Hidden-but-tracked open gaps: when the draw cap is exceeded the oldest open gap
+// is un-drawn but its record is kept so it can still turn grey when it later fills.
+// This bounds how many such records to retain per timeframe+element (memory guard).
+int maxTrackTF = 300
+
+// Invisible label-box geometry (bars): a fixed gap from the zone and a width to
+// hold the text. Repositioned beside each zone on the last bar.
+int labelGapMs   = barMs * 1
+int labelWidthMs = barMs * 6
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER - shade a base color for a timeframe rank (0 = longest/lightest)
+// ══════════════════════════════════════════════════════════════════════════════
+
+shadeColor(color base, int rank, int extra) =>
+    float baseT = color.t(base)
+    float t     = math.max(0, baseT - rank * darkenStep - extra)
+    color.new(base, t)
+
+// Element and timeframe names for zone labels (e.g. "FVG 1min", "VI 1h")
+elName(int kind) =>
+    kind == 2 ? "VI" : kind == 3 ? "Gap" : kind == 4 ? "SB" : "FVG"
+
+tfName(int tfMin) =>
+    switch tfMin
+        43200 => "1M"
+        10080 => "1W"
+        1440  => "1D"
+        240   => "4h"
+        120   => "2h"
+        90    => "90min"
+        60    => "1h"
+        30    => "30min"
+        15    => "15min"
+        5     => "5min"
+        3     => "3min"
+        2     => "2min"
+        1     => "1min"
+        => ""
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER - create a zone (element gate + min-size + per-TF cap)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Draws a dashed internal level line at price y (zero width; extended later)
+mkLvl(array<line> lns, int leftT, float y, color c) =>
+    array.push(lns, line.new(leftT, y, leftT, y, xloc=xloc.bar_time,
+         color=c, style=line.style_dashed, width=1))
+
+// Creates a zone box at [bottom, top] with the element's shade
+mkBox(int kind, int rank, float top, float bottom, int leftT) =>
+    color base = kind == 2 ? viColor : kind == 3 ? gapColor : kind == 4 ? suspColor : fvgColor
+    color bg   = shadeColor(base, rank, 0)
+    color bc   = showBorder ? shadeColor(base, rank, 25) : color.new(base, 100)
+    box.new(left=leftT, top=top, right=leftT, bottom=bottom, xloc=xloc.bar_time, bgcolor=bg, border_color=bc)
+
+// Element enabled?  /  Effective minimum height (global floor over per-element)
+okElement(int kind) =>
+    (kind == 0 and showFVG) or (kind == 2 and showVI) or (kind == 3 and showGap)
+
+minFor(int kind) =>
+    math.max(minAll, kind == 3 ? minGap : kind == 2 ? minVI : minFVG)
+
+// Move a FILLED zone to the grey pool: recolour it grey, freeze its right edge
+// at the fill bar, grey its label, and cap the pool by count. A zone only ever
+// turns grey when it is fully filled (mitigated) — an open (unfilled) gap always
+// keeps its element colour, so grey unambiguously means "filled".
+greyOut(Zone z) =>
+    box.delete(z.fillBox)   // whole zone greys now; drop any partial-fill overlay
+    z.fillBox := na
+    if na(z.bx)
+        // Zone was un-drawn by the draw cap before it filled — recreate it directly
+        // in its grey (filled) form, spanning formation → fill bar. Level lines are
+        // not restored (they were deleted when it was hidden); the box is the record.
+        z.bx := box.new(z.leftTime, z.top, time, z.bottom, xloc=xloc.bar_time,
+             bgcolor=mitFill, border_color=showBorder ? mitBorder : color.new(color.gray, 100))
+        if showLabels
+            int mLeft = labelSide == "Left" ? z.leftTime - labelGapMs - labelWidthMs : time + labelGapMs
+            z.lbl := box.new(mLeft, z.top, mLeft + labelWidthMs, z.bottom, xloc=xloc.bar_time,
+                 bgcolor=color.new(color.white, 100), border_color=color.new(color.white, 100),
+                 text=elName(z.kind) + " " + tfName(z.tfMin), text_color=mitText,
+                 text_halign=(labelSide == "Left" ? text.align_right : text.align_left),
+                 text_valign=text.align_center, text_size=size.small)
+    else
+        box.set_right(z.bx, time)
+        box.set_bgcolor(z.bx, mitFill)
+        box.set_border_color(z.bx, showBorder ? mitBorder : color.new(color.gray, 100))
+        for ln in z.lines
+            line.set_color(ln, mitLine)
+            line.set_x2(ln, time)
+        if not na(z.lbl)
+            box.set_text_color(z.lbl, mitText)
+            int mLeft = labelSide == "Left" ? box.get_left(z.bx) - labelGapMs - labelWidthMs : time + labelGapMs
+            box.set_left(z.lbl, mLeft)
+            box.set_right(z.lbl, mLeft + labelWidthMs)
+    array.push(mitZones, z)
+    // Cap per timeframe so a busy lower timeframe cannot crowd out a higher
+    // timeframe's filled gaps. Drop by FORMATION time, not fill time: keep the
+    // most-recently-FORMED filled gaps so the grey history walks cleanly backwards
+    // in time as the cap is raised. (mitZones is ordered by fill time — a gap enters
+    // when it fills — so the front entry is the earliest FILL, not the oldest gap;
+    // dropping it would strand a recently-formed gap while keeping an old one.)
+    int capTF = z.tfMin == chartMin ? maxMitigatedCur : maxMitigated
+    int cntTF = 0
+    for m in mitZones
+        if m.tfMin == z.tfMin
+            cntTF += 1
+    if cntTF > capTF
+        int dropIdx = -1
+        int oldest  = na
+        for i = 0 to array.size(mitZones) - 1
+            Zone m = array.get(mitZones, i)
+            if m.tfMin == z.tfMin and (dropIdx == -1 or m.leftTime < oldest)
+                dropIdx := i
+                oldest  := m.leftTime
+        if dropIdx >= 0
+            Zone drop = array.get(mitZones, dropIdx)
+            box.delete(drop.bx)
+            box.delete(drop.lbl)
+            for ln in drop.lines
+                line.delete(ln)
+            array.remove(mitZones, dropIdx)
+
+// Attaches level lines, stores the zone, enforces the per-TF cap
+finalizeZone(box bx, int kind, int dir, float top, float bottom, int tfMin, int rank, int leftT, int doneT) =>
+    color base   = kind == 2 ? viColor : kind == 3 ? gapColor : kind == 4 ? suspColor : fvgColor
+    color lc     = shadeColor(base, rank, 30)
+    float rangeH = top - bottom
+    bool  isDWM  = tfMin >= 1440
+    array<line> lns = array.new<line>()
+    if showMidline
+        mkLvl(lns, leftT, bottom + rangeH * 0.50, lc)
+    if isDWM and showQuartersDWM
+        mkLvl(lns, leftT, bottom + rangeH * 0.25, lc)
+        mkLvl(lns, leftT, bottom + rangeH * 0.75, lc)
+    if isDWM and showEighthsDWM
+        mkLvl(lns, leftT, bottom + rangeH * 0.125, lc)
+        mkLvl(lns, leftT, bottom + rangeH * 0.375, lc)
+        mkLvl(lns, leftT, bottom + rangeH * 0.625, lc)
+        mkLvl(lns, leftT, bottom + rangeH * 0.875, lc)
+
+    // Label: an invisible box beside the zone with black text (repositioned on the
+    // last bar). Matches the line-label style used by the other indicators.
+    box lbl = na
+    if showLabels
+        bool  ll      = labelSide == "Left"
+        int   lblLeft = ll ? leftT - labelGapMs - labelWidthMs : leftT + labelGapMs
+        lbl := box.new(lblLeft, top, lblLeft + labelWidthMs, bottom, xloc=xloc.bar_time,
+             bgcolor=color.new(color.white, 100), border_color=color.new(color.white, 100),
+             text=elName(kind) + " " + tfName(tfMin), text_color=color.black,
+             text_halign=(ll ? text.align_right : text.align_left),
+             text_valign=text.align_center, text_size=size.small)
+
+    array.push(zones, Zone.new(bx, lns, lbl, kind, dir, top, bottom, tfMin, doneT, na, na, leftT))
+
+    // Per-timeframe DRAW cap — how many OPEN gaps show at once on this timeframe,
+    // shared globally across all element types (FVGs, VIs, full gaps) so they age
+    // out together by time rather than each keeping a separate window (which looked
+    // odd when FVGs stopped but VIs continued). Over the cap, the oldest still-open
+    // gap is HIDDEN (its box/label/lines are removed) but its record is KEPT, so the
+    // mitigation loop can still fill it later. A gap that leaves the visible window
+    // and only then gets filled must still be able to turn grey; deleting it here
+    // would lose that fill forever, leaving an empty band where a grey gap belongs.
+    int drawn = 0
+    for z in zones
+        if z.tfMin == tfMin and not na(z.bx)
+            drawn += 1
+    if drawn > maxPerTF
+        for i = 0 to array.size(zones) - 1
+            Zone old = array.get(zones, i)
+            if old.tfMin == tfMin and not na(old.bx)
+                box.delete(old.bx)
+                box.delete(old.lbl)
+                box.delete(old.fillBox)
+                for ln in old.lines
+                    line.delete(ln)
+                old.bx      := na   // keep the record tracked; just stop drawing it
+                old.lbl     := na
+                old.fillBox := na
+                array.clear(old.lines)
+                break
+
+    // Hard memory guard — bound the number of hidden-but-tracked open gaps per
+    // timeframe (all element types together) so a long one-directional trend cannot
+    // grow the array without limit. Drop the genuine oldest (an aged, still-unfilled
+    // gap) fully.
+    int tracked = 0
+    for z in zones
+        if z.tfMin == tfMin
+            tracked += 1
+    if tracked > maxTrackTF
+        for i = 0 to array.size(zones) - 1
+            Zone old = array.get(zones, i)
+            if old.tfMin == tfMin
+                box.delete(old.bx)
+                box.delete(old.lbl)
+                box.delete(old.fillBox)
+                for ln in old.lines
+                    line.delete(ln)
+                array.remove(zones, i)
+                break
+
+// Creates a single-box zone (pure VI / full gap) with element + min-size gating
+addSimple(int kind, int dir, float top, float bottom, int tfMin, int rank, int leftT, int doneT) =>
+    if okElement(kind) and top > bottom and (top - bottom) >= minFor(kind)
+        box b = mkBox(kind, rank, top, bottom, leftT)
+        finalizeZone(b, kind, dir, top, bottom, tfMin, rank, leftT, doneT)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HELPER - scan one timeframe for inefficiencies on its last 4 closed candles.
+// a=oldest … d=newest (just closed). The FVG is on the newest triple (b,c,d);
+// VIs and full gaps are settled on the newest pair (c,d) so they appear as soon
+// as d closes. Junction VIs an FVG absorbs are suppressed/removed (see below).
+// ══════════════════════════════════════════════════════════════════════════════
+
+scanTF(simple string tf, bool en, int rank, int tfMin) =>
+    bool enabled = en or (alwaysCurrentTF and tfMin == chartMin)
+    bool doScan  = enabled and tfMin >= chartMin
+
+    // Pull data ONLY for enabled timeframes at/above the chart resolution.
+    // Requesting a timeframe BELOW the chart (e.g. 1-minute data on a daily
+    // chart) loads enormous intrabar history and blows the memory limit — so
+    // below-chart and disabled timeframes are skipped entirely.
+    float ah = na
+    float al = na
+    float bh = na
+    float bl = na
+    float bo = na
+    float bc = na
+    float ch = na
+    float cl = na
+    float co = na
+    float cc = na
+    float dh = na
+    float dl = na
+    float dop = na
+    float dcl = na
+    int   bt = na
+    int   ct = na
+    int   dt = na
+    if doScan and tfMin == chartMin
+        // Chart timeframe: use the native series directly (no request.security).
+        ah  := high[4]
+        al  := low[4]
+        bh  := high[3]
+        bl  := low[3]
+        bo  := open[3]
+        bc  := close[3]
+        bt  := time[3]
+        ch  := high[2]
+        cl  := low[2]
+        co  := open[2]
+        cc  := close[2]
+        ct  := time[2]
+        dh  := high[1]
+        dl  := low[1]
+        dop := open[1]
+        dcl := close[1]
+        dt  := time[1]
+    else if doScan
+        [ah_s, al_s, bh_s, bl_s, bo_s, bc_s, bt_s, ch_s, cl_s, co_s, cc_s, ct_s, dh_s, dl_s, dop_s, dcl_s, dt_s] = request.security(
+             syminfo.tickerid, tf,
+             [high[4], low[4],
+              high[3], low[3], open[3], close[3], time[3],
+              high[2], low[2], open[2], close[2], time[2],
+              high[1], low[1], open[1], close[1], time[1]],
+             lookahead=barmerge.lookahead_on)
+        ah  := ah_s
+        al  := al_s
+        bh  := bh_s
+        bl  := bl_s
+        bo  := bo_s
+        bc  := bc_s
+        bt  := bt_s
+        ch  := ch_s
+        cl  := cl_s
+        co  := co_s
+        cc  := cc_s
+        ct  := ct_s
+        dh  := dh_s
+        dl  := dl_s
+        dop := dop_s
+        dcl := dcl_s
+        dt  := dt_s
+
+    bool newBar = not na(dt) and ta.change(dt) != 0
+
+    if doScan and newBar and not na(ah) and not na(bt) and not na(ct)
+        int doneD = dt + tfMin * 60000  // (b,c,d) FVG and the (c,d) pair both complete at d's close
+
+        // Candle body edges. A Volume Imbalance is the gap between two candle
+        // BODIES, not a raw close-to-open span — measuring body-edge to
+        // body-edge keeps the zone correct whatever each candle's open/close
+        // order is (the earlier close-to-open method swallowed whole bodies on
+        // certain bull/bear combinations, ballooning the box).
+        float bBodyHi = math.max(bo, bc)
+        float bBodyLo = math.min(bo, bc)
+        float cBodyHi = math.max(co, cc)
+        float cBodyLo = math.min(co, cc)
+        float dBodyHi = math.max(dop, dcl)
+        float dBodyLo = math.min(dop, dcl)
+
+        // ── Fair Value Gap on the newest triple (b, c, d) ────────────────
+        bool bullFVG = dl > bh
+        bool bearFVG = dh < bl
+        bool isFVG   = bullFVG or bearFVG
+
+        if isFVG and showFVG
+            float extTop = bullFVG ? dl : bl
+            float extBot = bullFVG ? bh : dh
+            // Suspension block = an FVG with a Volume Imbalance on BOTH junctions
+            // (a body gap with overlapping wicks at both b→c and c→d).
+            bool viBC = (cBodyLo > bBodyHi and cl < bh) or (bBodyLo > cBodyHi and ch > bl)
+            bool viCD = (dBodyLo > cBodyHi and dl < ch) or (cBodyLo > dBodyHi and dh > cl)
+            int  fKind = (highlightSuspension and viBC and viCD) ? 4 : 0
+            // When VIs are included, grow the single FVG box to swallow the
+            // junction volume imbalances (body-to-body gap, wicks overlapping)
+            // at each edge, filling any white space between them and the FVG.
+            if includeVI
+                // junction b→c
+                if cBodyLo > bBodyHi and cl < bh          // VI up
+                    extBot := math.min(extBot, bBodyHi)
+                    extTop := math.max(extTop, cBodyLo)
+                else if bBodyLo > cBodyHi and ch > bl     // VI down
+                    extBot := math.min(extBot, cBodyHi)
+                    extTop := math.max(extTop, bBodyLo)
+                // junction c→d
+                if dBodyLo > cBodyHi and dl < ch          // VI up
+                    extBot := math.min(extBot, cBodyHi)
+                    extTop := math.max(extTop, dBodyLo)
+                else if cBodyLo > dBodyHi and dh > cl     // VI down
+                    extBot := math.min(extBot, dBodyHi)
+                    extTop := math.max(extTop, cBodyLo)
+            if extTop > extBot and (extTop - extBot) >= minFor(fKind)
+                finalizeZone(mkBox(fKind, rank, extTop, extBot, bt), fKind, bullFVG ? 1 : -1, extTop, extBot, tfMin, rank, bt, doneD)
+                // This FVG's LEFT junction (b,c) may have been drawn as a standalone
+                // VI on the prior bar (when (b,c) was the most-recent pair). It is
+                // now absorbed into the FVG, so remove it. It was anchored at b (bt).
+                if includeVI
+                    for i = array.size(zones) - 1 to 0
+                        Zone zj = array.get(zones, i)
+                        if zj.kind == 2 and zj.tfMin == tfMin and zj.leftTime == bt
+                            box.delete(zj.bx)
+                            box.delete(zj.lbl)
+                            box.delete(zj.fillBox)
+                            for ln in zj.lines
+                                line.delete(ln)
+                            array.remove(zones, i)
+                            break
+
+        // ── Settle the most-recent pair (c, d): full gap, or pure VI ─────
+        // Uses the newest closed pair so a VI/gap prints as soon as its second
+        // candle closes — no one-candle wait for the following candle. (c,d) is the
+        // right junction of the FVG (b,c,d); when that FVG absorbs it (FVGs shown +
+        // Include VIs on) the VI is not drawn. A VI that later becomes the LEFT
+        // junction of the next FVG is removed when that FVG is created (above).
+        bool viAbsorbed = isFVG and showFVG and includeVI
+        if dl > ch                                        // wicks separated up → full gap
+            addSimple(3, 1, dl, ch, tfMin, rank, ct, doneD)          // full gap up (red): c.high → d.low
+        else if dh < cl                                   // wicks separated down → full gap
+            addSimple(3, -1, cl, dh, tfMin, rank, ct, doneD)         // full gap down (red): d.high → c.low
+        else if dBodyLo > cBodyHi                         // bodies gap up, wicks overlap → VI
+            if not viAbsorbed
+                addSimple(2, 1, dBodyLo, cBodyHi, tfMin, rank, ct, doneD)   // pure VI (blue)
+        else if dBodyHi < cBodyLo                         // bodies gap down, wicks overlap → VI
+            if not viAbsorbed
+                addSimple(2, -1, cBodyLo, dBodyHi, tfMin, rank, ct, doneD)  // pure VI (blue)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SCAN ALL TIMEFRAMES
+// rank 0 = longest (lightest) … 12 = shortest (darkest); tfMin = minutes.
+// ══════════════════════════════════════════════════════════════════════════════
+
+scanTF("1M", tfMN, 0,  43200)
+scanTF("1W", tfW,  1,  10080)
+scanTF("1D", tfD,  2,  1440)
+scanTF("240", tf4h, 3, 240)
+scanTF("120", tf2h, 4, 120)
+scanTF("90",  tf90, 5, 90)
+scanTF("60",  tf1h, 6, 60)
+scanTF("30",  tf30, 7, 30)
+scanTF("15",  tf15, 8, 15)
+scanTF("5",   tf5,  9, 5)
+scanTF("3",   tf3,  10, 3)
+scanTF("2",   tf2,  11, 2)
+scanTF("1",   tf1,  12, 1)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MITIGATION — a zone is filled once price fully trades back through it.
+// Bullish zones fill from below (low ≤ bottom); bearish from above (high ≥ top).
+// Filled zones are removed, unless "Show Filled Gaps" keeps them in light grey
+// (any timeframe, with a fixed right edge at the fill), capped per timeframe.
+// ══════════════════════════════════════════════════════════════════════════════
+
+if (useMitigation or partialFill) and array.size(zones) > 0
+    for i = array.size(zones) - 1 to 0
+        Zone z = array.get(zones, i)
+        if time >= z.doneTime   // ≥: the bar opening at the formation close is already "after" it
+            // Track the deepest penetration for the partial-fill overlay. A bullish
+            // zone is entered from the top (track the lowest low ≥ its bottom); a
+            // bearish zone from the bottom (track the highest high ≤ its top).
+            if partialFill
+                if z.dir == 1 and low < z.top
+                    float p = math.max(low, z.bottom)
+                    z.fillLvl := na(z.fillLvl) ? p : math.min(z.fillLvl, p)
+                else if z.dir == -1 and high > z.bottom
+                    float p = math.min(high, z.top)
+                    z.fillLvl := na(z.fillLvl) ? p : math.max(z.fillLvl, p)
+            bool filled = useMitigation and (z.dir == 1 ? low <= z.bottom : high >= z.top)
+            if filled
+                if showMitigated
+                    greyOut(z)   // filled: keep in grey (any timeframe), right edge frozen at the fill
+                else
+                    box.delete(z.bx)
+                    box.delete(z.lbl)
+                    box.delete(z.fillBox)
+                    for ln in z.lines
+                        line.delete(ln)
+                array.remove(zones, i)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXTEND — keep unfilled zones extended to the right (last bar only)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if barstate.islast and array.size(zones) > 0
+    int rightT = time + extendBars * barMs
+    bool lblLeftSide = labelSide == "Left"
+    for z in zones
+        if not na(z.bx)   // hidden (aged-out) open gaps are tracked but not drawn
+            box.set_right(z.bx, rightT)
+            for ln in z.lines
+                line.set_x2(ln, rightT)
+            if not na(z.lbl)
+                int lblLeft = lblLeftSide ? box.get_left(z.bx) - labelGapMs - labelWidthMs : rightT + labelGapMs
+                box.set_left(z.lbl, lblLeft)
+                box.set_right(z.lbl, lblLeft + labelWidthMs)
+            // Partial-fill overlay: grey the consumed part (top→fillLvl bullish,
+            // fillLvl→bottom bearish). Draw/update it only if price has entered.
+            if partialFill and not na(z.fillLvl)
+                float ftop = z.dir == 1 ? z.top : z.fillLvl
+                float fbot = z.dir == 1 ? z.fillLvl : z.bottom
+                int   fleft = box.get_left(z.bx)
+                if ftop > fbot
+                    if na(z.fillBox)
+                        z.fillBox := box.new(fleft, ftop, rightT, fbot, xloc=xloc.bar_time, bgcolor=partFill, border_color=color.new(color.gray, 100))
+                    else
+                        box.set_lefttop(z.fillBox, fleft, ftop)
+                        box.set_rightbottom(z.fillBox, rightT, fbot)
+            else if not na(z.fillBox)
+                box.delete(z.fillBox)
+                z.fillBox := na
+
+// ══════════════════════════════════════════════════════════════════════════════
+// END OF SCRIPT
+// ══════════════════════════════════════════════════════════════════════════════

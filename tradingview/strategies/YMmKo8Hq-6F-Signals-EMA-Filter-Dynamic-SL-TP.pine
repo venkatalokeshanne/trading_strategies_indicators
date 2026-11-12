@@ -1,0 +1,198 @@
+//@version=6
+strategy("6F Signals + EMA Filter + Dynamic SL & TP", 
+     overlay=true, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=100,
+     process_orders_on_close=true)          // fills on signal-bar close (closer to real-life)
+
+// Inputs
+color high_color      = input.color(color.rgb(65, 105, 225, 100), "High Line Color", group="Line Colors")
+color low_color       = input.color(color.rgb(60, 60, 60, 100),   "Low Line Color",  group="Line Colors")
+color stop_loss_color = input.color(color.orange,               "Stop-Loss Line Color", group="Line Colors")
+color tp_color        = input.color(color.rgb(0,150,136,0),     "Take-Profit Line Color", group="Line Colors")
+
+bool show_labels      = input.bool(true,  "Show Labels",          group="Signal Display")
+bool show_arrows      = input.bool(true,  "Show Arrows",          group="Signal Display")
+bool show_stop_loss   = input.bool(true,  "Show Stop-Loss Lines",  group="Visualization")
+bool show_take_profit = input.bool(true,  "Show Take-Profit Lines",group="Visualization")
+
+float tp_pct        = input.float(3.0, "Take-Profit (%)", step=0.5, group="Strategy Settings") / 100
+float sl_buffer_pct = input.float(1.0, "Stop-Loss Buffer (%)", step=0.5, group="Strategy Settings") / 100
+
+int start_year  = input.int(2025, "Backtest Start Year", group="Strategy Settings")
+int start_month = input.int(1,    "Start Month",        group="Strategy Settings")
+int start_day   = input.int(1,    "Start Day",          group="Strategy Settings")
+bool allow_trades = time >= timestamp(start_year, start_month, start_day, 0, 0)
+
+// MA Filter
+bool   apply_ma_filter = input.bool(true,  "Apply MA Filter", group="MA Filter")
+int    ma6_len         = input.int(6,  "Fast MA Length", group="MA Filter")
+int    ma9_len         = input.int(9,  "Slow MA Length", group="MA Filter")
+string ma_type         = input.string("SMA", "MA Type", options=["SMA", "EMA"], group="MA Filter")
+
+ma6 = ma_type == "EMA" ? ta.ema(close, ma6_len) : ta.sma(close, ma6_len)
+ma9 = ma_type == "EMA" ? ta.ema(close, ma9_len) : ta.sma(close, ma9_len)
+
+bool bullish_trend = ma6 > ma9
+bool bearish_trend = ma6 < ma9
+
+bgcolor(bullish_trend ? color.new(color.green, 90) : color.new(color.red, 90))
+plot(ma6, color=color.black, linewidth=1)
+plot(ma9, color=color.black, linewidth=2)
+
+// Heikin Ashi + Core Logic
+var float ha_open = na
+float ha_close = (open + high + low + close) / 4
+ha_open := bar_index == 0 ? open : (ha_open[1] + ha_close[1]) / 2
+float ha_high = math.max(high, math.max(ha_open, ha_close))
+float ha_low  = math.min(low,  math.min(ha_open, ha_close))
+
+// === ADD FROM HERE ===
+bool is_ha_green = ha_close > ha_open
+
+float ha_level_1 = is_ha_green ? ha_close : ha_high   // Close (green) or High (red)
+float ha_level_2 = is_ha_green ? ha_low   : ha_close  // Low (green) or Close (red)
+
+color ha_line_color = is_ha_green ? color.new(color.green, 0) : color.new(color.red, 0)
+
+plot(ha_level_1, title="HA Level 1", color=ha_line_color, linewidth=2, style=plot.style_stepline)
+plot(ha_level_2, title="HA Level 2", color=ha_line_color, linewidth=2, style=plot.style_stepline)
+// === TO HERE ===
+
+var float c_high = na
+var float c_low  = na
+var bool prev_bullish = false
+
+var bool  signal_triggered = false
+var int   last_c_bar       = na
+var string last_signal     = "none"
+
+bool current_bullish = ha_close > ha_open
+
+if bar_index == 0
+    prev_bullish := current_bullish
+else if current_bullish != prev_bullish
+    c_high := ha_high
+    c_low  := ha_low
+    line.new(bar_index, c_high, bar_index + 3, c_high, color=high_color, width=2)
+    line.new(bar_index, c_low,  bar_index + 3, c_low,  color=low_color,  width=2)
+    signal_triggered := false
+    last_c_bar := bar_index
+
+bool potential_buy_signal  = not na(c_high) and ha_close > c_high
+bool potential_sell_signal = not na(c_low)  and ha_close < c_low
+
+bool buy_signal  = potential_buy_signal  and not signal_triggered and bar_index > last_c_bar and allow_trades
+bool sell_signal = potential_sell_signal and not signal_triggered and bar_index > last_c_bar and allow_trades
+
+if (buy_signal or sell_signal) and allow_trades
+    signal_triggered := true
+    last_signal := buy_signal ? "buy" : "sell"
+
+// Variables
+var float long_entry_price  = na
+var float short_entry_price = na
+var float long_stop_loss    = na
+var float short_stop_loss   = na
+var float long_take_profit  = na
+var float short_take_profit = na
+
+// Leverage Functions
+calc_lev_long()  => not na(long_entry_price) and not na(long_stop_loss) and long_entry_price > long_stop_loss ? math.round(long_entry_price / (long_entry_price - long_stop_loss)) : 1
+calc_lev_short() => not na(short_entry_price) and not na(short_stop_loss) and short_entry_price < short_stop_loss ? math.round(short_entry_price / (short_stop_loss - short_entry_price)) : 1
+
+// Entries
+if buy_signal
+    strategy.close("Short", comment="Opposite 6F Buy")
+    strategy.entry("Long", strategy.long)
+    long_entry_price  := close
+    long_take_profit  := close * (1 + tp_pct)
+    long_stop_loss    := ha_low[1] * (1 - sl_buffer_pct)
+    strategy.exit("Long Exit", "Long", 
+         stop=long_stop_loss, 
+         limit=long_take_profit,
+         comment_loss="SL Hit", 
+         comment_profit="TP Hit")
+
+if sell_signal
+    strategy.close("Long", comment="Opposite 6F Sell")
+    strategy.entry("Short", strategy.short)
+    short_entry_price := close
+    short_take_profit := close * (1 - tp_pct)
+    short_stop_loss   := ha_high[1] * (1 + sl_buffer_pct)
+    strategy.exit("Short Exit", "Short", 
+         stop=short_stop_loss, 
+         limit=short_take_profit,
+         comment_loss="SL Hit", 
+         comment_profit="TP Hit")
+
+// Dynamic Trailing SL (improved version – restores crosshair links)
+if strategy.position_size > 0
+    float new_sl = math.max(long_stop_loss, ha_low[1] * (1 - sl_buffer_pct))
+    if new_sl != long_stop_loss
+        long_stop_loss := new_sl
+        strategy.exit("Long Exit", "Long", 
+             stop=long_stop_loss, 
+             limit=long_take_profit,
+             comment_loss="SL Hit", 
+             comment_profit="TP Hit")
+
+if strategy.position_size < 0
+    float new_sl = math.min(short_stop_loss, ha_high[1] * (1 + sl_buffer_pct))
+    if new_sl != short_stop_loss
+        short_stop_loss := new_sl
+        strategy.exit("Short Exit", "Short", 
+             stop=short_stop_loss, 
+             limit=short_take_profit,
+             comment_loss="SL Hit", 
+             comment_profit="TP Hit")
+             
+// Labels
+if show_labels and buy_signal
+    lev = calc_lev_long()
+    label.new(bar_index, high, "TP: " + str.tostring(long_take_profit, "#.######") + "\nBuy: " + str.tostring(close, "#.######") + "\nSL: " + str.tostring(long_stop_loss, "#.######") + " (" + str.tostring(lev) + "X)", color=color.rgb(65,105,225,60), textcolor=color.black, style=label.style_label_up, yloc=yloc.belowbar)
+
+if show_labels and sell_signal
+    lev = calc_lev_short()
+    label.new(bar_index, low, "SL: " + str.tostring(short_stop_loss, "#.######") + " (" + str.tostring(lev) + "X)" + "\nSell: " + str.tostring(close, "#.######") + "\nTP: " + str.tostring(short_take_profit, "#.######"), color=color.rgb(60,60,60,40), textcolor=color.white, style=label.style_label_down, yloc=yloc.abovebar)
+
+// Arrows
+plotshape(show_arrows and buy_signal, location.belowbar, color=color.blue, style=shape.triangleup, size=size.tiny)
+plotshape(show_arrows and sell_signal, location.abovebar, color=color.black, style=shape.triangledown, size=size.tiny)
+
+// Moving Stop-Loss Lines
+int line_length = 1
+if show_stop_loss
+    if strategy.position_size > 0 and not na(long_stop_loss)
+        line.new(bar_index - line_length, long_stop_loss, bar_index, long_stop_loss, color=stop_loss_color, style=line.style_dotted, width=2)
+    if strategy.position_size < 0 and not na(short_stop_loss)
+        line.new(bar_index - line_length, short_stop_loss, bar_index, short_stop_loss, color=stop_loss_color, style=line.style_dotted, width=2)
+
+// TradersPost Alert
+if (buy_signal or sell_signal)
+    string action = buy_signal ? "buy" : "sell"
+    string market_pos = buy_signal ? "long" : "short"
+    float entry_price = close
+    float sl_price    = buy_signal ? long_stop_loss : short_stop_loss
+    float tp_price    = buy_signal ? long_take_profit : short_take_profit
+    int   lev         = buy_signal ? calc_lev_long() : calc_lev_short()
+
+    string json = 
+         '{' +
+         '"ticker": "' + syminfo.ticker + '",' +
+         '"action": "' + action + '",' +
+         '"sentiment": "' + market_pos + '",' +
+         '"price": ' + str.tostring(entry_price, "#.######") + ',' +
+         '"quantity": ' + str.tostring(math.abs(strategy.position_size == 0 ? 1 : strategy.position_size)) + ',' +
+         '"stop_loss": ' + str.tostring(sl_price, "#.######") + ',' +
+         '"take_profit": ' + str.tostring(tp_price, "#.######") + ',' +
+         '"leverage": ' + str.tostring(lev) + ',' +
+         '"time": "{{timenow}}",' +
+         '"interval": "{{interval}}"' +
+         '}'
+
+    string pretty = str.upper(action) + " " + syminfo.ticker + " | Price: " + str.tostring(entry_price, "#.######") + " | SL: " + str.tostring(sl_price, "#.######") + " | TP: " + str.tostring(tp_price, "#.######") + " | Lev: " + str.tostring(lev) + "x"
+
+    alert(pretty + "\n\n" + json, alert.freq_once_per_bar_close)
+
+prev_bullish := current_bullish

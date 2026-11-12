@@ -1,0 +1,436 @@
+//@version=6
+indicator("MYND Candlestick Pattern Reliability Learner v1.0", shorttitle="MYND CPRL v1.0", overlay=true)
+
+// =====================================================================================
+// MYND CANDLESTICK PATTERN RELIABILITY LEARNER v1.0
+// Detects 14 classic candlestick patterns (7 bullish, 7 bearish) from raw OHLC, then - the
+// actual point of this tool - tracks EACH pattern's own rolling, forward-graded win rate
+// independently and mutes any pattern that has stopped working recently rather than
+// treating every textbook pattern as permanently reliable (they aren't - reliability drifts
+// by symbol, timeframe, and regime). This reuses the exact rolling self-tracking-accuracy
+// architecture already proven in MYND KNN and MYND PWEV, applied to a new domain.
+//
+// Patterns covered: Bullish/Bearish Engulfing, Hammer, Hanging Man, Inverted Hammer,
+// Shooting Star, Bullish/Bearish Harami, Morning Star, Evening Star, Piercing Line, Dark
+// Cloud Cover, Three White Soldiers, Three Black Crows. Deliberately excludes plain Doji -
+// a doji signals indecision, not a directional bet, so it has no "did it work" outcome to
+// grade the same way the other 14 do. Not included in v1.
+//
+// Multi-timeframe confluence (the newest layer, per your request): up to 3 configurable
+// higher timeframes are checked for the SAME pattern (the stronger read) or a DIFFERENT
+// pattern that still agrees on DIRECTION (a softer but real confluence read). MTF Mode
+// governs what that does: Off ignores it, Warn fires the signal anyway but flags a caution
+// marker/alert on disagreement, Gate suppresses the signal entirely unless enough higher
+// timeframes agree. Genuine Pine constraint, stated plainly: request.security() needs a
+// single self-contained expression, so the full pattern-detection logic is written out
+// TWICE in this script - once at the top level for the live base-timeframe read (needed to
+// get 14 separate booleans for independent accuracy tracking), and once again inside
+// f_patternCode(), a fully self-contained function used only for the MTF pulls. This is
+// real, necessary duplication (Pine's execution model requires it for request.security() to
+// correctly re-evaluate on each higher timeframe's own data), not an oversight - the two
+// blocks use matching variable names and logic so they're easy to keep in sync.
+//
+// Reliability gating, stated plainly: a pattern with fewer than Minimum Tracked Occurrences
+// gets a cold-start benefit of the doubt (treated as reliable). Past that, it only
+// contributes to a live Bullish/Bearish Signal if its own rolling win rate clears Minimum
+// Reliability to Signal - muted patterns keep being tracked in the background in case they
+// recover. The MTF read itself is intentionally NOT reliability-gated per pattern per
+// timeframe (that would require duplicating the full rolling-accuracy machinery on every
+// higher timeframe too, a real compute-cost/complexity tradeoff not worth it for v1) - MTF
+// simply reports whether a genuine pattern match occurred on that higher timeframe's most
+// recently CLOSED bar, confirmed-only, never the still-forming one.
+//
+// Scope note - not included in v1: trend-filter and structural-proximity gates (e.g. only
+// trust a hammer at a known support level) were discussed as options but deliberately left
+// out here to keep this build focused - flagged as a candidate v1.1 addition, not forgotten.
+//
+// Built to the "Total Control", Theme & Accessibility, and Tooltip Coverage standards (see
+// MYND_Project_Notes.md). Full pre-delivery line-by-line and function review applied before
+// first delivery, per the standing rule adopted 2026-08-13.
+// =====================================================================================
+
+// ---------------------------- INPUTS: PATTERN DETECTION ----------------------------
+avgBodyLen = input.int(14, "Average Body Length", minval=5, group="Pattern Detection", tooltip="Lookback used to compute typical candle body size - patterns compare their own body against this average to judge 'large' or 'small'.")
+trendCtxLen = input.int(10, "Trend Context Length", minval=3, group="Pattern Detection", tooltip="Lookback (simple moving average of price) used to judge whether a pattern is forming after an uptrend or downtrend - this context is what determines, for example, whether a given candle shape counts as a bullish Hammer or a bearish Hanging Man.")
+smallBodyMult = input.float(0.5, "Small Body Threshold (x Average)", minval=0.1, maxval=1.0, step=0.05, group="Pattern Detection", tooltip="A candle body at or below this multiple of the Average Body Length counts as 'small' - used by Hammer, Inverted Hammer, and the star candle in Morning/Evening Star.")
+bigBodyMult = input.float(1.0, "Large Body Threshold (x Average)", minval=0.5, maxval=3.0, step=0.1, group="Pattern Detection", tooltip="A candle body at or above this multiple of the Average Body Length counts as 'large' - used by Morning/Evening Star and Piercing Line/Dark Cloud Cover.")
+wickRatioMult = input.float(2.0, "Long Wick Ratio (x Body)", minval=1.0, maxval=5.0, step=0.25, group="Pattern Detection", tooltip="How many multiples of the body's own size a wick must reach to count as 'long' - used by Hammer, Hanging Man, Inverted Hammer, and Shooting Star.")
+
+// ---------------------------- INPUTS: MTF CONFLUENCE ----------------------------
+enableMTF = input.bool(true, "Enable Multi-Timeframe Confluence", group="MTF Confluence", tooltip="When on, checks up to 3 higher timeframes for the same or matching-direction candlestick patterns and can warn on disagreement or gate signals to require agreement, per MTF Mode below.")
+mtfMode = input.string("Warn", "MTF Mode", options=["Off", "Warn", "Gate"], group="MTF Confluence", tooltip="Off: MTF is ignored entirely. Warn: signals still fire normally, but disagreement with every enabled higher timeframe flips a caution marker and can fire its own alert. Gate: signals are suppressed entirely unless enough higher timeframes agree (see Minimum HTFs Required to Gate).")
+minMtfAgreeForGate = input.int(1, "Minimum HTFs Required to Gate", minval=1, maxval=3, group="MTF Confluence", tooltip="Gate mode only: how many enabled higher timeframes must show directional agreement (same or different pattern, same bullish/bearish direction) for a signal to be allowed through.")
+htf1Enabled = input.bool(true, "Enable HTF 1", group="MTF Confluence", tooltip="Include this higher timeframe in the MTF confluence check.")
+htf1 = input.timeframe("60", "HTF 1", group="MTF Confluence", tooltip="First higher timeframe checked for pattern confluence. Uses that timeframe's most recently CLOSED bar only - never the still-forming one - to avoid repainting.")
+htf2Enabled = input.bool(true, "Enable HTF 2", group="MTF Confluence", tooltip="Include this higher timeframe in the MTF confluence check.")
+htf2 = input.timeframe("240", "HTF 2", group="MTF Confluence", tooltip="Second higher timeframe checked for pattern confluence. Uses that timeframe's most recently CLOSED bar only.")
+htf3Enabled = input.bool(false, "Enable HTF 3", group="MTF Confluence", tooltip="Include this higher timeframe in the MTF confluence check.")
+htf3 = input.timeframe("D", "HTF 3", group="MTF Confluence", tooltip="Third higher timeframe checked for pattern confluence. Uses that timeframe's most recently CLOSED bar only.")
+
+// ---------------------------- INPUTS: SIGNAL SETTINGS ----------------------------
+requireVolConfirm = input.bool(false, "Require Volume Confirmation on Signals", group="Signal Settings", tooltip="When on, live Bullish/Bearish Signals only fire if current volume also clears the multiple of average volume set below.")
+volConfirmLen = input.int(20, "Volume Confirmation Average Length", minval=2, group="Signal Settings", tooltip="Average volume length used for confirmation. Only applies when Require Volume Confirmation is on.")
+volConfirmMult = input.float(1.2, "Volume Confirmation Multiplier", minval=0.5, step=0.1, group="Signal Settings", tooltip="Volume must be at least this multiple of the average to confirm a signal. Only applies when Require Volume Confirmation is on.")
+
+// ---------------------------- INPUTS: ACCURACY TRACKING ----------------------------
+evalForwardBars = input.int(5, "Evaluation Forward Bars", minval=1, maxval=50, group="Accuracy Tracking", tooltip="How many bars forward each pattern's outcome is measured over when grading its rolling reliability - should roughly match your intended holding period.")
+rollingWindow = input.int(20, "Per-Pattern Rolling Window (occurrences)", minval=5, group="Accuracy Tracking", tooltip="How many of each individual pattern's most recent graded occurrences its own reliability % is based on - a rolling, not all-time, window, so a pattern that's stopped working gets muted relatively quickly.")
+minTrackedForGating = input.int(5, "Minimum Tracked Occurrences Before Gating", minval=1, group="Accuracy Tracking", tooltip="A pattern with fewer than this many graded occurrences gets a cold-start benefit of the doubt and is treated as reliable regardless of its early (small-sample) reading.")
+minReliabilityPct = input.float(50, "Minimum Reliability to Signal (%)", minval=1, maxval=99, group="Accuracy Tracking", tooltip="A pattern with a rolling reliability below this - once it has enough tracked occurrences - is muted from live signals, though it keeps being tracked in case it recovers.")
+
+// ---------------------------- INPUTS: THEME & ACCESSIBILITY ----------------------------
+themeMode = input.string("Light", "Theme Preset", options=["Light", "Dark", "Custom"], group="Theme & Accessibility", tooltip="Light and Dark apply a curated color palette suited to that chart background. Custom uses the individual color pickers in Display instead - Theme Preset overrides them unless set to Custom.")
+colorblindMode = input.bool(false, "Colorblind-Safe Signal Colors", group="Theme & Accessibility", tooltip="When on, overrides Bullish/Bearish colors to a colorblind-safe blue/orange palette (Okabe-Ito), regardless of Theme Preset or Custom colors.")
+
+// ---------------------------- INPUTS: DISPLAY ----------------------------
+showTable = input.bool(true, "Show Dashboard Table", group="Display")
+tablePosIn = input.string("Top Right", "Table Position", options=["Top Left", "Top Right", "Bottom Left", "Bottom Right"], group="Display")
+tableSizeIn = input.string("Small", "Table Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="Display", tooltip="Small is recommended by default since this dashboard has more rows than most MYND tools (per-pattern reliability transparency is the point of this tool).")
+headerBgColorCustom = input.color(color.new(color.navy, 0), "Custom Table Header Background", group="Display", tooltip="Only applied when Theme Preset is set to Custom.")
+headerTextColorCustom = input.color(color.new(color.white, 0), "Custom Table Header Text", group="Display", tooltip="Only applied when Theme Preset is set to Custom.")
+bullishColorCustom = input.color(color.new(color.green, 0), "Custom Bullish Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+bearishColorCustom = input.color(color.new(color.red, 0), "Custom Bearish Color", group="Display", tooltip="Only applied when Theme Preset is Custom AND Colorblind-Safe Signal Colors is off.")
+neutralColorCustom = input.color(color.new(color.gray, 0), "Custom Neutral/Building Color", group="Display", tooltip="Only applied when Theme Preset is set to Custom.")
+
+// =====================================================================================
+// THEME RESOLUTION (Light/Dark/Custom base palette, then Colorblind-Safe override on top)
+// =====================================================================================
+lightHeaderBg = color.new(color.navy, 0)
+lightHeaderText = color.new(color.white, 0)
+lightBullish = color.new(color.green, 0)
+lightBearish = color.new(color.red, 0)
+lightNeutral = color.new(color.gray, 0)
+
+darkHeaderBg = color.new(#1A1F2E, 0)
+darkHeaderText = color.new(#E0E0E0, 0)
+darkBullish = color.new(#26A69A, 0)
+darkBearish = color.new(#EF5350, 0)
+darkNeutral = color.new(#787B86, 0)
+
+cbBullish = color.new(#0072B2, 0)
+cbBearish = color.new(#E69F00, 0)
+
+headerBgColor = themeMode == "Custom" ? headerBgColorCustom : themeMode == "Dark" ? darkHeaderBg : lightHeaderBg
+headerTextColor = themeMode == "Custom" ? headerTextColorCustom : themeMode == "Dark" ? darkHeaderText : lightHeaderText
+baseBullishColor = themeMode == "Custom" ? bullishColorCustom : themeMode == "Dark" ? darkBullish : lightBullish
+baseBearishColor = themeMode == "Custom" ? bearishColorCustom : themeMode == "Dark" ? darkBearish : lightBearish
+neutralColor = themeMode == "Custom" ? neutralColorCustom : themeMode == "Dark" ? darkNeutral : lightNeutral
+bullishColor = colorblindMode ? cbBullish : baseBullishColor
+bearishColor = colorblindMode ? cbBearish : baseBearishColor
+
+// =====================================================================================
+// SELF-CONTAINED PATTERN CODE FUNCTION - used ONLY for MTF request.security() pulls.
+// Must be fully self-contained (no outer-scope series references) so Pine correctly
+// re-evaluates it against each higher timeframe's own OHLC data. Codes: 1-7 bullish,
+// -1 to -7 bearish, 0 none. Order: Engulfing, Hammer/InvHammer/HangingMan/ShootingStar,
+// Harami, Star, Piercing/DarkCloud, Soldiers/Crows.
+// =====================================================================================
+f_patternCode() =>
+    fnBody = math.abs(close - open)
+    fnRange = high - low
+    fnUpperWick = high - math.max(close, open)
+    fnLowerWick = math.min(close, open) - low
+    fnAvgBody = ta.sma(fnBody, avgBodyLen)
+    fnTrendSma = ta.sma(close, trendCtxLen)
+    fnCtx1 = close[1] > fnTrendSma[1] ? 1 : close[1] < fnTrendSma[1] ? -1 : 0
+    fnCtx2 = close[2] > fnTrendSma[2] ? 1 : close[2] < fnTrendSma[2] ? -1 : 0
+    fnCtx3 = close[3] > fnTrendSma[3] ? 1 : close[3] < fnTrendSma[3] ? -1 : 0
+    fnSmall = fnBody <= fnAvgBody * smallBodyMult
+    fnBigPrev1 = fnBody[1] >= fnAvgBody[1] * bigBodyMult
+    fnBigPrev2 = fnBody[2] >= fnAvgBody[2] * bigBodyMult
+
+    fnBullEngulf = close[1] < open[1] and close > open and open <= close[1] and close >= open[1]
+    fnBearEngulf = close[1] > open[1] and close < open and open >= close[1] and close <= open[1]
+
+    fnHammerShape = fnSmall and fnLowerWick >= fnBody * wickRatioMult and fnUpperWick <= fnBody * 0.5
+    fnInvHammerShape = fnSmall and fnUpperWick >= fnBody * wickRatioMult and fnLowerWick <= fnBody * 0.5
+    fnBullHammer = fnHammerShape and fnCtx1 == -1
+    fnBearHangingMan = fnHammerShape and fnCtx1 == 1
+    fnBullInvHammer = fnInvHammerShape and fnCtx1 == -1
+    fnBearShootingStar = fnInvHammerShape and fnCtx1 == 1
+
+    fnHaramiInside = math.max(open, close) <= math.max(open[1], close[1]) and math.min(open, close) >= math.min(open[1], close[1]) and fnBody <= fnBody[1] * 0.6
+    fnBullHarami = fnHaramiInside and close[1] < open[1] and fnCtx2 == -1
+    fnBearHarami = fnHaramiInside and close[1] > open[1] and fnCtx2 == 1
+
+    fnMid2 = (open[2] + close[2]) / 2
+    fnBullMorningStar = close[2] < open[2] and fnBigPrev2 and fnBody[1] <= fnBody[2] * 0.5 and close > open and close > fnMid2 and fnCtx3 == -1
+    fnBearEveningStar = close[2] > open[2] and fnBigPrev2 and fnBody[1] <= fnBody[2] * 0.5 and close < open and close < fnMid2 and fnCtx3 == 1
+
+    fnMid1 = (open[1] + close[1]) / 2
+    fnBullPiercing = close[1] < open[1] and fnBigPrev1 and close > open and open < close[1] and close > fnMid1 and close < open[1] and fnCtx2 == -1
+    fnBearDarkCloud = close[1] > open[1] and fnBigPrev1 and close < open and open > close[1] and close < fnMid1 and close > open[1] and fnCtx2 == 1
+
+    fnAllBull3 = close > open and close[1] > open[1] and close[2] > open[2]
+    fnAllBear3 = close < open and close[1] < open[1] and close[2] < open[2]
+    fnHigherCl = close > close[1] and close[1] > close[2]
+    fnLowerCl = close < close[1] and close[1] < close[2]
+    fnOpenInUp = open > open[1] and open < close[1] and open[1] > open[2] and open[1] < close[2]
+    fnOpenInDn = open < open[1] and open > close[1] and open[1] < open[2] and open[1] > close[2]
+    fnDecent0 = fnBody >= fnRange * 0.5
+    fnDecent1 = fnBody[1] >= (high[1] - low[1]) * 0.5
+    fnDecent2 = fnBody[2] >= (high[2] - low[2]) * 0.5
+    fnBullSoldiers = fnAllBull3 and fnHigherCl and fnOpenInUp and fnDecent0 and fnDecent1 and fnDecent2
+    fnBearCrows = fnAllBear3 and fnLowerCl and fnOpenInDn and fnDecent0 and fnDecent1 and fnDecent2
+
+    fnBullEngulf ? 1 : fnBullHammer ? 2 : fnBullInvHammer ? 3 : fnBullHarami ? 4 : fnBullMorningStar ? 5 : fnBullPiercing ? 6 : fnBullSoldiers ? 7 : fnBearEngulf ? -1 : fnBearHangingMan ? -2 : fnBearShootingStar ? -3 : fnBearHarami ? -4 : fnBearEveningStar ? -5 : fnBearDarkCloud ? -6 : fnBearCrows ? -7 : 0
+
+// =====================================================================================
+// LIVE BASE-TIMEFRAME PATTERN DETECTION (mirrors f_patternCode() above, kept as separate
+// named booleans here since each needs its own independent rolling accuracy tracker)
+// =====================================================================================
+body = math.abs(close - open)
+rangeVal = high - low
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+avgBody = ta.sma(body, avgBodyLen)
+trendSma = ta.sma(close, trendCtxLen)
+ctx1 = close[1] > trendSma[1] ? 1 : close[1] < trendSma[1] ? -1 : 0
+ctx2 = close[2] > trendSma[2] ? 1 : close[2] < trendSma[2] ? -1 : 0
+ctx3 = close[3] > trendSma[3] ? 1 : close[3] < trendSma[3] ? -1 : 0
+isSmallBody = body <= avgBody * smallBodyMult
+isBigBody = body >= avgBody * bigBodyMult
+
+bullEngulf = close[1] < open[1] and close > open and open <= close[1] and close >= open[1]
+bearEngulf = close[1] > open[1] and close < open and open >= close[1] and close <= open[1]
+
+hammerShape = isSmallBody and lowerWick >= body * wickRatioMult and upperWick <= body * 0.5
+invHammerShape = isSmallBody and upperWick >= body * wickRatioMult and lowerWick <= body * 0.5
+bullHammer = hammerShape and ctx1 == -1
+bearHangingMan = hammerShape and ctx1 == 1
+bullInvHammer = invHammerShape and ctx1 == -1
+bearShootingStar = invHammerShape and ctx1 == 1
+
+haramiInside = math.max(open, close) <= math.max(open[1], close[1]) and math.min(open, close) >= math.min(open[1], close[1]) and body <= body[1] * 0.6
+bullHarami = haramiInside and close[1] < open[1] and ctx2 == -1
+bearHarami = haramiInside and close[1] > open[1] and ctx2 == 1
+
+mid2 = (open[2] + close[2]) / 2
+bullMorningStar = close[2] < open[2] and isBigBody[2] and body[1] <= body[2] * 0.5 and close > open and close > mid2 and ctx3 == -1
+bearEveningStar = close[2] > open[2] and isBigBody[2] and body[1] <= body[2] * 0.5 and close < open and close < mid2 and ctx3 == 1
+
+mid1 = (open[1] + close[1]) / 2
+bullPiercing = close[1] < open[1] and isBigBody[1] and close > open and open < close[1] and close > mid1 and close < open[1] and ctx2 == -1
+bearDarkCloud = close[1] > open[1] and isBigBody[1] and close < open and open > close[1] and close < mid1 and close > open[1] and ctx2 == 1
+
+allBull3 = close > open and close[1] > open[1] and close[2] > open[2]
+allBear3 = close < open and close[1] < open[1] and close[2] < open[2]
+higherCl = close > close[1] and close[1] > close[2]
+lowerCl = close < close[1] and close[1] < close[2]
+openInUp = open > open[1] and open < close[1] and open[1] > open[2] and open[1] < close[2]
+openInDn = open < open[1] and open > close[1] and open[1] < open[2] and open[1] > close[2]
+decent0 = body >= rangeVal * 0.5
+decent1 = body[1] >= (high[1] - low[1]) * 0.5
+decent2 = body[2] >= (high[2] - low[2]) * 0.5
+bullSoldiers = allBull3 and higherCl and openInUp and decent0 and decent1 and decent2
+bearCrows = allBear3 and lowerCl and openInDn and decent0 and decent1 and decent2
+
+// =====================================================================================
+// RELIABILITY GATING + ROLLING ACCURACY TRACKING - one dedicated array per pattern.
+// Placed here (before MTF Confluence) since baseCode below needs the *Rel flags computed here.
+// =====================================================================================
+f_isReliable(accPct, trackedN) =>
+    trackedN < minTrackedForGating or na(accPct) or accPct >= minReliabilityPct
+
+f_gradeAndTrack(signalToGrade, resultsArr, isBullish) =>
+    if signalToGrade
+        priorClose = close[evalForwardBars]
+        outcomeReturn = priorClose > 0 ? (close - priorClose) / priorClose : 0.0
+        wasCorrect = isBullish ? outcomeReturn > 0 : outcomeReturn < 0
+        array.push(resultsArr, wasCorrect ? 1.0 : 0.0)
+        if array.size(resultsArr) > rollingWindow
+            array.shift(resultsArr)
+    trackedN = array.size(resultsArr)
+    accPct = trackedN > 0 ? array.avg(resultsArr) * 100 : float(na)
+    [accPct, trackedN]
+
+hasHistory = bar_index >= evalForwardBars
+
+var array<float> bullEngulfResults = array.new_float(0)
+var array<float> bullHammerResults = array.new_float(0)
+var array<float> bullInvHammerResults = array.new_float(0)
+var array<float> bullHaramiResults = array.new_float(0)
+var array<float> bullMorningStarResults = array.new_float(0)
+var array<float> bullPiercingResults = array.new_float(0)
+var array<float> bullSoldiersResults = array.new_float(0)
+var array<float> bearEngulfResults = array.new_float(0)
+var array<float> bearHangingManResults = array.new_float(0)
+var array<float> bearShootingStarResults = array.new_float(0)
+var array<float> bearHaramiResults = array.new_float(0)
+var array<float> bearEveningStarResults = array.new_float(0)
+var array<float> bearDarkCloudResults = array.new_float(0)
+var array<float> bearCrowsResults = array.new_float(0)
+
+[bullEngulfAcc, bullEngulfN] = f_gradeAndTrack(hasHistory ? bullEngulf[evalForwardBars] : false, bullEngulfResults, true)
+[bullHammerAcc, bullHammerN] = f_gradeAndTrack(hasHistory ? bullHammer[evalForwardBars] : false, bullHammerResults, true)
+[bullInvHammerAcc, bullInvHammerN] = f_gradeAndTrack(hasHistory ? bullInvHammer[evalForwardBars] : false, bullInvHammerResults, true)
+[bullHaramiAcc, bullHaramiN] = f_gradeAndTrack(hasHistory ? bullHarami[evalForwardBars] : false, bullHaramiResults, true)
+[bullMorningStarAcc, bullMorningStarN] = f_gradeAndTrack(hasHistory ? bullMorningStar[evalForwardBars] : false, bullMorningStarResults, true)
+[bullPiercingAcc, bullPiercingN] = f_gradeAndTrack(hasHistory ? bullPiercing[evalForwardBars] : false, bullPiercingResults, true)
+[bullSoldiersAcc, bullSoldiersN] = f_gradeAndTrack(hasHistory ? bullSoldiers[evalForwardBars] : false, bullSoldiersResults, true)
+[bearEngulfAcc, bearEngulfN] = f_gradeAndTrack(hasHistory ? bearEngulf[evalForwardBars] : false, bearEngulfResults, false)
+[bearHangingManAcc, bearHangingManN] = f_gradeAndTrack(hasHistory ? bearHangingMan[evalForwardBars] : false, bearHangingManResults, false)
+[bearShootingStarAcc, bearShootingStarN] = f_gradeAndTrack(hasHistory ? bearShootingStar[evalForwardBars] : false, bearShootingStarResults, false)
+[bearHaramiAcc, bearHaramiN] = f_gradeAndTrack(hasHistory ? bearHarami[evalForwardBars] : false, bearHaramiResults, false)
+[bearEveningStarAcc, bearEveningStarN] = f_gradeAndTrack(hasHistory ? bearEveningStar[evalForwardBars] : false, bearEveningStarResults, false)
+[bearDarkCloudAcc, bearDarkCloudN] = f_gradeAndTrack(hasHistory ? bearDarkCloud[evalForwardBars] : false, bearDarkCloudResults, false)
+[bearCrowsAcc, bearCrowsN] = f_gradeAndTrack(hasHistory ? bearCrows[evalForwardBars] : false, bearCrowsResults, false)
+
+bullEngulfRel = f_isReliable(bullEngulfAcc, bullEngulfN)
+bullHammerRel = f_isReliable(bullHammerAcc, bullHammerN)
+bullInvHammerRel = f_isReliable(bullInvHammerAcc, bullInvHammerN)
+bullHaramiRel = f_isReliable(bullHaramiAcc, bullHaramiN)
+bullMorningStarRel = f_isReliable(bullMorningStarAcc, bullMorningStarN)
+bullPiercingRel = f_isReliable(bullPiercingAcc, bullPiercingN)
+bullSoldiersRel = f_isReliable(bullSoldiersAcc, bullSoldiersN)
+bearEngulfRel = f_isReliable(bearEngulfAcc, bearEngulfN)
+bearHangingManRel = f_isReliable(bearHangingManAcc, bearHangingManN)
+bearShootingStarRel = f_isReliable(bearShootingStarAcc, bearShootingStarN)
+bearHaramiRel = f_isReliable(bearHaramiAcc, bearHaramiN)
+bearEveningStarRel = f_isReliable(bearEveningStarAcc, bearEveningStarN)
+bearDarkCloudRel = f_isReliable(bearDarkCloudAcc, bearDarkCloudN)
+bearCrowsRel = f_isReliable(bearCrowsAcc, bearCrowsN)
+
+// =====================================================================================
+// MTF CONFLUENCE - request.security() calls always run unconditionally (Pine requirement);
+// their RESULTS are used conditionally below. Pulls the previous (confirmed, closed) bar's
+// pattern code on each higher timeframe to avoid repainting.
+// =====================================================================================
+htf1CodeRaw = request.security(syminfo.tickerid, htf1, f_patternCode()[1], lookahead=barmerge.lookahead_off)
+htf2CodeRaw = request.security(syminfo.tickerid, htf2, f_patternCode()[1], lookahead=barmerge.lookahead_off)
+htf3CodeRaw = request.security(syminfo.tickerid, htf3, f_patternCode()[1], lookahead=barmerge.lookahead_off)
+
+// NOTE: gated by reliability (not the raw pattern booleans) so the MTF direction check always
+// compares against whichever pattern actually could drive a live Bullish/Bearish Signal - a
+// rare same-bar collision between an unreliable bullish pattern and a reliable bearish one
+// would otherwise make this compare the wrong direction.
+baseCode = (bullEngulf and bullEngulfRel) ? 1 : (bullHammer and bullHammerRel) ? 2 : (bullInvHammer and bullInvHammerRel) ? 3 : (bullHarami and bullHaramiRel) ? 4 : (bullMorningStar and bullMorningStarRel) ? 5 : (bullPiercing and bullPiercingRel) ? 6 : (bullSoldiers and bullSoldiersRel) ? 7 : (bearEngulf and bearEngulfRel) ? -1 : (bearHangingMan and bearHangingManRel) ? -2 : (bearShootingStar and bearShootingStarRel) ? -3 : (bearHarami and bearHaramiRel) ? -4 : (bearEveningStar and bearEveningStarRel) ? -5 : (bearDarkCloud and bearDarkCloudRel) ? -6 : (bearCrows and bearCrowsRel) ? -7 : 0
+
+mtf1On = enableMTF and htf1Enabled
+mtf2On = enableMTF and htf2Enabled
+mtf3On = enableMTF and htf3Enabled
+
+mtf1Agree = mtf1On and baseCode != 0 and htf1CodeRaw != 0 and math.sign(htf1CodeRaw) == math.sign(baseCode)
+mtf2Agree = mtf2On and baseCode != 0 and htf2CodeRaw != 0 and math.sign(htf2CodeRaw) == math.sign(baseCode)
+mtf3Agree = mtf3On and baseCode != 0 and htf3CodeRaw != 0 and math.sign(htf3CodeRaw) == math.sign(baseCode)
+mtf1Same = mtf1On and baseCode != 0 and htf1CodeRaw == baseCode
+mtf2Same = mtf2On and baseCode != 0 and htf2CodeRaw == baseCode
+mtf3Same = mtf3On and baseCode != 0 and htf3CodeRaw == baseCode
+
+mtfEnabledCount = (mtf1On ? 1 : 0) + (mtf2On ? 1 : 0) + (mtf3On ? 1 : 0)
+mtfDirAgreeCount = (mtf1Agree ? 1 : 0) + (mtf2Agree ? 1 : 0) + (mtf3Agree ? 1 : 0)
+mtfSamePatternCount = (mtf1Same ? 1 : 0) + (mtf2Same ? 1 : 0) + (mtf3Same ? 1 : 0)
+
+mtfGateOk = mtfMode != "Gate" or not enableMTF or mtfEnabledCount == 0 or mtfDirAgreeCount >= minMtfAgreeForGate
+mtfWarnFlag = mtfMode == "Warn" and enableMTF and mtfEnabledCount > 0 and baseCode != 0 and mtfDirAgreeCount == 0
+
+// =====================================================================================
+// SIGNAL LOGIC - aggregate across all reliable patterns, gated by MTF mode and volume
+// =====================================================================================
+anyBullishReliable = (bullEngulf and bullEngulfRel) or (bullHammer and bullHammerRel) or (bullInvHammer and bullInvHammerRel) or (bullHarami and bullHaramiRel) or (bullMorningStar and bullMorningStarRel) or (bullPiercing and bullPiercingRel) or (bullSoldiers and bullSoldiersRel)
+anyBearishReliable = (bearEngulf and bearEngulfRel) or (bearHangingMan and bearHangingManRel) or (bearShootingStar and bearShootingStarRel) or (bearHarami and bearHaramiRel) or (bearEveningStar and bearEveningStarRel) or (bearDarkCloud and bearDarkCloudRel) or (bearCrows and bearCrowsRel)
+
+volSma = ta.sma(volume, volConfirmLen)
+volOk = requireVolConfirm ? (volume >= volSma * volConfirmMult) : true
+
+bullishSignal = anyBullishReliable and mtfGateOk and volOk
+bearishSignal = anyBearishReliable and mtfGateOk and volOk
+
+var string lastEventType = "None"
+var int lastEventBar = na
+if bullishSignal
+    lastEventType := "Bullish Signal"
+    lastEventBar := bar_index
+if bearishSignal
+    lastEventType := "Bearish Signal"
+    lastEventBar := bar_index
+barsSinceEvent = na(lastEventBar) ? na : bar_index - lastEventBar
+
+// =====================================================================================
+// AGGREGATE RELIABILITY ROLL-UPS (tracked-count-weighted average across each side's 7 patterns)
+// =====================================================================================
+bullWeightedSum = (na(bullEngulfAcc) ? 0.0 : bullEngulfAcc * bullEngulfN) + (na(bullHammerAcc) ? 0.0 : bullHammerAcc * bullHammerN) + (na(bullInvHammerAcc) ? 0.0 : bullInvHammerAcc * bullInvHammerN) + (na(bullHaramiAcc) ? 0.0 : bullHaramiAcc * bullHaramiN) + (na(bullMorningStarAcc) ? 0.0 : bullMorningStarAcc * bullMorningStarN) + (na(bullPiercingAcc) ? 0.0 : bullPiercingAcc * bullPiercingN) + (na(bullSoldiersAcc) ? 0.0 : bullSoldiersAcc * bullSoldiersN)
+bullWeightedN = bullEngulfN + bullHammerN + bullInvHammerN + bullHaramiN + bullMorningStarN + bullPiercingN + bullSoldiersN
+avgBullAcc = bullWeightedN > 0 ? bullWeightedSum / bullWeightedN : float(na)
+
+bearWeightedSum = (na(bearEngulfAcc) ? 0.0 : bearEngulfAcc * bearEngulfN) + (na(bearHangingManAcc) ? 0.0 : bearHangingManAcc * bearHangingManN) + (na(bearShootingStarAcc) ? 0.0 : bearShootingStarAcc * bearShootingStarN) + (na(bearHaramiAcc) ? 0.0 : bearHaramiAcc * bearHaramiN) + (na(bearEveningStarAcc) ? 0.0 : bearEveningStarAcc * bearEveningStarN) + (na(bearDarkCloudAcc) ? 0.0 : bearDarkCloudAcc * bearDarkCloudN) + (na(bearCrowsAcc) ? 0.0 : bearCrowsAcc * bearCrowsN)
+bearWeightedN = bearEngulfN + bearHangingManN + bearShootingStarN + bearHaramiN + bearEveningStarN + bearDarkCloudN + bearCrowsN
+avgBearAcc = bearWeightedN > 0 ? bearWeightedSum / bearWeightedN : float(na)
+
+// =====================================================================================
+// PLOTS
+// =====================================================================================
+plotshape(bullishSignal and not mtfWarnFlag, title="Bullish Signal", style=shape.triangleup, location=location.belowbar, color=bullishColor, size=size.small)
+plotshape(bullishSignal and mtfWarnFlag, title="Bullish Signal (No MTF Confirmation)", style=shape.triangleup, location=location.belowbar, color=color.new(bullishColor, 55), size=size.tiny)
+plotshape(bearishSignal and not mtfWarnFlag, title="Bearish Signal", style=shape.triangledown, location=location.abovebar, color=bearishColor, size=size.small)
+plotshape(bearishSignal and mtfWarnFlag, title="Bearish Signal (No MTF Confirmation)", style=shape.triangledown, location=location.abovebar, color=color.new(bearishColor, 55), size=size.tiny)
+
+// =====================================================================================
+// DASHBOARD TABLE - 3 columns (Pattern / Reliability / Tracked), 19 rows
+// =====================================================================================
+tablePosConst = tablePosIn == "Top Left" ? position.top_left : tablePosIn == "Top Right" ? position.top_right : tablePosIn == "Bottom Left" ? position.bottom_left : position.bottom_right
+tableSizeConst = tableSizeIn == "Tiny" ? size.tiny : tableSizeIn == "Normal" ? size.normal : tableSizeIn == "Large" ? size.large : tableSizeIn == "Huge" ? size.huge : size.small
+
+var table dash = table.new(tablePosConst, 3, 19, border_width=1)
+
+f_cell(_col, _row, _txt, _bg, _txtcol) =>
+    table.cell(dash, _col, _row, _txt, bgcolor=_bg, text_color=_txtcol, text_size=tableSizeConst)
+
+f_relColor(accPct, trackedN) =>
+    trackedN < minTrackedForGating ? color.new(color.gray, 85) : na(accPct) ? color.new(color.gray, 85) : accPct >= minReliabilityPct ? color.new(bullishColor, 78) : color.new(bearishColor, 78)
+
+f_relTxt(accPct, trackedN) =>
+    trackedN < minTrackedForGating ? "Building..." : na(accPct) ? "—" : str.tostring(accPct, "#.#") + "%"
+
+f_patternRow(_row, _name, accPct, trackedN) =>
+    f_cell(0, _row, _name, color.new(color.gray, 90), color.black)
+    f_cell(1, _row, f_relTxt(accPct, trackedN), f_relColor(accPct, trackedN), color.black)
+    f_cell(2, _row, str.tostring(trackedN), color.new(color.gray, 90), color.black)
+
+if showTable and barstate.islast
+    f_cell(0, 0, "MYND CPRL v1.0", headerBgColor, headerTextColor)
+    f_cell(1, 0, "Reliability", headerBgColor, headerTextColor)
+    f_cell(2, 0, "Tracked", headerBgColor, headerTextColor)
+
+    mtfTxt = not enableMTF ? "MTF Off" : mtfMode + " (" + str.tostring(mtfDirAgreeCount) + "/" + str.tostring(mtfEnabledCount) + " agree, " + str.tostring(mtfSamePatternCount) + " same)"
+    f_cell(0, 1, "MTF Mode / Agreement", color.new(color.gray, 85), color.black)
+    f_cell(1, 1, mtfTxt, color.new(color.gray, 88), color.black)
+    f_cell(2, 1, "", color.new(color.gray, 88), color.black)
+
+    lastColor = lastEventType == "Bullish Signal" ? color.new(bullishColor, 70) : lastEventType == "Bearish Signal" ? color.new(bearishColor, 70) : color.new(color.gray, 85)
+    lastTxt = na(barsSinceEvent) ? "None yet" : lastEventType + " (" + str.tostring(barsSinceEvent) + " bars ago)"
+    f_cell(0, 2, "Last Signal", color.new(color.gray, 85), color.black)
+    f_cell(1, 2, lastTxt, lastColor, color.black)
+    f_cell(2, 2, "", lastColor, color.black)
+
+    f_patternRow(3, "Overall Bullish Reliability", avgBullAcc, bullWeightedN)
+    f_patternRow(4, "Overall Bearish Reliability", avgBearAcc, bearWeightedN)
+
+    f_patternRow(5, "Bullish Engulfing", bullEngulfAcc, bullEngulfN)
+    f_patternRow(6, "Hammer", bullHammerAcc, bullHammerN)
+    f_patternRow(7, "Inverted Hammer", bullInvHammerAcc, bullInvHammerN)
+    f_patternRow(8, "Bullish Harami", bullHaramiAcc, bullHaramiN)
+    f_patternRow(9, "Morning Star", bullMorningStarAcc, bullMorningStarN)
+    f_patternRow(10, "Piercing Line", bullPiercingAcc, bullPiercingN)
+    f_patternRow(11, "Three White Soldiers", bullSoldiersAcc, bullSoldiersN)
+
+    f_patternRow(12, "Bearish Engulfing", bearEngulfAcc, bearEngulfN)
+    f_patternRow(13, "Hanging Man", bearHangingManAcc, bearHangingManN)
+    f_patternRow(14, "Shooting Star", bearShootingStarAcc, bearShootingStarN)
+    f_patternRow(15, "Bearish Harami", bearHaramiAcc, bearHaramiN)
+    f_patternRow(16, "Evening Star", bearEveningStarAcc, bearEveningStarN)
+    f_patternRow(17, "Dark Cloud Cover", bearDarkCloudAcc, bearDarkCloudN)
+    f_patternRow(18, "Three Black Crows", bearCrowsAcc, bearCrowsN)
+
+// =====================================================================================
+// ALERTS - INDIVIDUAL
+// =====================================================================================
+alertcondition(bullishSignal, title="Bullish Signal", message="MYND CPRL: Bullish signal on {{ticker}} ({{interval}}) - check dashboard for which pattern(s) and their current reliability.")
+alertcondition(bearishSignal, title="Bearish Signal", message="MYND CPRL: Bearish signal on {{ticker}} ({{interval}}) - check dashboard for which pattern(s) and their current reliability.")
+alertcondition(mtfWarnFlag, title="MTF Disagreement Warning", message="MYND CPRL: A signal fired with NO higher-timeframe confirmation on {{ticker}} ({{interval}}) - check dashboard.")
+
+// =====================================================================================
+// ALERTS - COMBO BUNDLE
+// =====================================================================================
+allSignals = bullishSignal or bearishSignal
+alertcondition(allSignals, title="ALL Signals", message="MYND CPRL: Signal on {{ticker}} ({{interval}}) - check chart/dashboard.")

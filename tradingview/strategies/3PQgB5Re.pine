@@ -1,0 +1,227 @@
+//@version=6
+strategy("Estrategia A v2.9 - Partial TP + BE + NY10-15", 
+         shorttitle="EA v2.9",
+         overlay=true, 
+         pyramiding=0, 
+         initial_capital=10000, 
+         calc_on_order_fills=true, 
+         calc_on_every_tick=false,
+         default_qty_type=strategy.fixed,
+         default_qty_value=2)
+
+//=========================
+// Inputs
+//=========================
+smaLen          = input.int(20,    "SMA Length",   minval=1)
+slPips          = input.float(10.0, "Stop Loss (pips)",       step=0.1)
+tp1Pips         = input.float(12.0, "TP1 - 50% posicion (pips)", step=0.1)
+tp2Pips         = input.float(20.0, "TP2 - 50% posicion (pips)", step=0.1)
+
+grpBE           = "── Breakeven"
+beCushion       = input.float(0.0, "Colchon BE tras TP1 (pips)", step=0.5, group=grpBE)
+
+grpHour         = "── Filtro de hora (NY)"
+startHourNY     = input.int(10,  "Hora inicio NY", minval=0, maxval=23, group=grpHour)
+endHourNY       = input.int(15, "Hora cierre NY", minval=1, maxval=24, group=grpHour)
+
+grpCandle       = "── Filtro de vela"
+useStrongCandle = input.bool(true,  "Usar filtro de vela fuerte", group=grpCandle)
+bodyMult        = input.float(0.9,  "Multiplicador cuerpo",       step=0.1, group=grpCandle)
+rangeLookback   = input.int(20,     "Promedio cuerpo (barras)",   minval=5, group=grpCandle)
+
+grpRSI          = "── Filtro RSI"
+useRSI          = input.bool(true,  "Filtrar extremos RSI",  group=grpRSI)
+rsiLen          = input.int(14,     "RSI periodo",           minval=5, group=grpRSI)
+rsiLow          = input.float(30.0, "RSI minimo",            step=1.0, group=grpRSI)
+rsiHigh         = input.float(70.0, "RSI maximo",            step=1.0, group=grpRSI)
+
+grpBB           = "── Filtro BB squeeze"
+useSqueeze      = input.bool(true,    "Evitar rango (BB squeeze)", group=grpBB)
+bbLen           = input.int(20,       "BB Length",                 minval=5, group=grpBB)
+bbMult          = input.float(2.0,    "BB Mult",                   step=0.1, group=grpBB)
+squeezePct      = input.float(0.0015, "Umbral squeeze",            step=0.0001, group=grpBB)
+
+grpADX          = "── Filtro ADX (opcional)"
+useADX          = input.bool(false, "Usar filtro ADX", group=grpADX)
+adxLen          = input.int(14,     "ADX periodo",     minval=5, group=grpADX)
+adxMin          = input.float(25.0, "ADX minimo",      step=1.0, group=grpADX)
+
+grpDay          = "── Filtro de dia"
+useMon          = input.bool(true,  "Lunes",     group=grpDay)
+useTue          = input.bool(true,  "Martes",    group=grpDay)
+useWed          = input.bool(false, "Miercoles", group=grpDay)
+useThu          = input.bool(true,  "Jueves",    group=grpDay)
+useFri          = input.bool(true,  "Viernes",   group=grpDay)
+
+grpVis          = "── Visual"
+showBG          = input.bool(true, "Mostrar fondo sesion NY", group=grpVis)
+showADXline     = input.bool(true, "Mostrar ADX en panel",    group=grpVis)
+
+//=========================
+// Utilidades
+//=========================
+pip = 0.0001
+
+nyHour = hour(time, "America/New_York")
+inNY   = nyHour >= startHourNY and nyHour < endHourNY
+
+dow   = dayofweek(time, "America/New_York")
+dayOk = (dow == dayofweek.monday    and useMon)
+      or (dow == dayofweek.tuesday   and useTue)
+      or (dow == dayofweek.wednesday and useWed)
+      or (dow == dayofweek.thursday  and useThu)
+      or (dow == dayofweek.friday    and useFri)
+
+filterTime = inNY and dayOk
+
+//=========================
+// SMA base 5M
+//=========================
+sma5 = ta.sma(close, smaLen)
+
+crossUp   = close > sma5 and close[1] <= sma5[1]
+crossDown = close < sma5 and close[1] >= sma5[1]
+
+//=========================
+// Filtro MTF: 15M + 1H
+//=========================
+close15 = request.security(syminfo.tickerid, "15", close,                 barmerge.gaps_off, barmerge.lookahead_off)
+sma15   = request.security(syminfo.tickerid, "15", ta.sma(close, smaLen), barmerge.gaps_off, barmerge.lookahead_off)
+close60 = request.security(syminfo.tickerid, "60", close,                 barmerge.gaps_off, barmerge.lookahead_off)
+sma60   = request.security(syminfo.tickerid, "60", ta.sma(close, smaLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+bullTrend = close15 > sma15 and close60 > sma60
+bearTrend = close15 < sma15 and close60 < sma60
+
+//=========================
+// Vela fuerte
+//=========================
+body       = math.abs(close - open)
+avgBody    = ta.sma(body, rangeLookback)
+strongBull = close > open and body >= avgBody * bodyMult
+strongBear = close < open and body >= avgBody * bodyMult
+
+//=========================
+// RSI
+//=========================
+rsiVal = ta.rsi(close, rsiLen)
+rsiOk  = not useRSI or (rsiVal > rsiLow and rsiVal < rsiHigh)
+
+//=========================
+// BB squeeze
+//=========================
+basis        = ta.sma(close, bbLen)
+dev          = ta.stdev(close, bbLen) * bbMult
+bbWidth      = (basis + dev - (basis - dev)) / close
+notInSqueeze = bbWidth > squeezePct
+
+//=========================
+// ADX
+//=========================
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+adxOk = not useADX or adxVal > adxMin
+
+//=========================
+// Senales finales
+//=========================
+longSignal =
+     crossUp         and
+     bullTrend       and
+     filterTime      and
+     rsiOk           and
+     adxOk           and
+     (not useStrongCandle or strongBull) and
+     (not useSqueeze      or notInSqueeze)
+
+shortSignal =
+     crossDown       and
+     bearTrend       and
+     filterTime      and
+     rsiOk           and
+     adxOk           and
+     (not useStrongCandle or strongBear) and
+     (not useSqueeze      or notInSqueeze)
+
+//=========================
+// Entradas (tamanio 2 = 2 unidades para poder cerrar 50% en TP1)
+//=========================
+if longSignal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=2)
+
+if shortSignal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=2)
+
+//=========================
+// Salidas con Partial TP + Breakeven
+//=========================
+entryPrice = strategy.position_avg_price
+
+// TP1: cierra 50% (1 unidad) al llegar a 12 pips
+// TP2: cierra el 50% restante al llegar a 20 pips
+// SL: stop loss en ambas mitades
+// Tras TP1: el SL de la segunda mitad se mueve a entrada + colchon (BE)
+
+if strategy.position_size > 0
+    // Primera mitad: TP1 o SL
+    strategy.exit("Long TP1", from_entry="Long",
+                  qty       = 1,
+                  stop      = entryPrice - slPips   * pip,
+                  limit     = entryPrice + tp1Pips  * pip)
+    // Segunda mitad: TP2 o BE (SL se actualiza al activarse TP1)
+    beLevel = entryPrice + beCushion * pip
+    slLevel = strategy.position_size == 2 ? entryPrice - slPips * pip : beLevel
+    strategy.exit("Long TP2", from_entry="Long",
+                  qty       = 1,
+                  stop      = slLevel,
+                  limit     = entryPrice + tp2Pips  * pip)
+
+if strategy.position_size < 0
+    strategy.exit("Short TP1", from_entry="Short",
+                  qty       = 1,
+                  stop      = entryPrice + slPips   * pip,
+                  limit     = entryPrice - tp1Pips  * pip)
+    beLevel = entryPrice - beCushion * pip
+    slLevel = strategy.position_size == -2 ? entryPrice + slPips * pip : beLevel
+    strategy.exit("Short TP2", from_entry="Short",
+                  qty       = 1,
+                  stop      = slLevel,
+                  limit     = entryPrice - tp2Pips  * pip)
+
+//=========================
+// Visual
+//=========================
+plot(sma5, "SMA 20", color=color.new(color.blue, 0), linewidth=2)
+
+plotshape(longSignal,  title="Long",  style=shape.triangleup,
+          location=location.belowbar, color=color.new(color.green,0), size=size.small)
+plotshape(shortSignal, title="Short", style=shape.triangledown,
+          location=location.abovebar, color=color.new(color.red,0),   size=size.small)
+
+bgcolor(showBG and filterTime ? color.new(color.teal, 90) : na, title="Ventana NY")
+
+// Niveles TP1 / TP2 / SL en el grafico
+longTP1  = strategy.position_size > 0 ? strategy.position_avg_price + tp1Pips * pip : na
+longTP2  = strategy.position_size > 0 ? strategy.position_avg_price + tp2Pips * pip : na
+longSL   = strategy.position_size > 0 ? strategy.position_avg_price - slPips  * pip : na
+shortTP1 = strategy.position_size < 0 ? strategy.position_avg_price - tp1Pips * pip : na
+shortTP2 = strategy.position_size < 0 ? strategy.position_avg_price - tp2Pips * pip : na
+shortSL  = strategy.position_size < 0 ? strategy.position_avg_price + slPips  * pip : na
+
+plot(longTP1,  "Long TP1",  color=color.new(color.green, 30), style=plot.style_linebr, linewidth=1)
+plot(longTP2,  "Long TP2",  color=color.new(color.green,  0), style=plot.style_linebr, linewidth=2)
+plot(longSL,   "Long SL",   color=color.new(color.red,    0), style=plot.style_linebr, linewidth=1)
+plot(shortTP1, "Short TP1", color=color.new(color.green, 30), style=plot.style_linebr, linewidth=1)
+plot(shortTP2, "Short TP2", color=color.new(color.green,  0), style=plot.style_linebr, linewidth=2)
+plot(shortSL,  "Short SL",  color=color.new(color.red,    0), style=plot.style_linebr, linewidth=1)
+
+// RSI panel
+plot(rsiVal, "RSI", color=color.new(color.purple,0), linewidth=1, display=display.pane)
+hline(70, "RSI 70", color=color.new(color.red,   60), linestyle=hline.style_dashed)
+hline(50, "RSI 50", color=color.new(color.gray,  70), linestyle=hline.style_dotted)
+hline(30, "RSI 30", color=color.new(color.green, 60), linestyle=hline.style_dashed)
+
+// ADX panel
+plot(showADXline ? adxVal : na, "ADX",
+     color=color.new(color.orange,0), linewidth=1, display=display.pane)
+hline(25, "ADX 25", color=color.new(color.orange,60), linestyle=hline.style_dashed)
+hline(30, "ADX 30", color=color.new(color.red,   60), linestyle=hline.style_dashed)

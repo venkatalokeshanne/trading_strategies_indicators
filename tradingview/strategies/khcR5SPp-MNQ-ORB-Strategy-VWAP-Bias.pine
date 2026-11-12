@@ -1,0 +1,291 @@
+//@version=5
+strategy("MNQ ORB Strategy - VWAP + Bias", overlay=true,
+         default_qty_type=strategy.fixed,
+         default_qty_value=2,
+         pyramiding=0,
+         calc_on_order_fills=true,
+         process_orders_on_close=false)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════════════════════
+orbMinutes      = input.int(10,    "ORB Window (minutes)",           minval=1,  step=5,   group="ORB Settings")
+bufferTicks     = input.int(4,     "Buffer Above/Below ORB (ticks)", minval=0,  step=1,   group="ORB Settings")
+numContracts    = input.int(2,     "Number of Contracts",            minval=1,  step=1,   group="Position Sizing")
+tpTicks         = input.int(120,   "Take Profit (ticks)",            minval=4,  step=4,   group="Risk Management")
+slTicks         = input.int(60,    "Stop Loss (ticks)",              minval=4,  step=4,   group="Risk Management")
+useTrailingStop = input.bool(false,"Use Trailing Stop",              group="Risk Management")
+trailTicks      = input.float(60,  "Trailing Stop (ticks)",          minval=4,  step=4,   group="Risk Management")
+useATRFilter    = input.bool(true,  "Use ATR Range Filter",          group="Filters")
+atrMultiplier   = input.float(1.5,  "Max ORB Range (x Daily ATR)",   minval=0.5, step=0.1, group="Filters")
+useVWAPFilter   = input.bool(true,  "Use VWAP Filter",               group="Filters")
+useVWAPExit     = input.bool(true,  "Exit on VWAP Cross",            group="Filters")
+biasMode        = input.string("Both", "Trade Direction",
+                  options=["Both", "Long Only", "Short Only"],       group="Bias Settings")
+entryEnd        = input.int(11,    "Entry Window End (hour ET)",     minval=10, step=1,   group="Session Settings")
+showLevels      = input.bool(true,  "Show ORB Levels",               group="Display")
+showVWAP        = input.bool(true,  "Show VWAP",                     group="Display")
+showInfo        = input.bool(true,  "Show Info Panel",               group="Display")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TICK MATH
+// ══════════════════════════════════════════════════════════════════════════════
+tickSize     = syminfo.mintick
+pointValue   = syminfo.pointvalue
+tickValue    = tickSize * pointValue
+
+tpPoints     = tpTicks    * tickSize
+slPoints     = slTicks    * tickSize
+trailPoints  = trailTicks * tickSize
+bufferPoints = bufferTicks * tickSize
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VWAP
+// ══════════════════════════════════════════════════════════════════════════════
+vwap = ta.vwap(hlc3)
+plot(showVWAP ? vwap : na, "VWAP", color=color.new(color.purple, 0), linewidth=2)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ATR FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+dailyATR = request.security(syminfo.tickerid, "D", ta.atr(14), lookahead=barmerge.lookahead_off)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SESSION & ORB WINDOW LOGIC
+// ══════════════════════════════════════════════════════════════════════════════
+nyHour   = hour(time,   "America/New_York")
+nyMinute = minute(time, "America/New_York")
+nyMins   = nyHour * 60 + nyMinute
+
+marketOpen    = 9 * 60 + 30
+orbEnd        = marketOpen + orbMinutes
+entryClose    = entryEnd * 60
+
+isNewDay      = ta.change(time("D")) != 0
+isInORB       = nyMins >= marketOpen and nyMins < orbEnd
+isPostORB     = nyMins >= orbEnd
+isEntryWindow = nyMins >= orbEnd and nyMins <= entryClose
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STATE VARIABLES
+// ══════════════════════════════════════════════════════════════════════════════
+var float orbHigh              = na
+var float orbLow               = na
+var bool  orbSet               = false
+var bool  signalFiredToday     = false
+var bool  atrPassedToday       = false
+var float trailActivationPrice = na
+var bool  trailActivated       = false
+var bool  orbBrokenLong        = false
+var bool  orbBrokenShort       = false
+var bool  longEntryMissed      = false
+var bool  shortEntryMissed     = false
+
+if isNewDay
+    orbHigh              := na
+    orbLow               := na
+    orbSet               := false
+    signalFiredToday     := false
+    atrPassedToday       := false
+    trailActivationPrice := na
+    trailActivated       := false
+    orbBrokenLong        := false
+    orbBrokenShort       := false
+    longEntryMissed      := false
+    shortEntryMissed     := false
+
+// ── Track ORB high/low ──────────────────────────────────────────────────────
+if isInORB
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow  := na(orbLow)  ? low  : math.min(orbLow,  low)
+
+if isPostORB and not orbSet and not na(orbHigh)
+    orbSet         := true
+    orbRange       = orbHigh - orbLow
+    atrPassedToday := not useATRFilter or (orbRange <= atrMultiplier * dailyATR)
+
+buyLevel  = na(orbHigh) ? na : orbHigh + bufferPoints
+sellLevel = na(orbLow)  ? na : orbLow  - bufferPoints
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRACK BREAKOUTS AND MISSED ENTRIES
+// Key fix: if ORB breaks but VWAP blocks the entry, mark it as missed
+// No further entry allowed in that direction for the rest of the day
+// ══════════════════════════════════════════════════════════════════════════════
+longBreakBar  = orbSet and isPostORB and not na(buyLevel)  and high > buyLevel  and not orbBrokenLong
+shortBreakBar = orbSet and isPostORB and not na(sellLevel) and low  < sellLevel and not orbBrokenShort
+
+if longBreakBar
+    orbBrokenLong := true
+    if useVWAPFilter and close < vwap
+        longEntryMissed := true
+
+if shortBreakBar
+    orbBrokenShort := true
+    if useVWAPFilter and close > vwap
+        shortEntryMissed := true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VWAP FILTER
+// ══════════════════════════════════════════════════════════════════════════════
+aboveVWAP = close > vwap
+belowVWAP = close < vwap
+
+vwapLongOK  = not useVWAPFilter or aboveVWAP
+vwapShortOK = not useVWAPFilter or belowVWAP
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ENTRY SIGNALS
+// Entry only allowed on the exact breakout bar
+// If VWAP blocked the breakout bar, entry is missed for the day
+// ══════════════════════════════════════════════════════════════════════════════
+longSignal  = longBreakBar and not signalFiredToday
+              and not orbBrokenShort and atrPassedToday
+              and isEntryWindow and vwapLongOK
+              and not longEntryMissed
+              and (biasMode == "Both" or biasMode == "Long Only")
+
+shortSignal = shortBreakBar and not signalFiredToday
+              and not orbBrokenLong and atrPassedToday
+              and isEntryWindow and vwapShortOK
+              and not shortEntryMissed
+              and (biasMode == "Both" or biasMode == "Short Only")
+
+if longSignal
+    strategy.entry("ORB Long", strategy.long, qty=numContracts, stop=buyLevel)
+    signalFiredToday := true
+
+if shortSignal
+    strategy.entry("ORB Short", strategy.short, qty=numContracts, stop=sellLevel)
+    signalFiredToday := true
+
+// ══════════════════════════════════════════════════════════════════════════════
+// EXITS
+// ══════════════════════════════════════════════════════════════════════════════
+if strategy.position_size > 0
+    if useVWAPExit and ta.crossunder(close, vwap)
+        strategy.close("ORB Long", comment="VWAP Cross Exit")
+
+    if useTrailingStop
+        if barstate.isconfirmed
+            if na(trailActivationPrice)
+                trailActivationPrice := strategy.position_avg_price + trailPoints
+            if high >= trailActivationPrice
+                trailActivated := true
+
+        strategy.exit("TP", from_entry="ORB Long",
+                      limit = strategy.position_avg_price + tpPoints)
+
+        if trailActivated
+            strategy.exit("Trail", from_entry="ORB Long",
+                          trail_price  = trailActivationPrice,
+                          trail_offset = math.round(trailPoints / tickSize),
+                          stop         = strategy.position_avg_price - slPoints)
+        else
+            strategy.exit("Trail", from_entry="ORB Long",
+                          stop = strategy.position_avg_price - slPoints)
+    else
+        strategy.exit("TP/SL", from_entry="ORB Long",
+                      limit = strategy.position_avg_price + tpPoints,
+                      stop  = strategy.position_avg_price - slPoints)
+
+if strategy.position_size < 0
+    if useVWAPExit and ta.crossover(close, vwap)
+        strategy.close("ORB Short", comment="VWAP Cross Exit")
+
+    if useTrailingStop
+        if barstate.isconfirmed
+            if na(trailActivationPrice)
+                trailActivationPrice := strategy.position_avg_price - trailPoints
+            if low <= trailActivationPrice
+                trailActivated := true
+
+        strategy.exit("TP", from_entry="ORB Short",
+                      limit = strategy.position_avg_price - tpPoints)
+
+        if trailActivated
+            strategy.exit("Trail", from_entry="ORB Short",
+                          trail_price  = trailActivationPrice,
+                          trail_offset = math.round(trailPoints / tickSize),
+                          stop         = strategy.position_avg_price + slPoints)
+        else
+            strategy.exit("Trail", from_entry="ORB Short",
+                          stop = strategy.position_avg_price + slPoints)
+    else
+        strategy.exit("TP/SL", from_entry="ORB Short",
+                      limit = strategy.position_avg_price - tpPoints,
+                      stop  = strategy.position_avg_price + slPoints)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════════════════════════════════════
+plot(showLevels ? orbHigh   : na, "ORB High",   color=color.blue,   linewidth=1)
+plot(showLevels ? orbLow    : na, "ORB Low",    color=color.red,    linewidth=1)
+plot(showLevels ? buyLevel  : na, "Buy Level",  color=color.lime,   linewidth=2)
+plot(showLevels ? sellLevel : na, "Sell Level", color=color.orange, linewidth=2)
+
+plotshape(longSignal,  title="Long Signal",  style=shape.triangleup,
+          location=location.belowbar, color=color.green, size=size.large, text="ORB L")
+plotshape(shortSignal, title="Short Signal", style=shape.triangledown,
+          location=location.abovebar, color=color.red,   size=size.large, text="ORB S")
+
+// Missed entry markers — shows where VWAP blocked a breakout
+plotshape(longBreakBar  and longEntryMissed,  title="Long Missed",  style=shape.xcross,
+          location=location.belowbar, color=color.yellow, size=size.small, text="missed")
+plotshape(shortBreakBar and shortEntryMissed, title="Short Missed", style=shape.xcross,
+          location=location.abovebar, color=color.yellow, size=size.small, text="missed")
+
+vwapColor = close > vwap ? color.new(color.green, 80) : color.new(color.red, 80)
+bgcolor(showVWAP ? vwapColor : na, title="VWAP Background")
+
+// ── Info panel ───────────────────────────────────────────────────────────────
+if showInfo and barstate.islast
+    tpDollars = tpTicks * tickValue * numContracts
+    slDollars = slTicks * tickValue * numContracts
+    orbRange  = na(orbHigh) or na(orbLow) ? 0.0 : orbHigh - orbLow
+    orbTicks  = math.round(orbRange / tickSize)
+    vwapSide  = close > vwap ? "ABOVE" : "BELOW"
+
+    info  = "MNQ ORB — VWAP + Bias\n"
+    info += "Bias       : " + biasMode + "\n"
+    info += "Contracts  : " + str.tostring(numContracts) + "\n"
+    info += "TP         : " + str.tostring(tpTicks) + " ticks ($" + str.tostring(tpDollars, "#") + ")\n"
+    info += "SL         : " + str.tostring(slTicks) + " ticks ($" + str.tostring(slDollars, "#") + ")\n"
+    info += "ORB Range  : " + str.tostring(orbTicks) + " ticks\n"
+    info += "ATR Filter : " + (atrPassedToday ? "PASS" : "FAIL") + "\n"
+    info += "VWAP       : Price " + vwapSide + "\n"
+    info += "Long missed: " + (longEntryMissed  ? "YES — no re-entry" : "NO") + "\n"
+    info += "Short missed: " + (shortEntryMissed ? "YES — no re-entry" : "NO") + "\n"
+    info += "Entry OK   : " + (isEntryWindow ? "YES" : "NO")
+
+    var label infoLabel = na
+    label.delete(infoLabel)
+    infoLabel := label.new(bar_index, high,
+                  text=info,
+                  style=label.style_label_left,
+                  color=color.new(color.navy, 20),
+                  textcolor=color.white,
+                  size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TRADERSPOST ALERT
+// ══════════════════════════════════════════════════════════════════════════════
+if longSignal
+    jsonMsg = '{"ticker":"MNQ1!",'   +
+              '"action":"buy",'       +
+              '"orderType":"market",' +
+              '"quantity":'           + str.tostring(numContracts) + '}'
+    alert(jsonMsg, alert.freq_once_per_bar_close)
+
+if shortSignal
+    jsonMsg = '{"ticker":"MNQ1!",'   +
+              '"action":"sell",'      +
+              '"orderType":"market",' +
+              '"quantity":'           + str.tostring(numContracts) + '}'
+    alert(jsonMsg, alert.freq_once_per_bar_close)
+
+if strategy.position_size[1] > 0 and strategy.position_size == 0
+    alert('{"ticker":"MNQ1!","action":"exit"}', alert.freq_once_per_bar_close)
+
+if strategy.position_size[1] < 0 and strategy.position_size == 0
+    alert('{"ticker":"MNQ1!","action":"exit"}', alert.freq_once_per_bar_close)

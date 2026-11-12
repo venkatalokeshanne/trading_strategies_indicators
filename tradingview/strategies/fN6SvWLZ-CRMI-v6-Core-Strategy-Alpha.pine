@@ -1,0 +1,635 @@
+//@version=6
+strategy("CRMI v6 Core Strategy Alpha", overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10,
+     pyramiding=0,
+     calc_on_every_tick=false,
+     process_orders_on_close=true,
+     max_labels_count=300,
+     max_lines_count=300,
+     max_boxes_count=100)
+
+// =====================================================
+// ===================== INPUTS =========================
+// =====================================================
+
+// ---------- Structure ----------
+groupStructure = "Structure"
+majorPivotLen = input.int(10, "Major Pivot Length", minval=2, group=groupStructure)
+minorPivotLen = input.int(4, "Minor Pivot Length", minval=2, group=groupStructure)
+
+// ---------- Trend ----------
+groupTrend = "Trend"
+trendBaseLenFast = input.int(20, "Trend Base Fast", minval=2, group=groupTrend)
+trendBaseLenMid  = input.int(50, "Trend Base Mid", minval=2, group=groupTrend)
+trendBaseLenSlow = input.int(200, "Trend Base Slow", minval=2, group=groupTrend)
+trendSlopeLookback = input.int(10, "Trend Slope Lookback", minval=1, group=groupTrend)
+useTrendFilter = input.bool(true, "Use Trend Confirmation", group=groupTrend)
+
+// ---------- Value ----------
+groupValue = "Value Engine"
+equilibriumLen = input.int(34, "Equilibrium Length", minval=2, group=groupValue)
+equilibriumBandATRMult = input.float(1.0, "Equilibrium ATR Band", minval=0.1, step=0.1, group=groupValue)
+balancedValueThreshold = input.float(0.50, "Balanced Pullback Threshold", minval=0.1, maxval=0.95, step=0.05, group=groupValue)
+deepValueThreshold = input.float(0.70, "Deep Pullback Threshold", minval=0.1, maxval=0.95, step=0.05, group=groupValue)
+
+// ---------- Regime ----------
+groupRegime = "Regime"
+atrLen = input.int(14, "ATR Length", minval=1, group=groupRegime)
+trendEfficiencyLookback = input.int(20, "Trend Efficiency Lookback", minval=5, group=groupRegime)
+volatilityDisorderThreshold = input.float(2.2, "Volatility Disorder Threshold", minval=0.5, step=0.1, group=groupRegime)
+
+// ---------- Mode ----------
+groupMode = "Execution Mode"
+executionMode = input.string("HYBRID", "Execution Mode", options=["FAST", "LONG", "HYBRID"], group=groupMode)
+fastMinScore   = input.int(65, "Fast Min Score", minval=0, maxval=100, group=groupMode)
+longMinScore   = input.int(80, "Long Min Score", minval=0, maxval=100, group=groupMode)
+hybridMinScore = input.int(72, "Hybrid Min Score", minval=0, maxval=100, group=groupMode)
+
+// ---------- Risk ----------
+groupRisk = "Risk"
+atrStopMultFast = input.float(0.8, "ATR Stop Mult Fast", minval=0.1, step=0.1, group=groupRisk)
+atrStopMultLong = input.float(1.5, "ATR Stop Mult Long", minval=0.1, step=0.1, group=groupRisk)
+partialTakeRR   = input.float(1.5, "Target RR", minval=0.5, step=0.1, group=groupRisk)
+breakEvenTriggerRR = input.float(1.0, "Break-even Trigger RR", minval=0.2, step=0.1, group=groupRisk)
+minRR = input.float(1.2, "Minimum RR Filter", minval=0.5, step=0.1, group=groupRisk)
+
+// ---------- Control ----------
+groupControl = "Trade Control"
+cooldownBars = input.int(8, "Cooldown Bars After Exit", minval=0, group=groupControl)
+allowReentry = input.bool(true, "Allow Re-entry", group=groupControl)
+oneTradePerDirection = input.bool(true, "One Trade Per Direction Until Reset", group=groupControl)
+maxTradesPerCycle = input.int(2, "Max Trades Per Direction Cycle", minval=1, group=groupControl)
+
+// ---------- Display ----------
+groupDisplay = "Display"
+showTrend = input.bool(true, "Show Trend Baselines", group=groupDisplay)
+showValueZones = input.bool(true, "Show Value Bands", group=groupDisplay)
+showSignals = input.bool(true, "Show Entry Signals", group=groupDisplay)
+showDebug = input.bool(true, "Show Debug Table", group=groupDisplay)
+
+
+// =====================================================
+// ================= HELPER FUNCTIONS ===================
+// =====================================================
+
+f_clamp(_x, _min, _max) =>
+    math.max(_min, math.min(_x, _max))
+
+f_boolScore(_cond, _pts) =>
+    _cond ? _pts : 0
+
+f_safeDiv(_num, _den) =>
+    _den == 0.0 ? 0.0 : _num / _den
+
+f_slope(_src, _len) =>
+    _src - _src[_len]
+
+f_bodySize() =>
+    math.abs(close - open)
+
+f_upperWick() =>
+    high - math.max(open, close)
+
+f_lowerWick() =>
+    math.min(open, close) - low
+
+f_bullCandle() =>
+    close > open
+
+f_bearCandle() =>
+    close < open
+
+f_inRange(_x, _a, _b) =>
+    _x >= math.min(_a, _b) and _x <= math.max(_a, _b)
+
+
+// =====================================================
+// ================= RAW CALCULATIONS ===================
+// =====================================================
+
+atr = ta.atr(atrLen)
+eq = ta.ema(close, equilibriumLen)
+upperValueBand = eq + atr * equilibriumBandATRMult
+lowerValueBand = eq - atr * equilibriumBandATRMult
+
+trendBaseFast = ta.ema(close, trendBaseLenFast)
+trendBaseMid  = ta.ema(close, trendBaseLenMid)
+trendBaseSlow = ta.ema(close, trendBaseLenSlow)
+
+trendSlopeFast = f_slope(trendBaseFast, trendSlopeLookback)
+trendSlopeMid  = f_slope(trendBaseMid, trendSlopeLookback)
+trendSlopeSlow = f_slope(trendBaseSlow, trendSlopeLookback)
+
+priceAboveTrendStack = close > trendBaseFast and close > trendBaseMid and close > trendBaseSlow
+priceBelowTrendStack = close < trendBaseFast and close < trendBaseMid and close < trendBaseSlow
+
+phMajor = ta.pivothigh(high, majorPivotLen, majorPivotLen)
+plMajor = ta.pivotlow(low, majorPivotLen, majorPivotLen)
+
+phMinor = ta.pivothigh(high, minorPivotLen, minorPivotLen)
+plMinor = ta.pivotlow(low, minorPivotLen, minorPivotLen)
+
+
+// =====================================================
+// ================= STRUCTURE ENGINE ===================
+// =====================================================
+
+// Major pivots
+var float majorHigh1 = na
+var float majorHigh2 = na
+var float majorLow1  = na
+var float majorLow2  = na
+
+if not na(phMajor)
+    majorHigh2 := majorHigh1
+    majorHigh1 := phMajor
+
+if not na(plMajor)
+    majorLow2 := majorLow1
+    majorLow1 := plMajor
+
+// Minor pivots
+var float minorHigh1 = na
+var float minorHigh2 = na
+var float minorLow1  = na
+var float minorLow2  = na
+
+if not na(phMinor)
+    minorHigh2 := minorHigh1
+    minorHigh1 := phMinor
+
+if not na(plMinor)
+    minorLow2 := minorLow1
+    minorLow1 := plMinor
+
+majorBullStructure = not na(majorHigh1) and not na(majorHigh2) and not na(majorLow1) and not na(majorLow2) and majorHigh1 > majorHigh2 and majorLow1 > majorLow2
+majorBearStructure = not na(majorHigh1) and not na(majorHigh2) and not na(majorLow1) and not na(majorLow2) and majorHigh1 < majorHigh2 and majorLow1 < majorLow2
+
+minorBullStructure = not na(minorHigh1) and not na(minorHigh2) and not na(minorLow1) and not na(minorLow2) and minorHigh1 > minorHigh2 and minorLow1 > minorLow2
+minorBearStructure = not na(minorHigh1) and not na(minorHigh2) and not na(minorLow1) and not na(minorLow2) and minorHigh1 < minorHigh2 and minorLow1 < minorLow2
+
+majorBias = majorBullStructure and not majorBearStructure ? 1 : majorBearStructure and not majorBullStructure ? -1 : 0
+minorBias = minorBullStructure and not minorBearStructure ? 1 : minorBearStructure and not minorBullStructure ? -1 : 0
+
+minorBullShift = not na(minorHigh1) and close > minorHigh1
+minorBearShift = not na(minorLow1) and close < minorLow1
+
+
+// =====================================================
+// =================== TREND ENGINE =====================
+// =====================================================
+
+bullTrendAligned = trendBaseFast > trendBaseMid and trendBaseMid > trendBaseSlow and trendSlopeFast > 0 and trendSlopeMid > 0
+bearTrendAligned = trendBaseFast < trendBaseMid and trendBaseMid < trendBaseSlow and trendSlopeFast < 0 and trendSlopeMid < 0
+
+trendState =
+     priceAboveTrendStack and bullTrendAligned and trendSlopeSlow > 0 ? 3 :
+     close > trendBaseMid and trendSlopeMid > 0 ? 2 :
+     close > trendBaseSlow ? 1 :
+     priceBelowTrendStack and bearTrendAligned and trendSlopeSlow < 0 ? -3 :
+     close < trendBaseMid and trendSlopeMid < 0 ? -2 :
+     close < trendBaseSlow ? -1 : 0
+
+trendStrengthScore = math.abs(trendState)
+
+
+// =====================================================
+// =================== VALUE ENGINE =====================
+// =====================================================
+
+var float impulseLow = na
+var float impulseHigh = na
+
+if majorBias == 1
+    impulseLow := majorLow1
+    impulseHigh := majorHigh1
+else if majorBias == -1
+    impulseHigh := majorHigh1
+    impulseLow := majorLow1
+else
+    impulseLow := minorLow1
+    impulseHigh := minorHigh1
+
+impulseRange = not na(impulseHigh) and not na(impulseLow) ? math.abs(impulseHigh - impulseLow) : na
+
+retracementPctBull = not na(impulseRange) and impulseRange > 0 ? (impulseHigh - close) / impulseRange : na
+retracementPctBear = not na(impulseRange) and impulseRange > 0 ? (close - impulseLow) / impulseRange : na
+
+inDeepDiscount = (majorBias == 1 and not na(retracementPctBull) and retracementPctBull >= deepValueThreshold) or close < lowerValueBand
+inDiscount = (majorBias == 1 and not na(retracementPctBull) and retracementPctBull >= balancedValueThreshold) or close < eq
+
+inDeepPremium = (majorBias == -1 and not na(retracementPctBear) and retracementPctBear >= deepValueThreshold) or close > upperValueBand
+inPremium = (majorBias == -1 and not na(retracementPctBear) and retracementPctBear >= balancedValueThreshold) or close > eq
+
+valueState =
+     inDeepDiscount ? 2 :
+     inDiscount ? 1 :
+     inDeepPremium ? -2 :
+     inPremium ? -1 : 0
+
+
+// =====================================================
+// =================== REGIME ENGINE ====================
+// =====================================================
+
+netMove = math.abs(close - close[trendEfficiencyLookback])
+barTravel = math.abs(close - close[1])
+travel = math.sum(barTravel, trendEfficiencyLookback)
+trendEfficiency = f_safeDiv(netMove, travel)
+
+atrPct = f_safeDiv(atr, close) * 100.0
+volatilityDisorder = atrPct > volatilityDisorderThreshold
+
+trendExpansion = trendEfficiency > 0.45 and math.abs(trendState) >= 2
+pullbackContinuation = math.abs(trendState) >= 2 and valueState != 0
+rangeRotation = trendEfficiency < 0.25 and math.abs(trendState) <= 1
+transitionPhase = trendEfficiency >= 0.25 and trendEfficiency <= 0.45 and math.abs(trendState) <= 2
+
+regimeState =
+     volatilityDisorder ? -2 :
+     trendExpansion ? 2 :
+     pullbackContinuation ? 1 :
+     rangeRotation ? 0 :
+     transitionPhase ? -1 : 0
+
+
+// =====================================================
+// ================== PROFILE ENGINE ====================
+// =====================================================
+
+isFast = executionMode == "FAST"
+isLong = executionMode == "LONG"
+isHybrid = executionMode == "HYBRID"
+
+minScoreRequired = isFast ? fastMinScore : isLong ? longMinScore : hybridMinScore
+requireStrongTrend = isLong
+allowRangeTrades = isFast
+allowCounterTrendFast = isFast
+managementATRMult = isLong ? atrStopMultLong : isFast ? atrStopMultFast : (atrStopMultFast + atrStopMultLong) / 2.0
+
+
+// =====================================================
+// ================== REACTION ENGINE ===================
+// =====================================================
+
+bearBodyShrinking = f_bodySize() < f_bodySize()[1] and f_bearCandle()
+bullBodyShrinking = f_bodySize() < f_bodySize()[1] and f_bullCandle()
+
+buyReactionCount = 0
+buyReactionCount += f_boolScore(bearBodyShrinking, 1)
+buyReactionCount += f_boolScore(f_lowerWick() > f_bodySize(), 1)
+buyReactionCount += f_boolScore(low <= lowerValueBand or close < eq, 1)
+buyReactionCount += f_boolScore(close > low + (high - low) * 0.55, 1)
+buyReactionCount += f_boolScore(close > close[1], 1)
+
+sellReactionCount = 0
+sellReactionCount += f_boolScore(bullBodyShrinking, 1)
+sellReactionCount += f_boolScore(f_upperWick() > f_bodySize(), 1)
+sellReactionCount += f_boolScore(high >= upperValueBand or close > eq, 1)
+sellReactionCount += f_boolScore(close < low + (high - low) * 0.45, 1)
+sellReactionCount += f_boolScore(close < close[1], 1)
+
+buyReactionValid = buyReactionCount >= 2
+sellReactionValid = sellReactionCount >= 2
+
+
+// =====================================================
+// =================== TRIGGER ENGINE ===================
+// =====================================================
+
+bullImpulseRestart = close > high[1] and close > eq
+bearImpulseRestart = close < low[1] and close < eq
+
+bullMinor1 = f_bullCandle()
+bullMinor2 = close > ta.ema(close, 8)
+bullMinor3 = not na(minorLow1) and close > minorLow1
+
+bearMinor1 = f_bearCandle()
+bearMinor2 = close < ta.ema(close, 8)
+bearMinor3 = not na(minorHigh1) and close < minorHigh1
+
+bullMinorCount = 0
+bullMinorCount += f_boolScore(bullMinor1, 1)
+bullMinorCount += f_boolScore(bullMinor2, 1)
+bullMinorCount += f_boolScore(bullMinor3, 1)
+
+bearMinorCount = 0
+bearMinorCount += f_boolScore(bearMinor1, 1)
+bearMinorCount += f_boolScore(bearMinor2, 1)
+bearMinorCount += f_boolScore(bearMinor3, 1)
+
+buyTriggerValid = minorBullShift or bullImpulseRestart or bullMinorCount >= 2
+sellTriggerValid = minorBearShift or bearImpulseRestart or bearMinorCount >= 2
+
+
+// =====================================================
+// =================== SCORING ENGINE ===================
+// =====================================================
+
+// ----- Long Scores -----
+structureScoreLong = 0
+structureScoreLong += f_boolScore(majorBias == 1, 10)
+structureScoreLong += f_boolScore(minorBias >= 0, 5)
+structureScoreLong += f_boolScore(minorBullShift, 5)
+structureScoreLong += f_boolScore(not majorBearStructure, 5)
+structureScoreLong := int(f_clamp(structureScoreLong, 0, 25))
+
+valueScoreLong = 0
+valueScoreLong += f_boolScore(inDiscount, 10)
+valueScoreLong += f_boolScore(inDeepDiscount, 10)
+valueScoreLong += f_boolScore(close <= lowerValueBand, 5)
+valueScoreLong := int(f_clamp(valueScoreLong, 0, 25))
+
+trendScoreLong = 0
+trendScoreLong += trendState == 3 ? 15 : trendState == 2 ? 10 : trendState == 1 ? 5 : 0
+trendScoreLong += f_boolScore(bullTrendAligned, 5)
+trendScoreLong := int(f_clamp(trendScoreLong, 0, 20))
+
+reactionScoreLong = 0
+reactionScoreLong += f_boolScore(buyReactionValid, 5)
+reactionScoreLong += f_boolScore(f_lowerWick() > f_bodySize(), 5)
+reactionScoreLong += f_boolScore(buyTriggerValid, 5)
+reactionScoreLong := int(f_clamp(reactionScoreLong, 0, 15))
+
+riskScoreLong = 0
+
+// ----- Short Scores -----
+structureScoreShort = 0
+structureScoreShort += f_boolScore(majorBias == -1, 10)
+structureScoreShort += f_boolScore(minorBias <= 0, 5)
+structureScoreShort += f_boolScore(minorBearShift, 5)
+structureScoreShort += f_boolScore(not majorBullStructure, 5)
+structureScoreShort := int(f_clamp(structureScoreShort, 0, 25))
+
+valueScoreShort = 0
+valueScoreShort += f_boolScore(inPremium, 10)
+valueScoreShort += f_boolScore(inDeepPremium, 10)
+valueScoreShort += f_boolScore(close >= upperValueBand, 5)
+valueScoreShort := int(f_clamp(valueScoreShort, 0, 25))
+
+trendScoreShort = 0
+trendScoreShort += trendState == -3 ? 15 : trendState == -2 ? 10 : trendState == -1 ? 5 : 0
+trendScoreShort += f_boolScore(bearTrendAligned, 5)
+trendScoreShort := int(f_clamp(trendScoreShort, 0, 20))
+
+reactionScoreShort = 0
+reactionScoreShort += f_boolScore(sellReactionValid, 5)
+reactionScoreShort += f_boolScore(f_upperWick() > f_bodySize(), 5)
+reactionScoreShort += f_boolScore(sellTriggerValid, 5)
+reactionScoreShort := int(f_clamp(reactionScoreShort, 0, 15))
+
+riskScoreShort = 0
+
+
+// =====================================================
+// ================= RISK / TARGET ENGINE ===============
+// =====================================================
+
+longRefStop = not na(minorLow1) ? minorLow1 : low
+shortRefStop = not na(minorHigh1) ? minorHigh1 : high
+
+longStopCandidate = longRefStop - atr * managementATRMult
+shortStopCandidate = shortRefStop + atr * managementATRMult
+
+longRisk = close - longStopCandidate
+shortRisk = shortStopCandidate - close
+
+longTargetCandidate = close + longRisk * partialTakeRR
+shortTargetCandidate = close - shortRisk * partialTakeRR
+
+longRR = f_safeDiv(longTargetCandidate - close, longRisk)
+shortRR = f_safeDiv(close - shortTargetCandidate, shortRisk)
+
+riskScoreLong += f_boolScore(longRisk > syminfo.mintick * 10, 5)
+riskScoreLong += f_boolScore(longRR >= minRR, 5)
+riskScoreLong += f_boolScore(not na(majorHigh1) ? longTargetCandidate <= majorHigh1 * 1.03 : true, 5)
+riskScoreLong := int(f_clamp(riskScoreLong, 0, 15))
+
+riskScoreShort += f_boolScore(shortRisk > syminfo.mintick * 10, 5)
+riskScoreShort += f_boolScore(shortRR >= minRR, 5)
+riskScoreShort += f_boolScore(not na(majorLow1) ? shortTargetCandidate >= majorLow1 * 0.97 : true, 5)
+riskScoreShort := int(f_clamp(riskScoreShort, 0, 15))
+
+buyScore = structureScoreLong + valueScoreLong + trendScoreLong + reactionScoreLong + riskScoreLong
+sellScore = structureScoreShort + valueScoreShort + trendScoreShort + reactionScoreShort + riskScoreShort
+
+
+// =====================================================
+// ================= TRADE CONTROL ENGINE ===============
+// =====================================================
+
+var int lastExitBar = na
+var int longCycleTrades = 0
+var int shortCycleTrades = 0
+var int lastDirection = 0  // 1 long, -1 short, 0 none
+
+justClosedTrade = strategy.position_size == 0 and strategy.position_size[1] != 0
+if justClosedTrade
+    lastExitBar := bar_index
+
+cooldownActive = not na(lastExitBar) and (bar_index - lastExitBar) < cooldownBars
+
+if majorBias == 1 and majorBias[1] != 1
+    longCycleTrades := 0
+
+if majorBias == -1 and majorBias[1] != -1
+    shortCycleTrades := 0
+
+longCycleBlocked = longCycleTrades >= maxTradesPerCycle
+shortCycleBlocked = shortCycleTrades >= maxTradesPerCycle
+
+recentSameDirectionBlockedLong = oneTradePerDirection and lastDirection == 1 and not allowReentry
+recentSameDirectionBlockedShort = oneTradePerDirection and lastDirection == -1 and not allowReentry
+
+tooCloseToObstacleLong = not na(majorHigh1) and (majorHigh1 - close) < atr * 0.8
+tooCloseToObstacleShort = not na(majorLow1) and (close - majorLow1) < atr * 0.8
+
+midRangeNoValue = valueState == 0
+structureConflictExtreme = majorBias == 0 and minorBias == 0
+
+
+// =====================================================
+// =================== CONTEXT ENGINE ===================
+// =====================================================
+
+trendLongAllowed = not useTrendFilter or trendState >= 2
+trendShortAllowed = not useTrendFilter or trendState <= -2
+
+fastLongTrendAllowed = not useTrendFilter or trendState >= -1
+fastShortTrendAllowed = not useTrendFilter or trendState <= 1
+
+hybridLongTrendAllowed = not useTrendFilter or trendState >= 1
+hybridShortTrendAllowed = not useTrendFilter or trendState <= -1
+
+modeLongTrendPass = isLong ? trendLongAllowed : isFast ? fastLongTrendAllowed : hybridLongTrendAllowed
+modeShortTrendPass = isLong ? trendShortAllowed : isFast ? fastShortTrendAllowed : hybridShortTrendAllowed
+
+modeRegimeLongPass = isLong ? (regimeState == 2 or regimeState == 1) : isFast ? (regimeState != -2) : (regimeState == 2 or regimeState == 1 or regimeState == -1)
+modeRegimeShortPass = isLong ? (regimeState == 2 or regimeState == 1) : isFast ? (regimeState != -2) : (regimeState == 2 or regimeState == 1 or regimeState == -1)
+
+buyContextValid =
+     (majorBias == 1 or (isFast and allowCounterTrendFast and majorBias == 0))
+     and valueState >= 1
+     and modeRegimeLongPass
+     and modeLongTrendPass
+     and not tooCloseToObstacleLong
+     and not volatilityDisorder
+     and not structureConflictExtreme
+
+sellContextValid =
+     (majorBias == -1 or (isFast and allowCounterTrendFast and majorBias == 0))
+     and valueState <= -1
+     and modeRegimeShortPass
+     and modeShortTrendPass
+     and not tooCloseToObstacleShort
+     and not volatilityDisorder
+     and not structureConflictExtreme
+
+
+// =====================================================
+// =================== FINAL PERMISSION =================
+// =====================================================
+
+riskValidLong = longRR >= minRR and longRisk > syminfo.mintick * 10
+riskValidShort = shortRR >= minRR and shortRisk > syminfo.mintick * 10
+
+longEntryAllowed =
+     buyContextValid and
+     buyReactionValid and
+     buyTriggerValid and
+     buyScore >= minScoreRequired and
+     riskValidLong and
+     not cooldownActive and
+     not longCycleBlocked and
+     not recentSameDirectionBlockedLong and
+     not midRangeNoValue and
+     strategy.position_size == 0
+
+shortEntryAllowed =
+     sellContextValid and
+     sellReactionValid and
+     sellTriggerValid and
+     sellScore >= minScoreRequired and
+     riskValidShort and
+     not cooldownActive and
+     not shortCycleBlocked and
+     not recentSameDirectionBlockedShort and
+     not midRangeNoValue and
+     strategy.position_size == 0
+
+
+// =====================================================
+// ===================== EXECUTION ======================
+// =====================================================
+
+var float activeLongStop = na
+var float activeLongTarget = na
+var float activeShortStop = na
+var float activeShortTarget = na
+
+if longEntryAllowed
+    activeLongStop := longStopCandidate
+    activeLongTarget := longTargetCandidate
+    strategy.entry("CRMI Long", strategy.long)
+    longCycleTrades += 1
+    lastDirection := 1
+
+if shortEntryAllowed
+    activeShortStop := shortStopCandidate
+    activeShortTarget := shortTargetCandidate
+    strategy.entry("CRMI Short", strategy.short)
+    shortCycleTrades += 1
+    lastDirection := -1
+
+if strategy.position_size > 0
+    strategy.exit("CRMI Long Exit", from_entry="CRMI Long", stop=activeLongStop, limit=activeLongTarget)
+
+if strategy.position_size < 0
+    strategy.exit("CRMI Short Exit", from_entry="CRMI Short", stop=activeShortStop, limit=activeShortTarget)
+
+
+// =====================================================
+// =================== THESIS FAILURE ===================
+// =====================================================
+
+longThesisFailure =
+     strategy.position_size > 0 and
+     (
+         close < eq and
+         minorBearShift
+     )
+
+shortThesisFailure =
+     strategy.position_size < 0 and
+     (
+         close > eq and
+         minorBullShift
+     )
+
+if longThesisFailure
+    strategy.close("CRMI Long", comment="Thesis Failure")
+
+if shortThesisFailure
+    strategy.close("CRMI Short", comment="Thesis Failure")
+
+
+// =====================================================
+// ======================= VISUALS ======================
+// =====================================================
+
+plot(showTrend ? trendBaseFast : na, "Trend Fast", color=color.new(color.green, 0), linewidth=1)
+plot(showTrend ? trendBaseMid : na, "Trend Mid", color=color.new(color.blue, 0), linewidth=1)
+plot(showTrend ? trendBaseSlow : na, "Trend Slow", color=color.new(color.orange, 0), linewidth=2)
+
+plot(showValueZones ? eq : na, "Equilibrium", color=color.new(color.white, 0), linewidth=1)
+plot(showValueZones ? upperValueBand : na, "Upper Value Band", color=color.new(color.red, 50))
+plot(showValueZones ? lowerValueBand : na, "Lower Value Band", color=color.new(color.lime, 50))
+
+plotshape(showSignals and longEntryAllowed, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=color.lime, size=size.small, text="BUY")
+plotshape(showSignals and shortEntryAllowed, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, text="SELL")
+
+
+// =====================================================
+// ===================== DEBUG TABLE ====================
+// =====================================================
+
+var table dbg = table.new(position.top_right, 2, 12, border_width=1)
+
+if barstate.islast and showDebug
+    table.cell(dbg, 0, 0, "Mode", text_color=color.white, bgcolor=color.black)
+    table.cell(dbg, 1, 0, executionMode, text_color=color.yellow, bgcolor=color.black)
+
+    table.cell(dbg, 0, 1, "Major Bias", text_color=color.white)
+    table.cell(dbg, 1, 1, str.tostring(majorBias), text_color=color.yellow)
+
+    table.cell(dbg, 0, 2, "Trend State", text_color=color.white)
+    table.cell(dbg, 1, 2, str.tostring(trendState), text_color=color.yellow)
+
+    table.cell(dbg, 0, 3, "Value State", text_color=color.white)
+    table.cell(dbg, 1, 3, str.tostring(valueState), text_color=color.yellow)
+
+    table.cell(dbg, 0, 4, "Regime State", text_color=color.white)
+    table.cell(dbg, 1, 4, str.tostring(regimeState), text_color=color.yellow)
+
+    table.cell(dbg, 0, 5, "Buy Score", text_color=color.white)
+    table.cell(dbg, 1, 5, str.tostring(buyScore), text_color=color.lime)
+
+    table.cell(dbg, 0, 6, "Sell Score", text_color=color.white)
+    table.cell(dbg, 1, 6, str.tostring(sellScore), text_color=color.red)
+
+    table.cell(dbg, 0, 7, "Buy Context", text_color=color.white)
+    table.cell(dbg, 1, 7, str.tostring(buyContextValid), text_color=color.lime)
+
+    table.cell(dbg, 0, 8, "Sell Context", text_color=color.white)
+    table.cell(dbg, 1, 8, str.tostring(sellContextValid), text_color=color.red)
+
+    table.cell(dbg, 0, 9, "Buy Trigger", text_color=color.white)
+    table.cell(dbg, 1, 9, str.tostring(buyTriggerValid), text_color=color.lime)
+
+    table.cell(dbg, 0, 10, "Sell Trigger", text_color=color.white)
+    table.cell(dbg, 1, 10, str.tostring(sellTriggerValid), text_color=color.red)
+
+    table.cell(dbg, 0, 11, "Cooldown", text_color=color.white)
+    table.cell(dbg, 1, 11, str.tostring(cooldownActive), text_color=color.orange)

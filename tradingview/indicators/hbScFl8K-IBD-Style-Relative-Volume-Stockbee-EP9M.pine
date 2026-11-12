@@ -1,0 +1,778 @@
+//@version=6
+// max_labels_count=500 is the Pine maximum and is what the EP9M markers draw
+// into. Past 500 EP9M events on one chart the OLDEST markers are dropped
+// silently - see section 5a for why labels were chosen over plotshape anyway.
+indicator("IBD Style Relative Volume - Stockbee EP9M", shorttitle="RVOL + EP9M", overlay=false, format=format.volume, max_labels_count=500)
+
+// ==========================================
+// 1. Inputs
+// ==========================================
+// ---- The two RVOL rows ----
+// Each row is independent: its own lookback and its own estimator, and either
+// can be switched off. The pairing is the point - one row alone is a number,
+// two rows is a cross-check. Common configurations:
+//   20d Mean  + 50d Mean    - short vs long baseline. A gap means the volume
+//                             REGIME has shifted, not that today is unusual.
+//   50d Mean  + 50d Median  - same window, two estimators. A gap means one
+//                             outlier day (earnings, index add, halt-reopen) is
+//                             contaminating the mean and suppressing its RVOL.
+//   20d Mean  + 20d Median  - as above, on the shorter window.
+// Row 1 is the PRIMARY: it drives the plotted average line, the volume bar
+// coloring, and the EP9M marker offset. Row 2 is a readout only.
+r1_on  = input.bool(true,   title="Row 1", group="RVOL Rows", inline="r1", tooltip="ROW 1 IS THE PRIMARY. Beyond printing its own RVOL value it drives three things on the chart itself:  (1) the red average-volume line plotted across the columns,  (2) the bright-vs-dim coloring of each volume bar - bright means projected volume is above this baseline,  (3) the vertical offset of the EP9M markers.  Row 2 is a readout only and changes nothing on the chart. If Row 1 is switched off, Row 2 takes over these three duties.")
+r1_len = input.int(20,      title="days",  minval=2, maxval=1000, group="RVOL Rows", inline="r1")
+r1_est = input.string("Mean", title="",    options=["Mean", "Median"], group="RVOL Rows", inline="r1")
+
+r2_on  = input.bool(true,   title="Row 2", group="RVOL Rows", inline="r2", tooltip="ROW 2 IS A COMPARISON READOUT ONLY. It does not affect the average line, the bar coloring, or the EP9M marker offset - Row 1 owns those - unless Row 1 is switched off, in which case Row 2 inherits them.  Set this to the same length as Row 1 with the other estimator to compare Mean against Median on one window; set it to a different length with the same estimator to compare a short baseline against a long one.")
+r2_len = input.int(50,      title="days",  minval=2, maxval=1000, group="RVOL Rows", inline="r2")
+r2_est = input.string("Mean", title="",    options=["Mean", "Median"], group="RVOL Rows", inline="r2")
+r3_on  = input.bool(true,   title="Row 3: Pre-Market Volume", group="RVOL Rows", tooltip="Readout of this bar's own pre-market (pre-09:30 NY) volume, shown whether or not Add Pre-Market Volume is folding it into the columns. On intraday charts it shows the day's overnight block instead. Readout only - changes nothing else on the chart.")
+color_logic  = input.string("Close vs Open", title="Color Bars Based On", options=["Close vs Open", "Close vs Prior Close"], group="Visuals")
+
+// Direction-aware coloring of the RVOL VALUES in the table. When ON, each
+// RVOL row is colored by its own reading: at or above the upper threshold the
+// color follows the BAR's direction (green on an up bar, red on a down bar -
+// heavy volume confirms whichever way price is going), yellow between the
+// thresholds, white below the lower one (quiet volume carries no message).
+// When OFF, the legacy scheme returns: white values, silver when the bar is
+// closed, amber when the two baselines diverge >= 25% (the base-divergence
+// diagnostic row still carries that number either way).
+rvol_clr_on = input.bool(true, title="Direction-Aware RVOL Colors", group="Visuals", tooltip="At or above the upper threshold: green when the bar is up, red when it is down (direction per Color Bars Based On). Between the thresholds: yellow. Below the lower threshold: white. OFF restores the legacy white/silver/amber scheme.")
+rvol_hi     = input.float(1.0,  title="Strong At/Above", step=0.05, minval=0.0, group="Visuals", inline="rvclr")
+rvol_lo     = input.float(0.70, title="Quiet Below",     step=0.05, minval=0.0, group="Visuals", inline="rvclr", tooltip="RVOL >= the first value: green on an up bar, red on a down bar. Between the two values: yellow. Below the second value: white.")
+rvol_dir_s  = input.string("Close vs Prior Close", title="RVOL Direction Basis", options=["Close vs Prior Close", "Follow Bar Colors"], group="Visuals", tooltip="What 'up' means for the strong-RVOL green/red. Close vs Prior Close: green when today closes at or above yesterday's close, red below it - the day-over-day read, independent of the volume bar coloring. Follow Bar Colors: reuse the Color Bars Based On setting so the RVOL value always matches the bar's color.")
+add_pm_vol   = input.bool(true, title="Add Pre-Market Volume", group="Calculations", tooltip="Daily/Weekly: adds each bar's pre-market (pre-09:30 NY) volume, summed from lower-timeframe extended-session bars, to the plotted column, the average, and the live-bar projection. Intraday: adds overnight volume to the first bar of the day.")
+
+use_curve    = input.bool(true, title="Use Time-of-Day Volume Curve", group="Pacing", tooltip="ON: pace the live bar against an empirical per-symbol cumulative intraday volume curve built from this symbol's own recent history. OFF: fall back to v1 linear pacing (elapsed minutes / 390). The curve corrects the structural early-session inflation and late-session deflation of linear pacing.")
+curve_days_n = input.int(50, title="Curve Lookback (days)", minval=5, maxval=250, group="Pacing", tooltip="How many recent full sessions feed the intraday volume curve. Only complete regular sessions contribute - half days and partial days are excluded so they cannot flatten the curve.")
+rvol_trend_open_mins = input.int(60, title="RVOL Trend Opening Window (minutes)", minval=5, maxval=180, step=5, group="Pacing", tooltip="Sets the fixed RVOL trend anchor at the end of the first X regular-session minutes. The default 60-minute window anchors at 10:30 NY time. After the opening window, up means projected full-day RVOL is above that opening-anchor reading; down means it is below. A dash is shown until the opening window is complete.")
+rvol_trend_move = input.float(0.01, title="RVOL Trend Minimum Move (x)", minval=0.0, maxval=1.0, step=0.01, group="Pacing", tooltip="Minimum change in projected RVOL required for an up or down arrow. Smaller moves print a flat arrow so normal tick noise does not flip the signal.")
+
+// EP9M (Stockbee 9M) - frozen contract: close >= prior close x 1.04,
+// volume > prior volume, volume >= 9,000,000 (inclusive). Inverse = 4% down.
+show_ep9m       = input.bool(true, title="Show EP9M Markers", group="EP9M")
+ep9m_vol_min    = input.int(9000000, title="Min Share Volume", minval=1, group="EP9M")
+ep9m_pct        = input.float(4.0, title="Min % Move vs Prior Close", step=0.5, minval=0.1, group="EP9M")
+ep9m_daily_only = input.bool(true, title="Daily Timeframe Only", group="EP9M", tooltip="EP9M is a daily-session contract. Off = evaluate on whatever timeframe the chart shows.")
+
+// Marker appearance. Markers anchor to their OWN volume column and are lifted
+// clear of it by Marker Gap, so the tag still identifies its bar without sitting
+// on the bar.
+ep9m_marker = input.string("9M Text", title="Marker Shape", options=["9M Text", "EP9M Text", "Triangle", "Arrow", "Circle", "Diamond", "Square", "Cross", "Flag"], group="EP9M Markers", tooltip="9M Text (default) renders as bare colored text with no shape behind it - green on an up-EP9M, red on a down-EP9M. Triangle and Arrow additionally invert on a down-EP9M (green points up, red points down); the remaining shapes are symmetric and signal direction by color alone.")
+ep9m_size   = input.string("Small", title="Marker Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group="EP9M Markers", tooltip="ARROWS ARE THE EXCEPTION: they are thin outline glyphs that read much smaller than solid shapes or text, so the Arrow style is automatically bumped two rungs up (Small arrows render at Large). The bump applies on top of whatever you pick here, clamped at Huge.")
+ep9m_gap    = input.float(24.0, title="Marker Gap Above Column (%)", minval=0.0, maxval=200.0, step=1.0, group="EP9M Markers", tooltip="Vertical clearance between the top of the volume column and the marker, as a percentage of the 50-day AVERAGE volume. Measuring the gap against the average rather than each bar's own height keeps the visual spacing constant down the chart. 0 = flush with the column.")
+ep9m_col_up = input.color(color.green, title="Up Color",   group="EP9M Markers")
+ep9m_col_dn = input.color(color.red,   title="Down Color", group="EP9M Markers")
+
+// Diagnostic rows - exposes every term feeding RVOL so the build can be checked
+// number-by-number on the chart. Turn off once reconciled.
+show_debug = input.bool(false, title="Show Diagnostic Rows", group="Diagnostics")
+dbg_size_s = input.string("Small", title="Table Font Size", options=["Tiny", "Small", "Normal", "Large"], group="Diagnostics", tooltip="Controls BOTH the RVOL rows and the diagnostic rows. Small is the historical RVOL-row size; bump to Normal or Large to enlarge the RVOL readout.")
+
+// ==========================================
+// 1a. Session geometry constants
+// ==========================================
+// Regular session 09:30-16:00 NY = minute-of-day 570..960, bucketed at 5 min.
+// NB is a compile-time constant because array.new_float() sizing requires one.
+int RTH_OPEN_TOD  = 570
+int RTH_CLOSE_TOD = 960
+int BUCKET_MIN    = 5
+int NB            = 78    // (960 - 570) / 5
+
+// ==========================================
+// 1b. Lower-timeframe sub-bars (drives pre-market sum, the curve, and progress)
+// ==========================================
+eth_ticker = ticker.new(syminfo.prefix, syminfo.ticker, session.extended)
+rth_ticker = ticker.new(syminfo.prefix, syminfo.ticker, session.regular)
+
+// Lower-timeframe request must be <= the chart timeframe, so on intraday charts
+// we ask for the chart's own period (the returned bars are then ignored - the
+// intraday path uses ext_vol_total below). On daily/weekly/monthly we ask for
+// 5m, which gives NB=78 resolvable buckets across the regular session.
+// The call is UNCONDITIONAL and top-level: request.* must run on every bar.
+string pm_tf = timeframe.isintraday ? timeframe.period : "5"
+[pm_vol_arr, pm_time_arr] = request.security_lower_tf(eth_ticker, pm_tf, [volume, time])
+
+// Single pass over this bar's sub-bars, four accumulators:
+//   pm_vol       - pre-09:30 volume (the pre-market block)
+//   rth_sum      - 09:30-16:00 volume (the DOUBLE-COUNT DETECTOR, see below)
+//   day_buckets  - per-5min regular-session volume, feeds the curve
+//   last_rth_tod - time-of-day of the latest regular-session sub-bar seen.
+//                  This is the FEED'S OWN clock, not the wall clock, which is
+//                  what makes session progress immune to weekends, holidays,
+//                  and early closes.
+//
+// DOUBLE-COUNT DETECTOR: read it on the diagnostic table:
+//   raw volume ~= pm_vol + rth_sum  -> TradingView's `volume` ALREADY includes
+//                                      pre-market and adding pm_vol DOUBLE-COUNTS
+//   raw volume ~= rth_sum alone     -> `volume` is RTH-only and adding pm_vol is
+//                                      correct
+// This matters far more for EP9M than for RVOL: RVOL inflates numerator and
+// denominator together so the ratio barely moves, but the 9,000,000 share floor
+// is an ABSOLUTE threshold and a double count manufactures qualifiers.
+var array<float> day_buckets = array.new_float(NB, 0.0)
+array.fill(day_buckets, 0.0)
+
+float pm_vol       = 0.0
+float rth_sum      = 0.0
+int   pm_bars      = 0
+int   last_rth_tod = -1
+// Coverage instrumentation: the NY time-of-day of the FIRST and LAST sub-bar
+// the feed returned for this chart bar, regardless of session. This is the
+// decisive premarket diagnostic - if the span starts at 09:30 on every bar,
+// the lower-timeframe request is NOT delivering pre-market sub-bars to this
+// chart at all and every pm_vol on the chart is structurally 0.
+int   sub_first_tod = -1
+int   sub_last_tod  = -1
+
+int pm_n = array.size(pm_vol_arr)
+if pm_n > 0 and array.size(pm_time_arr) == pm_n
+    for i = 0 to pm_n - 1
+        float v = array.get(pm_vol_arr, i)
+        int   t = array.get(pm_time_arr, i)
+        if not na(v) and not na(t)
+            int tod = hour(t, "America/New_York") * 60 + minute(t, "America/New_York")
+            if sub_first_tod < 0
+                sub_first_tod := tod
+            sub_last_tod := tod
+            if tod < RTH_OPEN_TOD
+                pm_vol  += v
+                pm_bars += 1
+            else if tod < RTH_CLOSE_TOD
+                rth_sum += v
+                if tod > last_rth_tod
+                    last_rth_tod := tod
+                int b = int((tod - RTH_OPEN_TOD) / BUCKET_MIN)
+                if b >= 0 and b < NB
+                    array.set(day_buckets, b, array.get(day_buckets, b) + v)
+
+// ==========================================
+// 1b2. In-context pre-market accumulation (Route B - PRIMARY on daily)
+// ==========================================
+// The sub-bar array route above depends on HOW TradingView maps extended-
+// session intrabars onto regular-session daily bars - observed on-chart
+// delivering ZERO pre-09:30 sub-bars (2026-08-11). This route sidesteps the
+// mapping question entirely: the summing runs INSIDE the requested 5-minute
+// extended-session context, where session.ispremarket is meaningful, and only
+// the finished day-accumulated totals come back to the chart.
+//
+// WHY THE SAMPLED BAR IS COMPLETE AFTER THE OPEN: with lookahead_off a
+// lower-timeframe request.security() returns the LAST intrabar of each chart
+// bar (per the Pine docs), and the latest value on the realtime bar. Any
+// sampled bar at or after 09:30 carries the full pre-market total for its day,
+// because pre-market is over before the first regular-session intrabar prints.
+// The accumulators reset on session.isfirstbar (the 04:00 bar in the extended
+// context).
+//
+// PRE-OPEN DAILY CAVEAT: on a regular-session 1D chart, today's daily host bar
+// does not exist before 09:30. With gaps_off, the request can therefore carry
+// the prior session's completed PM total into the dashboard. Return the
+// requested 5-minute timestamp too, then date-check it before calling the
+// number current.
+//
+// rth_ctx doubles as the cross-check: it should track raw daily `volume`
+// (both regular-session-only; EOD block prints can produce small gaps).
+calc_sess_vols() =>
+    var float pm  = 0.0
+    var float rth = 0.0
+    if session.isfirstbar
+        pm  := 0.0
+        rth := 0.0
+    if session.ispremarket
+        pm += nz(volume)
+    if session.ismarket
+        rth += nz(volume)
+    [pm, rth, time]
+
+[pm_ctx_raw, rth_ctx_raw, pm_ctx_time] = request.security(eth_ticker, "5", calc_sess_vols(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+float pm_ctx  = nz(pm_ctx_raw)
+float rth_ctx = nz(rth_ctx_raw)
+
+// Stamp the Route B value with its own requested-context date. This prevents a
+// prior session's carried-forward PM total from being presented as today's
+// live pre-market volume before a new regular-session daily bar exists.
+string pm_ctx_date     = na(pm_ctx_time) ? "" : str.format_time(pm_ctx_time, "yyyy-MM-dd", "America/New_York")
+string current_ny_date = str.format_time(timenow, "yyyy-MM-dd", "America/New_York")
+bool   pm_ctx_is_today = pm_ctx_date == current_ny_date
+bool   stale_daily_pm  = timeframe.isdaily and barstate.islast and pm_ctx > 0 and not pm_ctx_is_today
+
+// Effective per-bar pre-market volume. Route B is the source on daily charts;
+// the sub-bar sum stays as the fallback and as the source on weekly/monthly,
+// where the sampled last intrabar belongs only to the period's FINAL session
+// and pm_ctx would therefore miss the earlier days' pre-market blocks.
+float pm_bar_eff = timeframe.isdaily and pm_ctx > 0 ? pm_ctx : pm_vol
+
+// Legacy intraday-only overnight term. Extended daily volume minus regular daily
+// volume. PROVEN 0 at daily resolution (both requests return the same value);
+// it survives solely to feed the intraday first-bar-of-day augmentation.
+eth_day_vol   = request.security(eth_ticker, "D", volume, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+rth_day_vol   = request.security(rth_ticker, "D", volume, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+ext_vol_total = math.max(0, eth_day_vol - rth_day_vol)
+
+// Detect the first bar of the day on intraday timeframes.
+// v6 note: ta.change() is hoisted OUT of the `and` expression. v6 evaluates
+// `and`/`or` lazily (short-circuit), and ta.* functions must be called on
+// every bar to keep their internal history correct.
+day_change = ta.change(time("D"))
+is_new_day = timeframe.isintraday and day_change != 0
+
+// ------------------------------------------
+// DOUBLE-COUNT GUARD (verified live 2026-08-11, ACVA vs Nasdaq official):
+// with a full-tape subscription TradingView's LIVE daily bar volume is
+// CONSOLIDATED - it already contains the pre-market prints (TV raw 18.11M vs
+// Nasdaq consolidated 18.13M incl. 2.445M PM; RTH-only would have read
+// 15.69M). Historical EOD bars may still be regular-session-only per TV's
+// docs. So the basis is DETECTED per bar: compare raw volume against the two
+// candidate decompositions from the extended-session context, and only add
+// pre-market when the bar's volume demonstrably lacks it. The comparison is
+// only ambiguous when pm_ctx is tiny - exactly when the choice doesn't matter.
+// ------------------------------------------
+bool vol_includes_pm = timeframe.isdaily and pm_ctx > 0 and rth_ctx > 0 and math.abs(volume - (rth_ctx + pm_ctx)) < math.abs(volume - rth_ctx)
+
+// Augment the plotted/averaged volume:
+//   intraday   -> overnight block on the first bar of the day (unchanged behavior)
+//   daily/wkly -> this bar's own pre-market volume, ONLY on bars whose raw
+//                 volume does not already contain it
+float pm_used = (add_pm_vol and not timeframe.isintraday and not vol_includes_pm) ? pm_bar_eff : 0.0
+
+float current_bar_vol = volume
+if add_pm_vol and is_new_day
+    current_bar_vol += ext_vol_total
+else
+    current_bar_vol += pm_used
+
+// ==========================================
+// 1c. Empirical intraday cumulative volume curve U(t)
+// ==========================================
+// Built from this symbol's OWN history. For each confirmed daily/weekly bar in
+// the trailing window we already have that bar's 5-minute sub-bars (above), so
+// we normalize its per-bucket volume by that day's own regular-session total and
+// accumulate the cumulative fraction into a running sum. U(t) is then the mean
+// cumulative fraction of a typical session completed by time t.
+//
+// Normalizing by each day's OWN total is what makes the curve scale-free - a
+// 30M-share day and a 3M-share day contribute equally to the SHAPE.
+//
+// Only complete regular sessions contribute: a day must have traded through at
+// least 15:50 to count. That excludes half days (1:00 PM closes) and partial
+// data days, which would otherwise drag the curve's tail down and make every
+// afternoon reading look hot.
+var array<float> curve_sum  = array.new_float(NB, 0.0)
+var int          curve_days = 0
+
+if barstate.isconfirmed and not timeframe.isintraday and pm_n > 0
+    bool in_window   = bar_index > last_bar_index - curve_days_n
+    bool full_sess   = last_rth_tod >= (RTH_CLOSE_TOD - 10)   // traded through >= 15:50
+    float day_total  = rth_sum
+    if in_window and full_sess and day_total > 0
+        float run = 0.0
+        for b = 0 to NB - 1
+            run += array.get(day_buckets, b)
+            array.set(curve_sum, b, array.get(curve_sum, b) + run / day_total)
+        curve_days += 1
+
+bool curve_ready = curve_days >= 5
+
+// Look up the cumulative fraction of a typical session complete at minute-of-day
+// `tod`, linearly interpolating inside the 5-minute bucket. Returns 0 before the
+// open and 1 at/after the close. Monotonic by construction: every contributing
+// day's cumulative series is non-decreasing, so their mean is too.
+// Params left untyped deliberately: the offline lint (lint_pine.sh) is a v5-era
+// parser that rejects typed signatures, and the annotations bought nothing here.
+curve_at(tod) =>
+    float outv = 1.0
+    if tod <= RTH_OPEN_TOD
+        outv := 0.0
+    else if tod >= RTH_CLOSE_TOD or not curve_ready
+        outv := 1.0
+    else
+        float f    = (tod - RTH_OPEN_TOD) / float(BUCKET_MIN)
+        int   i    = int(math.floor(f))
+        float frac = f - i
+        i := math.min(i, NB - 1)
+        float hi   = array.get(curve_sum, i) / curve_days
+        float lo   = i > 0 ? array.get(curve_sum, i - 1) / curve_days : 0.0
+        outv := lo + (hi - lo) * frac
+    outv
+
+// ==========================================
+// 2. Session progress
+// ==========================================
+ny_time = timenow
+ny_hour = hour(ny_time, "America/New_York")
+ny_min  = minute(ny_time, "America/New_York")
+ny_tod  = ny_hour * 60 + ny_min
+ny_dow  = dayofweek(ny_time, "America/New_York")
+
+elapsed_mins       = ny_tod - RTH_OPEN_TOD
+total_session_mins = RTH_CLOSE_TOD - RTH_OPEN_TOD   // 390
+
+// ------------------------------------------
+// 2a. LIVE-BAR GUARD  (the weekend/holiday fix)
+// ------------------------------------------
+// v1 asked only "is the wall clock inside 09:30-16:00?" and projected on that
+// alone. Three independent conditions now gate every projection; ALL must hold.
+// Any single one failing pins pct_completed to 1.0 (no projection at all).
+//
+//   is_weekday_now  - kills Saturday and Sunday outright.
+//   clock_in_sess   - the wall clock is inside the regular session.
+//   bar_is_current  - THE ACTUAL FIX. The chart's last bar must be the bar that
+//                     contains right now. On daily this is a strict NY calendar
+//                     date match, so Friday's bar can never be projected on
+//                     Saturday, and the prior trading day's bar can never be
+//                     projected on a holiday. On weekly/monthly we test that now
+//                     falls inside the bar's own span instead.
+//   barstate.isrealtime - data is genuinely ticking, not a replayed history bar.
+//                     Not sufficient alone: a chart left open across the close
+//                     can keep realtime status on a finished bar, which is
+//                     exactly how the Saturday reading survived in v1.
+bool is_weekday_now = ny_dow >= 2 and ny_dow <= 6            // Mon..Fri
+bool clock_in_sess  = elapsed_mins > 0 and elapsed_mins < total_session_mins
+
+bool date_matches = year(time, "America/New_York")       == year(ny_time, "America/New_York") and month(time, "America/New_York")      == month(ny_time, "America/New_York") and dayofmonth(time, "America/New_York") == dayofmonth(ny_time, "America/New_York")
+
+bool bar_is_current = timeframe.isdaily ? date_matches : (ny_time >= time and ny_time < time_close)
+
+bool is_live_bar = barstate.islast and barstate.isrealtime and is_weekday_now and clock_in_sess and bar_is_current
+
+// Additional data-side confirmation on daily charts: if the market is genuinely
+// open, the feed will have produced at least one regular-session sub-bar for
+// today. No RTH sub-bar => nothing has traded => treat the bar as complete.
+// This is what catches a half-day that has already closed, with no holiday table.
+bool feed_confirms = timeframe.isintraday or pm_n == 0 or last_rth_tod >= 0
+bool project_now   = is_live_bar and feed_confirms
+
+// ------------------------------------------
+// 2b. How far through the bar are we?
+// ------------------------------------------
+// Prefer the FEED's clock (time-of-day of the latest regular-session sub-bar
+// actually printed, +1 bucket since that sub-bar is complete) over the wall
+// clock. The feed cannot be ahead of a halted, closed, or early-closing market.
+int tod_used = (not timeframe.isintraday and last_rth_tod >= 0) ? math.min(last_rth_tod + BUCKET_MIN, RTH_CLOSE_TOD) : ny_tod
+
+float pct_linear = math.max(0.0, math.min(1.0, elapsed_mins / float(total_session_mins)))
+float pct_curve  = curve_at(tod_used)
+
+float pct_completed = 1.0
+
+if project_now
+    if timeframe.isintraday
+        // Intraday (5m, 15m, 60m): ms elapsed vs total ms in the candle. Volume
+        // within a single short bar is close enough to linear that a curve buys
+        // nothing here; the curve is a WITHIN-SESSION shape, not a within-bar one.
+        float elapsed_ms = ny_time - time
+        float total_ms   = time_close - time
+        pct_completed := elapsed_ms / total_ms
+
+    else if timeframe.isdaily
+        pct_completed := (use_curve and curve_ready) ? pct_curve : pct_linear
+
+    else if timeframe.isweekly
+        // Days already CLOSED this week, plus today's own session progress.
+        // Today's fraction now uses the curve instead of a linear minute count.
+        // NOTE: prev_days is a calendar count - a mid-week holiday is still
+        // counted as a full trading day (~1 day in 5, so up to ~20% optimistic
+        // on the divisor that week). Fixing that needs an exchange holiday
+        // calendar; flagged rather than silently approximated away.
+        int prev_days = ny_dow == 2 ? 0 : ny_dow == 3 ? 1 : ny_dow == 4 ? 2 : ny_dow == 5 ? 3 : ny_dow == 6 ? 4 : 5
+        float today_frac = (use_curve and curve_ready) ? pct_curve : pct_linear
+        pct_completed := (prev_days + today_frac) / 5.0
+
+    else if timeframe.ismonthly
+        // Approximate 21 trading days. Same holiday caveat as weekly, diluted
+        // over a longer bar (one missed day is ~5% of the divisor).
+        int dom             = dayofmonth(ny_time, "America/New_York")
+        int biz_days_passed = int(dom * (5.0 / 7.0))
+        float today_frac    = (use_curve and curve_ready) ? pct_curve : pct_linear
+        pct_completed := (math.max(0, biz_days_passed - 1) + today_frac) / 21.0
+
+// Safety cap against divide-by-zero / first-second-of-bar blowups
+pct_completed := math.max(0.01, math.min(1.0, pct_completed))
+
+// ==========================================
+// 3. Volume calculations
+// ==========================================
+// Every baseline uses the SAME basis as the plotted column (pre-market inclusive)
+// and EXCLUDES the live bar, so a big live bar can never inflate its own baseline.
+//
+// ALL FOUR are computed unconditionally. ta.* functions maintain internal state
+// and must execute on EVERY bar - putting them behind `if r1_est == "Median"`
+// would corrupt their history the moment the setting changed. So both estimators
+// are always calculated for both lengths and the SELECTION happens afterward, on
+// the finished values. This costs nothing meaningful and is the only correct way
+// to make a ta.* choice user-switchable.
+r1_mean = ta.sma(current_bar_vol[1],    r1_len)
+r1_med  = ta.median(current_bar_vol[1], r1_len)
+r2_mean = ta.sma(current_bar_vol[1],    r2_len)
+r2_med  = ta.median(current_bar_vol[1], r2_len)
+
+base1 = r1_est == "Median" ? r1_med : r1_mean
+base2 = r2_est == "Median" ? r2_med : r2_mean
+
+// PRIMARY baseline - drives the plotted average line, the volume bar coloring
+// and the EP9M marker offset. Row 1 owns these; if Row 1 is switched off Row 2
+// inherits them, and if both are off it falls back to Row 1's mean so the chart
+// still renders sensibly.
+prim_base = r1_on ? base1 : (r2_on ? base2 : r1_mean)
+
+// Typical pre-market block, keyed to Row 1's window. Diagnostic only.
+avg_pm = ta.sma(pm_used[1], r1_len)
+
+// ---- (a) HEADLINE: projected full-day volume ----
+// Pace ONLY the regular-session volume, then add the already-complete
+// pre-market block back as a static term. Same structure as v1 - only the
+// divisor changed from linear to curve-based.
+float proj_volume = current_bar_vol
+if project_now
+    if add_pm_vol and is_new_day
+        proj_volume := (volume / pct_completed) + ext_vol_total
+    else if vol_includes_pm
+        // Raw volume already contains the finished pre-market block: strip it
+        // out, pace ONLY the regular-session remainder, add it back fixed.
+        // Pacing the whole consolidated number would project the PM block
+        // through the rest of the day and massively over-read the open.
+        proj_volume := pm_ctx + math.max(0.0, volume - pm_ctx) / pct_completed
+    else
+        proj_volume := (volume / pct_completed) + pm_used
+
+// ---- The two RVOL readings ----
+// SAME numerator (the curve-paced projection above), DIFFERENT baselines. That
+// is the whole design: a second row only earns its space if it changes an INPUT,
+// never if it merely rearranges the arithmetic.
+//
+// (This is worth stating because an earlier build got it wrong. Its second row
+// showed volume-so-far / expected-volume-by-now, which is ALGEBRAICALLY the same
+// number as the first row - the pacing fraction cancels between numerator and
+// denominator - so both rows printed identical values on every chart.)
+//
+// What a gap between the rows means depends on how they are configured:
+//   SAME length, Mean vs Median -> an outlier day (earnings, index add,
+//     halt-and-reopen) is contaminating the mean. Volume is right-skewed, so a
+//     single 8x day lifts the mean for the whole window and suppresses its RVOL.
+//     The MEDIAN row is the honest one. Median normally reads a little higher
+//     than mean; a LARGE gap is the signal, not a small one.
+//   DIFFERENT lengths, same estimator -> the volume REGIME has shifted. A 20-day
+//     baseline well above the 50-day means participation has been building; well
+//     below means it has been draining. Neither row is wrong - they are
+//     measuring different windows.
+rvol1 = base1 > 0 ? proj_volume / base1 : na
+rvol2 = base2 > 0 ? proj_volume / base2 : na
+
+// ---- Same-day RVOL trend ----
+// Compare like-for-like projected full-day volume now versus a FIXED opening
+// anchor at the end of the first N regular-session minutes. With the default
+// 60-minute window, every post-10:30 reading is compared with the projected
+// full-day RVOL calculated from volume traded through 10:30 - not with a
+// rolling 60-minute lookback.
+// The lower-timeframe RTH buckets let this survive a chart refresh; unlike an
+// intrabar tick-to-tick comparison, it does not forget the morning's pace.
+// Both snapshots use the SAME pacing model selected above (curve or linear)
+// and the same fixed pre-market block. The denominator for each row is stable
+// during the day, so the sign answers the operator's question directly:
+//   up   -> projected full-day RVOL is above the fixed opening anchor
+//   down -> projected full-day RVOL is below the fixed opening anchor
+// Daily-only by design. On an intraday chart the headline rows describe each
+// candle rather than the whole session, so calling that a "day trend" would be
+// misleading.
+int   trend_ref_tod     = RTH_OPEN_TOD + rvol_trend_open_mins
+int   trend_ref_buckets = int(math.floor((trend_ref_tod - RTH_OPEN_TOD) / float(BUCKET_MIN)))
+// Both clocks must clear the opening window before a comparison is valid.
+bool  trend_window_complete = ny_tod >= trend_ref_tod and tod_used >= trend_ref_tod
+bool  trend_ready       = timeframe.isdaily and project_now and pm_n > 0 and last_rth_tod >= 0 and trend_window_complete and trend_ref_buckets > 0
+float trend_rth_ref     = 0.0
+
+if trend_ready
+    int trend_last_bucket = math.min(NB, trend_ref_buckets) - 1
+    for b = 0 to trend_last_bucket
+        trend_rth_ref += array.get(day_buckets, b)
+
+float trend_now_frac = (use_curve and curve_ready) ? pct_curve : math.max(0.0, math.min(1.0, (tod_used - RTH_OPEN_TOD) / float(total_session_mins)))
+float trend_ref_frac = (use_curve and curve_ready) ? curve_at(trend_ref_tod) : math.max(0.0, math.min(1.0, (trend_ref_tod - RTH_OPEN_TOD) / float(total_session_mins)))
+float trend_pm_fixed = vol_includes_pm ? pm_ctx : pm_used
+float trend_proj_now = trend_ready ? trend_pm_fixed + rth_sum / math.max(0.01, trend_now_frac) : na
+float trend_proj_ref = trend_ready ? trend_pm_fixed + trend_rth_ref / math.max(0.01, trend_ref_frac) : na
+
+float rvol1_trend_delta = trend_ready and base1 > 0 ? (trend_proj_now - trend_proj_ref) / base1 : na
+float rvol2_trend_delta = trend_ready and base2 > 0 ? (trend_proj_now - trend_proj_ref) / base2 : na
+
+// Divergence between the baselines, always >= 1.00 regardless of which is
+// larger, so one threshold covers both directions. 1.00 = the two agree exactly.
+base_skew = (base1 > 0 and base2 > 0) ? math.max(base1, base2) / math.min(base1, base2) : na
+
+// ---- Diagnostic only: what v1's linear pacing WOULD have printed ----
+// Kept so the size of the time-of-day correction is visible on a live bar.
+// This one IS genuinely different from row (a) - different pct, not different
+// algebra.
+float proj_linear = project_now and not timeframe.isintraday ? (volume / math.max(0.01, pct_linear)) + pm_used : current_bar_vol
+rvol_linear = prim_base > 0 ? proj_linear / prim_base : na
+
+// ==========================================
+// 4. Colors & visuals
+// ==========================================
+is_up = color_logic == "Close vs Open" ? (close >= open) : (close >= close[1])
+
+color_up_dim  = color.new(color.green, 60)
+color_up_high = color.new(color.green, 0)
+color_dn_dim  = color.new(color.red, 60)
+color_dn_high = color.new(color.red, 0)
+
+vol_color = is_up ? (proj_volume > prim_base ? color_up_high : color_up_dim) : (proj_volume > prim_base ? color_dn_high : color_dn_dim)
+
+// ==========================================
+// 4b. EP9M / Inverse EP9M detection
+// ==========================================
+// Contract (breadth-tracker/backfill/ep9m/SPEC.md, FROZEN 2026-07-20):
+//   close_D >= close_P * 1.04   (inclusive, vs PRIOR CLOSE - not the open)
+//   volume_D >  volume_P        (strictly greater)
+//   volume_D >= 9,000,000       (inclusive floor)
+// Inverse flips only the price leg: close_D <= close_P * 0.96.
+// NOTE: production uses NON-split-adjusted shares; TradingView's `volume` is
+// split-adjusted, so split names can disagree with the /ep9m-21d-screen output.
+//
+// OPERATOR DIRECTIVE 2026-08-03 - the chart EP9M INCLUDES pre-market volume by
+// design. Both volume legs are evaluated on current_bar_vol (the PM-inclusive
+// series), not raw `volume`, so a bar may clear the 9,000,000 floor on the
+// strength of its pre-market prints. This chart marker therefore DIVERGES from
+// the production /ep9m-21d-screen contract, which uses raw regular-session
+// volume with no pre-market. That divergence is accepted and intentional.
+//
+// EP9M is evaluated on ACTUAL traded volume, never on proj_volume - a projected
+// bar has not yet traded 9M shares. Live bars therefore only tag once the real
+// volume clears the floor, which is the correct (non-anticipatory) behavior.
+ep9m_tf_ok   = not ep9m_daily_only or timeframe.isdaily
+ep9m_mult_up = 1.0 + ep9m_pct / 100.0
+ep9m_mult_dn = 1.0 - ep9m_pct / 100.0
+
+ep9m_vol_ok = current_bar_vol > current_bar_vol[1] and current_bar_vol >= ep9m_vol_min
+ep9m_armed  = show_ep9m and ep9m_tf_ok and not na(close[1]) and not na(current_bar_vol[1])
+
+ep9m_up   = ep9m_armed and ep9m_vol_ok and close >= close[1] * ep9m_mult_up
+ep9m_down = ep9m_armed and ep9m_vol_ok and close <= close[1] * ep9m_mult_dn
+
+// ==========================================
+// 5. Plotting
+// ==========================================
+plot(current_bar_vol, title="Actual Volume", style=plot.style_columns, color=vol_color)
+plot(prim_base, title="Avg Vol", color=color.red, linewidth=2)
+
+// ==========================================
+// 5a. EP9M markers - shape, size, color and headroom all user-selectable
+// ==========================================
+// WHY LABELS INSTEAD OF plotshape():
+// plotshape()'s `style`, `size` and `text` are const-qualified - they cannot
+// read an input - so offering 9 shapes x 3 sizes required one call per
+// combination. TradingView charges TWO plot outputs per plotshape (value series
+// + color series), so 54 calls came to 111 outputs against a hard ceiling of 64
+// and the script would not compile. Trimming the matrix could not buy enough
+// room: even 5 shapes x 3 sizes lands at 63/64, with no margin.
+//
+// label.new() accepts SERIES values for style, size, color, text and position,
+// so the entire matrix collapses to ONE call and costs ZERO plot outputs. Total
+// script outputs are now just the 2 volume plots.
+//
+// THE TRADE-OFF, STATED PLAINLY: labels are capped by max_labels_count, set to
+// 500 (the maximum Pine allows). Beyond 500 EP9M events on a single chart the
+// OLDEST markers are dropped. For a name printing ~20 EP9M days a year that is
+// ~25 years of history, and truncation happens at the far-left edge where it
+// matters least - but it IS silent, so on a relentlessly active mega-cap assume
+// the deep history is incomplete.
+
+// Marker Y position: the top of the bar's own volume column, lifted clear by a
+// percentage of the 50-day AVERAGE volume rather than of the bar's own height.
+// Using the average keeps the visual gap CONSTANT down the chart - scaling the
+// gap off each bar would make tall EP9M bars (which is all of them) push their
+// markers far away while quiet bars kept theirs glued on.
+float marker_y = current_bar_vol + (ep9m_gap / 100.0) * prim_base
+
+// Size input -> Pine size constant, via a 0..4 ladder so the arrow compensation
+// below is a simple index shift. Series-legal on label.new(), which is the whole
+// reason this rewrite works.
+//
+// ARROW COMPENSATION: Pine's arrowup/arrowdown are thin outline glyphs, so at a
+// given nominal size they read far smaller on screen than the solid shapes
+// (triangle, circle, diamond, square). At Tiny the solid shapes are legible and
+// the arrows are not. Rather than force a bigger global size and blow up every
+// shape, arrows alone are bumped TWO rungs up the ladder; everything else uses
+// the selected size verbatim. Tiny arrows therefore render at Normal.
+// To override, just pick the size you want - the bump still applies on top,
+// clamped at Huge.
+int    sz_idx   = ep9m_size == "Tiny" ? 0 : ep9m_size == "Small" ? 1 : ep9m_size == "Large" ? 3 : ep9m_size == "Huge" ? 4 : 2
+int    sz_eff   = math.min(4, sz_idx + (ep9m_marker == "Arrow" ? 2 : 0))
+string mk_size  = sz_eff == 0 ? size.tiny : sz_eff == 1 ? size.small : sz_eff == 3 ? size.large : sz_eff == 4 ? size.huge : size.normal
+
+// Text options render as bare colored text with no shape behind them.
+// "9M Text" stacks the glyphs vertically - "9" on its own line, "M" beneath it -
+// via the \n escape, which label.new() honours. Stacking keeps the marker narrow
+// so adjacent EP9M bars on a dense daily chart do not collide horizontally.
+// "EP9M Text" stays on one line; at four characters a stack would be too tall.
+bool   mk_is_text = ep9m_marker == "9M Text" or ep9m_marker == "EP9M Text"
+string mk_text    = ep9m_marker == "9M Text" ? "9\nM" : ep9m_marker == "EP9M Text" ? "EP9M" : ""
+
+// Shape styles. UP and DOWN differ only where a shape HAS a direction: triangle
+// and arrow invert (green points up, red points down); circle, diamond, square,
+// cross and flag are symmetric and signal direction by color alone.
+string mk_sty_up = mk_is_text ? label.style_none : ep9m_marker == "Triangle" ? label.style_triangleup : ep9m_marker == "Arrow" ? label.style_arrowup : ep9m_marker == "Circle" ? label.style_circle : ep9m_marker == "Diamond" ? label.style_diamond : ep9m_marker == "Square" ? label.style_square : ep9m_marker == "Cross" ? label.style_xcross : ep9m_marker == "Flag" ? label.style_flag : label.style_triangleup
+string mk_sty_dn = mk_is_text ? label.style_none : ep9m_marker == "Triangle" ? label.style_triangledown : ep9m_marker == "Arrow" ? label.style_arrowdown : ep9m_marker == "Circle" ? label.style_circle : ep9m_marker == "Diamond" ? label.style_diamond : ep9m_marker == "Square" ? label.style_square : ep9m_marker == "Cross" ? label.style_xcross : ep9m_marker == "Flag" ? label.style_flag : label.style_triangledown
+
+// One label per qualifying bar. ep9m_up and ep9m_down are mutually exclusive -
+// a close cannot be both >= +4% and <= -4% against the same prior close.
+if ep9m_up or ep9m_down
+    bool mk_up = ep9m_up
+    label.new(bar_index, marker_y, text=mk_text, style=mk_up ? mk_sty_up : mk_sty_dn, color=mk_is_text ? color.new(color.black, 100) : (mk_up ? ep9m_col_up : ep9m_col_dn), textcolor=mk_up ? ep9m_col_up : ep9m_col_dn, size=mk_size, yloc=yloc.price)
+
+
+
+// ==========================================
+// 6. Dashboard table
+// ==========================================
+// Height is dynamic: either RVOL row can be switched off, so the table is sized
+// to whatever is actually enabled. math.max(1, ...) guards the case where both
+// rows AND diagnostics are off - table.new() will not accept zero rows.
+int n_head = (r1_on ? 1 : 0) + (r2_on ? 1 : 0) + (r3_on ? 1 : 0)
+int n_rows = math.max(1, n_head + (show_debug ? 20 : 0))
+var table rvolTable = table.new(position.top_right, 3, n_rows, border_width=1, border_color=color.gray, frame_width=1, frame_color=color.gray, bgcolor=color.new(#1e222d, 10))
+
+// Table font size input -> Pine size constant. One size for the whole table:
+// RVOL rows and diagnostic rows both follow it.
+string tbl_size = dbg_size_s == "Small" ? size.small : dbg_size_s == "Normal" ? size.normal : dbg_size_s == "Large" ? size.large : size.tiny
+
+dbg_row(r, label, val) =>
+    table.cell(rvolTable, 0, r, label, text_color=color.gray, text_size=tbl_size, text_halign=text.align_left)
+    table.cell(rvolTable, 1, r, val, text_color=color.white, text_size=tbl_size, text_halign=text.align_right)
+    table.cell(rvolTable, 2, r, "", text_size=tbl_size)
+
+// Pacing mode, shown so a suspicious reading can be traced to its cause without
+// turning diagnostics on:
+//   CLOSED - no projection at all (bar complete / market shut / weekend)
+//   CURVE  - paced on the empirical time-of-day curve
+//   LINEAR - curve unavailable or disabled; v1 linear pacing in force
+string pace_mode = not project_now ? "CLOSED" : (use_curve and curve_ready and not timeframe.isintraday) ? "CURVE" : "LINEAR"
+
+// The indicator and value format already establish that these are RVOL rows,
+// so the compact label only reads back the actual configuration.
+rvol_label(len, est) =>
+    str.tostring(len) + "d (" + est + ")"
+
+trend_arrow(delta) =>
+    na(delta) ? "-" : delta >= rvol_trend_move ? "↑" : delta <= -rvol_trend_move ? "↓" : "→"
+
+trend_color(delta) =>
+    na(delta) ? color.gray : delta >= rvol_trend_move ? color.lime : delta <= -rvol_trend_move ? color.red : color.gray
+
+trend_tooltip(delta) =>
+    na(delta) ? "No comparison until the opening window is complete on the live daily session." : "Projected full-day RVOL change vs the end of the first " + str.tostring(rvol_trend_open_mins) + " minutes: " + (delta >= 0 ? "+" : "") + str.tostring(delta, "0.00") + "x"
+
+fmt_tod(tod) =>
+    tod < 0 ? "n/a" : str.tostring(int(tod / 60)) + ":" + (tod % 60 < 10 ? "0" : "") + str.tostring(tod % 60)
+
+if barstate.islast
+    // Amber fires when the two baselines diverge by >= 25% in EITHER direction.
+    // What that means depends on the configuration - same length with different
+    // estimators points at an outlier contaminating the mean; different lengths
+    // point at a shift in the volume regime. Either way it says: the two rows
+    // disagree, read them both rather than just the top one.
+    bool rows_disagree = r1_on and r2_on and not na(base_skew) and base_skew >= 1.25
+    color val_color = pace_mode == "CLOSED" ? color.silver : (rows_disagree ? color.orange : color.white)
+
+    // Direction-aware override: each row colored by its OWN reading, live or
+    // closed. Strong volume takes the bar's direction color (is_up follows the
+    // Color Bars Based On setting); quiet volume is neutral white. Falls back
+    // to the legacy val_color when the toggle is off or the value is na.
+    // Direction per the RVOL Direction Basis input: day-over-day (vs prior
+    // close) by default, or slaved to the bar-color logic.
+    bool rvol_up   = rvol_dir_s == "Close vs Prior Close" ? close >= close[1] : is_up
+    color rvol_dir = rvol_up ? color.green : color.red
+    color v1_clr = rvol_clr_on and not na(rvol1) ? (rvol1 >= rvol_hi ? rvol_dir : rvol1 >= rvol_lo ? color.yellow : color.white) : val_color
+    color v2_clr = rvol_clr_on and not na(rvol2) ? (rvol2 >= rvol_hi ? rvol_dir : rvol2 >= rvol_lo ? color.yellow : color.white) : val_color
+
+    // Rows are written through a running counter, not fixed indices, so a
+    // disabled Row 1 does not leave a blank line above Row 2.
+    int r = 0
+
+    if r1_on
+        table.cell(rvolTable, 0, r, rvol_label(r1_len, r1_est), text_color=color.gray, text_size=tbl_size, text_halign=text.align_left)
+        table.cell(rvolTable, 1, r, str.tostring(rvol1, "0.00") + "x", text_color=v1_clr, text_size=tbl_size, text_halign=text.align_right)
+        table.cell(rvolTable, 2, r, trend_arrow(rvol1_trend_delta), text_color=trend_color(rvol1_trend_delta), text_size=tbl_size, text_halign=text.align_center, tooltip=trend_tooltip(rvol1_trend_delta))
+        r += 1
+
+    if r2_on
+        table.cell(rvolTable, 0, r, rvol_label(r2_len, r2_est), text_color=color.gray, text_size=tbl_size, text_halign=text.align_left)
+        table.cell(rvolTable, 1, r, str.tostring(rvol2, "0.00") + "x", text_color=v2_clr, text_size=tbl_size, text_halign=text.align_right)
+        table.cell(rvolTable, 2, r, trend_arrow(rvol2_trend_delta), text_color=trend_color(rvol2_trend_delta), text_size=tbl_size, text_halign=text.align_center, tooltip=trend_tooltip(rvol2_trend_delta))
+        r += 1
+
+    // Row 3: this bar's raw pre-market volume. Deliberately NOT pm_used, which
+    // zeroes when Add Pre-Market Volume is off - the readout stays live either
+    // way so the toggle can be judged against the number it would add.
+    //
+    // On a regular-session daily chart before 09:30, Route B can only map the
+    // prior trading day's value because today's host daily bar does not exist
+    // yet. Keep the number visible for diagnosis, but label and color it as
+    // prior-session data instead of presenting it as today's live PM volume.
+    if r3_on
+        float pm_disp = timeframe.isintraday ? ext_vol_total : pm_bar_eff
+
+        // "no data" instead of a misleading 0: pm_bars == 0 means the
+        // lower-timeframe request delivered ZERO pre-09:30 sub-bars for this
+        // bar - the feed is not returning pre-market data in this context,
+        // which is a different fact from a pre-market that genuinely traded
+        // nothing. If this reads "no data" on every liquid name, the entire
+        // Add Pre-Market Volume path is a no-op on this chart/feed.
+        bool pm_seen = timeframe.isintraday or pm_bars > 0 or (timeframe.isdaily and pm_ctx > 0)
+
+        string pm_label = stale_daily_pm ? "Pre-Mkt Vol (prior)" : "Pre-Mkt Vol"
+        string pm_txt   = stale_daily_pm ? str.tostring(pm_disp, format.volume) : pm_seen ? str.tostring(pm_disp, format.volume) : "no data"
+        color  pm_color = stale_daily_pm ? color.orange : pm_seen ? color.white : color.gray
+
+        table.cell(rvolTable, 0, r, pm_label, text_color=stale_daily_pm ? color.orange : color.gray, text_size=tbl_size, text_halign=text.align_left)
+        table.cell(rvolTable, 1, r, pm_txt, text_color=pm_color, text_size=tbl_size, text_halign=text.align_right)
+        table.cell(rvolTable, 2, r, "", text_size=tbl_size)
+        r += 1
+
+    // Both rows off and no diagnostics would otherwise leave an empty bordered
+    // box that reads as a bug rather than as a setting.
+    if n_head == 0 and not show_debug
+        table.cell(rvolTable, 0, 0, "RVOL rows hidden", text_color=color.gray, text_size=tbl_size, text_halign=text.align_left)
+        table.cell(rvolTable, 1, 0, "", text_size=tbl_size)
+        table.cell(rvolTable, 2, 0, "", text_size=tbl_size)
+
+    if show_debug
+        dbg_row(r,      "pace mode",        pace_mode)
+        dbg_row(r + 1,  "RVOL linear",      str.tostring(rvol_linear, "0.00") + "x")
+        dbg_row(r + 2,  "pct used",         str.tostring(pct_completed, "0.0000"))
+        dbg_row(r + 3,  "pct curve",        curve_ready ? str.tostring(pct_curve, "0.0000") : "n/a")
+        dbg_row(r + 4,  "pct linear",       str.tostring(pct_linear, "0.0000"))
+        dbg_row(r + 5,  "curve days",       str.tostring(curve_days))
+        dbg_row(r + 6,  "tod used (NY)",    fmt_tod(tod_used))
+        dbg_row(r + 7,  "live bar?",        project_now ? "YES" : "no")
+        dbg_row(r + 8,  "proj vol",         str.tostring(proj_volume, "#"))
+        dbg_row(r + 9,  "base 1",           str.tostring(base1, "#"))
+        dbg_row(r + 10, "base 2",           str.tostring(base2, "#"))
+        dbg_row(r + 11, "base divergence",  str.tostring(base_skew, "0.00") + "x")
+        dbg_row(r + 12, "avg PM",           str.tostring(avg_pm, "#"))
+        dbg_row(r + 13, "plotted bar",      str.tostring(current_bar_vol, "#"))
+        dbg_row(r + 14, "raw volume",       str.tostring(volume, "#"))
+        dbg_row(r + 15, "PM vol / RTH sum", str.tostring(pm_vol, "#") + " / " + str.tostring(rth_sum, "#"))
+        // THE PREMARKET VERDICT ROW. What the lower-timeframe request actually
+        // delivered for this bar: sub-bar count and the NY clock span they
+        // cover. "9:30-16:00" = the feed hands this chart REGULAR-session
+        // sub-bars only and premarket can never arrive; a span starting near
+        // 4:00 = premarket IS arriving and a zero PM vol is genuine.
+        dbg_row(r + 16, "subbars n @ span", str.tostring(pm_n) + " @ " + fmt_tod(sub_first_tod) + "-" + fmt_tod(sub_last_tod))
+        // Route B readout, and the on-screen A/B/C feed test:
+        //   A = "raw volume" row (native daily bar)
+        //   B = "RTH ctx" here and "RTH sum" above (regular-session cumulative)
+        //   C = "PM ctx" + "RTH ctx"
+        // A ~= B  -> native daily volume is RTH-only; adding PM is correct.
+        // A ~= C  -> the realtime daily feed already includes pre-market;
+        //            adding PM on the live bar would double-count.
+        // Neither -> feed discrepancy (late/block prints); read the numbers.
+        dbg_row(r + 17, "PM ctx / RTH ctx", str.tostring(pm_ctx, "#") + " / " + str.tostring(rth_ctx, "#"))
+        // The double-count guard's per-bar verdict: YES = raw volume is
+        // consolidated (PM inside; nothing added, RTH-only pacing in force),
+        // no = raw volume is regular-session-only (PM added on top).
+        dbg_row(r + 18, "PM in raw vol?", vol_includes_pm ? "YES" : "no")
+        // Date/time of the lower-timeframe bar that supplied PM ctx. Before the
+        // regular open on a 1D chart, a prior date here proves the dashboard is
+        // receiving a carried-forward prior-session total rather than today's PM.
+        dbg_row(r + 19, "PM ctx stamp", na(pm_ctx_time) ? "n/a" : str.format_time(pm_ctx_time, "yyyy-MM-dd HH:mm", "America/New_York"))

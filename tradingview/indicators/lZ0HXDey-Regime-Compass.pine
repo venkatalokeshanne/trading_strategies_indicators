@@ -1,0 +1,144 @@
+// This Pine Script(tm) v5 indicator is subject to the Terms of Use:
+// https://www.tradingview.com/pine-script-reference/v5/
+// Regime Compass v1.0
+// Classifies market regime into RISK-ON / NEUTRAL / RISK-OFF / CRISIS
+// Works on both TradFi and Crypto charts.
+
+//@version=6
+indicator("Regime Compass", overlay = false, format = format.price, precision = 1)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grp_vol  = "Volatility"
+hvLen    = input.int(20,   "Realized Vol Lookback",  minval = 5,  maxval = 100, group = grp_vol)
+hvSlow   = input.int(60,   "Slow RV Lookback",       minval = 20, maxval = 200, group = grp_vol)
+annFactor= input.float(365, "Annualization Factor (365 crypto, 252 equities)", minval = 1, group = grp_vol)
+
+grp_trend = "Trend"
+maFast   = input.int(20,  "Fast MA Length", minval = 5,  maxval = 100, group = grp_trend)
+maSlow   = input.int(50,  "Slow MA Length", minval = 20, maxval = 200, group = grp_trend)
+ma200    = input.int(200, "Long MA Length", minval = 100,maxval = 500, group = grp_trend)
+
+grp_mom  = "Momentum"
+rsiLen   = input.int(14,  "RSI Length",     minval = 5,  maxval = 50,  group = grp_mom)
+momLen   = input.int(20,  "ROC Length",     minval = 5,  maxval = 100, group = grp_mom)
+
+grp_ext  = "External Vol Index (optional)"
+useExtVol = input.bool(true, "Use VIX / BVIV when available", group = grp_ext)
+vixSym    = input.string("CBOE:VIX", "TradFi Vol Symbol", group = grp_ext)
+bvivSym   = input.string("DERIBIT:DVOL", "Crypto Vol Symbol", group = grp_ext)
+vixCrisis = input.float(30, "Vol Index Crisis Threshold", minval = 15, maxval = 80, group = grp_ext)
+vixElevated = input.float(22, "Vol Index Elevated Threshold", minval = 10, maxval = 50, group = grp_ext)
+vixCalm   = input.float(16, "Vol Index Calm Threshold", minval = 5, maxval = 30, group = grp_ext)
+
+grp_disp = "Display"
+showBg   = input.bool(true, "Color chart background", group = grp_disp)
+showDash = input.bool(true, "Show dashboard table",   group = grp_disp)
+
+// ── Detect asset class ──────────────────────────────────────────────────────
+isCrypto = (str.contains(str.lower(syminfo.type), "crypto") or (str.contains(str.lower(syminfo.currency), "usd") and (str.contains(str.lower(syminfo.basecurrency), "btc") or str.contains(str.lower(syminfo.basecurrency), "eth") or str.contains(str.lower(syminfo.basecurrency), "sol"))))
+
+annDays  = isCrypto ? 365.0 : 252.0
+actAnn   = annFactor != 365 ? annFactor : annDays
+
+// ── Component 1: Volatility Regime ──────────────────────────────────────────
+logRet   = math.log(close / close[1])
+hvFast   = ta.stdev(logRet, hvLen)  * math.sqrt(actAnn) * 100
+hvSlowV  = ta.stdev(logRet, hvSlow) * math.sqrt(actAnn) * 100
+hvRatio  = hvFast / math.max(hvSlowV, 0.001)
+
+// Percentile rank of fast HV over trailing year
+hvRank   = ta.percentrank(hvFast, 252)
+
+// External vol index
+volSym   = isCrypto ? bvivSym : vixSym
+extVol   = useExtVol ? request.security(volSym, "D", close, ignore_invalid_symbol = true) : na
+
+// Volatility score: -2 (crisis) to +2 (very calm)
+volScore = 0.0
+if not na(extVol)
+    volScore := extVol >= vixCrisis ? -2.0 : extVol >= vixElevated ? -1.0 : extVol <= vixCalm ? 1.5 : 0.0
+else
+    volScore := hvRank >= 90 ? -2.0 : hvRank >= 75 ? -1.0 : hvRank <= 20 ? 1.5 : 0.0
+
+// HV acceleration penalty
+volScore += hvRatio > 1.5 ? -0.5 : hvRatio < 0.7 ? 0.5 : 0.0
+
+// ── Component 2: Trend Regime ───────────────────────────────────────────────
+emaF     = ta.ema(close, maFast)
+emaS     = ta.ema(close, maSlow)
+emaL     = ta.ema(close, ma200)
+
+trendScore = 0.0
+trendScore += close > emaL ? 1.0 : -1.0
+trendScore += emaF > emaS  ? 0.5 : -0.5
+trendScore += close > emaF ? 0.5 : -0.5
+
+// ── Component 3: Momentum Regime ────────────────────────────────────────────
+rsiVal   = ta.rsi(close, rsiLen)
+rocVal   = ta.roc(close, momLen)
+rocRank  = ta.percentrank(rocVal, 252)
+
+momScore = 0.0
+momScore += rsiVal > 60 ? 1.0 : rsiVal < 40 ? -1.0 : 0.0
+momScore += rocRank > 70 ? 0.5 : rocRank < 30 ? -0.5 : 0.0
+
+// ── Composite Score ─────────────────────────────────────────────────────────
+// Weights: vol 40%, trend 35%, momentum 25%
+raw      = volScore * 0.40 + trendScore * 0.35 + momScore * 0.25
+composite = ta.ema(raw, 3)  // light smoothing to avoid flicker
+
+// ── Regime Classification ───────────────────────────────────────────────────
+CRISIS   = 1
+RISKOFF  = 2
+NEUTRAL  = 3
+RISKON   = 4
+
+regime   = composite <= -1.0 ? CRISIS : composite < 0.0 ? RISKOFF : composite < 0.8 ? NEUTRAL : RISKON
+
+regimeStr = regime == CRISIS ? "CRISIS" : regime == RISKOFF ? "RISK-OFF" : regime == NEUTRAL ? "NEUTRAL" : "RISK-ON"
+
+regimeCol = regime == CRISIS ? color.new(color.red, 0) : regime == RISKOFF ? color.new(color.orange, 0) : regime == NEUTRAL ? color.new(color.gray, 0) : color.new(color.green, 0)
+
+// ── Plot ────────────────────────────────────────────────────────────────────
+p1 = plot(composite, "Regime Score", color = regimeCol, linewidth = 2)
+
+hUpper = hline( 0.8, "Risk-On Threshold",  color = color.new(color.green, 70), linestyle = hline.style_dotted)
+hMid   = hline( 0.0, "Zero Line",          color = color.new(color.gray, 50),  linestyle = hline.style_solid)
+hLower = hline(-1.0, "Crisis Threshold",    color = color.new(color.red, 70),   linestyle = hline.style_dotted)
+
+fill(hUpper, hMid,   color = color.new(color.green, 92))
+fill(hMid,   hLower, color = color.new(color.red, 92))
+
+bgcolor(showBg ? color.new(regimeCol, 88) : na)
+barcolor(showBg ? regimeCol : na)
+
+// ── Dashboard Table ─────────────────────────────────────────────────────────
+if showDash and barstate.islast
+    var t = table.new(position.top_right, 2, 7, border_width = 1, bgcolor = color.new(color.black, 20), border_color = color.new(color.gray, 60))
+    table.cell(t, 0, 0, "REGIME COMPASS", text_color = color.white, text_size = size.normal, bgcolor = regimeCol)
+    table.cell(t, 1, 0, regimeStr, text_color = color.white, text_size = size.normal, bgcolor = regimeCol)
+
+    table.cell(t, 0, 1, "Score",      text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 1, str.tostring(composite, "#.##"), text_color = color.white, text_size = size.small)
+
+    table.cell(t, 0, 2, "Vol Score",  text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 2, str.tostring(volScore, "#.#"), text_color = volScore < 0 ? color.red : color.green, text_size = size.small)
+
+    table.cell(t, 0, 3, "Trend Score",text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 3, str.tostring(trendScore, "#.#"), text_color = trendScore < 0 ? color.red : color.green, text_size = size.small)
+
+    table.cell(t, 0, 4, "Mom Score",  text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 4, str.tostring(momScore, "#.#"), text_color = momScore < 0 ? color.red : color.green, text_size = size.small)
+
+    table.cell(t, 0, 5, "Fast HV",    text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 5, str.tostring(hvFast, "#.#") + "%", text_color = color.white, text_size = size.small)
+
+    extStr = not na(extVol) ? str.tostring(extVol, "#.#") : "n/a"
+    table.cell(t, 0, 6, isCrypto ? "DVOL" : "VIX", text_color = color.gray, text_size = size.small)
+    table.cell(t, 1, 6, extStr, text_color = color.white, text_size = size.small)
+
+// ── Alerts ──────────────────────────────────────────────────────────────────
+alertcondition(ta.crossunder(composite, -1.0), "Crisis Entry",  "Regime Compass: entering CRISIS")
+alertcondition(ta.crossover(composite, -1.0),  "Crisis Exit",   "Regime Compass: exiting CRISIS")
+alertcondition(ta.crossover(composite, 0.8),   "Risk-On Entry", "Regime Compass: entering RISK-ON")
+alertcondition(ta.crossunder(composite, 0.8),  "Risk-On Exit",  "Regime Compass: exiting RISK-ON")

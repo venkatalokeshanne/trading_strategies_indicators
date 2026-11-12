@@ -1,0 +1,247 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © StrixEDGE
+
+//@version=6
+indicator('Regime Detector [StrixEDGE]', overlay=true, max_labels_count=50)
+
+// ═══════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════
+
+// -- Core Parameters --
+adxPeriod     = input.int(14, "ADX Period", minval=2, maxval=50, tooltip="ADX calculation period. Standard: 14. Lower = faster reaction to trend shifts.", group="⚙️ Core Parameters")
+rsiPeriod     = input.int(14, "RSI Period", minval=2, maxval=100, tooltip="RSI calculation period. Standard: 14. Feeds the bull/bear regime bias detector.", group="⚙️ Core Parameters")
+kamaLength    = input.int(21, "KAMA Length", minval=2, maxval=100, tooltip="Kaufman Adaptive Moving Average length. Higher = smoother slope readings.", group="⚙️ Core Parameters")
+atrPeriod     = input.int(14, "ATR Period", minval=2, maxval=50, tooltip="ATR period for current volatility measurement.", group="⚙️ Core Parameters")
+atrLookback   = input.int(50, "ATR Lookback", minval=10, maxval=200, tooltip="Lookback for average ATR baseline. Current ATR is compared against this average.", group="⚙️ Core Parameters")
+flatThreshold = input.float(0.05, "Flat Threshold", minval=0.01, maxval=0.5, step=0.01, tooltip="KAMA slope threshold normalized by ATR. Below this = flat. Above = trending.", group="⚙️ Core Parameters")
+sensitivity   = input.string("Normal", "Sensitivity", options=["Conservative", "Normal", "Aggressive"], tooltip="Adjusts ADX thresholds. Conservative: 30/22. Normal: 25/20. Aggressive: 22/18.", group="⚙️ Core Parameters")
+
+// -- Visual Settings --
+showBackground  = input.bool(true, "Show Background Colors", tooltip="Subtle background color zones for each regime.", group="🎨 Visual Settings")
+showLabels      = input.bool(true, "Show Regime Labels", tooltip="Floating label with regime name, ADX, and ATR ratio.", group="🎨 Visual Settings")
+showTransitions = input.bool(true, "Show Regime Transitions", tooltip="Diamond markers when regime changes.", group="🎨 Visual Settings")
+
+// -- Table Settings --
+tableSize = input.string("Normal", title="📐 Table Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], tooltip="Display size of the data table.", group="📊 Table Settings")
+tablePos  = input.string("Top Right", title="📍 Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left"], tooltip="Data table position on chart.", group="📊 Table Settings")
+showTable = input.bool(true, title="Show Table", tooltip="Toggle data table visibility.", group="📊 Table Settings")
+
+
+// ═══════════════════════════════════════════
+// CALCULATIONS
+// ═══════════════════════════════════════════
+
+// -- Sensitivity-adjusted ADX thresholds --
+float adxStrongThr = switch sensitivity
+    "Conservative" => 30.0
+    "Aggressive"   => 22.0
+    => 25.0
+
+float adxWeakThr = switch sensitivity
+    "Conservative" => 22.0
+    "Aggressive"   => 18.0
+    => 20.0
+
+// -- 1. ADX Trend Strength (ta.dmi returns [DI+, DI-, ADX]) --
+[diPlus, diMinus, adxValue] = ta.dmi(adxPeriod, adxPeriod)
+
+// -- 2. RSI Range-Shift Detection --
+//    Count how many of the last 20 bars had RSI above/below 50.
+//    Bull regime = 15+ bars above 50. Bear regime = 15+ bars below.
+rsiValue = ta.rsi(close, rsiPeriod)
+float rsiAboveFlag  = rsiValue > 50 ? 1.0 : 0.0
+float rsiBullCount  = ta.sma(rsiAboveFlag, 20) * 20.0   // rolling count of bars RSI > 50
+float rsiBearCount  = 20.0 - nz(rsiBullCount, 10.0)      // complement
+bool  bullRegime    = not na(rsiBullCount) and rsiBullCount > 14.0
+bool  bearRegime    = not na(rsiBearCount) and rsiBearCount > 14.0
+
+// -- 3. KAMA Slope Analysis --
+//    KAMA is not a built-in in PineScript v6 — manual implementation.
+//    Kaufman Adaptive MA: adapts speed via efficiency ratio (direction / volatility).
+float _kamaFastSC   = 2.0 / 3.0           // fast smoothing constant (period 2)
+float _kamaSlowSC   = 2.0 / 31.0          // slow smoothing constant (period 30)
+float _kamaDir      = math.abs(close - close[kamaLength])
+float _kamaVol      = ta.sma(math.abs(close - close[1]), kamaLength) * kamaLength
+float _kamaER       = _kamaVol > 0 ? _kamaDir / _kamaVol : 0.0
+float _kamaSC       = math.pow(_kamaER * (_kamaFastSC - _kamaSlowSC) + _kamaSlowSC, 2)
+var float kamaValue = na
+kamaValue           := na(kamaValue[1]) ? close : kamaValue[1] + _kamaSC * (close - kamaValue[1])
+float kamaSlope       = (kamaValue - kamaValue[5]) / 5.0
+float atrNorm         = ta.atr(14)
+float normalizedSlope = atrNorm > 0 ? kamaSlope / atrNorm : 0.0
+bool  isTrending      = math.abs(normalizedSlope) > flatThreshold
+bool  isFlat          = math.abs(normalizedSlope) <= flatThreshold
+
+// -- 4. ATR Volatility Ratio --
+//    Current ATR vs its own moving average. >1.5 = volatile, <0.7 = compressed.
+float currentATR  = ta.atr(atrPeriod)
+float avgATR      = ta.sma(currentATR, atrLookback)
+float atrRatio    = avgATR > 0 ? currentATR / avgATR : 1.0
+bool  isVolatile  = atrRatio > 1.5
+bool  isCompressed = atrRatio < 0.7
+
+
+// ═══════════════════════════════════════════
+// SIGNALS & CONDITIONS
+// ═══════════════════════════════════════════
+
+// -- Individual regime conditions (priority order matters) --
+bool strongTrendUp   = adxValue > adxStrongThr and normalizedSlope > flatThreshold and bullRegime and diPlus > diMinus
+bool strongTrendDown = adxValue > adxStrongThr and normalizedSlope < -flatThreshold and bearRegime and diMinus > diPlus
+bool volatileChop    = adxValue < adxStrongThr and isVolatile and not strongTrendUp and not strongTrendDown
+bool partialRsi      = not na(rsiBullCount) and (rsiBullCount > 10.0 or rsiBearCount > 10.0)
+bool weakTrend       = adxValue > adxWeakThr and (isTrending or partialRsi) and not strongTrendUp and not strongTrendDown and not volatileChop
+// Ranging = everything else (low ADX, flat slope, no volatility spike)
+
+// -- Assign regime: 1=Strong Up, 2=Strong Down, 3=Weak Trend, 4=Ranging, 5=Volatile Chop --
+int currentRegime = strongTrendUp ? 1 : strongTrendDown ? 2 : volatileChop ? 5 : weakTrend ? 3 : 4
+
+// -- Detect transitions --
+bool regimeChanged    = bar_index > 0 and currentRegime != nz(currentRegime[1], currentRegime)
+bool strongTrendStart = (currentRegime == 1 or currentRegime == 2) and nz(currentRegime[1], 0) != 1 and nz(currentRegime[1], 0) != 2
+bool rangeStart       = currentRegime == 4 and nz(currentRegime[1], 0) != 4
+
+
+// ═══════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════
+
+// -- Background color per regime (very subtle transparency) --
+color bgColor = switch currentRegime
+    1 => color.new(#00BA7C, 92)
+    2 => color.new(#F4212E, 92)
+    3 => color.new(#8B98A5, 93)
+    4 => color.new(#1D9BF0, 94)
+    5 => color.new(#F7931A, 93)
+    => na
+
+bgcolor(showBackground ? bgColor : na, title="Regime Background")
+
+// -- Regime display text --
+string regimeText = switch currentRegime
+    1 => "STRONG TREND ▲"
+    2 => "STRONG TREND ▼"
+    3 => normalizedSlope >= 0 ? "WEAK TREND ▲" : "WEAK TREND ▼"
+    4 => "RANGING"
+    5 => "VOLATILE CHOP"
+    => "—"
+
+// -- Floating info label (delete-and-recreate pattern) --
+var label regimeLabel = na
+
+if showLabels
+    if not na(regimeLabel)
+        label.delete(regimeLabel)
+    color lblColor = switch currentRegime
+        1 => color.new(#00BA7C, 20)
+        2 => color.new(#F4212E, 20)
+        3 => color.new(#8B98A5, 20)
+        4 => color.new(#1D9BF0, 20)
+        5 => color.new(#F7931A, 20)
+        => color.new(#8B98A5, 20)
+    string lblText = regimeText + "\nADX: " + str.tostring(nz(adxValue), "#.#") + " | ATR×: " + str.tostring(nz(atrRatio, 1.0), "#.##")
+    regimeLabel := label.new(bar_index, na, lblText, color=lblColor, textcolor=color.white, style=label.style_label_left, size=size.normal, yloc=yloc.abovebar)
+
+// -- Transition diamond markers on regime change --
+color transColor = switch currentRegime
+    1 => #00BA7C
+    2 => #F4212E
+    3 => #8B98A5
+    4 => #1D9BF0
+    5 => #F7931A
+    => #8B98A5
+
+plotshape(showTransitions and regimeChanged, title="Regime Transition", style=shape.diamond, location=location.abovebar, color=transColor, size=size.small)
+
+
+// ═══════════════════════════════════════════
+// DATA TABLE — STYLE A (Dark Header)
+// ═══════════════════════════════════════════
+
+string tSize = switch tableSize
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+string tPos = switch tablePos
+    "Top Left"     => position.top_left
+    "Bottom Right"  => position.bottom_right
+    "Bottom Left"   => position.bottom_left
+    => position.top_right
+
+// Style A color constants
+var color HEADER_BG     = color.rgb(26, 26, 46)
+var color HEADER_TEXT   = #ffffff
+var color SUBHEADER_TXT = color.rgb(158, 158, 158)
+var color ROW_BG        = #ffffff
+var color LABEL_CLR     = color.rgb(102, 102, 102)
+var color BORDER_CLR    = color.rgb(240, 240, 240)
+var color BULL_CLR      = color.rgb(0, 176, 124)
+var color BEAR_CLR      = color.rgb(229, 57, 53)
+var color NEUT_CLR      = color.rgb(102, 102, 102)
+
+if barstate.islast and showTable
+    var tbl = table.new(tPos, columns=2, rows=9, bgcolor=ROW_BG, border_color=BORDER_CLR, border_width=1, frame_color=HEADER_BG, frame_width=0)
+
+    // ── Row 0: Dark header ──
+    table.cell(tbl, 0, 0, "StrixEDGE Regime Detector", bgcolor=HEADER_BG, text_color=HEADER_TEXT, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 0, syminfo.ticker + " · " + timeframe.period, bgcolor=HEADER_BG, text_color=SUBHEADER_TXT, text_size=tSize, text_halign=text.align_right)
+
+    // ── Row 1: Current regime ──
+    color regimeTblClr = switch currentRegime
+        1 => BULL_CLR
+        2 => BEAR_CLR
+        3 => NEUT_CLR
+        4 => color.rgb(29, 155, 240)
+        5 => color.rgb(247, 147, 26)
+        => NEUT_CLR
+    table.cell(tbl, 0, 1, "Regime", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 1, regimeText, bgcolor=ROW_BG, text_color=regimeTblClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 2: ADX value ──
+    color adxClr = adxValue > adxStrongThr ? BULL_CLR : adxValue < adxWeakThr ? BEAR_CLR : NEUT_CLR
+    table.cell(tbl, 0, 2, "ADX", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 2, str.tostring(nz(adxValue), "#.#"), bgcolor=ROW_BG, text_color=adxClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 3: DI+ / DI- ──
+    table.cell(tbl, 0, 3, "DI+ / DI−", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 3, str.tostring(nz(diPlus), "#.#") + " / " + str.tostring(nz(diMinus), "#.#"), bgcolor=ROW_BG, text_color=NEUT_CLR, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 4: RSI ──
+    color rsiClr = rsiValue > 60 ? BULL_CLR : rsiValue < 40 ? BEAR_CLR : NEUT_CLR
+    table.cell(tbl, 0, 4, "RSI", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 4, str.tostring(nz(rsiValue), "#.#"), bgcolor=ROW_BG, text_color=rsiClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 5: KAMA slope (ATR-normalized) ──
+    color slopeClr = normalizedSlope > flatThreshold ? BULL_CLR : normalizedSlope < -flatThreshold ? BEAR_CLR : NEUT_CLR
+    table.cell(tbl, 0, 5, "KAMA Slope", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 5, str.tostring(nz(normalizedSlope), "#.###"), bgcolor=ROW_BG, text_color=slopeClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 6: ATR ratio ──
+    color atrClr = isVolatile ? BEAR_CLR : isCompressed ? color.rgb(29, 155, 240) : NEUT_CLR
+    table.cell(tbl, 0, 6, "ATR Ratio", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 6, str.tostring(nz(atrRatio, 1.0), "#.##") + "x", bgcolor=ROW_BG, text_color=atrClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 7: Volatility state ──
+    string volText  = isVolatile ? "HIGH" : isCompressed ? "LOW" : "NORMAL"
+    color  volClr   = isVolatile ? BEAR_CLR : isCompressed ? color.rgb(29, 155, 240) : NEUT_CLR
+    table.cell(tbl, 0, 7, "Volatility", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 7, volText, bgcolor=ROW_BG, text_color=volClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+    // ── Row 8: RSI regime bias ──
+    string rsiBiasText = bullRegime ? "BULL BIAS" : bearRegime ? "BEAR BIAS" : "NEUTRAL"
+    color  rsiBiasClr  = bullRegime ? BULL_CLR : bearRegime ? BEAR_CLR : NEUT_CLR
+    table.cell(tbl, 0, 8, "RSI Regime", bgcolor=ROW_BG, text_color=LABEL_CLR, text_size=tSize, text_halign=text.align_left)
+    table.cell(tbl, 1, 8, rsiBiasText, bgcolor=ROW_BG, text_color=rsiBiasClr, text_size=tSize, text_halign=text.align_right, text_font_family=font.family_monospace)
+
+
+// ═══════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════
+
+alertcondition(regimeChanged, title="Regime Change", message="StrixEDGE Regime Detector: Market regime has changed.")
+alertcondition(strongTrendStart, title="Strong Trend Started", message="StrixEDGE Regime Detector: Strong trend detected — ADX above threshold with directional confirmation.")
+alertcondition(rangeStart, title="Range Detected", message="StrixEDGE Regime Detector: Market entered ranging regime — low ADX, flat slope, normal volatility.")

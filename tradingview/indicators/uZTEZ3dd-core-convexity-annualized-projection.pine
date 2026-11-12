@@ -1,0 +1,536 @@
+//@version=6
+indicator("[core convexity] annualized projection", "[core convexity] annualized projection", overlay=true, dynamic_requests=true, max_lines_count=200, max_labels_count=100)
+
+// old project from a year ago
+
+// =============================================================================
+// inputs
+// =============================================================================
+
+string GRP_ANCHOR = "anchoring"
+
+string anchorMode = input.string(
+     "timeframe candle open", "anchor method",
+     options=["timeframe candle open", "session open", "manual timestamp"],
+     group=GRP_ANCHOR,
+     tooltip="timeframe candle open uses TradingView's open for the selected anchor timeframe. session open uses the first chart bar inside the selected session. manual timestamp anchors once at the first chart bar at/after the timestamp.")
+
+string anchorTF = input.timeframe(
+     "D", "anchor timeframe",
+     group=GRP_ANCHOR,
+     active=anchorMode == "timeframe candle open",
+     tooltip="if this is below the chart timeframe, it is clamped to the chart timeframe instead of using an unreliable lower-timeframe anchor request.")
+
+string anchorSession = input.session(
+     "0930-1600", "anchor session",
+     group=GRP_ANCHOR,
+     active=anchorMode == "session open",
+     tooltip="interpreted in the chart symbol's exchange timezone.")
+
+int manualTimestamp = input.time(
+     1577836800000, "manual timestamp",
+     group=GRP_ANCHOR,
+     active=anchorMode == "manual timestamp")
+
+
+string GRP_VOL = "volatility engine"
+
+string volModel = input.string(
+     "blend", "volatility model",
+     options=["blend", "iv only", "yang-zhang rv only"],
+     group=GRP_VOL)
+
+float ivWeight = input.float(
+     0.50, "iv weight",
+     minval=0.0, maxval=1.0, step=0.05,
+     group=GRP_VOL,
+     active=volModel == "blend",
+     tooltip="blend = iv weight × iv + (1 - iv weight) × annualized Yang-Zhang rv.")
+
+string rvTF = input.timeframe(
+     "D", "yang-zhang timeframe",
+     group=GRP_VOL,
+     active=volModel != "iv only",
+     tooltip="only Yang-Zhang uses this timeframe. it no longer controls the anchor or cone geometry. if RV is set to 1m and the chart is 15m, the script pulls all available 1m intrabars and uses the latest 1m YZ value inside each 15m bar.")
+
+int yzLookback = input.int(
+     20, "yang-zhang lookback",
+     minval=2,
+     group=GRP_VOL,
+     active=volModel != "iv only")
+
+float rvPeriodsPerYear = input.float(
+     252.0, "rv periods / year",
+     minval=1.0,
+     group=GRP_VOL,
+     active=volModel != "iv only",
+     tooltip="annualizes the selected Yang-Zhang timeframe by sqrt(periods/year). use 252 for daily TradFi. if RV runs on intraday bars, set the number of those RV bars you consider one year.")
+
+string anchoredVolUpdate = input.string(
+     "latch at anchor", "anchored cone volatility",
+     options=["latch at anchor", "live"],
+     group=GRP_VOL,
+     tooltip="latch at anchor freezes volatility when the anchor starts. live lets the anchored cone breathe as IV/RV changes. rolling bands always recalculate.")
+
+
+string GRP_IV = "implied volatility"
+
+string ivMode = input.string(
+     "auto proxy", "iv source",
+     options=["auto proxy", "manual symbol", "fixed %"],
+     group=GRP_IV)
+
+string ivManualSymbol = input.symbol(
+     "CBOE:VIX", "manual iv symbol",
+     group=GRP_IV,
+     active=ivMode == "manual symbol")
+
+float ivFixedPct = input.float(
+     20.0, "fixed iv %",
+     minval=0.01,
+     group=GRP_IV,
+     active=ivMode == "fixed %")
+
+
+string GRP_STRUCTURE = "cone / rolling bands"
+
+string structureMode = input.string(
+     "anchored cone", "structure",
+     options=["anchored cone", "rolling bands"],
+     group=GRP_STRUCTURE,
+     tooltip="anchored cone expands smoothly with elapsed time from one anchor. rolling bands recenter on current price and expand/contract continuously with current volatility, more like VWAP-style deviation bands.")
+
+float annualDays = input.float(
+     252.0, "cone days / year",
+     minval=1.0,
+     group=GRP_STRUCTURE,
+     tooltip="time scaling for the cone/bands. 252 is the usual TradFi convention; 365 is common for crypto.")
+
+float rollingHorizonDays = input.float(
+     1.0, "rolling horizon (days)",
+     minval=0.001,
+     group=GRP_STRUCTURE,
+     active=structureMode == "rolling bands",
+     tooltip="rolling bands show the current annualized volatility scaled to this fixed horizon. because the center and volatility recalculate, the bands move, widen and contract every chart update.")
+
+bool showAnchor = input.bool(
+     true, "show anchor",
+     group=GRP_STRUCTURE,
+     active=structureMode == "anchored cone")
+
+bool showStandard = input.bool(true, "show standard deviations", group=GRP_STRUCTURE)
+
+float maxSigma = input.float(
+     3.0, "max standard deviation",
+     minval=0.5, maxval=3.0, step=0.5,
+     group=GRP_STRUCTURE)
+
+bool showFib0 = input.bool(false, "show fib 0.x", group=GRP_STRUCTURE)
+bool showFib1 = input.bool(false, "show fib 1.x", group=GRP_STRUCTURE)
+bool showFib2 = input.bool(false, "show fib 2.x", group=GRP_STRUCTURE)
+
+bool showForward = input.bool(
+     true, "forward projection",
+     group=GRP_STRUCTURE)
+
+float forwardDays = input.float(
+     5.0, "forward days",
+     minval=0.01,
+     group=GRP_STRUCTURE,
+     active=showForward,
+     tooltip="anchored mode keeps widening the cone into the future. rolling mode extends today's recalculated band levels horizontally as a current snapshot.")
+
+bool showStats = input.bool(true, "show volatility readout", group=GRP_STRUCTURE)
+
+
+// =============================================================================
+// helpers
+// =============================================================================
+
+float MS_IN_DAY = 86400000.0
+
+f_tf_floor(string candidate, string floorTf) =>
+    float c = timeframe.in_seconds(candidate)
+    float f = timeframe.in_seconds(floorTf)
+    not na(c) and not na(f) and c < f ? floorTf : candidate
+
+f_auto_iv_symbol() =>
+    string root = str.upper(syminfo.root)
+    string result = "CBOE:VIX"
+
+    if root == "NQ" or root == "MNQ" or root == "NDX" or root == "QQQ"
+        result := "CBOE:VXN"
+    else if root == "RTY" or root == "M2K" or root == "RUT" or root == "IWM"
+        result := "CBOE:RVX"
+    else if root == "YM" or root == "MYM" or root == "DJI"
+        result := "CBOE:VXD"
+    else if root == "GC" or root == "MGC" or syminfo.currency == "XAU"
+        result := "CBOE:GVZ"
+    else if root == "CL" or root == "MCL" or root == "QM"
+        result := "CBOE:OVX"
+    else if root == "6E" or root == "EUR"
+        result := "CBOE:EVZ"
+
+    result
+
+// Yang-Zhang reference implementation: returns volatility per RV bar.
+// This follows the supplied corrected reference:
+//   - overnight and open-to-close components use mean-adjusted sample variances
+//   - Rogers-Satchell uses the mean RS term over N
+//   - k = 0.34 / (1.34 + (N+1)/(N-1))
+// The previous/original script instead summed squared overnight/open-close returns
+// without subtracting their sample means and divided RS by N-1. Those choices are
+// why the numerical RV outcomes can differ even with the same OHLC/lookback.
+f_yang_zhang(int len) =>
+    float o = math.log(math.max(open, 0.0001))
+    float c = math.log(math.max(close, 0.0001))
+    float h = math.log(math.max(high, 0.0001))
+    float l = math.log(math.max(low, 0.0001))
+    float c1 = math.log(math.max(close[1], 0.0001))
+
+    float no = o - c1
+    float nu = h - o
+    float nd = l - o
+    float nc = c - o
+
+    float rsTerm = nu * (nu - nc) + nd * (nd - nc)
+    float vRS = math.sum(rsTerm, len) / len
+
+    float noAvg = math.sum(no, len) / len
+    float vO = math.sum(math.pow(no - noAvg, 2), len) / (len - 1)
+
+    float ncAvg = math.sum(nc, len) / len
+    float vC = math.sum(math.pow(nc - ncAvg, 2), len) / (len - 1)
+
+    float k = 0.34 / (1.34 + (len + 1.0) / (len - 1.0))
+    float yzVar = vO + k * vC + (1.0 - k) * vRS
+
+    math.sqrt(math.max(yzVar, 0.0))
+
+f_last_float(array<float> a) =>
+    array.size(a) > 0 ? array.get(a, array.size(a) - 1) : na
+
+f_band(float center, float sigma, float multiple, bool upper) =>
+    upper ? center * math.exp(multiple * sigma) : center * math.exp(-multiple * sigma)
+
+
+// =============================================================================
+// anchor engine
+//
+// IMPORTANT: anchor and cone geometry are chart/time-based again.
+// RV timeframe does not change where the anchor is or how the cone ages.
+// =============================================================================
+
+string effectiveAnchorTF = f_tf_floor(anchorTF, timeframe.period)
+
+[tfAnchorOpen, tfAnchorTime] = request.security(
+     syminfo.tickerid, effectiveAnchorTF, [open, time],
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+bool tfReset = not na(tfAnchorTime) and (na(tfAnchorTime[1]) or tfAnchorTime != tfAnchorTime[1])
+
+bool inAnchorSession = not na(time(timeframe.period, anchorSession))
+bool sessionReset = inAnchorSession and not inAnchorSession[1]
+
+bool manualReset = time >= manualTimestamp and (bar_index == 0 or time[1] < manualTimestamp)
+
+var float storedAnchor = na
+var int storedAnchorTime = na
+var bool manualDone = false
+
+float anchorPrice = na
+int anchorStartTime = na
+bool anchorReset = false
+
+if anchorMode == "timeframe candle open"
+    anchorPrice := tfAnchorOpen
+    anchorStartTime := tfAnchorTime
+    anchorReset := tfReset
+
+else if anchorMode == "session open"
+    if sessionReset or na(storedAnchor)
+        storedAnchor := open
+        storedAnchorTime := time
+    anchorPrice := storedAnchor
+    anchorStartTime := storedAnchorTime
+    anchorReset := sessionReset
+
+else
+    if manualReset and not manualDone
+        storedAnchor := open
+        storedAnchorTime := time
+        manualDone := true
+        anchorReset := true
+    anchorPrice := storedAnchor
+    anchorStartTime := storedAnchorTime
+
+bool hasAnchor = not na(anchorPrice) and not na(anchorStartTime)
+
+float elapsedDays = hasAnchor ? math.max((time - anchorStartTime) / MS_IN_DAY, 0.0) : na
+
+
+// =============================================================================
+// Yang-Zhang timeframe adapter
+//
+// HTF/equal TF: request.security()
+// LTF: request.security_lower_tf() and take the latest intrabar value.
+// This avoids the old behavior where a 1m engine became a sampled/stepped state
+// machine when viewed on a larger chart.
+// =============================================================================
+
+float chartSeconds = timeframe.in_seconds(timeframe.period)
+float rvSeconds = timeframe.in_seconds(rvTF)
+bool rvIsLower = not na(chartSeconds) and not na(rvSeconds) and rvSeconds < chartSeconds
+
+float yzPeriod = na
+
+if rvIsLower
+    yzArr = request.security_lower_tf(
+         syminfo.tickerid, rvTF,
+         f_yang_zhang(yzLookback),
+         ignore_invalid_timeframe=true)
+
+    yzPeriod := f_last_float(yzArr)
+else
+    yzPeriod := request.security(
+         syminfo.tickerid, rvTF,
+         f_yang_zhang(yzLookback),
+         gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+float yzAnnual = not na(yzPeriod) ? yzPeriod * math.sqrt(rvPeriodsPerYear) : na
+
+
+// =============================================================================
+// implied volatility
+// =============================================================================
+
+string autoIvSymbol = f_auto_iv_symbol()
+string selectedIvSymbol = ivMode == "manual symbol" ? ivManualSymbol : autoIvSymbol
+
+// IV is only a volatility input, not a geometry clock. request.security() with
+// lookahead_off gives the latest available IV value on each chart bar.
+float ivPct = ivMode == "fixed %" ? ivFixedPct : request.security(
+     selectedIvSymbol, rvTF, close,
+     gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off,
+     ignore_invalid_symbol=true)
+
+float ivAnnual = not na(ivPct) ? ivPct / 100.0 : na
+
+float selectedAnnualVol = switch volModel
+    "iv only" => ivAnnual
+    "yang-zhang rv only" => yzAnnual
+    => not na(ivAnnual) and not na(yzAnnual) ? ivWeight * ivAnnual + (1.0 - ivWeight) * yzAnnual :
+       not na(ivAnnual) ? ivAnnual : yzAnnual
+
+var float latchedAnnualVol = na
+if hasAnchor and (anchorReset or na(latchedAnnualVol))
+    latchedAnnualVol := selectedAnnualVol
+
+float anchoredAnnualVol = anchoredVolUpdate == "live" ? selectedAnnualVol : latchedAnnualVol
+
+
+// =============================================================================
+// structures
+// =============================================================================
+
+// Smooth anchored cone: elapsed clock time, not RV/calc bars.
+float anchoredSigma = hasAnchor and not na(anchoredAnnualVol) ?
+     anchoredAnnualVol * math.sqrt(elapsedDays / annualDays) : na
+
+// Rolling bands: current price + fixed horizon. Both center and vol recalc.
+float rollingSigma = not na(selectedAnnualVol) ?
+     selectedAnnualVol * math.sqrt(rollingHorizonDays / annualDays) : na
+
+float structureCenter = structureMode == "rolling bands" ? close : anchorPrice
+float structureSigma = structureMode == "rolling bands" ? rollingSigma : anchoredSigma
+
+bool structureReady = not na(structureCenter) and not na(structureSigma)
+
+
+// =============================================================================
+// style-safe plot colors
+// =============================================================================
+
+color C_ANCHOR = color.new(color.silver, 20)
+color C_05 = color.new(color.gray, 55)
+color C_10 = color.new(color.blue, 0)
+color C_15 = color.new(color.aqua, 15)
+color C_20 = color.new(color.orange, 5)
+color C_25 = color.new(color.fuchsia, 15)
+color C_30 = color.new(color.red, 15)
+color C_FIB0 = color.new(color.teal, 15)
+color C_FIB1 = color.new(color.purple, 15)
+color C_FIB2 = color.new(color.yellow, 10)
+color C_DATA = color.new(color.gray, 0)
+
+
+// =============================================================================
+// plots
+// =============================================================================
+
+plot(showAnchor and structureMode == "anchored cone" and hasAnchor ? anchorPrice : na, "anchor", color=C_ANCHOR)
+
+plot(showStandard and maxSigma >= 0.5 and structureReady ? f_band(structureCenter, structureSigma, 0.5, true) : na, "0.5σ upper", color=C_05)
+plot(showStandard and maxSigma >= 0.5 and structureReady ? f_band(structureCenter, structureSigma, 0.5, false) : na, "0.5σ lower", color=C_05)
+
+plot(showStandard and maxSigma >= 1.0 and structureReady ? f_band(structureCenter, structureSigma, 1.0, true) : na, "1.0σ upper", color=C_10, linewidth=2)
+plot(showStandard and maxSigma >= 1.0 and structureReady ? f_band(structureCenter, structureSigma, 1.0, false) : na, "1.0σ lower", color=C_10, linewidth=2)
+
+plot(showStandard and maxSigma >= 1.5 and structureReady ? f_band(structureCenter, structureSigma, 1.5, true) : na, "1.5σ upper", color=C_15)
+plot(showStandard and maxSigma >= 1.5 and structureReady ? f_band(structureCenter, structureSigma, 1.5, false) : na, "1.5σ lower", color=C_15)
+
+plot(showStandard and maxSigma >= 2.0 and structureReady ? f_band(structureCenter, structureSigma, 2.0, true) : na, "2.0σ upper", color=C_20)
+plot(showStandard and maxSigma >= 2.0 and structureReady ? f_band(structureCenter, structureSigma, 2.0, false) : na, "2.0σ lower", color=C_20)
+
+plot(showStandard and maxSigma >= 2.5 and structureReady ? f_band(structureCenter, structureSigma, 2.5, true) : na, "2.5σ upper", color=C_25)
+plot(showStandard and maxSigma >= 2.5 and structureReady ? f_band(structureCenter, structureSigma, 2.5, false) : na, "2.5σ lower", color=C_25)
+
+plot(showStandard and maxSigma >= 3.0 and structureReady ? f_band(structureCenter, structureSigma, 3.0, true) : na, "3.0σ upper", color=C_30)
+plot(showStandard and maxSigma >= 3.0 and structureReady ? f_band(structureCenter, structureSigma, 3.0, false) : na, "3.0σ lower", color=C_30)
+
+// fib 0.x
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.236, true) : na, "fib 0.236 upper", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.236, false) : na, "fib 0.236 lower", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.382, true) : na, "fib 0.382 upper", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.382, false) : na, "fib 0.382 lower", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.618, true) : na, "fib 0.618 upper", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.618, false) : na, "fib 0.618 lower", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.786, true) : na, "fib 0.786 upper", color=C_FIB0)
+plot(showFib0 and structureReady ? f_band(structureCenter, structureSigma, 0.786, false) : na, "fib 0.786 lower", color=C_FIB0)
+
+// fib 1.x
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.236, true) : na, "fib 1.236 upper", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.236, false) : na, "fib 1.236 lower", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.382, true) : na, "fib 1.382 upper", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.382, false) : na, "fib 1.382 lower", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.618, true) : na, "fib 1.618 upper", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.618, false) : na, "fib 1.618 lower", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.786, true) : na, "fib 1.786 upper", color=C_FIB1)
+plot(showFib1 and structureReady ? f_band(structureCenter, structureSigma, 1.786, false) : na, "fib 1.786 lower", color=C_FIB1)
+
+// fib 2.x
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.236, true) : na, "fib 2.236 upper", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.236, false) : na, "fib 2.236 lower", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.382, true) : na, "fib 2.382 upper", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.382, false) : na, "fib 2.382 lower", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.618, true) : na, "fib 2.618 upper", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.618, false) : na, "fib 2.618 lower", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.786, true) : na, "fib 2.786 upper", color=C_FIB2)
+plot(showFib2 and structureReady ? f_band(structureCenter, structureSigma, 2.786, false) : na, "fib 2.786 lower", color=C_FIB2)
+
+// data-window-only RV readout; does not distort the chart price scale.
+float rvDataWindow = yzAnnual * 100.0
+plot(rvDataWindow, "YZ RV annualized", color=C_DATA, display=display.data_window)
+
+
+// =============================================================================
+// forward projection
+// =============================================================================
+
+var array<line> projectionLines = array.new<line>()
+
+f_upsert_projection(int idx, int x1, float y1, int x2, float y2, color c, int width) =>
+    line id = na
+
+    if idx < array.size(projectionLines)
+        id := array.get(projectionLines, idx)
+        line.set_xy1(id, x1, y1)
+        line.set_xy2(id, x2, y2)
+        line.set_color(id, c)
+        line.set_width(id, width)
+    else
+        id := line.new(x1, y1, x2, y2, xloc=xloc.bar_time, extend=extend.none, color=c, width=width)
+        array.push(projectionLines, id)
+
+    id
+
+if barstate.islast
+    int used = 0
+
+    if showForward and structureReady
+        int xNow = time
+        int xFuture = time + int(forwardDays * MS_IN_DAY)
+
+        float futureCenter = structureCenter
+        float futureSigma = structureSigma
+
+        if structureMode == "anchored cone"
+            float futureElapsedDays = elapsedDays + forwardDays
+            futureCenter := anchorPrice
+            futureSigma := not na(anchoredAnnualVol) ?
+                 anchoredAnnualVol * math.sqrt(futureElapsedDays / annualDays) : na
+
+        // rolling mode intentionally keeps the CURRENT recalculated envelope flat
+        // into the future. on the next chart update it recenters/resizes again,
+        // which is analogous to a live VWAP/std-dev envelope snapshot.
+
+        if showStandard and maxSigma >= 0.5
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 0.5, true), xFuture, f_band(futureCenter, futureSigma, 0.5, true), C_05, 1)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 0.5, false), xFuture, f_band(futureCenter, futureSigma, 0.5, false), C_05, 1)
+            used += 1
+
+        if showStandard and maxSigma >= 1.0
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 1.0, true), xFuture, f_band(futureCenter, futureSigma, 1.0, true), C_10, 2)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 1.0, false), xFuture, f_band(futureCenter, futureSigma, 1.0, false), C_10, 2)
+            used += 1
+
+        if showStandard and maxSigma >= 1.5
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 1.5, true), xFuture, f_band(futureCenter, futureSigma, 1.5, true), C_15, 1)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 1.5, false), xFuture, f_band(futureCenter, futureSigma, 1.5, false), C_15, 1)
+            used += 1
+
+        if showStandard and maxSigma >= 2.0
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 2.0, true), xFuture, f_band(futureCenter, futureSigma, 2.0, true), C_20, 1)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 2.0, false), xFuture, f_band(futureCenter, futureSigma, 2.0, false), C_20, 1)
+            used += 1
+
+        if showStandard and maxSigma >= 2.5
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 2.5, true), xFuture, f_band(futureCenter, futureSigma, 2.5, true), C_25, 1)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 2.5, false), xFuture, f_band(futureCenter, futureSigma, 2.5, false), C_25, 1)
+            used += 1
+
+        if showStandard and maxSigma >= 3.0
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 3.0, true), xFuture, f_band(futureCenter, futureSigma, 3.0, true), C_30, 1)
+            used += 1
+            f_upsert_projection(used, xNow, f_band(structureCenter, structureSigma, 3.0, false), xFuture, f_band(futureCenter, futureSigma, 3.0, false), C_30, 1)
+            used += 1
+
+    while array.size(projectionLines) > used
+        line.delete(array.pop(projectionLines))
+
+
+// =============================================================================
+// compact stats
+// =============================================================================
+
+var table stats = table.new(position.top_right, 2, 5, border_width=0)
+
+if barstate.islast
+    table.clear(stats, 0, 0, 1, 4)
+
+    if showStats
+        string ivText = na(ivAnnual) ? "n/a" : str.tostring(ivAnnual * 100.0, "#.##") + "%"
+
+        string rvText = na(yzAnnual) ? "n/a" : str.tostring(yzAnnual * 100.0, "#.##") + "%"
+        string rvLabel = "yz rv"
+        string usedText = na(selectedAnnualVol) ? "n/a" : str.tostring(selectedAnnualVol * 100.0, "#.##") + "%"
+
+        table.cell(stats, 0, 0, "rv tf", text_color=color.gray, text_halign=text.align_right)
+        table.cell(stats, 1, 0, rvTF, text_color=color.silver, text_halign=text.align_right)
+
+        table.cell(stats, 0, 1, "iv", text_color=color.gray, text_halign=text.align_right)
+        table.cell(stats, 1, 1, ivText, text_color=color.aqua, text_halign=text.align_right)
+
+        table.cell(stats, 0, 2, rvLabel, text_color=color.gray, text_halign=text.align_right)
+        table.cell(stats, 1, 2, rvText, text_color=color.orange, text_halign=text.align_right)
+
+        table.cell(stats, 0, 3, "used vol", text_color=color.gray, text_halign=text.align_right)
+        table.cell(stats, 1, 3, usedText, text_color=color.lime, text_halign=text.align_right)
+
+        table.cell(stats, 0, 4, "iv proxy", text_color=color.gray, text_halign=text.align_right)
+        table.cell(stats, 1, 4, ivMode == "fixed %" ? "fixed" : selectedIvSymbol, text_color=color.silver, text_halign=text.align_right)

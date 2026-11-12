@@ -1,0 +1,453 @@
+//@version=6
+indicator("PM + HOD/LOD + FVG — Core (No Taps)", overlay=true, max_boxes_count=500)
+
+// === INPUTS: Core ===
+showCurrentPM   = input.bool(true,  "Show Current PM Levels")
+showBullish     = input.bool(true,  "Show Bullish FVGs")
+showBearish     = input.bool(true,  "Show Bearish FVGs")
+bullOpacity     = input.int(85,     "Bullish FVG Opacity %", minval=0, maxval=100)
+bearOpacity     = input.int(85,     "Bearish FVG Opacity %", minval=0, maxval=100)
+showFVGOutline  = input.bool(true,  "Show Border on FVG Zones")
+
+// === PM Line Appearance ===
+group_pm = "PM Line Appearance"
+pmLineWidth = input.int(1, "PM Line Thickness", minval=1, maxval=5, group=group_pm)
+
+// === FVG Appearance ===
+group_fvgappearance = "FVG Appearance"
+fvgBorderWidth = input.int(1, "FVG Border Width", minval=0, maxval=5, group=group_fvgappearance)
+
+// View Mode — controls purging on day roll
+viewMode  = input.string("Current", "View Mode", options=["Current", "Historical"])
+isCurrent = viewMode == "Current"
+
+// === FVG Filter ===
+group_fvgfilter = "FVG Filter Settings"
+minFVGsizeInput = input.float(
+     0.05,
+     "Minimum FVG Size ($)",
+     minval=0.05,
+     step=0.01,
+     group=group_fvgfilter
+)
+minFVGsize = math.round(minFVGsizeInput / syminfo.mintick) * syminfo.mintick
+
+// === HOD/LOD Lines ===
+group_day = "HOD/LOD Lines"
+hodSegColor = input.color(
+     color.new(color.blue, 0),
+     "HOD Line Color",
+     group=group_day
+)
+lodSegColor = input.color(
+     color.new(color.purple, 0),
+     "LOD Line Color",
+     group=group_day
+)
+dayLineStyleOpt = input.string(
+     "dashed",
+     "HOD/LOD Line Style",
+     options=["solid", "dashed", "dotted"],
+     group=group_day
+)
+dayLineWidth = input.int(
+     1,
+     "HOD/LOD Line Thickness",
+     minval=1,
+     maxval=5,
+     group=group_day
+)
+
+actualDayStyle = dayLineStyleOpt == "solid" ?
+     line.style_solid :
+     dayLineStyleOpt == "dashed" ?
+     line.style_dashed :
+     line.style_dotted
+
+// === Colors ===
+fvgColorBullish = color.new(color.green, bullOpacity)
+fvgColorBearish = color.new(color.red, bearOpacity)
+pmColor         = color.yellow
+
+// === Time (New York) ===
+// Fixed: premarket now begins at 4:00 AM instead of 4:01 AM.
+premarketStart = timestamp(
+     "America/New_York",
+     year,
+     month,
+     dayofmonth,
+     04,
+     00
+)
+premarketEnd = timestamp(
+     "America/New_York",
+     year,
+     month,
+     dayofmonth,
+     09,
+     29
+)
+marketStart = timestamp(
+     "America/New_York",
+     year,
+     month,
+     dayofmonth,
+     09,
+     30
+)
+marketEnd = timestamp(
+     "America/New_York",
+     year,
+     month,
+     dayofmonth,
+     16,
+     00
+)
+
+inPremarket = time >= premarketStart and time <= premarketEnd
+inSession   = time >= marketStart and time <= marketEnd
+afterClose  = time > marketEnd
+isNewDay    = ta.change(time("D")) != 0
+
+// === Helpers to purge ===
+f_clear_boxes(arr) =>
+    sz = array.size(arr)
+
+    if sz > 0
+        for i = 0 to sz - 1
+            b = array.get(arr, i)
+            box.delete(b)
+
+f_clear_lines(arr) =>
+    sz = array.size(arr)
+
+    if sz > 0
+        for i = 0 to sz - 1
+            ln = array.get(arr, i)
+            line.delete(ln)
+
+// =====================================
+// ============ PM LEVELS ==============
+// =====================================
+var float pmHigh = na
+var float pmLow  = na
+var line highLine = na
+var line lowLine  = na
+
+if isNewDay
+    pmHigh := na
+    pmLow  := na
+
+    if isCurrent
+        if not na(highLine)
+            line.delete(highLine)
+
+        if not na(lowLine)
+            line.delete(lowLine)
+
+    highLine := na
+    lowLine  := na
+
+if inPremarket
+    pmHigh := na(pmHigh) ? high : math.max(pmHigh, high)
+    pmLow  := na(pmLow) ? low : math.min(pmLow, low)
+
+if showCurrentPM and not na(pmHigh)
+    if na(highLine)
+        highLine := line.new(
+             bar_index,
+             pmHigh,
+             bar_index,
+             pmHigh,
+             extend=extend.none,
+             color=pmColor,
+             width=pmLineWidth
+        )
+    else
+        line.set_y1(highLine, pmHigh)
+        line.set_y2(highLine, pmHigh)
+        line.set_width(highLine, pmLineWidth)
+
+    if inPremarket or inSession
+        line.set_x2(highLine, bar_index)
+
+if showCurrentPM and not na(pmLow)
+    if na(lowLine)
+        lowLine := line.new(
+             bar_index,
+             pmLow,
+             bar_index,
+             pmLow,
+             extend=extend.none,
+             color=pmColor,
+             width=pmLineWidth
+        )
+    else
+        line.set_y1(lowLine, pmLow)
+        line.set_y2(lowLine, pmLow)
+        line.set_width(lowLine, pmLineWidth)
+
+    if inPremarket or inSession
+        line.set_x2(lowLine, bar_index)
+
+// =====================================
+// ====== HOD/LOD STEP SEGMENTS ========
+// =====================================
+var float dayHigh = na
+var float dayLow  = na
+var line hodCurrent = na
+var line lodCurrent = na
+var float pendingHOD = na
+var float pendingLOD = na
+var int pendingHODBar = na
+var int pendingLODBar = na
+
+var line[] hodSegments = array.new<line>()
+var line[] lodSegments = array.new<line>()
+
+if isNewDay
+    dayHigh := na
+    dayLow  := na
+
+    pendingHOD := na
+    pendingHODBar := na
+    pendingLOD := na
+    pendingLODBar := na
+
+    if not na(hodCurrent)
+        line.set_extend(hodCurrent, extend.none)
+        line.set_x2(hodCurrent, bar_index)
+        array.push(hodSegments, hodCurrent)
+        hodCurrent := na
+
+    if not na(lodCurrent)
+        line.set_extend(lodCurrent, extend.none)
+        line.set_x2(lodCurrent, bar_index)
+        array.push(lodSegments, lodCurrent)
+        lodCurrent := na
+
+    if isCurrent
+        f_clear_lines(hodSegments)
+        array.clear(hodSegments)
+
+        f_clear_lines(lodSegments)
+        array.clear(lodSegments)
+
+sessionJustOpened = inSession and not inSession[1]
+
+if sessionJustOpened
+    dayHigh := high
+    dayLow  := low
+
+    if not na(hodCurrent)
+        line.set_extend(hodCurrent, extend.none)
+        line.set_x2(hodCurrent, bar_index)
+
+    hodCurrent := line.new(
+         bar_index,
+         dayHigh,
+         bar_index + 1,
+         dayHigh,
+         extend=extend.right,
+         color=hodSegColor,
+         style=actualDayStyle,
+         width=dayLineWidth
+    )
+
+    if not na(lodCurrent)
+        line.set_extend(lodCurrent, extend.none)
+        line.set_x2(lodCurrent, bar_index)
+
+    lodCurrent := line.new(
+         bar_index,
+         dayLow,
+         bar_index + 1,
+         dayLow,
+         extend=extend.right,
+         color=lodSegColor,
+         style=actualDayStyle,
+         width=dayLineWidth
+    )
+
+    pendingHOD := na
+    pendingHODBar := na
+    pendingLOD := na
+    pendingLODBar := na
+
+dayHighPrev = inSession ? dayHigh[1] : na
+dayLowPrev  = inSession ? dayLow[1] : na
+
+if inSession
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow  := na(dayLow) ? low : math.min(dayLow, low)
+
+newHOD = inSession and not na(dayHighPrev) and high > dayHighPrev
+newLOD = inSession and not na(dayLowPrev) and low < dayLowPrev
+
+if newHOD
+    if not na(hodCurrent)
+        line.set_extend(hodCurrent, extend.none)
+        line.set_x2(hodCurrent, bar_index)
+        line.set_width(hodCurrent, dayLineWidth)
+        array.push(hodSegments, hodCurrent)
+        hodCurrent := na
+
+    pendingHOD := dayHigh
+    pendingHODBar := bar_index
+
+if newLOD
+    if not na(lodCurrent)
+        line.set_extend(lodCurrent, extend.none)
+        line.set_x2(lodCurrent, bar_index)
+        line.set_width(lodCurrent, dayLineWidth)
+        array.push(lodSegments, lodCurrent)
+        lodCurrent := na
+
+    pendingLOD := dayLow
+    pendingLODBar := bar_index
+
+if inSession and not newHOD and not na(pendingHOD) and na(hodCurrent)
+    hodCurrent := line.new(
+         pendingHODBar,
+         pendingHOD,
+         bar_index + 1,
+         pendingHOD,
+         extend=extend.right,
+         color=hodSegColor,
+         style=actualDayStyle,
+         width=dayLineWidth
+    )
+
+    pendingHOD := na
+    pendingHODBar := na
+
+if inSession and not newLOD and not na(pendingLOD) and na(lodCurrent)
+    lodCurrent := line.new(
+         pendingLODBar,
+         pendingLOD,
+         bar_index + 1,
+         pendingLOD,
+         extend=extend.right,
+         color=lodSegColor,
+         style=actualDayStyle,
+         width=dayLineWidth
+    )
+
+    pendingLOD := na
+    pendingLODBar := na
+
+if not na(hodCurrent)
+    line.set_width(hodCurrent, dayLineWidth)
+
+if not na(lodCurrent)
+    line.set_width(lodCurrent, dayLineWidth)
+
+// =====================================
+// =========== FVG ENGINE ==============
+// =====================================
+var box[] bullBoxes = array.new<box>()
+var float[] bullBottom = array.new<float>()
+var float[] bullTop = array.new<float>()
+var bool[] bullActive = array.new<bool>()
+
+var box[] bearBoxes = array.new<box>()
+var float[] bearBottom = array.new<float>()
+var float[] bearTop = array.new<float>()
+var bool[] bearActive = array.new<bool>()
+
+if isNewDay and isCurrent
+    f_clear_boxes(bullBoxes)
+    array.clear(bullBoxes)
+    array.clear(bullBottom)
+    array.clear(bullTop)
+    array.clear(bullActive)
+
+    f_clear_boxes(bearBoxes)
+    array.clear(bearBoxes)
+    array.clear(bearBottom)
+    array.clear(bearTop)
+    array.clear(bearActive)
+
+if inSession and showBullish and low > high[2]
+    bLow  = high[2]
+    bHigh = low
+
+    if bHigh - bLow >= minFVGsize
+        bx = box.new(
+             bar_index,
+             bHigh,
+             bar_index + 1,
+             bLow,
+             bgcolor=fvgColorBullish,
+             border_color=showFVGOutline ? color.new(color.green, 40) : na
+        )
+
+        box.set_border_width(
+             bx,
+             showFVGOutline ? fvgBorderWidth : 0
+        )
+
+        array.push(bullBoxes, bx)
+        array.push(bullBottom, bLow)
+        array.push(bullTop, bHigh)
+        array.push(bullActive, true)
+
+if inSession and showBearish and high < low[2]
+    tHigh = low[2]
+    tLow  = high
+
+    if tHigh - tLow >= minFVGsize
+        bx = box.new(
+             bar_index,
+             tHigh,
+             bar_index + 1,
+             tLow,
+             bgcolor=fvgColorBearish,
+             border_color=showFVGOutline ? color.new(color.red, 40) : na
+        )
+
+        box.set_border_width(
+             bx,
+             showFVGOutline ? fvgBorderWidth : 0
+        )
+
+        array.push(bearBoxes, bx)
+        array.push(bearBottom, tLow)
+        array.push(bearTop, tHigh)
+        array.push(bearActive, true)
+
+bullSz = array.size(bullBoxes)
+
+if bullSz > 0
+    for i = 0 to bullSz - 1
+        bx     = array.get(bullBoxes, i)
+        bottom = array.get(bullBottom, i)
+        active = array.get(bullActive, i)
+
+        if active
+            box.set_right(bx, bar_index)
+            box.set_border_width(
+                 bx,
+                 showFVGOutline ? fvgBorderWidth : 0
+            )
+
+            if low < bottom or afterClose
+                array.set(bullActive, i, false)
+
+bearSz = array.size(bearBoxes)
+
+if bearSz > 0
+    for i = 0 to bearSz - 1
+        bx     = array.get(bearBoxes, i)
+        top    = array.get(bearTop, i)
+        active = array.get(bearActive, i)
+
+        if active
+            box.set_right(bx, bar_index)
+            box.set_border_width(
+                 bx,
+                 showFVGOutline ? fvgBorderWidth : 0
+            )
+
+            if high > top or afterClose
+                array.set(bearActive, i, false)

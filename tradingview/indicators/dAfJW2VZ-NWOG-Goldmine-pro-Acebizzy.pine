@@ -1,0 +1,223 @@
+//@version=6
+indicator("NWOG Goldmine pro | Acebizzy", shorttitle="NWOG Goldmine pro | Acebizzy", overlay=true, max_boxes_count=500, max_labels_count=500)
+
+// ─── Filter ─────────────────────────────────────────────────────────────
+var string G_FILTER = "Filter"
+monthsToShow = input.int(1, "Months to show", minval=1, maxval=24, group=G_FILTER, tooltip="1 shows the current month only. Increase this to keep previous months' NWOG gaps visible too.", display=display.none)
+
+// ─── Week Start Mode ──────────────────────────────────────────────────
+var string G_WEEKSTART = "Week Start Detection"
+weekStartMode = input.string("Auto-detect", "Mode", options=["CME Sunday 6pm", "Monday first bar", "Auto-detect"], group=G_WEEKSTART, tooltip="CME mode looks for Sunday 6pm ET. Monday mode uses the first bar of the week (Monday). Auto chooses based on data.", display=display.none)
+
+// ─── Sunday Marks (only used in CME mode) ──────────────────────────────
+var string G_WEEK = "Sunday Marks (CME mode)"
+showWeekly       = input.bool(true, "Show Sunday boxes", group=G_WEEK, display=display.none)
+weekMarkStyle    = input.string("Candle body", "Sunday mark style", options=["Candle body", "Open level"], group=G_WEEK, tooltip="Candle body wraps the 6pm Sunday open candle. Open level uses a fixed tick band at the open.", display=display.none)
+fillSundayGap    = input.bool(true, "Fill Sunday opening gap", group=G_WEEK, tooltip="When the Sunday open gaps away from the previous traded close, expands the Sunday box to cover that empty opening gap.", display=display.none)
+weekBoxColor     = input.color(color.rgb(129, 181, 117), "Sunday box color", group=G_WEEK, display=display.none)
+weekTransparency = input.int(85, "Sunday box transparency", minval=0, maxval=100, group=G_WEEK, display=display.none)
+weekLabelPrefix  = input.string("week", "Sunday label prefix", group=G_WEEK, tooltip="1st Sunday in the month = 'week 1', 2nd Sunday = 'week 2', etc.", display=display.none)
+
+// ─── Monthly Openings ────────────────────────────────────────────────────
+var string G_MONTH = "Monthly Openings"
+showMonthly       = input.bool(true, "Show monthly opening boxes", group=G_MONTH, display=display.none)
+monthBoxColor     = input.color(color.rgb(160, 190, 150), "Monthly box color", group=G_MONTH, display=display.none)
+monthTransparency = input.int(82, "Monthly box transparency", minval=0, maxval=100, group=G_MONTH, display=display.none)
+
+// ─── Box Style ──────────────────────────────────────────────────────────
+var string G_STYLE = "Box Style"
+boxHeightTicks = input.int(20, "Open-level height (ticks)", minval=1, maxval=500, group=G_STYLE, tooltip="Used for monthly boxes, open-level Sunday marks, and flat Sunday bodies.", display=display.none)
+extendBoxes    = input.bool(true, "Extend boxes to the right", group=G_STYLE, display=display.none)
+extendMode     = input.string("All boxes", "Extension mode", options=["All boxes", "Active box only"], group=G_STYLE, tooltip="All boxes keeps every level stretched to the current bar. Active box only extends the most recent one.", display=display.none)
+showLabels     = input.bool(true, "Show labels", group=G_STYLE, display=display.none)
+labelSizeInput = input.string("Small", "Label size", options=["Tiny", "Small", "Normal"], group=G_STYLE, display=display.none)
+labelTextColor = input.color(color.black, "Label text color", group=G_STYLE, display=display.none)
+labelOnRight   = input.bool(true, "Place labels on right edge of box", group=G_STYLE, display=display.none)
+
+// ─── Time & Timezone ────────────────────────────────────────────────────
+var string G_TIME = "Time"
+tz             = input.string("America/New_York", "Timezone", group=G_TIME, tooltip="Used for Sunday detection and month boundaries.", display=display.none)
+sundayOpenHour = input.int(18, "Sunday open hour (24h)", minval=0, maxval=23, group=G_TIME, tooltip="Default 18 = 6:00 PM. Used only in CME mode.", display=display.none)
+
+// ─── Helpers ────────────────────────────────────────────────────────────
+halfHeight = boxHeightTicks * syminfo.mintick
+useBodyMark = weekMarkStyle == "Candle body"
+
+f_label_size(string s) =>
+    switch s
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        => size.normal
+
+labelSize = f_label_size(labelSizeInput)
+
+f_month_name(int m) =>
+    switch m
+        1  => "january"
+        2  => "february"
+        3  => "march"
+        4  => "april"
+        5  => "may"
+        6  => "june"
+        7  => "july"
+        8  => "august"
+        9  => "september"
+        10 => "october"
+        11 => "november"
+        => "december"
+
+f_month_key(int y, int m) =>
+    y * 12 + m
+
+f_in_scope(int y, int m) =>
+    currentKey = f_month_key(year(timenow, tz), month(timenow, tz))
+    barKey = f_month_key(y, m)
+    barKey <= currentKey and barKey > currentKey - monthsToShow
+
+f_delete_all(array<box> boxes, array<label> labels) =>
+    while array.size(boxes) > 0
+        box.delete(array.pop(boxes))
+    while array.size(labels) > 0
+        lb = array.pop(labels)
+        if not na(lb)
+            label.delete(lb)
+
+f_box_bounds(float anchorOpen, float anchorClose) =>
+    top = math.max(anchorOpen, anchorClose)
+    bot = math.min(anchorOpen, anchorClose)
+    if top == bot
+        top := anchorOpen + halfHeight
+        bot := anchorOpen - halfHeight
+    [top, bot]
+
+f_gap_box_bounds(float anchorOpen, float anchorClose, float priorClose, bool fillGap) =>
+    [top, bot] = f_box_bounds(anchorOpen, anchorClose)
+    if fillGap and not na(priorClose)
+        top := math.max(top, priorClose)
+        bot := math.min(bot, priorClose)
+    [top, bot]
+
+f_create_box(float top, float bottom, color baseColor, int transparency, string txt) =>
+    bx = box.new(bar_index, top, bar_index, bottom, border_color=na, bgcolor=color.new(baseColor, transparency))
+    lb = showLabels ? label.new(bar_index, top, txt, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, color=color.new(color.white, 100), textcolor=labelTextColor, size=labelSize) : na
+    [bx, lb]
+
+f_set_box_right(box bx, label lb, int rightBar) =>
+    if not na(bx)
+        box.set_right(bx, rightBar)
+    if not na(lb) and labelOnRight
+        label.set_x(lb, rightBar)
+
+f_extend_array(array<box> boxes, array<label> labels, int rightBar, bool allBoxes) =>
+    count = array.size(boxes)
+    if count > 0
+        startIdx = allBoxes ? 0 : count - 1
+        for i = startIdx to count - 1
+            f_set_box_right(array.get(boxes, i), array.get(labels, i), rightBar)
+
+// ─── Period detection ──────────────────────────────────────────────────
+tNow  = time
+tPrev = time[1]
+
+yNow  = year(tNow, tz)
+yPrev = year(tPrev, tz)
+mNow  = month(tNow, tz)
+mPrev = month(tPrev, tz)
+
+dowNow  = dayofweek(tNow, tz)
+dowPrev = dayofweek(tPrev, tz)
+hourNow  = hour(tNow, tz)
+hourPrev = hour(tPrev, tz)
+
+var bool hasSundayBars = false
+if barstate.isfirst
+    hasSundayBars := (dowNow == dayofweek.sunday and hourNow >= sundayOpenHour)
+if (dowNow == dayofweek.sunday and hourNow >= sundayOpenHour)
+    hasSundayBars := true
+
+useCMEMode = (weekStartMode == "CME Sunday 6pm") or (weekStartMode == "Auto-detect" and hasSundayBars)
+useMondayMode = (weekStartMode == "Monday first bar") or (weekStartMode == "Auto-detect" and not hasSundayBars)
+
+isSundayOpen = useCMEMode and not na(tPrev) and dowNow == dayofweek.sunday and hourNow >= sundayOpenHour and (dowPrev != dayofweek.sunday or hourPrev < sundayOpenHour)
+
+isNewWeek = not na(tPrev) and (weekofyear(tNow, tz) != weekofyear(tPrev, tz) or year(tNow, tz) != year(tPrev, tz))
+isMondayFirstBar = useMondayMode and isNewWeek
+
+isWeeklyOpen = isSundayOpen or isMondayFirstBar
+
+isNewMonth   = not na(tPrev) and (mNow != mPrev or yNow != yPrev)
+
+refYear  = year(timenow, tz)
+refMonth = month(timenow, tz)
+refMonthKey = f_month_key(refYear, refMonth)
+
+var int sundayNumberInMonth = 0
+
+if isNewMonth
+    sundayNumberInMonth := 0
+
+if isSundayOpen
+    sundayNumberInMonth += 1
+
+// ─── Box storage ──────────────────────────────────────────────────────
+var array<box>   weekBoxes   = array.new_box()
+var array<label> weekLabels  = array.new_label()
+var array<box>   monthBoxes  = array.new_box()
+var array<label> monthLabels = array.new_label()
+
+var int trackedMonthKey = na
+
+if na(trackedMonthKey) or refMonthKey != trackedMonthKey
+    f_delete_all(weekBoxes, weekLabels)
+    f_delete_all(monthBoxes, monthLabels)
+    sundayNumberInMonth := 0
+
+trackedMonthKey := refMonthKey
+
+extendAll = extendMode == "All boxes"
+
+// ─── Weekly logic ──────────────────────────────────────────────────────
+if showWeekly and isWeeklyOpen and f_in_scope(yNow, mNow)
+    if not extendBoxes or not extendAll
+        if array.size(weekBoxes) > 0
+            lastIdx = array.size(weekBoxes) - 1
+            f_set_box_right(array.get(weekBoxes, lastIdx), array.get(weekLabels, lastIdx), bar_index - 1)
+
+    float weekTop   = na
+    float weekBottom = na
+    string weekText = ""
+
+    if useMondayMode
+        [top, bot] = f_gap_box_bounds(open, open, close[1], fillSundayGap)
+        weekTop := top
+        weekBottom := bot
+        weekText := "Week " + str.tostring(weekofyear(tNow, tz))
+    else
+        boundsClose = useBodyMark ? close : open
+        [top, bot] = f_gap_box_bounds(open, boundsClose, close[1], fillSundayGap)
+        weekTop := top
+        weekBottom := bot
+        weekText := weekLabelPrefix + " " + str.tostring(sundayNumberInMonth)
+
+    [bx, lb] = f_create_box(weekTop, weekBottom, weekBoxColor, weekTransparency, weekText)
+    array.push(weekBoxes, bx)
+    array.push(weekLabels, lb)
+
+if showWeekly and extendBoxes and array.size(weekBoxes) > 0
+    f_extend_array(weekBoxes, weekLabels, bar_index, extendAll)
+
+// ─── Monthly logic ──────────────────────────────────────────────────────
+if showMonthly and isNewMonth and f_in_scope(yNow, mNow)
+    if not extendBoxes or not extendAll
+        if array.size(monthBoxes) > 0
+            lastIdx = array.size(monthBoxes) - 1
+            f_set_box_right(array.get(monthBoxes, lastIdx), array.get(monthLabels, lastIdx), bar_index - 1)
+
+    [monthTop, monthBottom] = f_box_bounds(open, open)
+    monthText = str.tostring(dayofmonth(tNow, tz)) + " day of " + f_month_name(mNow)
+    [bxM, lbM] = f_create_box(monthTop, monthBottom, monthBoxColor, monthTransparency, monthText)
+    array.push(monthBoxes, bxM)
+    array.push(monthLabels, lbM)
+
+if showMonthly and extendBoxes and array.size(monthBoxes) > 0
+    f_extend_array(monthBoxes, monthLabels, bar_index, extendAll)

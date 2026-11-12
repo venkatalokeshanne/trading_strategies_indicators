@@ -1,0 +1,190 @@
+//@version=6
+strategy("Strict Failed 2 + Daily Bias Only", overlay=true, pyramiding=0, process_orders_on_close=true)
+
+//==================================================================================================
+// INPUTS
+//==================================================================================================
+signalMinConsecutive = input.int(2, "Minimum Consecutive Candles", minval=2)
+enableFailed2Signals = input.bool(true, "Enable Failed 2 Signals")
+useConfirmation      = input.bool(true, "Use Bar Close Confirmation")
+
+useDailyBias         = input.bool(true, "Use Daily Failed 2 Bias")
+requireHTFBias       = input.bool(true, "Require Daily Bias In Trade Direction")
+
+stopBufferTicks      = input.int(0, "Stop Buffer (ticks)", minval=0)
+skipIfTargetPassed   = input.bool(true, "Skip if target already exceeded")
+
+//==================================================================================================
+// BAR LOGIC
+//==================================================================================================
+isBull = close > open
+isBear = close < open
+
+isInsideBar = high < high[1] and low > low[1]
+
+motherHigh = high[1]
+motherLow  = low[1]
+
+//==================================================================================================
+// STREAK LOGIC (Chart Timeframe)
+//==================================================================================================
+var int upStreak = 0
+var int dnStreak = 0
+
+prevUpStreak = upStreak
+prevDnStreak = dnStreak
+
+if isBull
+    dnStreak := 0
+    upStreak := upStreak == 0 ? 1 : upStreak + 1
+else if isBear
+    upStreak := 0
+    dnStreak := dnStreak == 0 ? 1 : dnStreak + 1
+else
+    upStreak := 0
+    dnStreak := 0
+
+streakEndedBullish = prevUpStreak >= signalMinConsecutive and not isBull and prevUpStreak > 0
+streakEndedBearish = prevDnStreak >= signalMinConsecutive and not isBear and prevDnStreak > 0
+
+//==================================================================================================
+// STRICT FAILED 2 ON CHART TIMEFRAME
+//==================================================================================================
+bearishFailed2 = (
+    enableFailed2Signals and
+    streakEndedBullish and
+    not isInsideBar and
+    isBear and
+    high > motherHigh and
+    low >= motherLow and
+    close < motherHigh and
+    close > motherLow
+)
+
+bullishFailed2 = (
+    enableFailed2Signals and
+    streakEndedBearish and
+    not isInsideBar and
+    isBull and
+    low < motherLow and
+    high <= motherHigh and
+    close > motherLow and
+    close < motherHigh
+)
+
+signalConfirmed = barstate.ishistory or not useConfirmation or barstate.isconfirmed
+
+bullishSignal = signalConfirmed and bullishFailed2
+bearishSignal = signalConfirmed and bearishFailed2
+
+//==================================================================================================
+// HTF FAILED 2 FUNCTIONS (using ta.barssince – safe inside request.security)
+//==================================================================================================
+f_htf_failed2_bull(_minConsecutive) =>
+    _bullish = close > open
+    _bearish = close < open
+    _insideBar = high < high[1] and low > low[1]
+    
+    _prevBearStreak = _bearish[1] ? ta.barssince(not _bearish)[1] : 0
+    _streakEndedBearish = _prevBearStreak >= _minConsecutive and not _bearish and _prevBearStreak > 0
+    
+    _motherHigh = high[1]
+    _motherLow  = low[1]
+    
+    _bullishFailed2 = (
+        _streakEndedBearish and
+        not _insideBar and
+        _bullish and
+        low < _motherLow and
+        high <= _motherHigh and
+        close > _motherLow and
+        close < _motherHigh
+    )
+    _bullishFailed2
+
+f_htf_failed2_bear(_minConsecutive) =>
+    _bullish = close > open
+    _bearish = close < open
+    _insideBar = high < high[1] and low > low[1]
+    
+    _prevBullStreak = _bullish[1] ? ta.barssince(not _bullish)[1] : 0
+    _streakEndedBullish = _prevBullStreak >= _minConsecutive and not _bullish and _prevBullStreak > 0
+    
+    _motherHigh = high[1]
+    _motherLow  = low[1]
+    
+    _bearishFailed2 = (
+        _streakEndedBullish and
+        not _insideBar and
+        _bearish and
+        high > _motherHigh and
+        low >= _motherLow and
+        close < _motherHigh and
+        close > _motherLow
+    )
+    _bearishFailed2
+
+//==================================================================================================
+// DAILY BIAS (Weekly removed)
+//==================================================================================================
+dailyBullF2 = useDailyBias ? request.security(syminfo.tickerid, "D", f_htf_failed2_bull(signalMinConsecutive), lookahead=barmerge.lookahead_off) : false
+dailyBearF2 = useDailyBias ? request.security(syminfo.tickerid, "D", f_htf_failed2_bear(signalMinConsecutive), lookahead=barmerge.lookahead_off) : false
+
+bullishBias = dailyBullF2
+bearishBias = dailyBearF2
+
+// No conflict possible because we only have daily, so allowBullBias = bullishBias, allowBearBias = bearishBias
+allowBullBias = bullishBias
+allowBearBias = bearishBias
+
+//==================================================================================================
+// TARGETS
+//==================================================================================================
+longTarget  = motherHigh
+shortTarget = motherLow
+
+tickSize = syminfo.mintick
+
+longStop  = low  - stopBufferTicks * tickSize
+shortStop = high + stopBufferTicks * tickSize
+
+validLongTarget  = longTarget > close
+validShortTarget = shortTarget < close
+
+longBiasOk  = not requireHTFBias or allowBullBias
+shortBiasOk = not requireHTFBias or allowBearBias
+
+takeLong  = bullishSignal and longBiasOk and (not skipIfTargetPassed or validLongTarget)
+takeShort = bearishSignal and shortBiasOk and (not skipIfTargetPassed or validShortTarget)
+
+//==================================================================================================
+// ORDERS
+//==================================================================================================
+if takeLong
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=longStop, limit=longTarget)
+
+if takeShort
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=shortStop, limit=shortTarget)
+
+//==================================================================================================
+// VISUALS
+//==================================================================================================
+plotshape(bearishFailed2, title="Bearish F2", location=location.abovebar, color=color.red, style=shape.triangledown, size=size.tiny, text="F2")
+plotshape(bullishFailed2, title="Bullish F2", location=location.belowbar, color=color.lime, style=shape.triangleup, size=size.tiny, text="F2")
+
+plot(bullishSignal ? longTarget : na, "Bull Target", color=color.green, style=plot.style_linebr)
+plot(bearishSignal ? shortTarget : na, "Bear Target", color=color.red, style=plot.style_linebr)
+
+bgcolor(allowBullBias ? color.new(color.green, 90) : na, title="Bullish Bias Background")
+bgcolor(allowBearBias ? color.new(color.red, 90) : na, title="Bearish Bias Background")
+
+plotshape(dailyBullF2,  title="Daily Bull F2 Bias",  location=location.bottom, style=shape.square, color=color.new(color.lime, 0), size=size.tiny, text="D+")
+plotshape(dailyBearF2,  title="Daily Bear F2 Bias",  location=location.top,    style=shape.square, color=color.new(color.red, 0), size=size.tiny, text="D-")
+
+//==================================================================================================
+// ALERTS
+//==================================================================================================
+alertcondition(takeLong, "Bullish Failed 2 Entry", "Bullish Failed 2 strategy entry with Daily bias")
+alertcondition(takeShort, "Bearish Failed 2 Entry", "Bearish Failed 2 strategy entry with Daily bias")

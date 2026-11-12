@@ -1,0 +1,284 @@
+//@version=6
+strategy("FLI + STC + MACD + EMA Strategy v1", shorttitle="FLI Strategy v1", overlay=true,
+         pyramiding=0,
+         commission_type=strategy.commission.percent,
+         commission_value=0.07,
+         slippage=2,
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10)
+
+//====================================================
+// INPUTS
+//====================================================
+
+string entryMode      = input.string("Balanced", "Entry Mode", options=["Loose", "Balanced", "Strict"])
+string labelSizeInput = input.string("normal", "Label Size", options=["tiny", "small", "normal", "large"])
+bool showBuyLabels    = input.bool(true, "Show Buy Labels")
+bool showSellLabels   = input.bool(true, "Show Sell Labels")
+bool showDebugPlots   = input.bool(false, "Show Debug Shapes")
+
+string groupFLI      = "Follow Line"
+int fliBbPeriod      = input.int(21, "BB Period", minval=1, group=groupFLI)
+float fliBbDev       = input.float(1.0, "BB Deviations", minval=0.1, step=0.05, group=groupFLI)
+bool fliUseATR       = input.bool(true, "Use ATR Filter", group=groupFLI)
+int fliAtrPeriod     = input.int(5, "ATR Period", minval=1, group=groupFLI)
+float fliLabelPad    = input.float(0.3, "Label ATR Pad Multiplier", minval=0.1, maxval=3.0, step=0.1, group=groupFLI)
+int fliLineWidth     = input.int(2, "Trend Line Width", minval=1, maxval=5, group=groupFLI)
+
+string groupEMA       = "EMA Filter"
+bool showEMA          = input.bool(true, "Show EMA", group=groupEMA)
+int emaLength         = input.int(200, "EMA Length", minval=1, group=groupEMA)
+bool emaFilterEnabled = input.bool(true, "Use EMA As Confirmation", group=groupEMA)
+string emaMode        = input.string("Price Above/Below", "EMA Confirmation Mode", options=["Price Above/Below", "Cross EMA", "EMA Slope", "Any EMA Bullish/Bearish"], group=groupEMA)
+
+string groupSTC        = "STC"
+bool useSTCConfirm     = input.bool(true, "Use STC Confirmation", group=groupSTC)
+int stcCycleLength     = input.int(12, "Cycle Length", minval=1, group=groupSTC)
+int stcFastLength      = input.int(26, "Fast Length", minval=1, group=groupSTC)
+int stcSlowLength      = input.int(50, "Slow Length", minval=1, group=groupSTC)
+float stcSmoothFactor  = input.float(0.5, "Smoothing Factor", minval=0.01, maxval=1.0, step=0.01, group=groupSTC)
+float stcBuyThreshold  = input.float(25.0, "Buy Threshold", minval=0, maxval=100, step=0.1, group=groupSTC)
+float stcSellThreshold = input.float(75.0, "Sell Threshold", minval=0, maxval=100, step=0.1, group=groupSTC)
+string stcMode         = input.string("Turn From Zone", "STC Confirmation Mode", options=["Turn From Zone", "Cross Threshold", "Slope Only", "Any Bullish/Bearish"], group=groupSTC)
+
+string groupMACD      = "MACD"
+bool useMACDConfirm   = input.bool(true, "Use MACD Confirmation", group=groupMACD)
+float macdSource      = input.source(close, "Source", group=groupMACD)
+int macdFastLen       = input.int(12, "Fast Length", minval=1, group=groupMACD)
+int macdSlowLen       = input.int(26, "Slow Length", minval=1, group=groupMACD)
+int macdSignalLen     = input.int(9, "Signal Length", minval=1, group=groupMACD)
+string macdOscType    = input.string("EMA", "Oscillator MA Type", options=["EMA", "SMA"], group=groupMACD)
+string macdSignalType = input.string("EMA", "Signal MA Type", options=["EMA", "SMA"], group=groupMACD)
+bool useMACDCross     = input.bool(true, "Require MACD Cross Logic", group=groupMACD)
+bool useMACDHistSlope = input.bool(true, "Use Histogram Slope Logic", group=groupMACD)
+bool macdZeroFilter   = input.bool(false, "Use MACD Zero-Line Filter", group=groupMACD)
+string macdMode       = input.string("Cross Or Slope", "MACD Confirmation Mode", options=["Cross Only", "Slope Only", "Cross Or Slope", "Cross And Slope"], group=groupMACD)
+
+string groupRisk  = "Risk Management"
+float riskPercent = input.float(1.0, "Risk % Per Trade", minval=0.1, maxval=10.0, step=0.1, group=groupRisk)
+int atrLen        = input.int(14, "ATR Length (SL/TP)", minval=1, group=groupRisk)
+
+string groupExit   = "Exit Settings"
+string exitMethod  = input.string("ATR", "Exit Method", options=["ATR", "Fixed RR", "Trailing", "FLI Flip"], group=groupExit)
+float atrSlMult    = input.float(1.5, "ATR SL Multiplier", minval=0.1, step=0.1, group=groupExit)
+float atrTpMult    = input.float(3.0, "ATR TP Multiplier", minval=0.1, step=0.1, group=groupExit)
+float fixedSlPts   = input.float(150.0, "Fixed SL (points)", minval=1.0, step=1.0, group=groupExit)
+float rrRatio      = input.float(2.0, "Risk:Reward Ratio", minval=0.5, step=0.1, group=groupExit)
+float trailAtrMult = input.float(2.0, "Trailing ATR Multiplier", minval=0.1, step=0.1, group=groupExit)
+
+//====================================================
+// HELPER FUNCTIONS
+//====================================================
+
+labelSize = labelSizeInput == "tiny" ? size.tiny : labelSizeInput == "small" ? size.small : labelSizeInput == "large" ? size.large : size.normal
+
+maFunc(source, length, maType) =>
+    maType == "EMA" ? ta.ema(source, length) : ta.sma(source, length)
+
+countTrue(a, b, c) =>
+    (a ? 1 : 0) + (b ? 1 : 0) + (c ? 1 : 0)
+
+//====================================================
+// FOLLOW LINE INDICATOR
+//====================================================
+
+float fliBasis  = ta.sma(close, fliBbPeriod)
+float fliDev    = ta.stdev(close, fliBbPeriod) * fliBbDev
+float fliUpper  = fliBasis + fliDev
+float fliLower  = fliBasis - fliDev
+int fliSignal   = close > fliUpper ? 1 : close < fliLower ? -1 : 0
+float fliAtr    = ta.atr(fliAtrPeriod)
+
+// FIXED: label pad now uses a simple ATR multiplier — much tighter to candles
+float fliPadAmt = fliAtr * fliLabelPad
+
+var float trendLine = na
+var int fliTrend    = 0
+
+if barstate.isfirst
+    trendLine := close
+else
+    if fliSignal == 1
+        float bullCandidate = fliUseATR ? (low - fliAtr) : low
+        trendLine := math.max(bullCandidate, nz(trendLine[1], bullCandidate))
+    else if fliSignal == -1
+        float bearCandidate = fliUseATR ? (high + fliAtr) : high
+        trendLine := math.min(bearCandidate, nz(trendLine[1], bearCandidate))
+    else
+        trendLine := nz(trendLine[1], close)
+
+fliTrend := nz(fliTrend[1], 0)
+if trendLine > nz(trendLine[1], trendLine)
+    fliTrend := 1
+else if trendLine < nz(trendLine[1], trendLine)
+    fliTrend := -1
+
+bool fliBuyFlip  = (nz(fliTrend[1]) == -1) and (fliTrend == 1)
+bool fliSellFlip = (nz(fliTrend[1]) == 1)  and (fliTrend == -1)
+
+color fliColor = fliTrend > 0 ? color.blue : color.red
+plot(trendLine, "Follow Line", color=fliColor, linewidth=fliLineWidth)
+
+//====================================================
+// EMA FILTER
+//====================================================
+
+float ema200      = ta.ema(close, emaLength)
+plot(showEMA ? ema200 : na, "EMA", color=color.red, linewidth=3)
+
+bool emaSlopeUp   = (ema200 > ema200[1])
+bool emaSlopeDown = (ema200 < ema200[1])
+
+bool emaBull = emaMode == "Price Above/Below" ? (close > ema200) : emaMode == "Cross EMA" ? ta.crossover(close, ema200) : emaMode == "EMA Slope" ? emaSlopeUp : (close > ema200 or ta.crossover(close, ema200) or emaSlopeUp)
+bool emaBear = emaMode == "Price Above/Below" ? (close < ema200) : emaMode == "Cross EMA" ? ta.crossunder(close, ema200) : emaMode == "EMA Slope" ? emaSlopeDown : (close < ema200 or ta.crossunder(close, ema200) or emaSlopeDown)
+
+bool emaBuyConfirm  = emaFilterEnabled ? emaBull : true
+bool emaSellConfirm = emaFilterEnabled ? emaBear : true
+
+//====================================================
+// STC
+//====================================================
+
+stcMacdValue(src, fastLen, slowLen) =>
+    float fastMA = ta.ema(src, fastLen)
+    float slowMA = ta.ema(src, slowLen)
+    fastMA - slowMA
+
+stcFunc(cycleLen, fastLen, slowLen, alpha) =>
+    var float k1  = na
+    var float d1  = na
+    var float k2  = na
+    var float stc = na
+    float macd       = stcMacdValue(close, fastLen, slowLen)
+    float lowestMacd = ta.lowest(macd, cycleLen)
+    float macdRange  = ta.highest(macd, cycleLen) - lowestMacd
+    k1 := macdRange > 0 ? ((macd - lowestMacd) / macdRange * 100) : nz(k1[1])
+    d1 := na(d1[1]) ? k1 : (d1[1] + alpha * (k1 - d1[1]))
+    float lowestD1 = ta.lowest(d1, cycleLen)
+    float d1Range  = ta.highest(d1, cycleLen) - lowestD1
+    k2 := d1Range > 0 ? ((d1 - lowestD1) / d1Range * 100) : nz(k2[1])
+    stc := na(stc[1]) ? k2 : (stc[1] + alpha * (k2 - stc[1]))
+    stc
+
+float stc = stcFunc(stcCycleLength, stcFastLength, stcSlowLength, stcSmoothFactor)
+
+bool stcRising    = (stc > stc[1])
+bool stcFalling   = (stc < stc[1])
+bool stcGreenTurn = (stc[2] >= stc[1]) and (stc > stc[1]) and (stc < stcBuyThreshold)
+bool stcRedTurn   = (stc[2] <= stc[1]) and (stc < stc[1]) and (stc > stcSellThreshold)
+bool stcCrossBuy  = ta.crossover(stc, stcBuyThreshold)
+bool stcCrossSell = ta.crossunder(stc, stcSellThreshold)
+
+bool stcBull = stcMode == "Turn From Zone" ? stcGreenTurn : stcMode == "Cross Threshold" ? stcCrossBuy : stcMode == "Slope Only" ? stcRising : (stcGreenTurn or stcCrossBuy or stcRising)
+bool stcBear = stcMode == "Turn From Zone" ? stcRedTurn : stcMode == "Cross Threshold" ? stcCrossSell : stcMode == "Slope Only" ? stcFalling : (stcRedTurn or stcCrossSell or stcFalling)
+
+bool stcBuyConfirm  = useSTCConfirm ? stcBull : true
+bool stcSellConfirm = useSTCConfirm ? stcBear : true
+
+//====================================================
+// MACD
+//====================================================
+
+float macdFastMA      = maFunc(macdSource, macdFastLen, macdOscType)
+float macdSlowMA      = maFunc(macdSource, macdSlowLen, macdOscType)
+float macdLine        = macdFastMA - macdSlowMA
+float macdSignal      = maFunc(macdLine, macdSignalLen, macdSignalType)
+float macdHist        = macdLine - macdSignal
+bool macdBullCrossRaw = ta.crossover(macdLine, macdSignal)
+bool macdBearCrossRaw = ta.crossunder(macdLine, macdSignal)
+bool macdBullCross    = macdZeroFilter ? (macdBullCrossRaw and (macdLine <= 0)) : macdBullCrossRaw
+bool macdBearCross    = macdZeroFilter ? (macdBearCrossRaw and (macdLine >= 0)) : macdBearCrossRaw
+bool macdHistUp       = (macdHist > macdHist[1])
+bool macdHistDown     = (macdHist < macdHist[1])
+
+bool macdBull = macdMode == "Cross Only" ? macdBullCross : macdMode == "Slope Only" ? macdHistUp : macdMode == "Cross Or Slope" ? ((useMACDCross and macdBullCross) or (useMACDHistSlope and macdHistUp)) : ((not useMACDCross or macdBullCross) and (not useMACDHistSlope or macdHistUp))
+bool macdBear = macdMode == "Cross Only" ? macdBearCross : macdMode == "Slope Only" ? macdHistDown : macdMode == "Cross Or Slope" ? ((useMACDCross and macdBearCross) or (useMACDHistSlope and macdHistDown)) : ((not useMACDCross or macdBearCross) and (not useMACDHistSlope or macdHistDown))
+
+bool macdBuyConfirm  = useMACDConfirm ? macdBull : true
+bool macdSellConfirm = useMACDConfirm ? macdBear : true
+
+//====================================================
+// COMBINED ENTRY LOGIC
+//====================================================
+
+int enabledConfirmations = (useSTCConfirm ? 1 : 0) + (useMACDConfirm ? 1 : 0) + (emaFilterEnabled ? 1 : 0)
+int buyConfirmCount      = countTrue(stcBuyConfirm, macdBuyConfirm, emaBuyConfirm)
+int sellConfirmCount     = countTrue(stcSellConfirm, macdSellConfirm, emaSellConfirm)
+int requiredCount        = entryMode == "Loose" ? math.min(1, enabledConfirmations) : entryMode == "Balanced" ? math.min(2, enabledConfirmations) : enabledConfirmations
+
+bool buyConfirmed  = fliBuyFlip  and (enabledConfirmations == 0 ? true : (buyConfirmCount  >= requiredCount))
+bool sellConfirmed = fliSellFlip and (enabledConfirmations == 0 ? true : (sellConfirmCount >= requiredCount))
+
+//====================================================
+// ATR + EXIT CALCULATIONS
+//====================================================
+
+float atrValue    = ta.atr(atrLen)
+float slDist      = exitMethod == "Fixed RR" ? (fixedSlPts * syminfo.mintick) : (atrValue * atrSlMult)
+slDist           := math.max(slDist, syminfo.mintick * 10)
+
+float longSl      = close - slDist
+float longTp      = exitMethod == "ATR" ? (close + (atrValue * atrTpMult)) : exitMethod == "Fixed RR" ? (close + (fixedSlPts * syminfo.mintick * rrRatio)) : na
+float shortSl     = close + slDist
+float shortTp     = exitMethod == "ATR" ? (close - (atrValue * atrTpMult)) : exitMethod == "Fixed RR" ? (close - (fixedSlPts * syminfo.mintick * rrRatio)) : na
+float trailOffset = exitMethod == "Trailing" ? (atrValue * trailAtrMult / syminfo.mintick) : na
+
+//====================================================
+// POSITION SIZING
+//====================================================
+
+float riskAmount = strategy.equity * (riskPercent / 100)
+float posQty     = math.max(math.min(riskAmount / slDist, 1000), 0.01)
+
+//====================================================
+// ENTRY & EXIT EXECUTION
+//====================================================
+
+if buyConfirmed and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=posQty)
+    strategy.exit("Long Exit", "Long", stop=exitMethod == "FLI Flip" ? na : longSl, limit=exitMethod == "FLI Flip" or exitMethod == "Trailing" ? na : longTp, trail_offset=trailOffset)
+
+if sellConfirmed and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=posQty)
+    strategy.exit("Short Exit", "Short", stop=exitMethod == "FLI Flip" ? na : shortSl, limit=exitMethod == "FLI Flip" or exitMethod == "Trailing" ? na : shortTp, trail_offset=trailOffset)
+
+if exitMethod == "FLI Flip"
+    if fliSellFlip and strategy.position_size > 0
+        strategy.close("Long", comment="FLI Flip Exit")
+    if fliBuyFlip and strategy.position_size < 0
+        strategy.close("Short", comment="FLI Flip Exit")
+
+//====================================================
+// LABELS — FIXED: now anchored tightly to candle high/low
+//====================================================
+
+if buyConfirmed and showBuyLabels
+    label.new(bar_index, low - fliPadAmt, "BUY", style=label.style_label_up, color=color.blue, textcolor=color.white, size=labelSize)
+
+if sellConfirmed and showSellLabels
+    label.new(bar_index, high + fliPadAmt, "SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=labelSize)
+
+//====================================================
+// DEBUG MARKERS
+//====================================================
+
+plotshape(showDebugPlots and fliBuyFlip,      title="FLI Buy Flip",      style=shape.circle,       location=location.belowbar, color=color.new(color.blue,   0), size=size.tiny)
+plotshape(showDebugPlots and fliSellFlip,     title="FLI Sell Flip",     style=shape.circle,       location=location.abovebar, color=color.new(color.red,    0), size=size.tiny)
+plotshape(showDebugPlots and stcBuyConfirm,   title="STC Buy Confirm",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green,  0), size=size.tiny)
+plotshape(showDebugPlots and stcSellConfirm,  title="STC Sell Confirm",  style=shape.triangledown, location=location.abovebar, color=color.new(color.maroon, 0), size=size.tiny)
+plotshape(showDebugPlots and macdBuyConfirm,  title="MACD Buy Confirm",  style=shape.square,       location=location.belowbar, color=color.new(color.aqua,   0), size=size.tiny)
+plotshape(showDebugPlots and macdSellConfirm, title="MACD Sell Confirm", style=shape.square,       location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+
+//====================================================
+// ALERTS
+//====================================================
+
+alertcondition(buyConfirmed,  title="Combo Buy",       message="FLI Long Entry: {{ticker}} at {{close}}")
+alertcondition(sellConfirmed, title="Combo Sell",      message="FLI Short Entry: {{ticker}} at {{close}}")
+alertcondition(fliBuyFlip,    title="FLI Buy Flip",    message="Follow Line bullish flip on {{ticker}}")
+alertcondition(fliSellFlip,   title="FLI Sell Flip",   message="Follow Line bearish flip on {{ticker}}")
+alertcondition(stcGreenTurn,  title="STC Green Turn",  message="STC bullish turn on {{ticker}}")
+alertcondition(stcRedTurn,    title="STC Red Turn",    message="STC bearish turn on {{ticker}}")
+alertcondition(macdBullCross, title="MACD Bull Cross", message="MACD bullish crossover on {{ticker}}")
+alertcondition(macdBearCross, title="MACD Bear Cross", message="MACD bearish crossover on {{ticker}}")

@@ -1,0 +1,746 @@
+//@version=6
+indicator("SR & SD Zone Pro", overlay = true, max_labels_count = 500, max_boxes_count = 500, max_lines_count = 500)
+
+// =====================
+// SETTINGS (Inputs)
+// =====================
+groupVol = "Grouped Pivot Volume & SD Zones"
+
+pLowLen  = 1 //input.int(1, "Pivot Low Length", minval=1, group=groupVol, tooltip="Pivot low detection sensitivity.\n• Short Term: 1 - 3\n• Medium Term: 5 - 10\n• Long Term: 14 - 21")
+pHighLen = 1 //input.int(1, "Pivot High Length", minval=1, group=groupVol, tooltip="Pivot high detection sensitivity.\n• Short Term: 1 - 3\n• Medium Term: 5 - 10\n• Long Term: 14 - 21")
+
+showDemandLabels = input.bool(false, "Show Demand Labels?", group=groupVol, tooltip="Toggles volume labels on or off in the Demand zone.")
+showSupplyLabels = input.bool(false, "Show Supply Labels?", group=groupVol, tooltip="Toggles volume labels on or off in the Supply zone.")
+
+xGroupLow        = 1 //input.int(1, "Low Pivots to Group", minval=1, maxval=50, group=groupVol, tooltip="Number of consecutive low pivots to group together.\n• Short Term: 2 - 3\n• Medium Term: 5\n• Long Term: 8 - 10")
+xGroupHigh       = 1 //input.int(1, "High Pivots to Group", minval=1, maxval=50, group=groupVol, tooltip="Number of consecutive high pivots to group together.\n• Short Term: 2 - 3\n• Medium Term: 5\n• Long Term: 8 - 10")
+
+maxBarDist       = 1 //input.int(1, "Proximity Distance (Bars)", minval=1, maxval=200, group=groupVol, tooltip="Maximum bar distance to merge new pivots into the active cluster.\n• Short Term: 5 - 10 bars\n• Medium Term: 15 - 25 bars\n• Long Term: 30+ bars")
+
+mergeTolMult     = input.float(1.5, "ATR Multiplier (Box Merge Tolerance)", minval=0, step=0.1, group=groupVol, tooltip="Boxes will merge if the distance between them is less than ATR * this value.\n• Short Term: 0.5 - 1.0 (Narrower zones)\n• Medium Term: 1.5 - 2.0\n• Long Term: 2.5+ (Wider zones)")
+mergeCrossSide   = input.bool(true, "Merge Supply & Demand Overlaps?", group=groupVol, tooltip="When enabled, a Supply zone and a Demand zone will also merge into one another if their price ranges overlap within the ATR tolerance above. The oldest zone is kept and its label shows the combined volume.")
+useMergedColor   = input.bool(false, "Enable Merged Zone Color?", group=groupVol, tooltip="When ON, a zone formed by a Supply/Demand cross-merge is recolored using the color below, so it stands out from pure Supply or Demand zones. When OFF, merged zones keep the normal Supply (green) / Demand (red) color of the zone that absorbed them.")
+mergedColor      = input.color(color.orange, "Merged Zone Color", group=groupVol, tooltip="Color applied to a zone once it results from a Supply/Demand cross-merge (only relevant when 'Merge Supply & Demand Overlaps?' and 'Enable Merged Zone Color?' are both enabled), so merged zones are visually distinct from pure Supply or Demand zones.")
+
+displayMode      = input.string("Both", "Display Mode", options=["Demand Only", "Supply Only", "Both"], group=groupVol, tooltip="Select which types of zones (Demand, Supply, or Both) to calculate and render.")
+showDemand       = displayMode != "Supply Only"
+showSupply       = displayMode != "Demand Only"
+maxBoxCount      = 0 //input.int(0, "Maximum Box Count (0 = Unlimited)", minval=0, group=groupVol, tooltip="Maximum number of persistent boxes retained on chart per side. Oldest boxes are removed automatically when exceeded.")
+
+showActiveBox    = input.bool(false, "Show Last (Non-Merged) Box?", group=groupVol, tooltip="Master switch for the most recently formed Demand/Supply box that has not (yet) been absorbed by a merge. When OFF, that latest non-merged box is hidden on either side, regardless of the two toggles below. When ON, the Demand/Supply toggles below control each side independently. Older boxes, and any box formed via a same-side or cross-side merge, are never affected by this and always remain visible.")
+showActiveDemand = input.bool(true, "Show Last Demand Box?", group=groupVol, tooltip="When 'Show Last (Non-Merged) Box?' is ON, this controls whether the most recent non-merged Demand (Low) box is drawn.")
+showActiveSupply = input.bool(true, "Show Last Supply Box?", group=groupVol, tooltip="When 'Show Last (Non-Merged) Box?' is ON, this controls whether the most recent non-merged Supply (High) box is drawn.")
+
+extendOnlyOnTouch = input.bool(true, "Extend Boxes Only on Price Proximity?", group=groupVol, tooltip="OFF: Boxes are extended to the current bar on every bar (default behavior).\nON: Boxes are extended/updated only when price comes within the tolerance below of the box range; otherwise they stay fixed at the last bar they touched.")
+proximityPct      = input.float(0.15, "Proximity Tolerance (%)", minval=0, step=0.05, group=groupVol, tooltip="How close (in percent) price must get to the box's top/bottom level to trigger box extension (only used when 'Extend Boxes Only on Price Proximity?' is enabled).")
+
+// =====================
+// PRICE RANGE FILTER (independent of Maximum Box Count)
+// =====================
+groupPriceFilter = "Price Range Filter"
+
+isPriceRangeFilterActive = input.bool(false, "Enable Price Range Filter?", group=groupPriceFilter, tooltip="When enabled, boxes that fall outside the price range defined below are hidden. Works independently of the 'Maximum Box Count' setting (regardless of whether it is 0 or not).")
+
+minPriceFilter = input.float(0.0001,      "Min Price (Lower Limit)", step=0.0001, group=groupPriceFilter, tooltip="Boxes below this price are hidden.")
+maxPriceFilter = input.float(999999.0001, "Max Price (Upper Limit)", step=0.0001, group=groupPriceFilter, tooltip="Boxes above this price are hidden.")
+
+effMinPriceFilter = minPriceFilter
+effMaxPriceFilter = maxPriceFilter
+
+// True whenever the toggle is ON, regardless of the Maximum Box Count value.
+applyPriceFilter = isPriceRangeFilterActive
+
+// A box is considered "in range" only if it is fully contained within [effMinPriceFilter, effMaxPriceFilter].
+f_inPriceRange(float top, float bottom) =>
+    not na(top) and not na(bottom) and bottom >= effMinPriceFilter and top <= effMaxPriceFilter
+
+// =====================
+// MULTI-TIMEFRAME (MTF) SETTINGS
+// =====================
+groupMTF = "Multi-Timeframe (MTF)"
+
+useMTF       = input.bool(false, "Enable MTF?", group=groupMTF, tooltip="When ON, pivot detection and volume are calculated from the timeframe selected below instead of the chart's own timeframe.")
+mtfTimeframe = input.timeframe("", "MTF Timeframe", group=groupMTF, tooltip="The timeframe from which pivot and volume data will be pulled. If left blank, the chart's own timeframe is used.\n\nFree selection is possible, but HIGHER timeframes (larger than the chart's current TF, e.g. 4-10x) are recommended: this provides more reliable pivot detection, more meaningful volume clusters, and fewer data repetition/repaint issues.\n\nLower (smaller than chart) timeframes can also technically be selected, but since MTF bars do not align perfectly with chart bars and bars may appear missing/duplicated on the chart, deviations can occur in pivot placement and timing. Therefore lower TF selection should be used with caution.")
+
+// Effective MTF resolution: falls back to the chart's own timeframe when left blank
+mtfRes = mtfTimeframe == "" ? timeframe.period : mtfTimeframe
+
+// Running record of each chart bar's time/bar_index, used to map an MTF pivot's
+// timestamp back to the correct chart bar_index for box/label placement.
+var float[] chartTimeArr   = array.new_float()
+var int[]   chartBarIdxArr = array.new_int()
+
+array.unshift(chartTimeArr, time)
+array.unshift(chartBarIdxArr, bar_index)
+if array.size(chartTimeArr) > 5000
+    array.pop(chartTimeArr)
+    array.pop(chartBarIdxArr)
+
+// Finds the chart bar_index whose bar time matches the given MTF pivot timestamp.
+findBarIndexForTime(float targetTime) =>
+    int result = na
+    if not na(targetTime)
+        int n = array.size(chartTimeArr)
+        for i = 0 to n - 1
+            if array.get(chartTimeArr, i) == targetTime
+                result := array.get(chartBarIdxArr, i)
+                break
+    result
+
+// Pivot Calculations
+// Local (chart timeframe) pivots - always computed so that useMTF = false keeps the original behavior untouched.
+pLowLocal  = ta.pivotlow(low,   pLowLen, pLowLen)
+pHighLocal = ta.pivothigh(high, pHighLen, pHighLen)
+
+// MTF pivots - computed at mtfRes resolution (pivot function runs inside the security context,
+// so pivots are detected using that timeframe's own bars), plus the matching volume and bar time
+// of the pivot bar, fetched with gaps_on so a value only appears on the chart bar where the MTF
+// bar actually closes/confirms (preventing repeated repainting fills).
+[secPLow, secPLowVol, secPLowTime]    = request.security(syminfo.tickerid, mtfRes, [ta.pivotlow(low, pLowLen, pLowLen), volume[pLowLen], time[pLowLen]],       gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+[secPHigh, secPHighVol, secPHighTime] = request.security(syminfo.tickerid, mtfRes, [ta.pivothigh(high, pHighLen, pHighLen), volume[pHighLen], time[pHighLen]], gaps=barmerge.gaps_on, lookahead=barmerge.lookahead_off)
+
+pLow  = useMTF ? secPLow  : pLowLocal
+pHigh = useMTF ? secPHigh : pHighLocal
+
+var pLowVals  = array.new_float()
+var pLowLocs  = array.new_int()
+var pLowVols  = array.new_float()
+
+var pHighVals = array.new_float()
+var pHighLocs = array.new_int()
+var pHighVols = array.new_float()
+
+// Update Arrays
+if not na(pLow)
+    int   locLow = bar_index - pLowLen
+    float volLow = volume[pLowLen]
+    if useMTF
+        volLow := secPLowVol
+        int mappedLow = findBarIndexForTime(secPLowTime)
+        if not na(mappedLow)
+            locLow := mappedLow
+    array.unshift(pLowVals, pLow)
+    array.unshift(pLowLocs, locLow)
+    array.unshift(pLowVols, volLow)
+    if array.size(pLowVals) > 2520 
+        array.pop(pLowVals), array.pop(pLowLocs), array.pop(pLowVols)
+
+if not na(pHigh)
+    int   locHigh = bar_index - pHighLen
+    float volHigh = volume[pHighLen]
+    if useMTF
+        volHigh := secPHighVol
+        int mappedHigh = findBarIndexForTime(secPHighTime)
+        if not na(mappedHigh)
+            locHigh := mappedHigh
+    array.unshift(pHighVals, pHigh)
+    array.unshift(pHighLocs, locHigh)
+    array.unshift(pHighVols, volHigh)
+    if array.size(pHighVals) > 2520
+        array.pop(pHighVals), array.pop(pHighLocs), array.pop(pHighVols)
+
+// =====================
+// VOLUME FORMATTING FUNCTION
+// =====================
+formatVol(float v) =>
+    if na(v)
+        ""
+    else if v >= 1000000000
+        str.tostring(v / 1000000000, "#.##") + "B"
+    else if v >= 1000000
+        str.tostring(v / 1000000, "#.##") + "M"
+    else if v >= 1000
+        str.tostring(v / 1000, "#.##") + "K"
+    else
+        str.tostring(v, "#")
+
+// =====================
+// PROXIMITY CHECK FUNCTION (used only when extendOnlyOnTouch = true)
+// =====================
+touchesBox(float top, float bottom, float tolPct) =>
+    float tol       = tolPct / 100.0
+    float effTop    = top * (1 + tol)
+    float effBottom = bottom * (1 - tol)
+    high >= effBottom and low <= effTop
+
+// =====================
+// LAST (NON-MERGED) BOX VISIBILITY HELPERS
+// =====================
+// showActiveLowNow / showActiveHighNow reflect whether the box currently being formed
+// (i.e. the newest one, not yet absorbed into any merge) should be visible.
+// The box/label objects are always created regardless of this flag, so all merge and
+// closed-box bookkeeping keeps working exactly as before; only their color/visibility
+// is affected. Once such a box is finalized as a brand-new (non-merged) closed box,
+// it is recolored back to normal, since a newer cluster has by then taken over as "last".
+bool showActiveLowNow  = showActiveBox and showActiveDemand
+bool showActiveHighNow = showActiveBox and showActiveSupply
+
+f_boxBgColor(color baseColor, bool hidden) =>
+    hidden ? color.new(baseColor, 100) : color.new(baseColor, 85)
+
+f_boxBorderColor(color baseColor, bool hidden) =>
+    hidden ? color.new(baseColor, 100) : baseColor
+
+f_lblBgColor(color baseColor, bool hidden) =>
+    hidden ? color.new(baseColor, 100) : baseColor
+
+f_lblTextColor(bool hidden) =>
+    hidden ? color.new(color.white, 100) : color.white
+
+// =====================
+// CLUSTERING & BOX STATE (GLOBAL)
+// =====================
+var int   lastLowClusterBar   = na
+var float lastLowClusterPrice = na
+var float lastLowClusterVol   = 0.0
+var label lastLowClusterLabel = na
+var box   lastLowClusterBox   = na
+
+var int   lastHighClusterBar   = na
+var float lastHighClusterPrice = na
+var float lastHighClusterVol   = 0.0
+var label lastHighClusterLabel = na
+var box   lastHighClusterBox   = na
+
+// Closed/Finalized Clusters Data Storage
+var box[]   closedLowClusterBoxes    = array.new_box()
+var float[] closedLowClusterTops     = array.new_float()
+var float[] closedLowClusterBottoms  = array.new_float()
+var float[] closedLowClusterVols     = array.new_float()
+var label[] closedLowClusterLabels   = array.new_label()
+
+var box[]   closedHighClusterBoxes    = array.new_box()
+var float[] closedHighClusterTops     = array.new_float()
+var float[] closedHighClusterBottoms  = array.new_float()
+var float[] closedHighClusterVols     = array.new_float()
+var label[] closedHighClusterLabels   = array.new_label()
+
+// Internal hard cap (fixed, not user-facing): when extendOnlyOnTouch is ON, closed boxes are
+// no longer capped by maxBoxCount, so this fixed ceiling per side keeps total boxes safely
+// under Pine's max_boxes_count=500 engine limit (2 sides x 240 + 2 active boxes = 482, safe margin).
+int internalHardCap = 240
+
+// Dynamic Margin using ATR
+float boxMargin = ta.atr(14) * 0.5
+
+// Box Merge Tolerance Gap
+float mergeTolerance = ta.atr(14) * mergeTolMult
+
+// =====================
+// DEMAND (LOW) CLUSTERING
+// =====================
+if showDemand and not na(pLow)
+    int totalLowPivots = array.size(pLowVals)
+    
+    if totalLowPivots >= xGroupLow and (totalLowPivots % xGroupLow == 0)
+        float minVal = 999999999.0
+        int minIndexInArray = -1
+        float groupVolSum = 0.0
+
+        for i = 0 to xGroupLow - 1
+            float val = array.get(pLowVals, i)
+            float vol = array.get(pLowVols, i)
+            groupVolSum += vol
+            
+            if val < minVal
+                minVal := val
+                minIndexInArray := i
+
+        int minBarIdx = array.get(pLowLocs, minIndexInArray)
+
+        // Proximity Check
+        if not na(lastLowClusterBar) and (minBarIdx - lastLowClusterBar <= maxBarDist)
+            label.delete(lastLowClusterLabel)
+            if not na(lastLowClusterBox)
+                box.delete(lastLowClusterBox)
+
+            float combinedVol = lastLowClusterVol + groupVolSum
+            int finalBar      = minVal < lastLowClusterPrice ? minBarIdx : lastLowClusterBar
+            float finalPrice  = math.min(minVal, lastLowClusterPrice)
+
+            label newLbl = na
+            if showDemandLabels
+                newLbl := label.new(
+                     x=bar_index, 
+                     y=finalPrice, 
+                     text=formatVol(combinedVol), 
+                     style=label.style_label_left, 
+                     color=f_lblBgColor(color.red, not showActiveLowNow), 
+                     textcolor=f_lblTextColor(not showActiveLowNow), 
+                     size=size.normal
+                 )
+
+            box newBox = box.new(
+                     left=finalBar, 
+                     top=finalPrice + boxMargin, 
+                     right=bar_index, 
+                     bottom=finalPrice, 
+                     bgcolor=f_boxBgColor(color.red, not showActiveLowNow), 
+                     border_color=f_boxBorderColor(color.red, not showActiveLowNow), 
+                     border_width=1
+                 )
+
+            lastLowClusterBar   := finalBar
+            lastLowClusterPrice := finalPrice
+            lastLowClusterVol   := combinedVol
+            lastLowClusterLabel := newLbl
+            lastLowClusterBox   := newBox
+        else
+            // Finalize previous cluster & check overlap with existing closed boxes
+            if not na(lastLowClusterBox)
+                float prevTop    = box.get_top(lastLowClusterBox)
+                float prevBottom = box.get_bottom(lastLowClusterBox)
+                int   mergeIdx   = -1
+
+                if array.size(closedLowClusterBoxes) > 0
+                    for i = 0 to array.size(closedLowClusterBoxes) - 1
+                        if mergeIdx == -1
+                            float t = array.get(closedLowClusterTops, i)
+                            float b = array.get(closedLowClusterBottoms, i)
+                            if (prevTop + mergeTolerance) >= b and (t + mergeTolerance) >= prevBottom
+                                mergeIdx := i
+
+                if mergeIdx != -1
+                    // Merge into existing closed box
+                    float combinedVol = array.get(closedLowClusterVols, mergeIdx) + lastLowClusterVol
+                    array.set(closedLowClusterVols, mergeIdx, combinedVol)
+                    if not na(array.get(closedLowClusterLabels, mergeIdx))
+                        label.set_text(array.get(closedLowClusterLabels, mergeIdx), formatVol(combinedVol))
+                    box.delete(lastLowClusterBox)
+                    label.delete(lastLowClusterLabel)
+                else
+                    // Try cross-side merge (into an existing Supply/High box) if enabled
+                    int crossMergeIdx = -1
+                    if mergeCrossSide and array.size(closedHighClusterBoxes) > 0
+                        for i = 0 to array.size(closedHighClusterBoxes) - 1
+                            if crossMergeIdx == -1
+                                float t2 = array.get(closedHighClusterTops, i)
+                                float b2 = array.get(closedHighClusterBottoms, i)
+                                if (prevTop + mergeTolerance) >= b2 and (t2 + mergeTolerance) >= prevBottom
+                                    crossMergeIdx := i
+
+                    if crossMergeIdx != -1
+                        // Merge into existing closed Demand box -> recolor as a merged zone
+                        float combinedVolCross = array.get(closedHighClusterVols, crossMergeIdx) + lastLowClusterVol
+                        array.set(closedHighClusterVols, crossMergeIdx, combinedVolCross)
+                        box mergedBoxLH = array.get(closedHighClusterBoxes, crossMergeIdx)
+                        if useMergedColor
+                            box.set_bgcolor(mergedBoxLH, color.new(mergedColor, 85))
+                            box.set_border_color(mergedBoxLH, mergedColor)
+                        if not na(array.get(closedHighClusterLabels, crossMergeIdx))
+                            label lblLH = array.get(closedHighClusterLabels, crossMergeIdx)
+                            label.set_text(lblLH, formatVol(combinedVolCross))
+                            if useMergedColor
+                                label.set_color(lblLH, mergedColor)
+                        box.delete(lastLowClusterBox)
+                        label.delete(lastLowClusterLabel)
+                    else
+                        // Store as new closed box.
+                        // This box is no longer "the last" (a newer cluster is about to take over),
+                        // so restore its normal (visible) coloring regardless of the current toggle state.
+                        box.set_bgcolor(lastLowClusterBox, color.new(color.red, 85))
+                        box.set_border_color(lastLowClusterBox, color.red)
+                        if not na(lastLowClusterLabel)
+                            label.set_color(lastLowClusterLabel, color.red)
+                            label.set_textcolor(lastLowClusterLabel, color.white)
+
+                        array.push(closedLowClusterBoxes, lastLowClusterBox)
+                        array.push(closedLowClusterTops, prevTop)
+                        array.push(closedLowClusterBottoms, prevBottom)
+                        array.push(closedLowClusterVols, lastLowClusterVol)
+                        array.push(closedLowClusterLabels, lastLowClusterLabel)
+
+                        // Shift oldest box if capacity is exceeded.
+                        // OFF: capped by user's maxBoxCount (original behavior).
+                        // ON: maxBoxCount no longer caps deletion (needed for the touch-only rule),
+                        // so a fixed internalHardCap is used instead to stay under Pine's 500-box engine limit.
+                        if (not extendOnlyOnTouch and maxBoxCount > 0 and array.size(closedLowClusterBoxes) > maxBoxCount) or (extendOnlyOnTouch and array.size(closedLowClusterBoxes) > internalHardCap)
+                            box.delete(array.shift(closedLowClusterBoxes))
+                            array.shift(closedLowClusterTops)
+                            array.shift(closedLowClusterBottoms)
+                            array.shift(closedLowClusterVols)
+                            label.delete(array.shift(closedLowClusterLabels))
+
+            label newLbl = na
+            if showDemandLabels
+                newLbl := label.new(
+                     x=bar_index, 
+                     y=minVal, 
+                     text=formatVol(groupVolSum), 
+                     style=label.style_label_left, 
+                     color=f_lblBgColor(color.red, not showActiveLowNow), 
+                     textcolor=f_lblTextColor(not showActiveLowNow), 
+                     size=size.normal
+                 )
+
+            box newBox = box.new(
+                     left=minBarIdx, 
+                     top=minVal + boxMargin, 
+                     right=bar_index, 
+                     bottom=minVal, 
+                     bgcolor=f_boxBgColor(color.red, not showActiveLowNow), 
+                     border_color=f_boxBorderColor(color.red, not showActiveLowNow), 
+                     border_width=1
+                 )
+
+            lastLowClusterBar   := minBarIdx
+            lastLowClusterPrice := minVal
+            lastLowClusterVol   := groupVolSum
+            lastLowClusterLabel := newLbl
+            lastLowClusterBox   := newBox
+
+// =====================
+// SUPPLY (HIGH) CLUSTERING
+// =====================
+if showSupply and not na(pHigh)
+    int totalHighPivots = array.size(pHighVals)
+    
+    if totalHighPivots >= xGroupHigh and (totalHighPivots % xGroupHigh == 0)
+        float maxVal = -1.0
+        int maxIndexInArray = -1
+        float groupVolSum = 0.0
+
+        for i = 0 to xGroupHigh - 1
+            float val = array.get(pHighVals, i)
+            float vol = array.get(pHighVols, i)
+            groupVolSum += vol
+            
+            if val > maxVal
+                maxVal := val
+                maxIndexInArray := i
+
+        int maxBarIdx = array.get(pHighLocs, maxIndexInArray)
+
+        // Proximity Check
+        if not na(lastHighClusterBar) and (maxBarIdx - lastHighClusterBar <= maxBarDist)
+            label.delete(lastHighClusterLabel)
+            if not na(lastHighClusterBox)
+                box.delete(lastHighClusterBox)
+
+            float combinedVol = lastHighClusterVol + groupVolSum
+            int finalBar      = maxVal > lastHighClusterPrice ? maxBarIdx : lastHighClusterBar
+            float finalPrice  = math.max(maxVal, lastHighClusterPrice)
+
+            label newLbl = na
+            if showSupplyLabels
+                newLbl := label.new(
+                     x=bar_index, 
+                     y=finalPrice, 
+                     text=formatVol(combinedVol), 
+                     style=label.style_label_left, 
+                     color=f_lblBgColor(color.green, not showActiveHighNow), 
+                     textcolor=f_lblTextColor(not showActiveHighNow), 
+                     size=size.normal
+                 )
+
+            box newBox = box.new(
+                     left=finalBar, 
+                     top=finalPrice, 
+                     right=bar_index, 
+                     bottom=finalPrice - boxMargin, 
+                     bgcolor=f_boxBgColor(color.green, not showActiveHighNow), 
+                     border_color=f_boxBorderColor(color.green, not showActiveHighNow), 
+                     border_width=1
+                 )
+
+            lastHighClusterBar   := finalBar
+            lastHighClusterPrice := finalPrice
+            lastHighClusterVol   := combinedVol
+            lastHighClusterLabel := newLbl
+            lastHighClusterBox   := newBox
+        else
+            // Finalize previous cluster & check overlap with existing closed boxes
+            if not na(lastHighClusterBox)
+                float prevTop    = box.get_top(lastHighClusterBox)
+                float prevBottom = box.get_bottom(lastHighClusterBox)
+                int   mergeIdx   = -1
+
+                if array.size(closedHighClusterBoxes) > 0
+                    for i = 0 to array.size(closedHighClusterBoxes) - 1
+                        if mergeIdx == -1
+                            float t = array.get(closedHighClusterTops, i)
+                            float b = array.get(closedHighClusterBottoms, i)
+                            if (prevTop + mergeTolerance) >= b and (t + mergeTolerance) >= prevBottom
+                                mergeIdx := i
+
+                if mergeIdx != -1
+                    // Merge into existing closed box
+                    float combinedVol = array.get(closedHighClusterVols, mergeIdx) + lastHighClusterVol
+                    array.set(closedHighClusterVols, mergeIdx, combinedVol)
+                    if not na(array.get(closedHighClusterLabels, mergeIdx))
+                        label.set_text(array.get(closedHighClusterLabels, mergeIdx), formatVol(combinedVol))
+                    box.delete(lastHighClusterBox)
+                    label.delete(lastHighClusterLabel)
+                else
+                    // Try cross-side merge (into an existing Demand/Low box) if enabled
+                    int crossMergeIdx = -1
+                    if mergeCrossSide and array.size(closedLowClusterBoxes) > 0
+                        for i = 0 to array.size(closedLowClusterBoxes) - 1
+                            if crossMergeIdx == -1
+                                float t2 = array.get(closedLowClusterTops, i)
+                                float b2 = array.get(closedLowClusterBottoms, i)
+                                if (prevTop + mergeTolerance) >= b2 and (t2 + mergeTolerance) >= prevBottom
+                                    crossMergeIdx := i
+
+                    if crossMergeIdx != -1
+                        // Merge into existing closed Demand box -> recolor as a merged zone
+                        float combinedVolCross = array.get(closedLowClusterVols, crossMergeIdx) + lastHighClusterVol
+                        array.set(closedLowClusterVols, crossMergeIdx, combinedVolCross)
+                        box mergedBoxHL = array.get(closedLowClusterBoxes, crossMergeIdx)
+                        if useMergedColor
+                            box.set_bgcolor(mergedBoxHL, color.new(mergedColor, 85))
+                            box.set_border_color(mergedBoxHL, mergedColor)
+                        if not na(array.get(closedLowClusterLabels, crossMergeIdx))
+                            label lblHL = array.get(closedLowClusterLabels, crossMergeIdx)
+                            label.set_text(lblHL, formatVol(combinedVolCross))
+                            if useMergedColor
+                                label.set_color(lblHL, mergedColor)
+                        box.delete(lastHighClusterBox)
+                        label.delete(lastHighClusterLabel)
+                    else
+                        // Store as new closed box.
+                        // This box is no longer "the last" (a newer cluster is about to take over),
+                        // so restore its normal (visible) coloring regardless of the current toggle state.
+                        box.set_bgcolor(lastHighClusterBox, color.new(color.green, 85))
+                        box.set_border_color(lastHighClusterBox, color.green)
+                        if not na(lastHighClusterLabel)
+                            label.set_color(lastHighClusterLabel, color.green)
+                            label.set_textcolor(lastHighClusterLabel, color.white)
+
+                        array.push(closedHighClusterBoxes, lastHighClusterBox)
+                        array.push(closedHighClusterTops, prevTop)
+                        array.push(closedHighClusterBottoms, prevBottom)
+                        array.push(closedHighClusterVols, lastHighClusterVol)
+                        array.push(closedHighClusterLabels, lastHighClusterLabel)
+
+                        // Shift oldest box if capacity is exceeded.
+                        // OFF: capped by user's maxBoxCount (original behavior).
+                        // ON: maxBoxCount no longer caps deletion (needed for the touch-only rule),
+                        // so a fixed internalHardCap is used instead to stay under Pine's 500-box engine limit.
+                        if (not extendOnlyOnTouch and maxBoxCount > 0 and array.size(closedHighClusterBoxes) > maxBoxCount) or (extendOnlyOnTouch and array.size(closedHighClusterBoxes) > internalHardCap)
+                            box.delete(array.shift(closedHighClusterBoxes))
+                            array.shift(closedHighClusterTops)
+                            array.shift(closedHighClusterBottoms)
+                            array.shift(closedHighClusterVols)
+                            label.delete(array.shift(closedHighClusterLabels))
+
+            label newLbl = na
+            if showSupplyLabels
+                newLbl := label.new(
+                     x=bar_index, 
+                     y=maxVal, 
+                     text=formatVol(groupVolSum), 
+                     style=label.style_label_left, 
+                     color=f_lblBgColor(color.green, not showActiveHighNow), 
+                     textcolor=f_lblTextColor(not showActiveHighNow), 
+                     size=size.normal
+                 )
+
+            box newBox = box.new(
+                     left=maxBarIdx, 
+                     top=maxVal, 
+                     right=bar_index, 
+                     bottom=maxVal - boxMargin, 
+                     bgcolor=f_boxBgColor(color.green, not showActiveHighNow), 
+                     border_color=f_boxBorderColor(color.green, not showActiveHighNow), 
+                     border_width=1
+                 )
+
+            lastHighClusterBar   := maxBarIdx
+            lastHighClusterPrice := maxVal
+            lastHighClusterVol   := groupVolSum
+            lastHighClusterLabel := newLbl
+            lastHighClusterBox   := newBox
+
+// =====================
+// EXTEND ACTIVE & CLOSED BOXES TO CURRENT BAR
+// =====================
+if not na(lastLowClusterBox)
+    box.set_right(lastLowClusterBox, bar_index)
+    if not na(lastLowClusterLabel)
+        label.set_x(lastLowClusterLabel, bar_index)
+    // Price Range Filter: only hides, never restores a color (existing logic above already
+    // set the correct visible/hidden color for this bar; we only add extra hiding on top).
+    if applyPriceFilter and not f_inPriceRange(box.get_top(lastLowClusterBox), box.get_bottom(lastLowClusterBox))
+        box.set_bgcolor(lastLowClusterBox, color.new(color.red, 100))
+        box.set_border_color(lastLowClusterBox, color.new(color.red, 100))
+        if not na(lastLowClusterLabel)
+            label.set_color(lastLowClusterLabel, color.new(color.red, 100))
+            label.set_textcolor(lastLowClusterLabel, color.new(color.white, 100))
+
+if not na(lastHighClusterBox)
+    box.set_right(lastHighClusterBox, bar_index)
+    if not na(lastHighClusterLabel)
+        label.set_x(lastHighClusterLabel, bar_index)
+    if applyPriceFilter and not f_inPriceRange(box.get_top(lastHighClusterBox), box.get_bottom(lastHighClusterBox))
+        box.set_bgcolor(lastHighClusterBox, color.new(color.green, 100))
+        box.set_border_color(lastHighClusterBox, color.new(color.green, 100))
+        if not na(lastHighClusterLabel)
+            label.set_color(lastHighClusterLabel, color.new(color.green, 100))
+            label.set_textcolor(lastHighClusterLabel, color.new(color.white, 100))
+
+int dbgTouchExtendedLow = 0
+if array.size(closedLowClusterBoxes) > 0
+    int lowClosedSize = array.size(closedLowClusterBoxes)
+    for i = 0 to lowClosedSize - 1
+        box closedLowBox = array.get(closedLowClusterBoxes, i)
+        bool isRecentExemptLow = extendOnlyOnTouch and maxBoxCount > 0 and (lowClosedSize - i) <= maxBoxCount
+        bool doExtendLowClosed = not extendOnlyOnTouch or isRecentExemptLow or touchesBox(box.get_top(closedLowBox), box.get_bottom(closedLowBox), proximityPct)
+        if doExtendLowClosed
+            dbgTouchExtendedLow += 1
+            box.set_right(closedLowBox, bar_index)
+            label closedLowLbl = array.get(closedLowClusterLabels, i)
+            if not na(closedLowLbl)
+                label.set_x(closedLowLbl, bar_index)
+        // Price Range Filter: applies every bar regardless of extend/touch state, only hides,
+        // never restores color (existing merge/finalize logic already sets the base color).
+        if applyPriceFilter and not f_inPriceRange(box.get_top(closedLowBox), box.get_bottom(closedLowBox))
+            box.set_bgcolor(closedLowBox, color.new(color.red, 100))
+            box.set_border_color(closedLowBox, color.new(color.red, 100))
+            label closedLowLblHide = array.get(closedLowClusterLabels, i)
+            if not na(closedLowLblHide)
+                label.set_color(closedLowLblHide, color.new(color.red, 100))
+                label.set_textcolor(closedLowLblHide, color.new(color.white, 100))
+
+int dbgTouchExtendedHigh = 0
+if array.size(closedHighClusterBoxes) > 0
+    int highClosedSize = array.size(closedHighClusterBoxes)
+    for i = 0 to highClosedSize - 1
+        box closedHighBox = array.get(closedHighClusterBoxes, i)
+        bool isRecentExemptHigh = extendOnlyOnTouch and maxBoxCount > 0 and (highClosedSize - i) <= maxBoxCount
+        bool doExtendHighClosed = not extendOnlyOnTouch or isRecentExemptHigh or touchesBox(box.get_top(closedHighBox), box.get_bottom(closedHighBox), proximityPct)
+        if doExtendHighClosed
+            dbgTouchExtendedHigh += 1
+            box.set_right(closedHighBox, bar_index)
+            label closedHighLbl = array.get(closedHighClusterLabels, i)
+            if not na(closedHighLbl)
+                label.set_x(closedHighLbl, bar_index)
+        // Price Range Filter: applies every bar regardless of extend/touch state, only hides,
+        // never restores color (existing merge/finalize logic already sets the base color).
+        if applyPriceFilter and not f_inPriceRange(box.get_top(closedHighBox), box.get_bottom(closedHighBox))
+            box.set_bgcolor(closedHighBox, color.new(color.green, 100))
+            box.set_border_color(closedHighBox, color.new(color.green, 100))
+            label closedHighLblHide = array.get(closedHighClusterLabels, i)
+            if not na(closedHighLblHide)
+                label.set_color(closedHighLblHide, color.new(color.green, 100))
+                label.set_textcolor(closedHighLblHide, color.new(color.white, 100))
+
+// =====================
+// NEAREST-TO-PRICE CLOSED BOX EXTENSION (touch-only mode)
+// =====================
+// Supply/Demand tipine bakılmaksızın, güncel close fiyatının hemen üstünde kalan 1 closed kutu
+// ile hemen altında kalan 1 closed kutu bulunur ve bu ikisi touch şartından bağımsız olarak
+// her bar bar_index'e kadar uzatılır. Fiyat hareket ettikçe bu çift her barda yeniden hesaplanır,
+// dolayısıyla farklı kutulara geçebilir. Sadece extendOnlyOnTouch = true iken çalışır.
+// Aktif (henüz kapanmamış) kutulara dokunmaz. Price Range Filter'ın renk/gizleme mantığına
+// dokunmaz (o, yukarıdaki loop'larda zaten uygulandı) - filtre önceliğini korur.
+if extendOnlyOnTouch
+    box   nearestAboveBox1   = na
+    label nearestAboveLabel1 = na
+    float nearestAboveDist1  = 1e10
+    box   nearestAboveBox2   = na
+    label nearestAboveLabel2 = na
+    float nearestAboveDist2  = 1e10
+
+    box   nearestBelowBox1   = na
+    label nearestBelowLabel1 = na
+    float nearestBelowDist1  = 1e10
+    box   nearestBelowBox2   = na
+    label nearestBelowLabel2 = na
+    float nearestBelowDist2  = 1e10
+
+    if array.size(closedLowClusterBoxes) > 0
+        for i = 0 to array.size(closedLowClusterBoxes) - 1
+            box   b  = array.get(closedLowClusterBoxes, i)
+            label lb = array.get(closedLowClusterLabels, i)
+            float t  = box.get_top(b)
+            float bo = box.get_bottom(b)
+            // Guard: skip boxes with na top/bottom (can happen for very early boxes formed
+            // before ta.atr(14) has warmed up, since boxMargin would have been na then).
+            if not na(t) and not na(bo)
+                // Skip the box price is currently inside (bottom <= close <= top) - that one
+                // is already kept extended by the existing touch mechanism; we only want the
+                // 2 nearest boxes strictly above and strictly below it.
+                if bo > close
+                    float dAbove = bo - close
+                    if dAbove < nearestAboveDist1
+                        nearestAboveDist2  := nearestAboveDist1
+                        nearestAboveBox2   := nearestAboveBox1
+                        nearestAboveLabel2 := nearestAboveLabel1
+                        nearestAboveDist1  := dAbove
+                        nearestAboveBox1   := b
+                        nearestAboveLabel1 := lb
+                    else if dAbove < nearestAboveDist2
+                        nearestAboveDist2  := dAbove
+                        nearestAboveBox2   := b
+                        nearestAboveLabel2 := lb
+                if t < close
+                    float dBelow = close - t
+                    if dBelow < nearestBelowDist1
+                        nearestBelowDist2  := nearestBelowDist1
+                        nearestBelowBox2   := nearestBelowBox1
+                        nearestBelowLabel2 := nearestBelowLabel1
+                        nearestBelowDist1  := dBelow
+                        nearestBelowBox1   := b
+                        nearestBelowLabel1 := lb
+                    else if dBelow < nearestBelowDist2
+                        nearestBelowDist2  := dBelow
+                        nearestBelowBox2   := b
+                        nearestBelowLabel2 := lb
+
+    if array.size(closedHighClusterBoxes) > 0
+        for i = 0 to array.size(closedHighClusterBoxes) - 1
+            box   b  = array.get(closedHighClusterBoxes, i)
+            label lb = array.get(closedHighClusterLabels, i)
+            float t  = box.get_top(b)
+            float bo = box.get_bottom(b)
+            // Guard: skip boxes with na top/bottom (can happen for very early boxes formed
+            // before ta.atr(14) has warmed up, since boxMargin would have been na then).
+            if not na(t) and not na(bo)
+                // Skip the box price is currently inside (bottom <= close <= top) - that one
+                // is already kept extended by the existing touch mechanism; we only want the
+                // 2 nearest boxes strictly above and strictly below it.
+                if bo > close
+                    float dAbove = bo - close
+                    if dAbove < nearestAboveDist1
+                        nearestAboveDist2  := nearestAboveDist1
+                        nearestAboveBox2   := nearestAboveBox1
+                        nearestAboveLabel2 := nearestAboveLabel1
+                        nearestAboveDist1  := dAbove
+                        nearestAboveBox1   := b
+                        nearestAboveLabel1 := lb
+                    else if dAbove < nearestAboveDist2
+                        nearestAboveDist2  := dAbove
+                        nearestAboveBox2   := b
+                        nearestAboveLabel2 := lb
+                if t < close
+                    float dBelow = close - t
+                    if dBelow < nearestBelowDist1
+                        nearestBelowDist2  := nearestBelowDist1
+                        nearestBelowBox2   := nearestBelowBox1
+                        nearestBelowLabel2 := nearestBelowLabel1
+                        nearestBelowDist1  := dBelow
+                        nearestBelowBox1   := b
+                        nearestBelowLabel1 := lb
+                    else if dBelow < nearestBelowDist2
+                        nearestBelowDist2  := dBelow
+                        nearestBelowBox2   := b
+                        nearestBelowLabel2 := lb
+
+    if not na(nearestAboveBox1)
+        box.set_right(nearestAboveBox1, bar_index)
+        if not na(nearestAboveLabel1)
+            label.set_x(nearestAboveLabel1, bar_index)
+    if not na(nearestAboveBox2)
+        box.set_right(nearestAboveBox2, bar_index)
+        if not na(nearestAboveLabel2)
+            label.set_x(nearestAboveLabel2, bar_index)
+
+    if not na(nearestBelowBox1)
+        box.set_right(nearestBelowBox1, bar_index)
+        if not na(nearestBelowLabel1)
+            label.set_x(nearestBelowLabel1, bar_index)
+    if not na(nearestBelowBox2)
+        box.set_right(nearestBelowBox2, bar_index)
+        if not na(nearestBelowLabel2)
+            label.set_x(nearestBelowLabel2, bar_index)

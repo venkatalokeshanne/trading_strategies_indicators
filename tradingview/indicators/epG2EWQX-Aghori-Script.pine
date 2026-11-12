@@ -1,0 +1,810 @@
+// This Pine Script(r) code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("Delta Volume Structure [CLEVER]", shorttitle="DVS", format=format.volume, precision=0, 
+  max_labels_count=500, max_lines_count=500, max_boxes_count=500, explicit_plot_zorder=true,
+  overlay=true)
+
+// ==============================================================================
+// INPUTS
+// ==============================================================================
+
+// -- Overlay Control --
+grpOvr       = "Display Mode"
+showOverlay  = input.bool(true, "Show Signals on Price Chart (Overlay)", group=grpOvr,
+  tooltip="When enabled, key signals also appear on the main price chart.")
+
+// -- Delta Engine --
+grpDelta     = "Delta Engine"
+deltaMethod  = input.string("OHLC Approximation", "Estimation Method", 
+  options=["OHLC Approximation", "Close vs Open", "Upper/Lower Wick"], group=grpDelta)
+smoothLen    = input.int(1, "Delta Smoothing", minval=1, maxval=20, group=grpDelta)
+
+// -- CVD --
+grpCVD       = "Cumulative Delta Volume"
+showCVD      = input.bool(false, "Show CVD Line", group=grpCVD, tooltip="Enable only if using indicator in a separate bottom pane.")
+cvdMALen     = input.int(20, "CVD MA Length", minval=5, maxval=100, group=grpCVD)
+showCVDMA    = input.bool(true, "Show CVD MA", group=grpCVD)
+cvdResetMode = input.string("Daily", "CVD Reset", options=["None", "Daily", "Weekly"], group=grpCVD)
+cvdNormLen   = input.int(100, "CVD Normalize Window", minval=20, maxval=500, group=grpCVD)
+
+// -- Detection --
+grpDetect    = "Smart Detection"
+showDiv      = input.bool(true, "Show Divergences", group=grpDetect)
+divPivLen    = input.int(5, "Pivot Length", minval=2, maxval=15, group=grpDetect)
+showAbsorp   = input.bool(true, "Show Absorption Detection", group=grpDetect)
+showClimax   = input.bool(true, "Show Climax / Exhaustion", group=grpDetect)
+
+// -- Volume Filter --
+grpFilter    = "Volume Filter"
+volMALen     = input.int(20, "Volume MA Length", minval=5, maxval=100, group=grpFilter)
+highVolMult  = input.float(1.5, "High Volume Multiplier", minval=1.0, maxval=5.0, step=0.1, group=grpFilter)
+climaxMult   = input.float(2.0, "Climax Volume Multiplier", minval=1.5, maxval=5.0, step=0.1, group=grpFilter)
+absorpThresh = input.float(15.0, "Absorption: Max Delta % of Volume", minval=5.0, maxval=40.0, step=1.0, group=grpFilter,
+  tooltip="If delta is less than this % of total volume despite high volume, Absorption detected.")
+
+// -- Rolling Window --
+grpRoll      = "Rolling Analysis"
+rollingLen   = input.int(10, "Rolling Net Delta Bars", minval=3, maxval=50, group=grpRoll)
+consLen      = input.int(3, "Consecutive Delta Threshold", minval=2, maxval=10, group=grpRoll,
+  tooltip="Minimum consecutive bars of same-sign delta to highlight streak.")
+
+// -- SuperTrend Engine --
+grpST        = "SuperTrend Engine"
+showST       = input.bool(true, "Show SuperTrend Table", group=grpST)
+stFactor     = input.float(3.0, "ATR Multiplier", minval=0.5, maxval=10.0, step=0.1, group=grpST)
+stATRPeriod  = input.int(10, "ATR Period", minval=1, maxval=50, group=grpST)
+stHourlyTF   = input.timeframe("60", "Hourly Timeframe", group=grpST)
+showSTChart  = input.bool(true, "Plot SuperTrend Line on Chart (Current TF)", group=grpST)
+showSTSignals = input.bool(true, "Show SuperTrend Buy/Sell Labels on Chart", group=grpST)
+
+// -- Mobile / Compact View --
+grpMobile    = "Mobile / Compact View"
+mobileView   = input.bool(false, "Enable Mobile-Friendly Dashboard", group=grpMobile,
+  tooltip="Shows a simplified, larger-text table with just Delta + SuperTrend values (Hourly/Daily/Weekly/Monthly) — easier to read on small screens. Replaces the full dashboard and SuperTrend table while enabled.")
+mobilePos    = input.string("Bottom Center", "Mobile Dashboard Position",
+  options=["Top Right", "Top Center", "Bottom Right", "Bottom Center", "Middle Right"], group=grpMobile)
+mobileTextSize = input.string("Normal", "Mobile Text Size", options=["Small", "Normal", "Large"], group=grpMobile)
+
+// -- Dashboard --
+grpDash      = "Dashboard"
+showDash     = input.bool(true, "Show Dashboard", group=grpDash)
+dashSizeInput = input.string("Auto", "Dashboard Size", options=["Tiny", "Small", "Auto", "Normal", "Large"], group=grpDash)
+
+// ==============================================================================
+// COLOR SYSTEM
+// ==============================================================================
+neonBull    = color.rgb(0, 221, 255)
+neonBear    = color.rgb(252, 60, 255)
+dimBull     = color.rgb(0, 128, 130)
+dimBear     = color.rgb(133, 35, 140)
+accentCyan  = color.rgb(0, 200, 255)
+accentGold  = color.rgb(255, 215, 0)
+accentPurp  = color.rgb(180, 100, 255)
+cvdBullCol  = color.rgb(0, 180, 255)
+cvdBearCol  = color.rgb(255, 130, 60)
+absorpCol   = color.rgb(255, 180, 0)
+climaxCol   = color.rgb(238, 0, 255)
+dashBg      = color.rgb(8, 10, 18)
+headerBg    = color.rgb(12, 18, 35)
+rowBg1      = color.rgb(10, 14, 24)
+rowBg2      = color.rgb(16, 20, 34)
+dashBorder  = color.rgb(30, 40, 65)
+sepColor    = color.rgb(25, 32, 50)
+textBright  = color.rgb(235, 240, 255)
+textMid     = color.rgb(160, 170, 195)
+textDim     = color.rgb(90, 100, 125)
+neutCol     = color.rgb(50, 55, 70)
+mtfBg       = color.rgb(10, 18, 30)
+
+// ==============================================================================
+// DELTA ENGINE
+// ==============================================================================
+f_deltaOHLC() =>
+    r = high - low
+    r == 0 ? (close >= open ? volume : -volume) : volume * ((close - low) - (high - close)) / r
+
+f_deltaSimple() =>
+    close >= open ? volume : -volume
+
+f_deltaWick() =>
+    r = high - low
+    if r == 0
+        close >= open ? volume : -volume
+    else
+        uW = high - math.max(open, close)
+        lW = math.min(open, close) - low
+        bd = math.abs(close - open)
+        bP = lW + (close >= open ? bd : 0.0)
+        sP = uW + (close <  open ? bd : 0.0)
+        t  = bP + sP
+        t == 0 ? 0.0 : volume * (bP - sP) / t
+
+rawDelta = switch deltaMethod
+    "OHLC Approximation" => f_deltaOHLC()
+    "Close vs Open"      => f_deltaSimple()
+    "Upper/Lower Wick"   => f_deltaWick()
+    => f_deltaOHLC()
+
+delta = smoothLen > 1 ? ta.ema(rawDelta, smoothLen) : rawDelta
+
+// Buy / Sell split
+buyVol = switch deltaMethod
+    "OHLC Approximation" =>
+        r = high - low
+        r == 0 ? (close >= open ? volume : 0.0) : volume * (close - low) / r
+    "Close vs Open" => close >= open ? volume : 0.0
+    => volume * 0.5
+sellVol = volume - buyVol
+
+// ==============================================================================
+// MULTI-TIMEFRAME DELTA (Daily / Weekly / Monthly)
+// ==============================================================================
+f_mtfDelta() =>
+    _r = high - low
+    _raw = switch deltaMethod
+        "OHLC Approximation" => _r == 0 ? (close >= open ? volume : -volume) : volume * ((close - low) - (high - close)) / _r
+        "Close vs Open"      => close >= open ? volume : -volume
+        "Upper/Lower Wick"   =>
+            if _r == 0
+                close >= open ? volume : -volume
+            else
+                _uW = high - math.max(open, close)
+                _lW = math.min(open, close) - low
+                _bd = math.abs(close - open)
+                _bP = _lW + (close >= open ? _bd : 0.0)
+                _sP = _uW + (close <  open ? _bd : 0.0)
+                _t  = _bP + _sP
+                _t == 0 ? 0.0 : volume * (_bP - _sP) / _t
+        => _r == 0 ? (close >= open ? volume : -volume) : volume * ((close - low) - (high - close)) / _r
+    _raw
+
+// Current bar delta per TF
+dailyDelta   = request.security(syminfo.tickerid, "D", f_mtfDelta(), lookahead=barmerge.lookahead_off)
+weeklyDelta  = request.security(syminfo.tickerid, "W", f_mtfDelta(), lookahead=barmerge.lookahead_off)
+monthlyDelta = request.security(syminfo.tickerid, "M", f_mtfDelta(), lookahead=barmerge.lookahead_off)
+
+// Previous bar delta per TF — used ONLY for the momentum glyph (↑/↓), not for color/sign
+dailyDeltaPrev   = request.security(syminfo.tickerid, "D", f_mtfDelta()[1], lookahead=barmerge.lookahead_off)
+weeklyDeltaPrev  = request.security(syminfo.tickerid, "W", f_mtfDelta()[1], lookahead=barmerge.lookahead_off)
+monthlyDeltaPrev = request.security(syminfo.tickerid, "M", f_mtfDelta()[1], lookahead=barmerge.lookahead_off)
+
+// Momentum: is delta increasing or decreasing vs. the prior bar on that timeframe
+dDeltaChange = dailyDelta   - dailyDeltaPrev
+wDeltaChange = weeklyDelta  - weeklyDeltaPrev
+mDeltaChange = monthlyDelta - monthlyDeltaPrev
+
+// ==============================================================================
+// SUPERTREND ENGINE (Hourly / Daily / Weekly / Monthly)
+// ==============================================================================
+f_st(_factor, _atrPeriod) =>
+    [_st, _dir] = ta.supertrend(_factor, _atrPeriod)
+    [_st, _dir]
+
+f_stDirPrev(_factor, _atrPeriod) =>
+    [_st, _dir] = ta.supertrend(_factor, _atrPeriod)
+    _dir[1]
+
+// Current chart-timeframe SuperTrend (used for the optional overlay plot/labels)
+[curST, curDir] = ta.supertrend(stFactor, stATRPeriod)
+stBuySignal  = curDir == -1 and curDir[1] == 1
+stSellSignal = curDir == 1  and curDir[1] == -1
+
+// Multi-timeframe SuperTrend value + direction
+[hST, hDir] = request.security(syminfo.tickerid, stHourlyTF, f_st(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+[dST, dDir] = request.security(syminfo.tickerid, "D",        f_st(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+[wST, wDir] = request.security(syminfo.tickerid, "W",        f_st(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+[mST, mDir] = request.security(syminfo.tickerid, "M",        f_st(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+
+// Previous-bar direction per TF, used to flag a fresh flip on that timeframe
+hDirPrev = request.security(syminfo.tickerid, stHourlyTF, f_stDirPrev(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+dDirPrev = request.security(syminfo.tickerid, "D",        f_stDirPrev(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+wDirPrev = request.security(syminfo.tickerid, "W",        f_stDirPrev(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+mDirPrev = request.security(syminfo.tickerid, "M",        f_stDirPrev(stFactor, stATRPeriod), lookahead=barmerge.lookahead_off)
+
+hSTFlipBuy  = hDir == -1 and hDirPrev == 1
+hSTFlipSell = hDir == 1  and hDirPrev == -1
+dSTFlipBuy  = dDir == -1 and dDirPrev == 1
+dSTFlipSell = dDir == 1  and dDirPrev == -1
+wSTFlipBuy  = wDir == -1 and wDirPrev == 1
+wSTFlipSell = wDir == 1  and wDirPrev == -1
+mSTFlipBuy  = mDir == -1 and mDirPrev == 1
+mSTFlipSell = mDir == 1  and mDirPrev == -1
+
+// Labels / colors per timeframe (direction -1 = uptrend/BUY, 1 = downtrend/SELL)
+hSTLbl = hDir == -1 ? "BUY"  : "SELL"
+dSTLbl = dDir == -1 ? "BUY"  : "SELL"
+wSTLbl = wDir == -1 ? "BUY"  : "SELL"
+mSTLbl = mDir == -1 ? "BUY"  : "SELL"
+hSTCol = hDir == -1 ? neonBull : neonBear
+dSTCol = dDir == -1 ? neonBull : neonBear
+wSTCol = wDir == -1 ? neonBull : neonBear
+mSTCol = mDir == -1 ? neonBull : neonBear
+
+hSTFlipTxt = hSTFlipBuy ? "NEW BUY" : (hSTFlipSell ? "NEW SELL" : "-")
+dSTFlipTxt = dSTFlipBuy ? "NEW BUY" : (dSTFlipSell ? "NEW SELL" : "-")
+wSTFlipTxt = wSTFlipBuy ? "NEW BUY" : (wSTFlipSell ? "NEW SELL" : "-")
+mSTFlipTxt = mSTFlipBuy ? "NEW BUY" : (mSTFlipSell ? "NEW SELL" : "-")
+hSTFlipCol = hSTFlipBuy ? neonBull : (hSTFlipSell ? neonBear : textDim)
+dSTFlipCol = dSTFlipBuy ? neonBull : (dSTFlipSell ? neonBear : textDim)
+wSTFlipCol = wSTFlipBuy ? neonBull : (wSTFlipSell ? neonBear : textDim)
+mSTFlipCol = mSTFlipBuy ? neonBull : (mSTFlipSell ? neonBear : textDim)
+
+// ==============================================================================
+// CVD -- CUMULATIVE DELTA
+// ==============================================================================
+isNewDay  = ta.change(time("D")) != 0
+isNewWeek = ta.change(time("W")) != 0
+shouldReset = switch cvdResetMode
+    "Daily"  => isNewDay
+    "Weekly" => isNewWeek
+    => false
+
+var float cvd = 0.0
+if shouldReset
+    cvd := delta
+else
+    cvd += delta
+
+cvdMA = ta.ema(cvd, cvdMALen)
+
+// Normalize CVD to price scale for overlay mode
+priceMid    = (ta.highest(high, cvdNormLen) + ta.lowest(low, cvdNormLen)) / 2.0
+priceRng    = ta.highest(high, cvdNormLen) - ta.lowest(low, cvdNormLen)
+cvdMax      = ta.highest(math.abs(cvd), cvdNormLen)
+cvdScale    = cvdMax != 0 ? (priceRng * 0.3) / cvdMax : 1.0
+cvdScaled   = priceMid + cvd * cvdScale
+cvdMAScaled = priceMid + cvdMA * cvdScale
+
+// ==============================================================================
+// ADVANCED METRICS
+// ==============================================================================
+volMA         = ta.sma(volume, volMALen)
+isHighVol     = volume >= volMA * highVolMult
+deltaPercent  = volume != 0 ? (delta / volume) * 100.0 : 0.0
+absDelta      = math.abs(delta)
+absDeltaMA    = ta.sma(absDelta, volMALen)
+deltaStrength = absDeltaMA != 0 ? absDelta / absDeltaMA : 0.0
+
+// -- Absorption Detection --
+isAbsorption = volume >= volMA * highVolMult and math.abs(deltaPercent) < absorpThresh
+absorbType   = isAbsorption and close > open ? 1 : (isAbsorption and close < open ? -1 : 0)
+
+// -- Climax / Exhaustion Detection --
+isClimax   = volume >= volMA * climaxMult and math.abs(deltaPercent) > 60
+climaxType = isClimax and delta > 0 ? 1 : (isClimax and delta < 0 ? -1 : 0)
+
+// -- Delta Flip --
+deltaFlipBull = ta.crossover(delta, 0.0)
+deltaFlipBear = ta.crossunder(delta, 0.0)
+
+// -- Rolling Net Delta --
+rollingDelta    = math.sum(delta, rollingLen)
+rollingDeltaPct = math.sum(volume, rollingLen) != 0 ? (rollingDelta / math.sum(volume, rollingLen)) * 100.0 : 0.0
+
+// -- Consecutive Delta Streak --
+var int consBull = 0
+var int consBear = 0
+if delta > 0
+    consBull += 1
+    consBear := 0
+else if delta < 0
+    consBear += 1
+    consBull := 0
+else
+    consBull := 0
+    consBear := 0
+
+isStreak = consBull >= consLen or consBear >= consLen
+
+// -- Delta vs Price Confirmation --
+priceDir = close > open ? 1 : (close < open ? -1 : 0)
+deltaDir = delta > 0 ? 1 : (delta < 0 ? -1 : 0)
+isConfirmed = priceDir == deltaDir and priceDir != 0
+isDeltaPriceDivergent = priceDir != deltaDir and priceDir != 0 and deltaDir != 0
+
+// -- Buy/Sell Imbalance Ratio --
+imbalanceRatio = sellVol > 0 ? buyVol / sellVol : 99.0
+imbalanceStr = imbalanceRatio > 2.0 ? "Strong Buy" : (imbalanceRatio > 1.3 ? "Buy" : (imbalanceRatio < 0.5 ? "Strong Sell" : (imbalanceRatio < 0.77 ? "Sell" : "Balanced")))
+imbalanceCol = imbalanceRatio > 2.0 ? neonBull : (imbalanceRatio > 1.3 ? color.rgb(100, 196, 220) : (imbalanceRatio < 0.5 ? neonBear : (imbalanceRatio < 0.77 ? color.rgb(204, 100, 220) : textMid)))
+
+// -- CVD Slope / Trend --
+cvdSlope = ta.change(cvd, 5)
+cvdSlopeMA = ta.change(cvd, 20)
+cvdTrend = cvdSlope > 0 and cvdSlopeMA > 0 ? "Rising" : (cvdSlope < 0 and cvdSlopeMA < 0 ? "Falling" : (cvdSlope > 0 and cvdSlopeMA < 0 ? "Rev Up" : (cvdSlope < 0 and cvdSlopeMA > 0 ? "Rev Down" : "Flat")))
+cvdTrendCol = cvdSlope > 0 and cvdSlopeMA > 0 ? neonBull : (cvdSlope < 0 and cvdSlopeMA < 0 ? neonBear : (cvdSlope > 0 ? color.rgb(120, 220, 210) : (cvdSlope < 0 ? color.rgb(205, 110, 220) : textMid)))
+
+// -- Momentum --
+cvdROC   = ta.change(cvd, 5)
+cvdAccel = ta.change(cvdROC, 3)
+momStr = cvdROC > 0 and cvdAccel > 0 ? "Strong Buy" : (cvdROC > 0 and cvdAccel <= 0 ? "Weak Buy" : (cvdROC < 0 and cvdAccel < 0 ? "Strong Sell" : (cvdROC < 0 and cvdAccel >= 0 ? "Weak Sell" : "Neutral")))
+momCol = cvdROC > 0 and cvdAccel > 0 ? neonBull : (cvdROC > 0 and cvdAccel <= 0 ? color.rgb(100, 208, 210) : (cvdROC < 0 and cvdAccel < 0 ? neonBear : (cvdROC < 0 and cvdAccel >= 0 ? color.rgb(218, 100, 220) : textMid)))
+
+// -- Institutional Footprint --
+atr14 = ta.atr(14)
+barRange = high - low
+avgRange = ta.sma(barRange, 20)
+isInstitutional = volume >= volMA * highVolMult and barRange < avgRange * 0.6
+
+// -- Session Tracking --
+var float sBuy = 0.0, var float sSell = 0.0, var float sDelta = 0.0
+var int   sBars = 0
+var int   sFlips = 0
+var float sMaxDelta = 0.0
+var float sMinDelta = 0.0
+var int   sAbsorpCount = 0
+var int   sClimaxCount = 0
+var int   sInstCount = 0
+var float pocPrice = close
+var float pocVol = 0.0
+if isNewDay
+    sBuy   := 0.0
+    sSell  := 0.0
+    sDelta := 0.0
+    sBars  := 0
+    sFlips := 0
+    sMaxDelta := 0.0
+    sMinDelta := 0.0
+    sAbsorpCount := 0
+    sClimaxCount := 0
+    sInstCount := 0
+    pocPrice := close
+    pocVol := 0.0
+sBuy   += buyVol
+sSell  += sellVol
+sDelta += delta
+sBars  += 1
+if deltaFlipBull or deltaFlipBear
+    sFlips += 1
+sMaxDelta := math.max(sMaxDelta, delta)
+sMinDelta := math.min(sMinDelta, delta)
+if isAbsorption
+    sAbsorpCount += 1
+if isClimax
+    sClimaxCount += 1
+if isInstitutional
+    sInstCount += 1
+if volume > pocVol
+    pocVol := volume
+    pocPrice := math.round_to_mintick((high + low + close) / 3)
+
+// -- Price Trend (EMA 9 vs EMA 21) --
+ema9  = ta.ema(close, 9)
+ema21 = ta.ema(close, 21)
+ema50 = ta.ema(close, 50)
+trendStr = close > ema9 and ema9 > ema21 and ema21 > ema50 ? "STRONG UP" : (close > ema9 and ema9 > ema21 ? "UP" : (close < ema9 and ema9 < ema21 and ema21 < ema50 ? "STRONG DN" : (close < ema9 and ema9 < ema21 ? "DOWN" : "CHOP")))
+trendCol = trendStr == "STRONG UP" ? neonBull : (trendStr == "UP" ? color.rgb(100, 210, 220) : (trendStr == "STRONG DN" ? neonBear : (trendStr == "DOWN" ? color.rgb(212, 100, 220) : textMid)))
+
+// -- Delta Acceleration --
+deltaAccel = ta.change(delta, 3)
+accelStr = deltaAccel > 0 and delta > 0 ? "Accel" : (deltaAccel < 0 and delta < 0 ? "Accel" : (deltaAccel > 0 and delta < 0 ? "Decel" : (deltaAccel < 0 and delta > 0 ? "Decel" : "Steady")))
+accelCol = accelStr == "Accel" ? accentGold : (accelStr == "Decel" ? accentCyan : textDim)
+
+// -- Aggression Index --
+volRank = volMA != 0 ? volume / volMA : 1.0
+aggrIndex = deltaPercent * volRank
+aggrStr = aggrIndex > 30 ? "EXT BUY" : (aggrIndex > 15 ? "AGG BUY" : (aggrIndex < -30 ? "EXT SELL" : (aggrIndex < -15 ? "AGG SELL" : "NORMAL")))
+aggrCol = aggrIndex > 30 ? accentGold : (aggrIndex > 15 ? neonBull : (aggrIndex < -30 ? accentGold : (aggrIndex < -15 ? neonBear : textMid)))
+
+// -- Bar Position Analysis --
+barBody = math.abs(close - open)
+barBodyPct = barRange != 0 ? (barBody / barRange) * 100 : 0.0
+closePos = barRange != 0 ? ((close - low) / barRange) * 100 : 50.0
+barPosStr = closePos > 80 ? "TOP" : (closePos > 60 ? "UPPER" : (closePos < 20 ? "BOTTOM" : (closePos < 40 ? "LOWER" : "MID")))
+barPosCol = closePos > 60 ? neonBull : (closePos < 40 ? neonBear : textMid)
+
+// -- Weighted Delta Score (WDS) --
+wds = (deltaPercent * 0.4) + ((volRank - 1.0) * 30.0 * 0.3) + ((closePos - 50.0) * 0.3)
+wdsStr = wds > 25 ? "STR BUY" : (wds > 10 ? "BUY" : (wds < -25 ? "STR SELL" : (wds < -10 ? "SELL" : "NEUTRAL")))
+wdsCol = wds > 25 ? neonBull : (wds > 10 ? color.rgb(100, 196, 220) : (wds < -25 ? neonBear : (wds < -10 ? color.rgb(220, 100, 214) : textMid)))
+
+// -- Overall Market Bias --
+biasScore = 0.0
+biasScore := biasScore + (cvdSlope > 0 ? 1.0 : (cvdSlope < 0 ? -1.0 : 0.0))
+biasScore := biasScore + (cvdROC > 0 ? 1.0 : (cvdROC < 0 ? -1.0 : 0.0))
+biasScore := biasScore + (isConfirmed and delta > 0 ? 1.0 : (isConfirmed and delta < 0 ? -1.0 : 0.0))
+biasScore := biasScore + (imbalanceRatio > 1.3 ? 1.0 : (imbalanceRatio < 0.77 ? -1.0 : 0.0))
+biasScore := biasScore + (sDelta > 0 ? 1.0 : (sDelta < 0 ? -1.0 : 0.0))
+biasStr = biasScore >= 4 ? "STR BULL" : (biasScore >= 2 ? "BULLISH" : (biasScore <= -4 ? "STR BEAR" : (biasScore <= -2 ? "BEARISH" : "NEUTRAL")))
+biasCol = biasScore >= 4 ? neonBull : (biasScore >= 2 ? color.rgb(100, 220, 208) : (biasScore <= -4 ? neonBear : (biasScore <= -2 ? color.rgb(212, 100, 220) : textMid)))
+
+// ==============================================================================
+// DIVERGENCE DETECTION
+// ==============================================================================
+priceHi = ta.pivothigh(high, divPivLen, divPivLen)
+priceLo = ta.pivotlow(low,  divPivLen, divPivLen)
+cvdHi   = ta.pivothigh(cvd, divPivLen, divPivLen)
+cvdLo   = ta.pivotlow(cvd,  divPivLen, divPivLen)
+
+var float pPH = na, var float pPL = na
+var float pCH = na, var float pCL = na
+
+bearDiv = not na(priceHi) and not na(cvdHi) and not na(pPH) and not na(pCH) and 
+          priceHi > pPH and cvdHi < pCH
+bullDiv = not na(priceLo) and not na(cvdLo) and not na(pPL) and not na(pCL) and 
+          priceLo < pPL and cvdLo > pCL
+
+if not na(priceHi)
+    pPH := priceHi
+if not na(priceLo)
+    pPL := priceLo
+if not na(cvdHi)
+    pCH := cvdHi
+if not na(cvdLo)
+    pCL := cvdLo
+
+// ==============================================================================
+// PLOTS
+// ==============================================================================
+cvdLC  = cvdScaled >= cvdMAScaled ? color.new(cvdBullCol, 15) : color.new(cvdBearCol, 15)
+plot(showCVD ? cvdScaled : na, "CVD", color=cvdLC, linewidth=2)
+plot(showCVD and showCVDMA ? cvdMAScaled : na, "CVD MA", color=color.new(#fc64ff, 40), linewidth=1)
+
+pC1 = plot(showCVD ? cvdScaled : na, "cf1", color=color(na), display=display.none, editable=false)
+pC2 = plot(showCVD and showCVDMA ? cvdMAScaled : na, "cf2", color=color(na), display=display.none, editable=false)
+fill(pC1, pC2, color=cvdScaled > cvdMAScaled ? color.new(cvdBullCol, 88) : color.new(cvdBearCol, 88))
+
+// SuperTrend line on current chart timeframe
+plot(showOverlay and showSTChart ? curST : na, "SuperTrend", color=curDir == -1 ? neonBull : neonBear, linewidth=2, style=plot.style_linebr)
+
+// ==============================================================================
+// OVERLAY PLOTS
+// ==============================================================================
+plotshape(showOverlay and showDiv and bullDiv ? low : na, "Bull Divergence", shape.labelup, location.belowbar,
+  color=color.new(neonBull, 10), textcolor=dashBg, text="BULL\nDIV", size=size.small, offset=-divPivLen)
+plotshape(showOverlay and showDiv and bearDiv ? high : na, "Bear Divergence", shape.labeldown, location.abovebar,
+  color=color.new(neonBear, 10), textcolor=textBright, text="BEAR\nDIV", size=size.small, offset=-divPivLen)
+plotshape(showOverlay and showAbsorp and absorbType == 1 ? low : na, "Absorb Buy", shape.diamond, location.belowbar,
+  color=color.new(absorpCol, 0), size=size.tiny)
+plotshape(showOverlay and showAbsorp and absorbType == -1 ? high : na, "Absorb Sell", shape.diamond, location.abovebar,
+  color=color.new(absorpCol, 0), size=size.tiny)
+plotshape(showOverlay and showClimax and climaxType == 1 ? high : na, "Buy Climax", shape.xcross, location.abovebar,
+  color=color.new(climaxCol, 0), size=size.small, text="CLIMAX", textcolor=climaxCol)
+plotshape(showOverlay and showClimax and climaxType == -1 ? low : na, "Sell Climax", shape.xcross, location.belowbar,
+  color=color.new(climaxCol, 0), size=size.small, text="CLIMAX", textcolor=climaxCol)
+plotshape(showOverlay and isInstitutional ? close : na, "Institutional", shape.square, location.abovebar,
+  color=color.new(accentPurp, 20), size=size.tiny)
+plotshape(showOverlay and showSTSignals and stBuySignal ? curST : na, "ST Buy", shape.triangleup, location.belowbar,
+  color=color.new(neonBull, 0), size=size.small, text="BUY", textcolor=textBright)
+plotshape(showOverlay and showSTSignals and stSellSignal ? curST : na, "ST Sell", shape.triangledown, location.abovebar,
+  color=color.new(neonBear, 0), size=size.small, text="SELL", textcolor=textBright)
+
+// ==============================================================================
+// DASHBOARD (Full / Desktop)
+// ==============================================================================
+var table dash = na
+
+if showDash and not mobileView
+    if na(dash)
+        dash := table.new(position.bottom_center, 26, 4,
+          bgcolor=color.new(dashBg, 5),
+          border_color=color.new(dashBorder, 20),
+          border_width=1,
+          frame_color=color.new(accentCyan, 50),
+          frame_width=1)
+
+    s = switch dashSizeInput
+        "Tiny"   => size.tiny
+        "Small"  => size.small
+        "Auto"   => size.auto
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.auto
+    ss = s == size.tiny ? size.tiny : size.small
+
+    // ── Pre-compute MTF display values ──────────────────────
+    // Arrow glyphs — driven purely by the SIGN of the delta itself (bullish/bearish),
+    // not by whether it moved up or down versus the previous bar.
+    dArrow = dailyDelta   > 0 ? "▲" : (dailyDelta   < 0 ? "▼" : "─")
+    wArrow = weeklyDelta  > 0 ? "▲" : (weeklyDelta  < 0 ? "▼" : "─")
+    mArrow = monthlyDelta > 0 ? "▲" : (monthlyDelta < 0 ? "▼" : "─")
+
+    // Arrow/text colors: green = bullish (delta > 0), red/pink = bearish (delta < 0), dim = flat
+    dArrowCol = dailyDelta   > 0 ? color.rgb(0, 230, 120) : (dailyDelta   < 0 ? color.rgb(255, 70, 130) : textDim)
+    wArrowCol = weeklyDelta  > 0 ? color.rgb(0, 230, 120) : (weeklyDelta  < 0 ? color.rgb(255, 70, 130) : textDim)
+    mArrowCol = monthlyDelta > 0 ? color.rgb(0, 230, 120) : (monthlyDelta < 0 ? color.rgb(255, 70, 130) : textDim)
+
+    // Momentum glyphs — separate from sign/color: ↑ delta rising vs prior bar, ↓ falling, → unchanged
+    dMomArrow = dDeltaChange > 0 ? "↑" : (dDeltaChange < 0 ? "↓" : "→")
+    wMomArrow = wDeltaChange > 0 ? "↑" : (wDeltaChange < 0 ? "↓" : "→")
+    mMomArrow = mDeltaChange > 0 ? "↑" : (mDeltaChange < 0 ? "↓" : "→")
+
+    // % of volume
+    dVol = request.security(syminfo.tickerid, "D", volume, lookahead=barmerge.lookahead_off)
+    wVol = request.security(syminfo.tickerid, "W", volume, lookahead=barmerge.lookahead_off)
+    mVol = request.security(syminfo.tickerid, "M", volume, lookahead=barmerge.lookahead_off)
+    dDPct = dVol > 0 ? dailyDelta   / dVol * 100 : 0.0
+    wDPct = wVol > 0 ? weeklyDelta  / wVol * 100 : 0.0
+    mDPct = mVol > 0 ? monthlyDelta / mVol * 100 : 0.0
+
+    // Bias label
+    dBias = dailyDelta   > 0 ? "BULLISH" : (dailyDelta   < 0 ? "BEARISH" : "FLAT")
+    wBias = weeklyDelta  > 0 ? "BULLISH" : (weeklyDelta  < 0 ? "BEARISH" : "FLAT")
+    mBias = monthlyDelta > 0 ? "BULLISH" : (monthlyDelta < 0 ? "BEARISH" : "FLAT")
+
+    // MTF cell backgrounds — subtle tint by sign of delta (bullish/bearish), matching the arrows
+    dBg = dailyDelta   > 0 ? color.rgb(5, 22, 18) : (dailyDelta   < 0 ? color.rgb(22, 8, 18) : color.new(mtfBg, 0))
+    wBg = weeklyDelta  > 0 ? color.rgb(5, 22, 18) : (weeklyDelta  < 0 ? color.rgb(22, 8, 18) : color.new(mtfBg, 0))
+    mBg = monthlyDelta > 0 ? color.rgb(5, 22, 18) : (monthlyDelta < 0 ? color.rgb(22, 8, 18) : color.new(mtfBg, 0))
+
+    // ──────────────────────────────────────────────────────
+    // ROW 0: SECTION HEADERS
+    // ──────────────────────────────────────────────────────
+    table.cell(dash, 0, 0, " DVS PRO ", text_color=accentCyan, text_size=ss, text_font_family=font.family_monospace, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 1, 0, " DELTA ", text_color=accentGold, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 2, 0, " BUY ", text_color=neonBull, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 3, 0, " SELL ", text_color=neonBear, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 4, 0, " IMBAL ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 5, 0, " AGGR ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 6, 0, "", bgcolor=sepColor)
+    table.cell(dash, 7, 0, " CVD ", text_color=accentCyan, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 8, 0, " TREND ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 9, 0, " MOM ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 10, 0, " STR ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 11, 0, " WDS ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 12, 0, "", bgcolor=sepColor)
+    table.cell(dash, 13, 0, " CONFIRM ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 14, 0, " ABSORP ", text_color=absorpCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 15, 0, " CLIMAX ", text_color=climaxCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 16, 0, " SMART$ ", text_color=accentPurp, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 17, 0, "", bgcolor=sepColor)
+    table.cell(dash, 18, 0, " SESS D ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 19, 0, " STREAK ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 20, 0, " VOL/MA ", text_color=textMid, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 21, 0, " BIAS ", text_color=accentGold, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 22, 0, "", bgcolor=sepColor)
+    table.cell(dash, 23, 0, " D-DELTA ", text_color=color.rgb(80, 200, 255), text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+    table.cell(dash, 24, 0, " W-DELTA ", text_color=color.rgb(160, 130, 255), text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+    table.cell(dash, 25, 0, " M-DELTA ", text_color=accentGold, text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+
+    // ──────────────────────────────────────────────────────
+    // ROW 1: PRIMARY VALUES  +  MTF value + arrow (sign-based)
+    // ──────────────────────────────────────────────────────
+    bPct  = volume != 0 ? buyVol  / volume * 100 : 50.0
+    sPctV = volume != 0 ? sellVol / volume * 100 : 50.0
+
+    table.cell(dash, 0, 1, " v3.1 ", text_color=accentGold, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 1, 1, " " + str.tostring(delta, "#,###") + " ", text_color=delta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 2, 1, " " + str.tostring(bPct, "#.#") + "% ", text_color=neonBull, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 3, 1, " " + str.tostring(sPctV, "#.#") + "% ", text_color=neonBear, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 4, 1, " " + str.tostring(imbalanceRatio, "#.##") + "x ", text_color=imbalanceCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 5, 1, " " + str.tostring(aggrIndex, "#.#") + " ", text_color=aggrCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 6, 1, "", bgcolor=sepColor)
+
+    cvdSig = cvd > cvdMA ? "Bull" : "Bear"
+    table.cell(dash, 7, 1, " " + str.tostring(cvd, "#,###") + " ", text_color=cvd >= 0 ? cvdBullCol : cvdBearCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 8, 1, " " + cvdTrend + " ", text_color=cvdTrendCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 9, 1, " " + momStr + " ", text_color=momCol, text_size=s, bgcolor=rowBg1)
+
+    dsLbl = deltaStrength > 2.5 ? "EXTREME" : (deltaStrength > 1.8 ? "HIGH" : (deltaStrength > 1.0 ? "NORMAL" : "LOW"))
+    dsCol = deltaStrength > 2.5 ? accentGold : (deltaStrength > 1.8 ? neonBull : (deltaStrength > 1.0 ? textBright : textDim))
+    table.cell(dash, 10, 1, " " + dsLbl + " ", text_color=dsCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 11, 1, " " + wdsStr + " ", text_color=wdsCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 12, 1, "", bgcolor=sepColor)
+
+    confStr = isConfirmed ? "CONFIRMED" : (isDeltaPriceDivergent ? "DIVERGENT" : "MIXED")
+    confCol = isConfirmed ? neonBull : (isDeltaPriceDivergent ? neonBear : textMid)
+    absStr  = isAbsorption ? (absorbType == 1 ? "HID SELL" : "HID BUY") : "-"
+    absCol  = isAbsorption ? absorpCol : textDim
+    clxStr  = isClimax ? (climaxType == 1 ? "BUY CLX" : "SELL CLX") : "-"
+    clxCol  = isClimax ? climaxCol : textDim
+    insStr  = isInstitutional ? "DETECTED" : "-"
+    insCol  = isInstitutional ? accentPurp : textDim
+
+    table.cell(dash, 13, 1, " " + confStr + " ", text_color=confCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 14, 1, " " + absStr  + " ", text_color=absCol,  text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 15, 1, " " + clxStr  + " ", text_color=clxCol,  text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 16, 1, " " + insStr  + " ", text_color=insCol,  text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 17, 1, "", bgcolor=sepColor)
+
+    streakVal = consBull > 0 ? consBull : consBear
+    streakDir = consBull > 0 ? "Bull" : (consBear > 0 ? "Bear" : "-")
+    streakCol = consBull >= consLen ? neonBull : (consBear >= consLen ? neonBear : textDim)
+    vR  = volMA != 0 ? volume / volMA : 0.0
+    vRC = vR >= highVolMult ? accentGold : (vR >= 1.0 ? neonBull : textDim)
+
+    table.cell(dash, 18, 1, " " + str.tostring(sDelta, "#,###") + " ", text_color=sDelta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 19, 1, " " + str.tostring(streakVal) + " " + streakDir + " ", text_color=streakCol, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 20, 1, " " + str.tostring(vR, "#.##") + "x ", text_color=vRC, text_size=s, bgcolor=rowBg1)
+    table.cell(dash, 21, 1, " " + biasStr + " ", text_color=biasCol, text_size=s, bgcolor=rowBg1)
+
+    // MTF Row 1 — value + arrow, color = sign of delta
+    table.cell(dash, 22, 1, "", bgcolor=sepColor)
+    table.cell(dash, 23, 1, " " + str.tostring(dailyDelta,   "#,###") + "  " + dArrow + dMomArrow + " ", text_color=dArrowCol, text_size=s, bgcolor=dBg)
+    table.cell(dash, 24, 1, " " + str.tostring(weeklyDelta,  "#,###") + "  " + wArrow + wMomArrow + " ", text_color=wArrowCol, text_size=s, bgcolor=wBg)
+    table.cell(dash, 25, 1, " " + str.tostring(monthlyDelta, "#,###") + "  " + mArrow + mMomArrow + " ", text_color=mArrowCol, text_size=s, bgcolor=mBg)
+
+    // ──────────────────────────────────────────────────────
+    // ROW 2: SECONDARY VALUES  +  MTF % of volume + arrow (sign-based)
+    // ──────────────────────────────────────────────────────
+    table.cell(dash, 0, 2, " LIVE ", text_color=neonBull, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 1, 2, " " + str.tostring(deltaPercent, "#.#") + "% ", text_color=delta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 2, 2, " " + str.tostring(buyVol, "#,###") + " ", text_color=dimBull, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 3, 2, " " + str.tostring(sellVol, "#,###") + " ", text_color=dimBear, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 4, 2, " " + imbalanceStr + " ", text_color=imbalanceCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 5, 2, " " + aggrStr + " ", text_color=aggrCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 6, 2, "", bgcolor=sepColor)
+    table.cell(dash, 7, 2, " " + cvdSig + " ", text_color=cvd > cvdMA ? neonBull : neonBear, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 8, 2, " " + accelStr + " ", text_color=accelCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 9, 2, " " + str.tostring(deltaStrength, "#.##") + "x ", text_color=dsCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 10, 2, " " + str.tostring(wds, "#.#") + " ", text_color=wdsCol, text_size=s, bgcolor=rowBg2)
+
+    bodyCol = barBodyPct > 70 ? neonBull : (barBodyPct < 30 ? absorpCol : textMid)
+    bodyLbl = barBodyPct > 70 ? "STRONG" : (barBodyPct < 30 ? "DOJI" : "NORMAL")
+    table.cell(dash, 11, 2, " " + barPosStr + " ", text_color=barPosCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 12, 2, "", bgcolor=sepColor)
+    table.cell(dash, 13, 2, " Body:" + bodyLbl + " ", text_color=bodyCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 14, 2, " A:" + str.tostring(sAbsorpCount) + " ", text_color=absorpCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 15, 2, " C:" + str.tostring(sClimaxCount) + " ", text_color=climaxCol, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 16, 2, " I:" + str.tostring(sInstCount) + " ", text_color=accentPurp, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 17, 2, "", bgcolor=sepColor)
+    table.cell(dash, 18, 2, sDelta >= 0 ? " BULLISH " : " BEARISH ", text_color=sDelta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=rowBg2)
+    table.cell(dash, 19, 2, " Flips:" + str.tostring(sFlips) + " ", text_color=textMid, text_size=s, bgcolor=rowBg2)
+    vLbl = vR >= 2.0 ? "EXTREME" : (vR >= 1.5 ? "HIGH" : (vR >= 1.0 ? "ABOVE" : "LOW"))
+    table.cell(dash, 20, 2, " " + vLbl + " ", text_color=vRC, text_size=s, bgcolor=rowBg2)
+    mShort = switch deltaMethod
+        "OHLC Approximation" => "OHLC"
+        "Close vs Open"      => "C/O"
+        => "Wick"
+    table.cell(dash, 21, 2, " " + mShort + "|" + cvdResetMode + " ", text_color=textDim, text_size=s, bgcolor=rowBg2)
+
+    // MTF Row 2 — % of volume + arrow, color = sign of delta
+    table.cell(dash, 22, 2, "", bgcolor=sepColor)
+    table.cell(dash, 23, 2, " " + str.tostring(dDPct, "#.#") + "%  " + dArrow + dMomArrow + " ", text_color=dArrowCol, text_size=s, bgcolor=color.new(mtfBg, 10))
+    table.cell(dash, 24, 2, " " + str.tostring(wDPct, "#.#") + "%  " + wArrow + wMomArrow + " ", text_color=wArrowCol, text_size=s, bgcolor=color.new(mtfBg, 10))
+    table.cell(dash, 25, 2, " " + str.tostring(mDPct, "#.#") + "%  " + mArrow + mMomArrow + " ", text_color=mArrowCol, text_size=s, bgcolor=color.new(mtfBg, 10))
+
+    // ──────────────────────────────────────────────────────
+    // ROW 3: ROLLING & SESSION  +  MTF bias + arrow (sign-based)
+    // ──────────────────────────────────────────────────────
+    bBars = math.round(bPct / 10)
+    pBar  = ""
+    for k = 0 to 9
+        pBar += k < bBars ? "|" : "."
+    pLbl = bPct > 60 ? "BUYERS" : (bPct < 40 ? "SELLERS" : "NEUTRAL")
+    pCol = bPct > 60 ? neonBull : (bPct < 40 ? neonBear : textMid)
+
+    table.cell(dash, 0, 3, " PRESS ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 1, 3, " " + pBar + " ", text_color=pCol, text_size=s, text_font_family=font.family_monospace, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 2, 3, " " + pLbl + " ", text_color=pCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 3, 3, " TREND ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 4, 3, " " + trendStr + " ", text_color=trendCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 5, 3, " POC ", text_color=accentGold, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 6, 3, " " + str.tostring(pocPrice) + " ", text_color=accentGold, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 7, 3, " Roll" + str.tostring(rollingLen) + " ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 8, 3, " " + str.tostring(rollingDelta, "#,###") + " ", text_color=rollingDelta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 9, 3, " " + str.tostring(rollingDeltaPct, "#.#") + "% ", text_color=rollingDelta >= 0 ? neonBull : neonBear, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 10, 3, "", bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 11, 3, "", bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 12, 3, "", bgcolor=sepColor)
+    table.cell(dash, 13, 3, " SessHi ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 14, 3, " " + str.tostring(sMaxDelta, "#,###") + " ", text_color=neonBull, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 15, 3, " SessLo ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 16, 3, " " + str.tostring(sMinDelta, "#,###") + " ", text_color=neonBear, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 17, 3, "", bgcolor=sepColor)
+    table.cell(dash, 18, 3, " Bars:" + str.tostring(sBars) + " ", text_color=textDim, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 19, 3, " Pos:" + str.tostring(closePos, "#") + "% ", text_color=barPosCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 20, 3, " Body:" + str.tostring(barBodyPct, "#") + "% ", text_color=bodyCol, text_size=s, bgcolor=color.new(headerBg, 0))
+    table.cell(dash, 21, 3, " v3.1 ", text_color=color.new(textDim, 50), text_size=s, bgcolor=color.new(headerBg, 0))
+
+    // MTF Row 3 — bias label + arrow, color = sign of delta
+    table.cell(dash, 22, 3, "", bgcolor=sepColor)
+    table.cell(dash, 23, 3, " " + dBias + "  " + dArrow + dMomArrow + " ", text_color=dArrowCol, text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+    table.cell(dash, 24, 3, " " + wBias + "  " + wArrow + wMomArrow + " ", text_color=wArrowCol, text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+    table.cell(dash, 25, 3, " " + mBias + "  " + mArrow + mMomArrow + " ", text_color=mArrowCol, text_size=s, bgcolor=color.new(color.rgb(8, 20, 35), 0))
+
+// ==============================================================================
+// SUPERTREND TABLE (Hourly / Daily / Weekly / Monthly) — Full / Desktop
+// ==============================================================================
+var table stDash = na
+
+if showST and not mobileView
+    if na(stDash)
+        stDash := table.new(position.top_right, 5, 4,
+          bgcolor=color.new(dashBg, 5),
+          border_color=color.new(dashBorder, 20),
+          border_width=1,
+          frame_color=color.new(accentGold, 50),
+          frame_width=1)
+
+    table.cell(stDash, 0, 0, " SUPERTREND ", text_color=accentGold, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 1, 0, " " + stHourlyTF + "m ", text_color=textMid, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 2, 0, " D ", text_color=textMid, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 3, 0, " W ", text_color=textMid, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 4, 0, " M ", text_color=textMid, text_size=size.small, bgcolor=color.new(headerBg, 0))
+
+    table.cell(stDash, 0, 1, " Signal ", text_color=textDim, text_size=size.small, bgcolor=rowBg1)
+    table.cell(stDash, 1, 1, " " + hSTLbl + " ", text_color=hSTCol, text_size=size.small, bgcolor=rowBg1)
+    table.cell(stDash, 2, 1, " " + dSTLbl + " ", text_color=dSTCol, text_size=size.small, bgcolor=rowBg1)
+    table.cell(stDash, 3, 1, " " + wSTLbl + " ", text_color=wSTCol, text_size=size.small, bgcolor=rowBg1)
+    table.cell(stDash, 4, 1, " " + mSTLbl + " ", text_color=mSTCol, text_size=size.small, bgcolor=rowBg1)
+
+    table.cell(stDash, 0, 2, " Value ", text_color=textDim, text_size=size.small, bgcolor=rowBg2)
+    table.cell(stDash, 1, 2, " " + str.tostring(hST, format.mintick) + " ", text_color=hSTCol, text_size=size.small, bgcolor=rowBg2)
+    table.cell(stDash, 2, 2, " " + str.tostring(dST, format.mintick) + " ", text_color=dSTCol, text_size=size.small, bgcolor=rowBg2)
+    table.cell(stDash, 3, 2, " " + str.tostring(wST, format.mintick) + " ", text_color=wSTCol, text_size=size.small, bgcolor=rowBg2)
+    table.cell(stDash, 4, 2, " " + str.tostring(mST, format.mintick) + " ", text_color=mSTCol, text_size=size.small, bgcolor=rowBg2)
+
+    table.cell(stDash, 0, 3, " Flip ", text_color=textDim, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 1, 3, " " + hSTFlipTxt + " ", text_color=hSTFlipCol, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 2, 3, " " + dSTFlipTxt + " ", text_color=dSTFlipCol, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 3, 3, " " + wSTFlipTxt + " ", text_color=wSTFlipCol, text_size=size.small, bgcolor=color.new(headerBg, 0))
+    table.cell(stDash, 4, 3, " " + mSTFlipTxt + " ", text_color=mSTFlipCol, text_size=size.small, bgcolor=color.new(headerBg, 0))
+
+// ==============================================================================
+// MOBILE DASHBOARD — compact Delta + SuperTrend view for small screens
+// ==============================================================================
+var table mDash = na
+
+if mobileView
+    mPos = switch mobilePos
+        "Top Right"     => position.top_right
+        "Top Center"    => position.top_center
+        "Bottom Right"  => position.bottom_right
+        "Bottom Center" => position.bottom_center
+        "Middle Right"  => position.middle_right
+        => position.bottom_center
+    mSize = switch mobileTextSize
+        "Small"  => size.small
+        "Normal" => size.normal
+        "Large"  => size.large
+        => size.normal
+
+    if na(mDash)
+        mDash := table.new(mPos, 2, 9,
+          bgcolor=color.new(dashBg, 5),
+          border_color=color.new(dashBorder, 20),
+          border_width=1,
+          frame_color=color.new(accentCyan, 50),
+          frame_width=1)
+
+    table.cell(mDash, 0, 0, " DVS MOBILE ", text_color=accentCyan, text_size=mSize, bgcolor=color.new(headerBg, 0))
+    table.cell(mDash, 1, 0, " v3.1 ", text_color=accentGold, text_size=mSize, bgcolor=color.new(headerBg, 0))
+
+    table.cell(mDash, 0, 1, " DELTA ", text_color=textMid, text_size=mSize, bgcolor=rowBg1)
+    table.cell(mDash, 1, 1, " " + str.tostring(delta, "#,###") + " ", text_color=delta >= 0 ? neonBull : neonBear, text_size=mSize, bgcolor=rowBg1)
+
+    table.cell(mDash, 0, 2, " CVD ", text_color=textMid, text_size=mSize, bgcolor=rowBg2)
+    table.cell(mDash, 1, 2, " " + cvdTrend + " ", text_color=cvdTrendCol, text_size=mSize, bgcolor=rowBg2)
+
+    table.cell(mDash, 0, 3, " BIAS ", text_color=textMid, text_size=mSize, bgcolor=rowBg1)
+    table.cell(mDash, 1, 3, " " + biasStr + " ", text_color=biasCol, text_size=mSize, bgcolor=rowBg1)
+
+    table.cell(mDash, 0, 4, "", bgcolor=sepColor)
+    table.cell(mDash, 1, 4, "", bgcolor=sepColor)
+
+    table.cell(mDash, 0, 5, " ST " + stHourlyTF + "m ", text_color=textMid, text_size=mSize, bgcolor=rowBg2)
+    table.cell(mDash, 1, 5, " " + hSTLbl + " ", text_color=hSTCol, text_size=mSize, bgcolor=rowBg2)
+
+    table.cell(mDash, 0, 6, " ST DAILY ", text_color=textMid, text_size=mSize, bgcolor=rowBg1)
+    table.cell(mDash, 1, 6, " " + dSTLbl + " ", text_color=dSTCol, text_size=mSize, bgcolor=rowBg1)
+
+    table.cell(mDash, 0, 7, " ST WEEKLY ", text_color=textMid, text_size=mSize, bgcolor=rowBg2)
+    table.cell(mDash, 1, 7, " " + wSTLbl + " ", text_color=wSTCol, text_size=mSize, bgcolor=rowBg2)
+
+    table.cell(mDash, 0, 8, " ST MONTHLY ", text_color=textMid, text_size=mSize, bgcolor=rowBg1)
+    table.cell(mDash, 1, 8, " " + mSTLbl + " ", text_color=mSTCol, text_size=mSize, bgcolor=rowBg1)
+
+// ==============================================================================
+// ALERTS
+// ==============================================================================
+alertcondition(isHighVol and delta > 0, title="HV Buy Delta", message="DVS: High buy delta on {{ticker}}")
+alertcondition(isHighVol and delta < 0, title="HV Sell Delta", message="DVS: High sell delta on {{ticker}}")
+alertcondition(bullDiv, title="Bullish Divergence", message="DVS: Bull divergence on {{ticker}}")
+alertcondition(bearDiv, title="Bearish Divergence", message="DVS: Bear divergence on {{ticker}}")
+alertcondition(isAbsorption, title="Absorption Detected", message="DVS: Absorption on {{ticker}}")
+alertcondition(isClimax, title="Volume Climax", message="DVS: Volume climax on {{ticker}}")
+alertcondition(isInstitutional, title="Institutional Footprint", message="DVS: Institutional footprint on {{ticker}}")
+alertcondition(ta.crossover(cvd, cvdMA), title="CVD Cross Up", message="DVS: CVD above MA on {{ticker}}")
+alertcondition(ta.crossunder(cvd, cvdMA), title="CVD Cross Down", message="DVS: CVD below MA on {{ticker}}")
+alertcondition(isStreak and consBull >= consLen, title="Bull Streak", message="DVS: Consecutive buy bars streak on {{ticker}}")
+alertcondition(isStreak and consBear >= consLen, title="Bear Streak", message="DVS: Consecutive sell bars streak on {{ticker}}")
+alertcondition(stBuySignal, title="SuperTrend Buy (Chart TF)", message="DVS: SuperTrend flipped bullish on {{ticker}}")
+alertcondition(stSellSignal, title="SuperTrend Sell (Chart TF)", message="DVS: SuperTrend flipped bearish on {{ticker}}")
+alertcondition(hSTFlipBuy, title="SuperTrend Buy (Hourly)", message="DVS: Hourly SuperTrend flipped bullish on {{ticker}}")
+alertcondition(hSTFlipSell, title="SuperTrend Sell (Hourly)", message="DVS: Hourly SuperTrend flipped bearish on {{ticker}}")
+alertcondition(dSTFlipBuy, title="SuperTrend Buy (Daily)", message="DVS: Daily SuperTrend flipped bullish on {{ticker}}")
+alertcondition(dSTFlipSell, title="SuperTrend Sell (Daily)", message="DVS: Daily SuperTrend flipped bearish on {{ticker}}")
+alertcondition(wSTFlipBuy, title="SuperTrend Buy (Weekly)", message="DVS: Weekly SuperTrend flipped bullish on {{ticker}}")
+alertcondition(wSTFlipSell, title="SuperTrend Sell (Weekly)", message="DVS: Weekly SuperTrend flipped bearish on {{ticker}}")
+alertcondition(mSTFlipBuy, title="SuperTrend Buy (Monthly)", message="DVS: Monthly SuperTrend flipped bullish on {{ticker}}")
+alertcondition(mSTFlipSell, title="SuperTrend Sell (Monthly)", message="DVS: Monthly SuperTrend flipped bearish on {{ticker}}")

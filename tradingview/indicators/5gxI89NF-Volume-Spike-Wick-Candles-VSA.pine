@@ -1,0 +1,131 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  Volume Spike + Wick Candles  [VSA]   — any timeframe
+//
+//  Arrows and candle colour only. No histogram, no lines, no table — the
+//  20-period volume SMA runs purely as a calculation.
+//
+//  A candle is marked yellow when either:
+//    · volume reaches 1.5x the session-relative average — a yellow arrow
+//      points down at the bar and the candle turns yellow, or
+//    · the candle is a rejection wick (hammer or gravestone).
+//
+//  "Session-relative" adapts to the timeframe:
+//    · Intraday  — the average rebuilds at each new trading day (the
+//                  symbol's own session start, so 18:00 ET on futures),
+//                  which keeps the overnight lull from inflating the ratio
+//                  at the cash open. Until 20 bars have printed in the
+//                  session, the running session average is used instead.
+//    · Daily+    — "session" is meaningless, so a plain rolling SMA is used.
+// ═══════════════════════════════════════════════════════════════════════════
+
+indicator("Volume Spike + Wick Candles [VSA]", shorttitle="VSA", overlay=true)
+
+// ─── ① Volume & spike ──────────────────────────────────────────────────────
+gV        = "① Volume & spike"
+smaLen    = input.int(20,    "Volume SMA length",       minval=1,   group=gV)
+spikeMult = input.float(1.5, "Spike threshold (× SMA)", minval=0.1, step=0.1, group=gV)
+sessRel   = input.bool(true, "Session-relative baseline", group=gV, tooltip="On intraday timeframes the average rebuilds at each session start. Turn off to always use a plain rolling SMA. Ignored on daily and higher.")
+
+// ─── ② Spike marker ────────────────────────────────────────────────────────
+gA       = "② Spike marker"
+cSpike   = input.color(color.new(color.yellow, 0), "Yellow", group=gA)
+showArw  = input.bool(true, "Arrow pointing down at the bar", group=gA)
+arrowSz  = input.string("Small", "Arrow size", options=["Tiny","Small","Normal","Large"], group=gA)
+shadeBar = input.bool(true, "Colour the candle yellow", group=gA)
+
+// ─── ③ Wick candles (hammer / gravestone) ──────────────────────────────────
+gW       = "③ Wick candles"
+useWick  = input.bool(true,  "Colour hammer / gravestone candles", group=gW)
+wantHam  = input.bool(true,  "Hammer — long lower wick (bullish)",     group=gW)
+wantGrav = input.bool(true,  "Gravestone — long upper wick (bearish)", group=gW)
+wickMult = input.float(2.0,  "Wick ≥ × body",              minval=0.5, step=0.1, group=gW, tooltip="How many times the candle body the dominant wick must be. Higher = stricter.")
+wickPct  = input.float(50,   "Wick ≥ % of bar range",      minval=10, maxval=90, step=5, group=gW)
+oppPct   = input.float(15,   "Opposite wick ≤ % of range", minval=0,  maxval=50, step=5, group=gW, tooltip="Keeps out candles with long wicks on both ends, which are indecision rather than rejection.")
+bodyPct  = input.float(40,   "Body ≤ % of bar range",      minval=5,  maxval=80, step=5, group=gW)
+cHammer  = input.color(color.new(color.yellow, 0), "Hammer colour",     group=gW)
+cGrave   = input.color(color.new(color.yellow, 0), "Gravestone colour", group=gW)
+
+// ═══ SESSION-RELATIVE BASELINE ═════════════════════════════════════════════
+// New trading day for this symbol. On futures this rolls at the 18:00 ET
+// session open, not at midnight, which is what makes the baseline correct.
+bool intra   = timeframe.isintraday
+bool newSess = intra and ta.change(time("D")) != 0
+
+var int   sessBars = 0
+var float sessVol  = 0.0
+
+if newSess
+    sessBars := 0
+    sessVol  := 0.0
+
+sessBars += 1
+sessVol  += nz(volume)
+
+float rollSma = ta.sma(volume, smaLen)
+float sessAvg = sessBars > 0 ? sessVol / sessBars : na
+bool  useSess = sessRel and intra
+
+float volBase  = useSess ? (sessBars >= smaLen ? rollSma : sessAvg) : rollSma
+float volRatio = na(volBase) or volBase <= 0 ? 0.0 : volume / volBase
+bool  volSpike = volRatio >= spikeMult and not na(volBase)
+
+// ═══ WICK CANDLES ══════════════════════════════════════════════════════════
+// Hammer     — price probed down, was rejected, closed back up: long lower
+//              wick, small body sitting near the top of the range.
+// Gravestone — the mirror image: long upper wick, body near the low.
+float wRng  = high - low
+float wBody = math.abs(close - open)
+float wUp   = high - math.max(close, open)
+float wDn   = math.min(close, open) - low
+bool  wOk   = wRng > 0
+
+// A zero-body candle (a true doji) has an infinite wick-to-body ratio, so the
+// body test is treated as satisfied rather than dividing by zero.
+bool bodyOkHam  = wOk and (wBody == 0 or wDn >= wickMult * wBody)
+bool bodyOkGrav = wOk and (wBody == 0 or wUp >= wickMult * wBody)
+
+bool isHammer = useWick and wantHam and wOk and bodyOkHam
+     and wDn   >= wRng * wickPct / 100
+     and wUp   <= wRng * oppPct  / 100
+     and wBody <= wRng * bodyPct / 100
+
+bool isGrave  = useWick and wantGrav and wOk and bodyOkGrav
+     and wUp   >= wRng * wickPct / 100
+     and wDn   <= wRng * oppPct  / 100
+     and wBody <= wRng * bodyPct / 100
+
+// If a candle somehow qualifies as both, the longer wick decides.
+bool hammer  = isHammer and (not isGrave or wDn >= wUp)
+bool grave   = isGrave  and (not isHammer or wUp >  wDn)
+bool anyWick = hammer or grave
+
+// ═══ MARKERS ═══════════════════════════════════════════════════════════════
+// plotshape() needs a const string for `size`, so it cannot take an input
+// directly. One call per size, gated on the input, gives the same result.
+bool arw = volSpike and showArw
+
+plotshape(arw and arrowSz == "Tiny",   "Spike arrow (tiny)",   shape.arrowdown, location.abovebar, cSpike, size=size.tiny)
+plotshape(arw and arrowSz == "Small",  "Spike arrow (small)",  shape.arrowdown, location.abovebar, cSpike, size=size.small)
+plotshape(arw and arrowSz == "Normal", "Spike arrow (normal)", shape.arrowdown, location.abovebar, cSpike, size=size.normal)
+plotshape(arw and arrowSz == "Large",  "Spike arrow (large)",  shape.arrowdown, location.abovebar, cSpike, size=size.large)
+
+// Volume spike takes priority, then hammer, then gravestone. All default to
+// the same yellow, so the order only matters if you set distinct colours.
+barcolor(shadeBar and volSpike ? cSpike
+     : hammer ? cHammer
+     : grave  ? cGrave
+     : na, title="Spike / wick candle")
+
+// ═══ ALERTS ════════════════════════════════════════════════════════════════
+alertcondition(volSpike, "Volume spike", "VSA volume spike on {{ticker}} {{interval}} — volume >= threshold × average")
+alertcondition(hammer,   "Hammer",       "VSA hammer on {{ticker}} {{interval}} — long lower wick, rejection of the low")
+alertcondition(grave,    "Gravestone",   "VSA gravestone on {{ticker}} {{interval}} — long upper wick, rejection of the high")
+alertcondition(hammer or grave, "Any wick candle", "VSA wick candle on {{ticker}} {{interval}}")
+alertcondition(volSpike and (hammer or grave), "Spike + wick", "VSA volume spike AND wick rejection on {{ticker}} {{interval}}")
+
+if volSpike
+    alert("VSA spike  " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick) + "  |  vol " + str.tostring(volume, "#") + " = " + str.tostring(volRatio, "#.00") + "× avg" + (anyWick ? "  +  " + (hammer ? "HAMMER" : "GRAVESTONE") : ""), alert.freq_once_per_bar_close)
+
+if anyWick and not volSpike
+    alert("VSA " + (hammer ? "HAMMER" : "GRAVESTONE") + "  " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)

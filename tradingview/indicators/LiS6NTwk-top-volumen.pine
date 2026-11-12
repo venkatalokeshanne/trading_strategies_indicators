@@ -1,0 +1,187 @@
+//@version=6
+indicator("Perfil de Volumen Anclado - VAH/VAL Rompimiento y Absorción", overlay=true, max_lines_count=500)
+
+// ============================ INPUTS ============================
+bins              = input.int(24, "Número de niveles (bins)")
+vaPercent         = input.float(70, "Área de valor (%)", minval=50, maxval=95)
+volLookback       = input.int(20, "Periodo volumen promedio")
+volMultiplier     = input.float(1.5, "Volumen mínimo (x promedio)")
+wickRatio         = input.float(0.4, "Mecha mínima para absorción (%)", minval=0.1, maxval=0.9)
+showProfile       = input.bool(true, "Mostrar curva de volumen")
+profileWidthBars  = input.int(20, "Ancho máximo de la curva (barras)", minval=5, maxval=100)
+maxActiveLevels   = input.int(40, "Máximo de niveles históricos activos", minval=5, maxval=100)
+
+colVAH   = input.color(color.orange, "Color VAH")
+colVAL   = input.color(color.orange, "Color VAL")
+colPOC   = input.color(color.yellow, "Color POC")
+colCurve = input.color(color.new(color.gray, 30), "Color curva de volumen")
+
+// ====================== SESIÓN (SE ANCLA CADA DÍA) ========================
+var float[] barHigh = array.new_float(0)
+var float[] barLow  = array.new_float(0)
+var float[] barVol  = array.new_float(0)
+
+newDay = ta.change(time("D")) != 0
+
+var int sessionStartIdx = na
+var float vah = na
+var float val = na
+var float poc = na
+var line vahLine = na
+var line valLine = na
+var line pocLine = na
+
+var line[]  activeVahLines  = array.new<line>(0)
+var float[] activeVahPrices = array.new_float(0)
+var line[]  activeValLines  = array.new<line>(0)
+var float[] activeValPrices = array.new_float(0)
+
+if newDay
+    if not na(vahLine)
+        array.push(activeVahLines, vahLine)
+        array.push(activeVahPrices, vah)
+        if array.size(activeVahLines) > maxActiveLevels
+            line.delete(array.shift(activeVahLines))
+            array.shift(activeVahPrices)
+    if not na(valLine)
+        array.push(activeValLines, valLine)
+        array.push(activeValPrices, val)
+        if array.size(activeValLines) > maxActiveLevels
+            line.delete(array.shift(activeValLines))
+            array.shift(activeValPrices)
+    array.clear(barHigh)
+    array.clear(barLow)
+    array.clear(barVol)
+    sessionStartIdx := bar_index
+    vahLine := na
+    valLine := na
+    pocLine := na
+
+array.push(barHigh, high)
+array.push(barLow, low)
+array.push(barVol, volume)
+
+// ===================== CONSTRUCCIÓN DEL PERFIL (día en curso) ====================
+var float sessLowSaved = na
+var float binSizeSaved = na
+
+sessHigh = array.max(barHigh)
+sessLow  = array.min(barLow)
+volBins  = array.new_float(bins, 0.0)
+
+if sessHigh > sessLow
+    binSize = (sessHigh - sessLow) / bins
+    for i = 0 to array.size(barHigh) - 1
+        bH = array.get(barHigh, i)
+        bL = array.get(barLow, i)
+        bV = array.get(barVol, i)
+        rng = bH - bL
+        if rng <= 0
+            idx = math.min(int((bH - sessLow) / binSize), bins - 1)
+            array.set(volBins, idx, array.get(volBins, idx) + bV)
+        else
+            for b = 0 to bins - 1
+                binLow  = sessLow + b * binSize
+                binHigh = binLow + binSize
+                overlap = math.min(bH, binHigh) - math.max(bL, binLow)
+                if overlap > 0
+                    array.set(volBins, b, array.get(volBins, b) + bV * (overlap / rng))
+    pocIdx = array.indexof(volBins, array.max(volBins))
+    poc := sessLow + (pocIdx + 0.5) * binSize
+    totalVol = array.sum(volBins)
+    targetVol = totalVol * vaPercent / 100
+    accVol = array.get(volBins, pocIdx)
+    lowerIdx = pocIdx
+    upperIdx = pocIdx
+    while accVol < targetVol and (lowerIdx > 0 or upperIdx < bins - 1)
+        volDown = lowerIdx > 0 ? array.get(volBins, lowerIdx - 1) : -1.0
+        volUp   = upperIdx < bins - 1 ? array.get(volBins, upperIdx + 1) : -1.0
+        if volUp >= volDown
+            upperIdx += 1
+            accVol += volUp
+        else
+            lowerIdx -= 1
+            accVol += volDown
+    val := sessLow + lowerIdx * binSize
+    vah := sessLow + (upperIdx + 1) * binSize
+    sessLowSaved := sessLow
+    binSizeSaved := binSize
+
+// ========================= LÍNEAS DEL DÍA EN CURSO (VAH/VAL/POC) =======================
+if not na(vah)
+    if not na(vahLine)
+        line.delete(vahLine)
+        line.delete(valLine)
+        line.delete(pocLine)
+    vahLine := line.new(sessionStartIdx, vah, bar_index, vah, color=colVAH, width=2)
+    valLine := line.new(sessionStartIdx, val, bar_index, val, color=colVAL, width=2)
+    pocLine := line.new(sessionStartIdx, poc, bar_index, poc, color=colPOC, width=1, style=line.style_dashed)
+
+// ================= EXTENDER O ROMPER NIVELES HISTÓRICOS (VAH/VAL) =================
+if barstate.isconfirmed and array.size(activeVahLines) > 0
+    for j = array.size(activeVahLines) - 1 to 0
+        lnId = array.get(activeVahLines, j)
+        lvl  = array.get(activeVahPrices, j)
+        if close > lvl
+            array.remove(activeVahLines, j)
+            array.remove(activeVahPrices, j)
+        else
+            line.set_x2(lnId, bar_index)
+
+if barstate.isconfirmed and array.size(activeValLines) > 0
+    for j = array.size(activeValLines) - 1 to 0
+        lnId2 = array.get(activeValLines, j)
+        lvl2  = array.get(activeValPrices, j)
+        if close < lvl2
+            array.remove(activeValLines, j)
+            array.remove(activeValPrices, j)
+        else
+            line.set_x2(lnId2, bar_index)
+
+// ========================= CURVA DE VOLUMEN (LÍNEA, NO BARRAS) =======================
+var line[] profileLines = array.new<line>(0)
+
+if newDay
+    array.clear(profileLines)
+
+if array.size(profileLines) > 0
+    for i = 0 to array.size(profileLines) - 1
+        line.delete(array.get(profileLines, i))
+    array.clear(profileLines)
+
+if showProfile and not na(sessLowSaved)
+    maxVol = array.max(volBins)
+    if maxVol > 0
+        for b = 1 to bins - 1
+            vPrev = array.get(volBins, b - 1)
+            vCurr = array.get(volBins, b)
+            fracPrev = vPrev / maxVol
+            fracCurr = vCurr / maxVol
+            xPrev = sessionStartIdx + math.round(profileWidthBars * fracPrev)
+            xCurr = sessionStartIdx + math.round(profileWidthBars * fracCurr)
+            yPrev = sessLowSaved + (b - 1 + 0.5) * binSizeSaved
+            yCurr = sessLowSaved + (b + 0.5) * binSizeSaved
+            ln = line.new(xPrev, yPrev, xCurr, yCurr, color=colCurve, width=2)
+            array.push(profileLines, ln)
+
+// ========================= SEÑALES (confirmadas al cierre de vela) =================================
+avgVol = ta.sma(volume, volLookback)
+volOK  = volume > avgVol * volMultiplier
+candleRange = high - low
+upperWick = high - math.max(close, open)
+lowerWick = math.min(close, open) - low
+
+brkUp = barstate.isconfirmed and volOK and close > vah and close[1] <= vah[1]
+brkDn = barstate.isconfirmed and volOK and close < val and close[1] >= val[1]
+absUp = barstate.isconfirmed and volOK and candleRange > 0 and low < val and close >= val and close > open and (lowerWick / candleRange) >= wickRatio
+absDn = barstate.isconfirmed and volOK and candleRange > 0 and high > vah and close <= vah and close < open and (upperWick / candleRange) >= wickRatio
+
+plotshape(brkUp, "Rompimiento Alcista", shape.triangleup, location.belowbar, color.lime, size=size.small, text="ROMP↑")
+plotshape(brkDn, "Rompimiento Bajista", shape.triangledown, location.abovebar, color.red, size=size.small, text="ROMP↓")
+plotshape(absUp, "Absorción en VAL", shape.circle, location.belowbar, color.aqua, size=size.small, text="ABS↑")
+plotshape(absDn, "Absorción en VAH", shape.circle, location.abovebar, color.fuchsia, size=size.small, text="ABS↓")
+
+alertcondition(brkUp, "Rompimiento Alcista VAH", "Precio rompió por encima del VAH con volumen")
+alertcondition(brkDn, "Rompimiento Bajista VAL", "Precio rompió por debajo del VAL con volumen")
+alertcondition(absUp, "Absorción en VAL", "Absorción alcista confirmada en VAL")
+alertcondition(absDn, "Absorción en VAH", "Absorción bajista confirmada en VAH")

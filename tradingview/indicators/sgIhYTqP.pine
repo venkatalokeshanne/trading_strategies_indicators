@@ -1,0 +1,871 @@
+//@version=6
+indicator("Hunter DWM Control Pro", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+//========================[ COLORS & STYLE ]========================//
+day_color        = input.color(color.rgb(10, 126, 14),  "Daily Color")
+week_color       = input.color(color.rgb(38, 87, 250),  "Weekly Color")
+month_color      = input.color(color.rgb(123, 5, 233),  "Monthly Color")
+color_bars_by_tf = input.bool(true, "Color Candles by Highest Breakout TF")
+
+tf_line_width    = input.int(2, "TF Line Width", minval=1, maxval=5)
+sl_line_width    = input.int(2, "SL Line Width", minval=1, maxval=5)
+
+tf_line_style_in = input.string("solid", "TF Line Style", options=["solid","dashed","dotted"])
+sl_line_style_in = input.string("solid", "SL Line Style", options=["solid","dashed","dotted"])
+
+getStyle(s) => s == "dashed" ? line.style_dashed : s == "dotted" ? line.style_dotted : line.style_solid
+
+tf_line_style = getStyle(tf_line_style_in)
+sl_line_style = getStyle(sl_line_style_in)
+
+line_length      = input.int(8, "TF Line Length (bars)", minval=1, maxval=1000)
+sl_length_bars   = input.int(5, "SL Line Length (bars)", minval=1, maxval=500)
+
+//========================[ LABEL STYLE ]========================//
+label_text_color = input.color(color.white, "Label Text Color")
+label_size_opt   = input.string("normal", "Label Size", options=["tiny","small","normal","large","huge"])
+
+getSize(s) => s == "tiny" ? size.tiny : s == "small" ? size.small : s == "large" ? size.large : s == "huge" ? size.huge : size.normal
+
+label_text_size  = getSize(label_size_opt)
+
+//========================[ TABLE STYLE ]========================//
+table_border_color   = input.color(color.rgb(169, 180, 178), "Table Border")
+table_header_bg      = input.color(color.rgb(3, 66, 29),  "Header BG")
+table_cell_bg        = input.color(color.new(#353746, 0), "Cell BG")
+table_text_color     = input.color(color.white, "Text Color")
+
+table_text_size_opt  = input.string("normal", "Table Text Size", options=["tiny","small","normal","large","huge"])
+table_text_size      = getSize(table_text_size_opt)
+tf_label_bg_transparency = input.int(0, "TF Label BG Transparency", minval=0, maxval=100)
+sl_label_bg_transparency = input.int(0, "SL Label BG Transparency", minval=0, maxval=100)
+table_pos_in = input.string("top_right", "Table Position", options=["top_left","top_center","top_right","bottom_left","bottom_center","bottom_right"])
+
+getTablePos(s) => s == "top_left" ? position.top_left : s == "top_center" ? position.top_center : s == "top_right" ? position.top_right : s == "bottom_left" ? position.bottom_left : s == "bottom_center" ? position.bottom_center : position.bottom_right
+
+table_position = getTablePos(table_pos_in)
+
+//========================[ ACTION COLORS ]========================//
+action_wait_bg    = input.color(color.new(#242529, 0), "WAIT BG")
+action_buy_bg     = input.color(color.new(#006e04, 0), "BUY BG")
+action_hold_bg    = input.color(color.new(#006e04, 0), "HOLD BG")
+action_hr_buy_bg  = input.color(color.rgb(150, 0, 0), "High-Risk BUY/HOLD BG")
+action_text_color = color.white
+
+//========================[ INTERNAL ARRAYS & STATE ]========================//
+var line[]   drawn_lines  = array.new_line()
+var label[]  drawn_labels = array.new_label()
+var line[]   sl_lines     = array.new_line()
+var label[]  sl_labels    = array.new_label()
+
+var table results = table.new(table_position, 11, 6, border_width=1, border_color=table_border_color)
+
+max_objects_allowed = input.int(700, "Max Objects Allowed", minval=100, maxval=2000)
+
+//========================[ CANDLE SHAPE HELPERS ]========================//
+upperWick(o,h,c) => h - math.max(o,c)
+lowerWick(o,l,c) => math.min(o,c) - l
+
+isBullishShape(o,h,l,c) =>
+    body  = c - o
+    upper = upperWick(o,h,c)
+    lower = lowerWick(o,l,c)
+    (c > o) and (body > (upper + lower))
+
+isBearishShape(o,h,l,c) =>
+    body  = o - c
+    upper = upperWick(o,h,c)
+    lower = lowerWick(o,l,c)
+    (c < o) and (body > (upper + lower))
+    //========================[ GENERIC TF DATA FUNCTION — CORRECTED ]========================//
+// All structure calculations are evaluated INSIDE the requested timeframe.
+// This avoids cross-context series mixing and keeps D/W/M logic internally consistent.
+f_tf_core() =>
+    bullShape = isBullishShape(open, high, low, close)
+    bearShape = isBearishShape(open, high, low, close)
+
+    lastBullLow = ta.valuewhen(bullShape, low, 0)
+    bearUnder   = bearShape and not na(lastBullLow) and close < lastBullLow
+
+    lastBearHigh = ta.valuewhen(bearUnder, high, 0)
+    lastBearLow  = ta.valuewhen(bearUnder, low, 0)
+    lastBearTime = ta.valuewhen(bearUnder, time, 0)
+
+    breakoutFlag  = not na(lastBearHigh) and not na(lastBearTime) and time > lastBearTime and close > lastBearHigh
+    breakoutEvent = breakoutFlag and not breakoutFlag[1]
+
+    // Lock the structural stop to the LOW of the bearish structure being broken.
+    // This guarantees a logical long-side invalidation below the breakout level.
+    cycleAnchorTime = ta.valuewhen(breakoutEvent, lastBearTime, 0)
+    cycleSL         = ta.valuewhen(breakoutEvent, lastBearLow, 0)
+    cycleActive     = not na(cycleAnchorTime) and cycleAnchorTime == lastBearTime
+
+    [open, high, low, close, time, lastBearHigh, lastBearLow, lastBearTime, breakoutFlag, lastBullLow, cycleSL, cycleAnchorTime, cycleActive, breakoutEvent]
+
+get_tf_data(tf) =>
+    request.security(syminfo.tickerid, tf, f_tf_core(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// Confirmed HTF snapshot: the expression is offset by one bar inside the requested
+// context and paired with lookahead_on, so Weekly/Monthly event locking uses only
+// completed higher-timeframe bars.
+f_tf_confirmed_core() =>
+    [o, h, l, c, t, bh, bl, bt, brk, bull_low, csl, canchor, cactive, bevent] = f_tf_core()
+    [o[1], h[1], l[1], c[1], t[1], bh[1], bl[1], bt[1], brk[1], bull_low[1], csl[1], canchor[1], cactive[1], bevent[1]]
+
+get_tf_confirmed(tf) =>
+    request.security(syminfo.tickerid, tf, f_tf_confirmed_core(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_on)
+
+//========================[ TF DATA (D / W / M) ]========================//
+[d_o, d_h, d_l, d_c, d_t, d_bh, d_bl, d_bt, d_break, d_bull_low, d_cycle_sl, d_cycle_anchor, d_cycle_active, d_break_event] = get_tf_data("D")
+[w_o, w_h, w_l, w_c, w_t, w_bh, w_bl, w_bt, w_break, w_bull_low, w_cycle_sl, w_cycle_anchor, w_cycle_active, w_break_event] = get_tf_data("W")
+[m_o, m_h, m_l, m_c, m_t, m_bh, m_bl, m_bt, m_break, m_bull_low, m_cycle_sl, m_cycle_anchor, m_cycle_active, m_break_event] = get_tf_data("M")
+
+// Stable snapshots from the most recently completed Weekly and Monthly bars.
+[wc_o, wc_h, wc_l, wc_c, wc_t, wc_bh, wc_bl, wc_bt, wc_break, wc_bull_low, wc_cycle_sl, wc_cycle_anchor, wc_cycle_active, wc_break_event] = get_tf_confirmed("W")
+[mc_o, mc_h, mc_l, mc_c, mc_t, mc_bh, mc_bl, mc_bt, mc_break, mc_bull_low, mc_cycle_sl, mc_cycle_anchor, mc_cycle_active, mc_break_event] = get_tf_confirmed("M")
+
+// On the Daily chart, these flags mark the first bar of a new higher-timeframe period.
+// They let Weekly/Monthly target and invalidation events be confirmed from the just-closed HTF bar.
+bool new_week_period = timeframe.isdaily and ta.change(time("W")) != 0
+bool new_month_period = timeframe.isdaily and ta.change(time("M")) != 0
+
+//========================[ TF ARRAYS ]========================//
+var string[] tf_names         = array.from("D","W","M")
+var float[]  tf_highs         = array.new_float(3, na)
+var float[]  tf_lows          = array.new_float(3, na)
+var int[]    tf_times         = array.new_int(3, na)
+var color[]  tf_colors        = array.new_color(3, color.white)
+var bool[]   tf_breaks        = array.new_bool(3, false)
+var bool[]   tf_break_events  = array.new_bool(3, false)
+var bool[]   tf_cycle_active  = array.new_bool(3, false)
+var float[]  tf_cycle_sl      = array.new_float(3, na)
+var int[]    tf_cycle_anchor  = array.new_int(3, na)
+
+if timeframe.isdaily
+    array.set(tf_highs, 0, d_bh)
+    array.set(tf_lows,  0, d_bl)
+    array.set(tf_times, 0, na(d_bt) ? -1 : int(d_bt))
+    array.set(tf_colors,0, day_color)
+    array.set(tf_breaks,0, d_break)
+    array.set(tf_break_events,0, d_break_event)
+    array.set(tf_cycle_active,0, d_cycle_active)
+    array.set(tf_cycle_sl,0, d_cycle_sl)
+    array.set(tf_cycle_anchor,0, d_cycle_anchor)
+
+    array.set(tf_highs, 1, w_bh)
+    array.set(tf_lows,  1, w_bl)
+    array.set(tf_times, 1, na(w_bt) ? -1 : int(w_bt))
+    array.set(tf_colors,1, week_color)
+    array.set(tf_breaks,1, w_break)
+    array.set(tf_break_events,1, w_break_event)
+    array.set(tf_cycle_active,1, w_cycle_active)
+    array.set(tf_cycle_sl,1, w_cycle_sl)
+    array.set(tf_cycle_anchor,1, w_cycle_anchor)
+
+    array.set(tf_highs, 2, m_bh)
+    array.set(tf_lows,  2, m_bl)
+    array.set(tf_times, 2, na(m_bt) ? -1 : int(m_bt))
+    array.set(tf_colors,2, month_color)
+    array.set(tf_breaks,2, m_break)
+    array.set(tf_break_events,2, m_break_event)
+    array.set(tf_cycle_active,2, m_cycle_active)
+    array.set(tf_cycle_sl,2, m_cycle_sl)
+    array.set(tf_cycle_anchor,2, m_cycle_anchor)
+
+//========================[ STRUCTURAL INVALIDATION PER TF — CONFIRMED + LATCHED ]========================//
+var float[]  sl_prices         = array.new_float(3, na)
+var string[] sl_status         = array.new_string(3, "INACTIVE")
+var bool[]   sl_broken_latched = array.new_bool(3, false)
+var int[]    sl_status_anchor  = array.new_int(3, na)
+
+if timeframe.isdaily
+    for i = 0 to 2
+        bool  cycle_on       = array.get(tf_cycle_active, i)
+        float active_sl      = array.get(tf_cycle_sl, i)
+        int   cycle_anchor   = array.get(tf_cycle_anchor, i)
+        float candidate_sl   = array.get(tf_lows, i)
+        int   tracked_anchor = array.get(sl_status_anchor, i)
+
+        // A different structural anchor starts a new invalidation cycle.
+        if cycle_on and not na(cycle_anchor) and (na(tracked_anchor) or cycle_anchor != tracked_anchor)
+            array.set(sl_status_anchor, i, cycle_anchor)
+            array.set(sl_broken_latched, i, false)
+
+        // Invalidation is confirmed by the close of the relevant timeframe.
+        bool confirmed_break = false
+        if i == 0
+            confirmed_break := barstate.isconfirmed and cycle_on and not na(active_sl) and d_c < active_sl
+        else if i == 1
+            confirmed_break := new_week_period and cycle_on and not na(cycle_anchor) and wc_cycle_active and not na(wc_cycle_anchor) and wc_cycle_anchor == cycle_anchor and not na(wc_cycle_sl) and wc_c < wc_cycle_sl
+        else
+            confirmed_break := new_month_period and cycle_on and not na(cycle_anchor) and mc_cycle_active and not na(mc_cycle_anchor) and mc_cycle_anchor == cycle_anchor and not na(mc_cycle_sl) and mc_c < mc_cycle_sl
+
+        if confirmed_break
+            array.set(sl_broken_latched, i, true)
+
+        bool broken_latched = array.get(sl_broken_latched, i)
+        float sl_val = cycle_on and not na(active_sl) ? active_sl : candidate_sl
+        string st = cycle_on and not na(active_sl) ? (broken_latched ? "BROKEN" : "ACTIVE") : "INACTIVE"
+
+        array.set(sl_prices, i, sl_val)
+        array.set(sl_status, i, st)
+
+//========================[ TARGET ENGINE — PRIMARY + EXTENSIONS ]========================//
+
+// Reuse the already requested D/W/M OHLC values.
+// This removes duplicated request.security() calls without changing the visual output.
+// OHLC used for target confirmation. Daily uses the confirmed current bar;
+// Weekly/Monthly use the just-closed HTF bar on the first Daily bar of the new period.
+get_idx_confirmed_ohlc(i) =>
+    float o = na
+    float h = na
+    float l = na
+    float c = na
+    if i == 0
+        o := d_o
+        h := d_h
+        l := d_l
+        c := d_c
+    else if i == 1
+        o := wc_o
+        h := wc_h
+        l := wc_l
+        c := wc_c
+    else
+        o := mc_o
+        h := mc_h
+        l := mc_l
+        c := mc_c
+    [o, h, l, c]
+
+f_tf_close_confirmed(i) =>
+    i == 0 ? barstate.isconfirmed : i == 1 ? new_week_period : new_month_period
+
+// --- ARRAYS ---
+var float[] orig_high  = array.new_float(3, na)
+var float[] orig_low   = array.new_float(3, na)
+var int[]   orig_time  = array.new_int(3, na)
+
+var float[] T1 = array.new_float(3, na)
+var float[] T2 = array.new_float(3, na)
+var float[] T3 = array.new_float(3, na)
+
+var bool[] hit1 = array.new_bool(3, false)
+var bool[] hit2 = array.new_bool(3, false)
+var bool[] hit3 = array.new_bool(3, false)
+
+var float[] EXT1 = array.new_float(3, na)
+var float[] EXT2 = array.new_float(3, na)
+var float[] EXT3 = array.new_float(3, na)
+
+var bool[] ext_active = array.new_bool(3, false)
+var bool[] ext_hit1   = array.new_bool(3, false)
+var bool[] ext_hit2   = array.new_bool(3, false)
+var bool[] ext_hit3   = array.new_bool(3, false)
+
+var float[] ext_high  = array.new_float(3, na)
+var float[] ext_low   = array.new_float(3, na)
+var float[] ext_close = array.new_float(3, na)
+var int[]   ext_time  = array.new_int(3, na)
+
+// A locked target map is valid only while it belongs to the currently active structural cycle
+// and that cycle has not broken its structural invalidation level.
+f_cycle_is_valid(i) =>
+    int locked_anchor = array.get(orig_time, i)
+    int live_anchor   = array.get(tf_cycle_anchor, i)
+    bool cycle_on     = array.get(tf_cycle_active, i)
+    bool sl_broken    = array.get(sl_broken_latched, i)
+    cycle_on and not sl_broken and not na(locked_anchor) and not na(live_anchor) and locked_anchor == live_anchor
+
+//========================[ RESET EACH TF ON A CONFIRMED STRUCTURAL BREAKOUT ]========================//
+// Daily locks on the confirmed Daily breakout bar.
+// Weekly/Monthly lock only after their respective higher-timeframe bar has closed.
+for i = 0 to 2
+    float bh = i == 0 ? d_bh : i == 1 ? wc_bh : mc_bh
+    float bl = i == 0 ? d_bl : i == 1 ? wc_bl : mc_bl
+    int   bt_raw = i == 0 ? d_bt : i == 1 ? wc_bt : mc_bt
+    int   bt = na(bt_raw) ? -1 : bt_raw
+
+    bool new_break = i == 0 ? (barstate.isconfirmed and d_break_event) : i == 1 ? (new_week_period and wc_break_event) : (new_month_period and mc_break_event)
+    int prev_bt = array.get(orig_time, i)
+    bool anchor_changed = na(prev_bt) or bt != prev_bt
+    bool need_reset = new_break and anchor_changed
+
+    if need_reset and not na(bh) and not na(bl) and bt != -1
+        float diff = bh - bl
+        if diff > syminfo.mintick
+            array.set(orig_high, i, bh)
+            array.set(orig_low,  i, bl)
+            array.set(orig_time, i, bt)
+
+            array.set(T1, i, bh + diff)
+            array.set(T2, i, bh + diff * 2)
+            array.set(T3, i, bh + diff * 3)
+
+            array.set(hit1, i, false)
+            array.set(hit2, i, false)
+            array.set(hit3, i, false)
+
+            array.set(ext_active, i, false)
+            array.set(ext_hit1, i, false)
+            array.set(ext_hit2, i, false)
+            array.set(ext_hit3, i, false)
+
+            array.set(EXT1, i, na)
+            array.set(EXT2, i, na)
+            array.set(EXT3, i, na)
+
+            array.set(ext_high, i, na)
+            array.set(ext_low, i, na)
+            array.set(ext_close, i, na)
+            array.set(ext_time, i, na)
+
+//========================[ PRIMARY TARGET HIT DETECTION — CONFIRMED CLOSES ]========================//
+bool d_target_hit_event = false
+
+for i = 0 to 2
+    bool eval_ready = f_tf_close_confirmed(i)
+    int locked_anchor = array.get(orig_time, i)
+    int confirmed_anchor = i == 0 ? d_cycle_anchor : i == 1 ? wc_cycle_anchor : mc_cycle_anchor
+    bool confirmed_cycle_on = i == 0 ? d_cycle_active : i == 1 ? wc_cycle_active : mc_cycle_active
+    bool cycle_matches = eval_ready and confirmed_cycle_on and not array.get(sl_broken_latched, i) and not na(locked_anchor) and not na(confirmed_anchor) and locked_anchor == confirmed_anchor
+
+    if cycle_matches
+        [o_i, h_i, l_i, c_i] = get_idx_confirmed_ohlc(i)
+
+        float t1 = array.get(T1, i)
+        float t2 = array.get(T2, i)
+        float t3 = array.get(T3, i)
+
+        if not na(t1) and c_i >= t1 and not array.get(hit1, i)
+            array.set(hit1, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+        if not na(t2) and c_i >= t2 and array.get(hit1, i) and not array.get(hit2, i)
+            array.set(hit2, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+        if not na(t3) and c_i >= t3 and array.get(hit2, i) and not array.get(hit3, i)
+            array.set(hit3, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+//========================[ PRIMARY EXTENSION — CONFIRMED + LOCKED ]========================//
+// The extension anchor is created once after T3 and only from a confirmed timeframe close.
+for i = 0 to 2
+    bool eval_ready = f_tf_close_confirmed(i)
+    int locked_anchor = array.get(orig_time, i)
+    int confirmed_anchor = i == 0 ? d_cycle_anchor : i == 1 ? wc_cycle_anchor : mc_cycle_anchor
+    bool confirmed_cycle_on = i == 0 ? d_cycle_active : i == 1 ? wc_cycle_active : mc_cycle_active
+    bool cycle_matches = eval_ready and confirmed_cycle_on and not array.get(sl_broken_latched, i) and not na(locked_anchor) and not na(confirmed_anchor) and locked_anchor == confirmed_anchor
+
+    if cycle_matches
+        [o_i, h_i, l_i, c_i] = get_idx_confirmed_ohlc(i)
+        float t3 = array.get(T3, i)
+        bool isBull = isBullishShape(o_i, h_i, l_i, c_i)
+        bool closeAboveT3 = not na(t3) and c_i >= t3
+        bool ext_on = array.get(ext_active, i)
+        bool can_create_ext = array.get(hit3, i) and not ext_on and closeAboveT3 and isBull
+
+        if can_create_ext
+            float diff = h_i - l_i
+            if diff > syminfo.mintick
+                array.set(EXT1, i, h_i + diff)
+                array.set(EXT2, i, h_i + diff * 2)
+                array.set(EXT3, i, h_i + diff * 3)
+
+                array.set(ext_high, i, h_i)
+                array.set(ext_low,  i, l_i)
+                array.set(ext_close,i, c_i)
+                int tf_time_i = i == 0 ? d_t : i == 1 ? wc_t : mc_t
+                array.set(ext_time, i, tf_time_i)
+                array.set(ext_active, i, true)
+
+//========================[ EXTENSION TARGET HIT DETECTION — CONFIRMED CLOSES ]========================//
+for i = 0 to 2
+    bool eval_ready = f_tf_close_confirmed(i)
+    int locked_anchor = array.get(orig_time, i)
+    int confirmed_anchor = i == 0 ? d_cycle_anchor : i == 1 ? wc_cycle_anchor : mc_cycle_anchor
+    bool confirmed_cycle_on = i == 0 ? d_cycle_active : i == 1 ? wc_cycle_active : mc_cycle_active
+    bool cycle_matches = eval_ready and confirmed_cycle_on and not array.get(sl_broken_latched, i) and not na(locked_anchor) and not na(confirmed_anchor) and locked_anchor == confirmed_anchor
+
+    if cycle_matches and array.get(ext_active, i)
+        [o_i, h_i, l_i, c_i] = get_idx_confirmed_ohlc(i)
+
+        float e1 = array.get(EXT1, i)
+        float e2 = array.get(EXT2, i)
+        float e3 = array.get(EXT3, i)
+
+        if not na(e1) and c_i >= e1 and not array.get(ext_hit1, i)
+            array.set(ext_hit1, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+        if not na(e2) and c_i >= e2 and array.get(ext_hit1, i) and not array.get(ext_hit2, i)
+            array.set(ext_hit2, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+        if not na(e3) and c_i >= e3 and array.get(ext_hit2, i) and not array.get(ext_hit3, i)
+            array.set(ext_hit3, i, true)
+            if i == 0
+                d_target_hit_event := true
+
+//========================[ DYNAMIC SUPPORT / RESISTANCE — DETERMINISTIC ]========================//
+var float[] res_array = array.new_float(3, na)
+var float[] sup_array = array.new_float(3, na)
+
+for i = 0 to 2
+    float lastBearHigh = array.get(tf_highs, i)
+    bool has_valid_cycle = f_cycle_is_valid(i)
+
+    float t1 = array.get(T1, i)
+    float t2 = array.get(T2, i)
+    float t3 = array.get(T3, i)
+
+    bool hit1_i = array.get(hit1, i)
+    bool hit2_i = array.get(hit2, i)
+    bool hit3_i = array.get(hit3, i)
+
+    bool ext_on = array.get(ext_active, i)
+    float ext1 = array.get(EXT1, i)
+    float ext2 = array.get(EXT2, i)
+    float ext3 = array.get(EXT3, i)
+
+    bool ext_hit1_i = array.get(ext_hit1, i)
+    bool ext_hit2_i = array.get(ext_hit2, i)
+    bool ext_hit3_i = array.get(ext_hit3, i)
+
+    float next_res = na
+    float next_sup = na
+
+    // If the previous cycle is no longer current, do not carry its RS/SUP map forward.
+    if not has_valid_cycle
+        next_res := lastBearHigh
+        next_sup := na
+    else if ext_on
+        if ext_hit3_i
+            next_sup := ext3
+            next_res := na
+        else if ext_hit2_i
+            next_sup := ext2
+            next_res := ext3
+        else if ext_hit1_i
+            next_sup := ext1
+            next_res := ext2
+        else
+            next_sup := t3
+            next_res := ext1
+    else
+        if hit3_i
+            next_sup := t3
+            next_res := na
+        else if hit2_i
+            next_sup := t2
+            next_res := t3
+        else if hit1_i
+            next_sup := t1
+            next_res := t2
+        else
+            next_sup := array.get(orig_high, i)
+            next_res := t1
+
+    array.set(res_array, i, next_res)
+    array.set(sup_array, i, next_sup)
+
+//========================[ CANDLE COLOR BY HIGHEST ACTIVE BREAKOUT TF ]========================//
+// Highest active timeframe has priority: Monthly > Weekly > Daily.
+// When no breakout cycle is active, na preserves the chart's normal candle colors.
+color breakout_bar_color = m_break ? month_color : w_break ? week_color : d_break ? day_color : na
+barcolor(color_bars_by_tf and timeframe.isdaily ? breakout_bar_color : na, title="Breakout Timeframe Candle Color")
+
+//========================[ SIGNAL ENGINE — STRUCTURE-SYNCHRONIZED ]========================//
+// BUY  = a newly confirmed Daily structural breakout.
+// HOLD = the same Daily structural cycle remains current and its locked SL is intact.
+// TP   = a new target is confirmed while that same cycle remains active.
+// EXIT = the locked structural SL is broken.
+// WAIT = no valid Daily trade-state cycle is active.
+var bool  trade_active = false
+var float trade_sl = na
+var int   trade_anchor = na
+
+bool exit_event = false
+
+// First reconcile an existing trade-state with the live Daily structural cycle.
+if trade_active and timeframe.isdaily and barstate.isconfirmed
+    bool stop_broken_now = not na(trade_sl) and d_c < trade_sl
+    bool same_cycle_now = d_cycle_active and not na(trade_anchor) and not na(d_cycle_anchor) and d_cycle_anchor == trade_anchor
+
+    if stop_broken_now
+        trade_active := false
+        exit_event := true
+        trade_sl := na
+        trade_anchor := na
+    else if not same_cycle_now
+        // The structure was replaced/invalidated without breaking the locked SL.
+        // End the stale HOLD state silently and return Action to WAIT.
+        trade_active := false
+        trade_sl := na
+        trade_anchor := na
+
+bool daily_t1_already_hit = array.get(hit1, 0)
+bool buy_event = timeframe.isdaily and barstate.isconfirmed and d_break_event and d_cycle_active and not array.get(sl_broken_latched, 0) and not trade_active and not daily_t1_already_hit and not na(d_cycle_sl) and not na(d_cycle_anchor)
+
+if buy_event
+    trade_active := true
+    trade_sl := d_cycle_sl
+    trade_anchor := d_cycle_anchor
+
+bool daily_trade_cycle_valid = trade_active and d_cycle_active and not array.get(sl_broken_latched, 0) and not na(trade_anchor) and not na(d_cycle_anchor) and trade_anchor == d_cycle_anchor
+bool tp_event = daily_trade_cycle_valid and d_target_hit_event
+bool high_risk_context = d_break and not w_break and m_break
+
+string action = "WAIT"
+color action_bg = action_wait_bg
+
+if exit_event
+    action := "EXIT"
+    action_bg := action_hr_buy_bg
+else if buy_event
+    action := "BUY"
+    action_bg := high_risk_context ? action_hr_buy_bg : action_buy_bg
+else if tp_event
+    action := "TP"
+    action_bg := action_buy_bg
+else if daily_trade_cycle_valid
+    action := "HOLD"
+    action_bg := high_risk_context ? action_hr_buy_bg : action_hold_bg
+
+string final_action = action
+color final_action_bg = action_bg
+
+// Alerts use the same synchronized state events shown by Action.
+alertcondition(buy_event, title="BUY", message="Confirmed Daily structural breakout on {{ticker}}")
+alertcondition(tp_event, title="TP", message="A target was confirmed on {{ticker}}")
+alertcondition(exit_event, title="EXIT", message="Structural stop was broken on {{ticker}}")
+
+//========================[ DRAWING SECTION — DAILY ONLY ]========================//
+
+if timeframe.isdaily
+    //========================[ OBJECT LIMIT CONTROL ]========================//
+    int total_objects = array.size(drawn_lines) + array.size(drawn_labels) + array.size(sl_lines) + array.size(sl_labels)
+    if total_objects > max_objects_allowed
+        for i = 0 to array.size(drawn_lines) - 1
+            line ln = array.get(drawn_lines, i)
+            if not na(ln)
+                line.delete(ln)
+        array.clear(drawn_lines)
+
+        for i = 0 to array.size(drawn_labels) - 1
+            label lb = array.get(drawn_labels, i)
+            if not na(lb)
+                label.delete(lb)
+        array.clear(drawn_labels)
+
+        for i = 0 to array.size(sl_lines) - 1
+            line ln2 = array.get(sl_lines, i)
+            if not na(ln2)
+                line.delete(ln2)
+        array.clear(sl_lines)
+
+        for i = 0 to array.size(sl_labels) - 1
+            label lb2 = array.get(sl_labels, i)
+            if not na(lb2)
+                label.delete(lb2)
+        array.clear(sl_labels)
+
+    //========================[ TIME CALCULATIONS — FIXED ]========================//
+    // The script is drawn on the Daily chart. Using time - time[1] here is unsafe
+    // because weekends/holidays can make the last bar gap 2–4 calendar days.
+    // That multiplied the requested forward length and forced publication charts
+    // to reserve excessive empty space on the right. Use a fixed Daily time step.
+    int daily_ms = 24 * 60 * 60 * 1000
+    int drawEnd = time + math.min(line_length, 1000) * daily_ms
+
+    int dailyStartTime = d_bt
+
+    //========================[ CLEAR OLD SL LINES ]========================//
+    if array.size(sl_lines) > 0
+        for i = 0 to array.size(sl_lines) - 1
+            line lnOld = array.get(sl_lines, i)
+            if not na(lnOld)
+                line.delete(lnOld)
+        array.clear(sl_lines)
+
+    if array.size(sl_labels) > 0
+        for i = 0 to array.size(sl_labels) - 1
+            label lbOld = array.get(sl_labels, i)
+            if not na(lbOld)
+                label.delete(lbOld)
+        array.clear(sl_labels)
+
+    //========================[ DRAW SL LINES ]========================//
+    for si = 0 to 2
+        float slp = array.get(sl_prices, si)
+        if not na(slp)
+            color clr = si == 0 ? day_color : si == 1 ? week_color : month_color
+            int sl_endTime = time + sl_length_bars * daily_ms
+
+            line lnSL = line.new(time, slp, sl_endTime, slp, xloc=xloc.bar_time, color=color.new(clr,0), width=sl_line_width, style=sl_line_style)
+            array.push(sl_lines, lnSL)
+
+            label lbSL = label.new(sl_endTime, slp, str.tostring(slp, format.mintick), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=label_text_color, color=color.new(clr, sl_label_bg_transparency), size=label_text_size)
+            array.push(sl_labels, lbSL)
+
+    //========================[ CLEAR OLD TF LINES ]========================//
+    if array.size(drawn_lines) > 0
+        for i = 0 to array.size(drawn_lines) - 1
+            line lnOld = array.get(drawn_lines, i)
+            if not na(lnOld)
+                line.delete(lnOld)
+        array.clear(drawn_lines)
+
+    if array.size(drawn_labels) > 0
+        for i = 0 to array.size(drawn_labels) - 1
+            label lbOld = array.get(drawn_labels, i)
+            if not na(lbOld)
+                label.delete(lbOld)
+        array.clear(drawn_labels)
+
+    //========================[ DRAW TF LINES (D/W/M) ]========================//
+    for k = 0 to 2
+        float price   = array.get(tf_highs, k)
+        int   barTime = array.get(tf_times, k)
+        color clr     = array.get(tf_colors, k)
+        string name   = array.get(tf_names, k)
+
+        if not na(price) and barTime != -1 and not na(drawEnd)
+            int startTime = (k != 0 and not na(dailyStartTime) and dailyStartTime != -1) ? dailyStartTime : barTime
+
+            if startTime < drawEnd
+                line lnTF = line.new(startTime, price, drawEnd, price, xloc=xloc.bar_time, color=color.new(clr,0), width=tf_line_width, style=tf_line_style)
+                array.push(drawn_lines, lnTF)
+
+                label lbTF = label.new(drawEnd, price, name + " " + str.tostring(price, format.mintick), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, textcolor=label_text_color, color=color.new(clr, tf_label_bg_transparency), size=label_text_size)
+                array.push(drawn_labels, lbTF)
+                //========================[ TABLE BUILDING — DAILY ONLY ]========================//
+if timeframe.isdaily
+    table.clear(results, 0, 0, 10, 5)
+
+    // Header
+    table.cell(results, 0, 0, "TF",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 1, 0, "Last High", text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 2, 0, "Breakout",  text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 3, 0, "SL",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 4, 0, "RS",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 5, 0, "SUP",       text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 6, 0, "SL Stat",   text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 7, 0, "T1",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 8, 0, "T2",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results, 9, 0, "T3",        text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+    table.cell(results,10, 0, "Action",    text_color=table_text_color, bgcolor=table_header_bg, text_halign=text.align_center, text_size=table_text_size)
+
+    // Rows (D/W/M)
+    for i = 0 to 2
+        string tf_name = i == 0 ? "Daily" : i == 1 ? "Weekly" : "Monthly"
+        float high_val = array.get(tf_highs, i)
+        bool  brk      = array.get(tf_breaks, i)
+        float slv      = array.get(sl_prices, i)
+        string sl_status_str = array.get(sl_status, i)
+        color sl_bg = sl_status_str == "ACTIVE" ? color.rgb(5,119,9) : sl_status_str == "BROKEN" ? color.rgb(170,1,1) : color.rgb(53, 4, 4)
+
+        float rs_val  = array.get(res_array, i)
+        float sup_val = array.get(sup_array, i)
+
+        bool row_cycle_valid = f_cycle_is_valid(i)
+        bool ext_on_row = row_cycle_valid and array.get(ext_active, i)
+        float locked_t1 = array.get(T1, i)
+        float locked_t2 = array.get(T2, i)
+        float locked_t3 = array.get(T3, i)
+
+        // Keep the old table's useful "road ahead" feeling:
+        // when no valid locked cycle is active, show projected targets from the current structure,
+        // while actual hit logic uses only targets belonging to the current valid cycle.
+        float low_val = array.get(tf_lows, i)
+        float preview_diff = not na(high_val) and not na(low_val) ? high_val - low_val : na
+        float preview_t1 = not na(preview_diff) and preview_diff > syminfo.mintick ? high_val + preview_diff : na
+        float preview_t2 = not na(preview_diff) and preview_diff > syminfo.mintick ? high_val + preview_diff * 2 : na
+        float preview_t3 = not na(preview_diff) and preview_diff > syminfo.mintick ? high_val + preview_diff * 3 : na
+
+        float tt1 = row_cycle_valid ? (ext_on_row ? array.get(EXT1, i) : locked_t1) : preview_t1
+        float tt2 = row_cycle_valid ? (ext_on_row ? array.get(EXT2, i) : locked_t2) : preview_t2
+        float tt3 = row_cycle_valid ? (ext_on_row ? array.get(EXT3, i) : locked_t3) : preview_t3
+
+        color tbg = ext_on_row ? color.rgb(114,61,0) : color.rgb(21,160,26)
+
+        table.cell(results, 0, i+1, tf_name, text_color=table_text_color, bgcolor=array.get(tf_colors, i), text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 1, i+1, na(high_val) ? "-" : str.tostring(high_val, format.mintick), text_color=table_text_color, bgcolor=table_cell_bg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 2, i+1, brk ? "✓" : "✗", text_color=table_text_color, bgcolor=brk ? color.new(#189b1c,20) : color.new(#fa2323,0), text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 3, i+1, na(slv) ? "-" : str.tostring(slv, format.mintick), text_color=table_text_color, bgcolor=table_cell_bg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 4, i+1, na(rs_val) ? "-" : str.tostring(rs_val, format.mintick), text_color=table_text_color, bgcolor=table_cell_bg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 5, i+1, na(sup_val) ? "-" : str.tostring(sup_val, format.mintick), text_color=table_text_color, bgcolor=table_cell_bg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 6, i+1, sl_status_str, text_color=table_text_color, bgcolor=sl_bg, text_halign=text.align_center, text_size=table_text_size)
+
+        table.cell(results, 7, i+1, na(tt1) ? "-" : str.tostring(tt1, format.mintick), text_color=color.white, bgcolor=tbg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 8, i+1, na(tt2) ? "-" : str.tostring(tt2, format.mintick), text_color=color.white, bgcolor=tbg, text_halign=text.align_center, text_size=table_text_size)
+        table.cell(results, 9, i+1, na(tt3) ? "-" : str.tostring(tt3, format.mintick), text_color=color.white, bgcolor=tbg, text_halign=text.align_center, text_size=table_text_size)
+
+    //========================[ FINAL ACTION CELL ]========================//
+    table.cell(results, 10, 1, "", text_color=action_text_color, bgcolor=table_cell_bg)
+    table.cell(results, 10, 2, final_action, text_color=action_text_color, bgcolor=final_action_bg)
+    table.cell(results, 10, 3, "", text_color=action_text_color, bgcolor=table_cell_bg)
+
+    //========================[ ADVANCED RADAR CONTROL CLOUD ]========================//
+// Cleaner replacement for the old dual-cloud + candle-marker/pattern system.
+// Bull and Bear control feeds are built from genuinely strong directional candles,
+// then carried forward and smoothed so the cloud remains continuous and readable.
+radar_len = input.int(11, "Radar Control EMA Length", minval=2)
+radar_slow_len = input.int(33, "Radar Bias EMA Length", minval=3)
+radar_compression_atr = input.float(0.18, "Radar Compression Spread / ATR", minval=0.02, step=0.01)
+radar_cloud_trans = input.int(86, "Radar Cloud Transparency", minval=70, maxval=96)
+radar_bull_color = input.color(color.rgb(10, 150, 70), "Radar Bull Color")
+radar_bear_color = input.color(color.rgb(205, 55, 55), "Radar Bear Color")
+show_radar_cloud = input.bool(true, "Show Advanced Radar Cloud")
+show_radar_bias = input.bool(false, "Show Radar Slow Bias")
+font_size = input.string(title="Radar Table Text Size", defval="small", options=["tiny", "small", "normal", "large", "huge"])
+
+float radar_body_now = math.abs(close - open)
+float radar_upper_wick = high - math.max(open, close)
+float radar_lower_wick = math.min(open, close) - low
+float radar_wick_sum = radar_upper_wick + radar_lower_wick
+bool radar_strong_bull = close > open and radar_body_now > radar_wick_sum
+bool radar_strong_bear = close < open and radar_body_now > radar_wick_sum
+
+var float radar_bull_feed = na
+var float radar_bear_feed = na
+radar_bull_feed := radar_strong_bull ? (low + radar_body_now * 0.60) : nz(radar_bull_feed[1], hl2)
+radar_bear_feed := radar_strong_bear ? (high - radar_body_now * 0.60) : nz(radar_bear_feed[1], hl2)
+
+float radar_bull_control = ta.ema(radar_bull_feed, radar_len)
+float radar_bear_control = ta.ema(radar_bear_feed, radar_len)
+float radar_bias = ta.ema((radar_bull_control + radar_bear_control) / 2.0, radar_slow_len)
+float radar_atr = ta.atr(14)
+float radar_spread = radar_atr > 0 ? math.abs(radar_bull_control - radar_bear_control) / radar_atr : 0.0
+float radar_upper = math.max(radar_bull_control, radar_bear_control)
+float radar_lower = math.min(radar_bull_control, radar_bear_control)
+
+int radar_control_state = 0 // 1 Bull, -1 Bear, 2 Compression, 0 Transition
+if radar_spread <= radar_compression_atr
+    radar_control_state := 2
+else if close > radar_upper and radar_bull_control >= radar_bull_control[1]
+    radar_control_state := 1
+else if close < radar_lower and radar_bear_control <= radar_bear_control[1]
+    radar_control_state := -1
+else
+    radar_control_state := 0
+
+color radar_cloud_color = radar_control_state == 1 ? radar_bull_color : radar_control_state == -1 ? radar_bear_color : radar_control_state == 2 ? color.rgb(190,145,20) : color.rgb(125,125,125)
+
+p_radar_bull = plot(show_radar_cloud ? radar_bull_control : na, title="Radar Bull Control", color=radar_bull_color, linewidth=1)
+p_radar_bear = plot(show_radar_cloud ? radar_bear_control : na, title="Radar Bear Control", color=radar_bear_color, linewidth=1)
+fill(p_radar_bull, p_radar_bear, color=show_radar_cloud ? color.new(radar_cloud_color, radar_cloud_trans) : na, title="Advanced Radar Control Cloud")
+plot(show_radar_bias ? radar_bias : na, title="Radar Slow Bias", color=color.new(color.gray,35), linewidth=1)
+
+// Trend output retained for the original bottom-right table and Early Entry filter.
+trend_up = radar_control_state == 1
+trend_down = radar_control_state == -1
+trend_txt = trend_up ? "UP" : trend_down ? "DOWN" : radar_control_state == 2 ? "COMPRESSION" : "NEUTRAL"
+trend_color = trend_up ? color.rgb(0,180,0) : trend_down ? color.rgb(200,0,0) : radar_control_state == 2 ? color.rgb(190,145,20) : color.rgb(125,125,125)
+
+//========================[ DAILY ACCELERATION — CORRECTED ]========================//
+accel_len    = 7
+strength_len = 7
+
+// Directional candle impulse normalized by its recent average size.
+speed     = close - open
+norm_base = ta.sma(math.abs(speed), strength_len)
+strength  = norm_base != 0 ? speed / norm_base : 0.0
+
+// Acceleration is now the change in normalized directional strength.
+// This makes positive/negative readings mathematically coherent.
+accel = strength - nz(strength[1])
+
+//========================[ PROFESSIONAL MOMENTUM MERGE ]========================//
+string note_label = ""
+color  note_color = color.white
+
+if strength > 1.5 and accel > 0
+    note_label := "Explosive"
+    note_color := color.rgb(255, 0, 0)
+else if strength > 0.7 and accel >= 0
+    note_label := "Strong"
+    note_color := color.rgb(0, 180, 0)
+else if strength > 0 and strength[1] <= 0
+    note_label := "Starting"
+    note_color := color.rgb(255, 165, 0)
+else if strength > 0 and accel < 0
+    note_label := "Fading"
+    note_color := color.rgb(255, 140, 0)
+else if strength > 0.3
+    note_label := "Moderate"
+    note_color := color.rgb(0, 120, 255)
+else if strength > 0
+    note_label := "Weak"
+    note_color := color.rgb(150, 150, 150)
+else if strength < 0 and accel < 0
+    note_label := "Reversing"
+    note_color := color.rgb(180, 0, 0)
+else
+    note_label := "Dead"
+    note_color := color.rgb(80, 80, 80)
+
+//========================[ EARLY ENTRY ENGINE — CORRECTED ]========================//
+// Kept as an alert-only feature; it does not change the old chart layout.
+daily_cross_up = barstate.isconfirmed and ta.crossover(close, d_bh)
+
+accel_positive     = accel > 0
+strong_momentum    = strength > 0.7
+explosive_momentum = strength > 1.5
+momentum_ok        = note_label == "Strong" or note_label == "Explosive"
+weekly_ok          = w_break
+
+early_entry = daily_cross_up and weekly_ok and trend_up and accel_positive and (strong_momentum or explosive_momentum) and momentum_ok
+
+alertcondition(early_entry, title="Early Entry", message="Early Entry Signal\nDaily + Weekly Breakout + Bullish Radar + Strong Momentum on {{ticker}}")
+
+//////////////////////////////////////////////////////
+var table radar_table = table.new(position.bottom_right, 4, 2, border_width=1, border_color=color.white)
+
+if barstate.islast
+    table.clear(radar_table, 0, 0, 3, 1)
+
+    // Headers
+    table.cell(radar_table, 0, 0, "Trend",    text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=font_size)
+    table.cell(radar_table, 1, 0, "Accel",    text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=font_size)
+    table.cell(radar_table, 2, 0, "Strength", text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=font_size)
+    table.cell(radar_table, 3, 0, "Note",     text_color=color.white, bgcolor=color.rgb(30,30,30), text_size=font_size)
+
+    // Data Row
+    table.cell(radar_table, 0, 1, trend_txt, text_color=color.white, bgcolor=trend_color, text_size=font_size)
+    table.cell(radar_table, 1, 1, str.tostring(accel, format.mintick), text_color=color.white, bgcolor=color.rgb(0,0,0), text_size=font_size)
+    table.cell(radar_table, 2, 1, str.tostring(strength, "#.##"),      text_color=color.white, bgcolor=color.rgb(0,0,0), text_size=font_size)
+    table.cell(radar_table, 3, 1, note_label, text_color=color.white, bgcolor=note_color, text_size=font_size)
+
+//========================[ NON-DAILY CLEANUP ]========================//
+if not timeframe.isdaily
+    if array.size(drawn_lines) > 0
+        for i = 0 to array.size(drawn_lines) - 1
+            line lnOld = array.get(drawn_lines, i)
+            if not na(lnOld)
+                line.delete(lnOld)
+        array.clear(drawn_lines)
+    if array.size(drawn_labels) > 0
+        for i = 0 to array.size(drawn_labels) - 1
+            label lbOld = array.get(drawn_labels, i)
+            if not na(lbOld)
+                label.delete(lbOld)
+        array.clear(drawn_labels)
+    if array.size(sl_lines) > 0
+        for i = 0 to array.size(sl_lines) - 1
+            line lnOld2 = array.get(sl_lines, i)
+            if not na(lnOld2)
+                line.delete(lnOld2)
+        array.clear(sl_lines)
+    if array.size(sl_labels) > 0
+        for i = 0 to array.size(sl_labels) - 1
+            label lbOld2 = array.get(sl_labels, i)
+            if not na(lbOld2)
+                label.delete(lbOld2)
+        array.clear(sl_labels)

@@ -1,0 +1,670 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  VWAP + EMA 9 CROSS  —  as written in the guide
+//
+//  THE SEQUENCE, in order:
+//    1. The 9 EMA crosses the VWAP on the 3-minute chart.
+//    2. You WAIT. Step 8: "wait approximately 2 minutes before taking the
+//       trade… you want to see the candle hold its position above or below the
+//       VWAP for most of its duration before committing."
+//    3. A candle then CLOSES on the correct side of the VWAP, having wicked it.
+//       That close is the entry.
+//
+//  Cross below, wait, close below  -> sell.   Cross above, wait, close above -> buy.
+//
+//  On the timing: the guide asks you to enter about two minutes into a forming
+//  candle. A bar-close indicator cannot do that without repainting, so the wait
+//  is one full 3-minute bar instead — three minutes rather than two, and later
+//  rather than earlier. That is the conservative direction, and page 6 backs it:
+//  "all entries are based on 3-minute candle closes only."
+//
+//  Page 8 lets you skip ahead when the cross has not finished: "you can act when
+//  you can see the EMA BEGINNING to cross." An EMA curling hard into the VWAP
+//  counts, which is what lets this catch a sharp reversal the lagging average
+//  has not physically crossed yet.
+//
+//  VISUALS: no arrows. A solid coloured line at the entry price running to the
+//  exit, dotted lines at the target and stop, one word at the entry, the result
+//  in R at the exit. Green is a buy, red is a sell.
+//
+//  THE CANDLE, page 8 verbatim: it "closes above or below the VWAP while the
+//  wick of that candle touches or crosses through the VWAP line". Where it
+//  closes, and that the wick reached the line. The open is never mentioned.
+//
+//  Two candles satisfy that, and BOTH are taken. They are drawn differently
+//  because they are not the same trade:
+//    REJECTION — open and close on the same side, only the wick crosses. Price
+//                went to the level and was refused. The picture the guide draws.
+//    BREAKOUT  — open one side, close the other. Price went THROUGH the level.
+//                Allowed by the words, never illustrated, usually the sharper
+//                move, and by far the more common of the two on index CFDs.
+//  Which one gets the solid line is a setting in section ⑦; by default the
+//  breakout is solid and the rejection is dotted.
+//  Either can be switched off on its own in section ③, and the status panel
+//  keeps a running count of each so you can judge them separately.
+//
+//  Anything not in the guide is labelled "NOT in the guide" and defaults to OFF.
+//  The one sanctioned bypass: a curling EMA and an oversized high-volume candle
+//  both skip the wait, because the guide says in those words that they may.
+// ═══════════════════════════════════════════════════════════════════════════
+
+indicator("VWAP + EMA 9 — Trade Levels", shorttitle = "VWAP+EMA9", overlay = true,
+     max_lines_count = 500, max_labels_count = 500)
+
+// ══════════════════════════════════════════════════════════════ ① MARKET ════
+grpP = "① Market and session"
+preset = input.string("US stocks / indices", "Preset", options = ["US stocks / indices", "Gold · XAUUSD", "Custom"], group = grpP,
+     tooltip = "US stocks / indices: VWAP anchors at 09:30 ET, window 09:30-11:30. This is the guide's own market — it names SPX, SPY, QQQ and IWM.\n\nGold: anchor and window start at the COMEX open, 08:20 ET. NOT in the guide — page 4 restricts this strategy to high-volume US index products and says so is \"foundational to why the strategy works\".")
+cAnchorHH = input.int(9,  "Custom · anchor hour",   minval = 0, maxval = 23, group = grpP)
+cAnchorMM = input.int(30, "Custom · anchor minute", minval = 0, maxval = 59, group = grpP)
+cStartHH  = input.int(9,  "Custom · window start hour",   minval = 0, maxval = 23, group = grpP)
+cStartMM  = input.int(30, "Custom · window start minute", minval = 0, maxval = 59, group = grpP)
+cEndHH    = input.int(11, "Custom · window end hour",     minval = 0, maxval = 23, group = grpP)
+cEndMM    = input.int(30, "Custom · window end minute",   minval = 0, maxval = 59, group = grpP)
+mktTZ     = input.string("America/New_York", "Timezone", group = grpP,
+     options = ["America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Australia/Sydney", "UTC"])
+useSession = input.bool(true, "Morning session only", group = grpP,
+     tooltip = "Guide, step 2 and the closing page: the setup appears most reliably in the first 1-2 hours, when volume is heaviest.")
+// ── second window ───────────────────────────────────────────────────────────
+// Each window carries its own timezone, so it is "the first two hours of that
+// session" in local terms and daylight saving never drifts it.
+use2      = input.bool(false, "Also trade a second session — NOT in the guide", group = grpP,
+     tooltip = "The guide is a US-morning system. Page 2 and the closing page both tie the edge to the first 1-2 hours of the New York day, when \"volume is highest and institutional order flow is most active\" — and page 5 warns that on thin volume \"price can slice through [the VWAP] randomly… the signals become noise rather than signal.\"\n\nAn index CFD does trade through the Asian hours, but on a fraction of the volume. The mechanics work; whether the edge survives is an open question you should answer with a few weeks of watching, not an assumption.")
+sess2Mode = input.string("Asian · Tokyo open", "Second window", options = ["Asian · Tokyo open", "Asian · full Tokyo", "London open", "Custom"], group = grpP,
+     tooltip = "Tokyo open: 09:00-11:30 Japan time — the first two hours of the Asian day, mirroring what the guide does with the New York open.\n\nFull Tokyo: 09:00-15:00 JST, the whole cash session.\n\nLondon open: 08:00-10:30 UK time.\n\nEach is expressed in its own timezone, so none of them drift when a daylight-saving change happens somewhere else.")
+c2StartHH = input.int(9,  "Second window · start hour", minval = 0, maxval = 23, group = grpP)
+c2StartMM = input.int(0,  "Second window · start minute", minval = 0, maxval = 59, group = grpP)
+c2EndHH   = input.int(11, "Second window · end hour", minval = 0, maxval = 23, group = grpP)
+c2EndMM   = input.int(30, "Second window · end minute", minval = 0, maxval = 59, group = grpP)
+tz2Custom = input.string("Asia/Tokyo", "Second window · timezone", group = grpP,
+     options = ["Asia/Tokyo", "Asia/Hong_Kong", "Asia/Singapore", "Asia/Shanghai", "Australia/Sydney", "Europe/London", "America/New_York", "UTC"])
+reAnchor  = input.bool(true, "Give each window its own VWAP", group = grpP,
+     tooltip = "ON: the VWAP restarts when each window opens, so the Asian session gets a fresh line instead of one already carrying ten hours of New York volume. That heavy line barely moves, which is exactly the condition under which this setup stops producing signals.\n\nOFF: one VWAP anchored once a day, shared by both windows. Closer to a literal reading, and much less useful in the second window.")
+
+enforceTF  = input.bool(true, "Only signal on a 3-minute chart", group = grpP,
+     tooltip = "Guide, step 3: \"Do not attempt to run this strategy on a 1-minute, 5-minute, or 15-minute chart.\" With this on, switching timeframes stops the signals rather than quietly producing ones the guide would not recognise.")
+
+// ═══════════════════════════════════════════ ② THE CROSS, THEN THE WAIT ══════
+grpC = "② The cross and the wait"
+waitBars = input.int(1, "Wait N bars after the cross before entering", minval = 0, maxval = 10, group = grpC,
+     tooltip = "Guide, step 8 — \"the rule that protects you from false signals more than any other part of this system\": after you spot the setup, wait about two minutes and confirm the candle is holding its position before committing.\n\n1 bar on a 3-minute chart is the closest a non-repainting script can get: the cross registers at one candle's close, and the NEXT candle has to close on the correct side of the VWAP before anything is drawn. Three minutes rather than two, and later rather than earlier.\n\n0 enters on the cross candle itself, with no wait at all.")
+crossBars = input.int(3, "…and no later than N bars after it", minval = 1, maxval = 200, group = grpC,
+     tooltip = "The far edge of the window. Guide, page 7: the two things must happen \"simultaneously — or nearly so\". A cross is an event; an EMA that crossed three hundred bars ago is not crossing.\n\nRaising this loosens toward \"the EMA is merely on the right side\", which is a different and far noisier system.")
+allowCurl = input.bool(true, "Also accept an EMA curling toward the cross", group = grpC,
+     tooltip = "Guide, page 8: \"The cross does not need to be fully completed — you can act when you can see the EMA beginning to cross in the expected direction.\"\n\nThe 9 EMA lags, so after a fast reversal it has not physically crossed yet even though the move is obvious. This path is exempt from the wait above, because the guide frames it as acting early on purpose.")
+curlGap = input.float(0.35, "Curl counts when the gap is under N × ATR", minval = 0.05, maxval = 3.0, step = 0.05, group = grpC)
+
+// ═══════════════════════════════════════════════════════════ ③ WHAT TO TAKE ══
+grpS = "③ What to take"
+tierMode   = input.string("Every valid setup", "Setups", options = ["Every valid setup", "Confluence only"], group = grpS,
+     tooltip = "Confluence only: the guide's \"best confluence signal\" — the candle wicks BOTH the VWAP and the 9 EMA at once. Page 8 says to prioritise these.")
+tradeLong  = input.bool(true, "Buys",  group = grpS)
+tradeShort = input.bool(true, "Sells", group = grpS)
+takeReject = input.bool(true, "Take REJECTION candles — solid line", group = grpS,
+     tooltip = "The picture the guide illustrates: the wick pierces the VWAP and the body holds clear on the far side, so the candle opened and closed on the same side of the line. Price went to the level and was refused.\n\nDrawn with a SOLID entry line.")
+takeBreak  = input.bool(true, "Take BREAKOUT candles — dashed line", group = grpS,
+     tooltip = "Also satisfies the guide, page 8, word for word: \"a 3-minute candle that CLOSES above or below the VWAP while the WICK of that candle touches or crosses through the VWAP line.\" Nothing there about the open — so a candle that opens one side of the VWAP and closes the other qualifies just as much.\n\nDifferent character though: this is price going THROUGH the level rather than being refused at it. Often the sharper move, and the pattern the guide never draws.\n\nDrawn with a DASHED entry line so you can judge the two separately.")
+histDays   = input.int(21, "Show trades from the last N days", minval = 1, maxval = 365, group = grpS,
+     tooltip = "21 = three weeks. Older drawings are erased so the chart stays readable and the script stays inside TradingView's cap of 500 drawing objects.\n\nIf you ask for more history than that cap allows, the oldest trades drop off anyway and the status panel says \"capped\". Fewer objects per trade means more history fits — turning off the price text, or leaving the stop and target off, roughly doubles what you can show.\n\nHow far back it can actually go is also limited by how much intraday data your TradingView plan loads.")
+
+// ═══════════════════════════════════════════════════════ ④ INDICATOR SETUP ═══
+grpI = "④ Indicators"
+emaLen    = input.int(9, "EMA length", minval = 1, maxval = 200, group = grpI, tooltip = "Guide, step 1: 9.")
+srcChoice = input.string("ohlc4", "VWAP source", options = ["ohlc4", "hlc3", "hl2", "close"], group = grpI, tooltip = "Guide, step 1: OHLC/4. The guide calls this non-negotiable.")
+volMode   = input.string("Auto", "Volume source", options = ["Auto", "This symbol", "Borrow from another symbol", "Time-weighted"], group = grpI,
+     tooltip = "Auto uses the symbol's own volume and borrows only if it has none. Anything other than real volume means the line is not a true VWAP — the status panel says which is live, and the guide is explicit that VWAP on a volume-less instrument is noise.")
+volSym    = input.symbol("COMEX:GC1!", "Borrow volume from", group = grpI)
+volLen    = input.int(20, "Volume average length", minval = 1, group = grpI)
+volMult   = input.float(1.8, "Volume spike multiple", minval = 1.0, step = 0.1, group = grpI)
+rangeMult = input.float(1.6, "Oversized-candle multiple", minval = 1.0, step = 0.1, group = grpI,
+     tooltip = "Guide, step 8, the volume-candle exception: an oversized, high-volume candle is self-confirming and skips the wait.")
+
+// ══════════════════════════════════ ⑤ EXTRAS — NONE OF THIS IS IN THE GUIDE ══
+grpE = "⑤ Extras — NOT in the guide, all off by default"
+slMode = input.string("None", "Stop placement", options = ["None", "Rejection wick", "Beyond VWAP", "ATR multiple"], group = grpE,
+     tooltip = "The guide has no stop-loss. Its only exit is a candle closing through the 9 EMA. A stop changes the outcome distribution completely, so it is off unless you choose it.")
+slBuffer  = input.float(0.15, "Stop buffer (× ATR)", minval = 0.0, step = 0.05, group = grpE)
+slAtrMult = input.float(1.5, "ATR multiple (ATR mode only)", minval = 0.1, step = 0.1, group = grpE)
+rMult     = input.float(0.0, "Target = N × risk  (0 = no target)", minval = 0.0, step = 0.25, group = grpE,
+     tooltip = "The guide has no profit target either. Needs a stop to measure risk from, so it does nothing while the stop is None.")
+xRej   = input.float(0.0, "Min rejection wick (% of range)", minval = 0.0, maxval = 100.0, step = 5.0, group = grpE,
+     tooltip = "The guide asks only that the wick touches the VWAP. Waived on an oversized high-volume candle, where the body is the rejection.")
+xBody  = input.float(0.0, "Min candle body (% of range)", minval = 0.0, maxval = 100.0, step = 5.0, group = grpE)
+xCool  = input.int(0, "Wait N bars after a trade closes", minval = 0, maxval = 200, group = grpE)
+armWithin = input.int(20, "Give up on a trade that never reaches the 9 EMA, after N bars", minval = 1, maxval = 500, group = grpE,
+     tooltip = "The guide's exit fires when a candle closes back THROUGH the 9 EMA — which assumes you were on the far side of it to begin with. A trade that enters between the VWAP and the EMA and never gets past the EMA can therefore never trigger that exit.\n\nWith no stop set, nothing else would close it either: it would sit open indefinitely, blocking every later setup and carrying through the weekend. This closes it flat instead.")
+flatNewDay = input.bool(true, "Close anything still open at the start of a new session", group = grpE,
+     tooltip = "The guide is an intraday system and never contemplates holding overnight. Off means a trade can survive the gap.")
+xMinR  = input.float(0.0, "Ignore candles smaller than", minval = 0.0, step = 0.1, group = grpE)
+
+// ══════════════════════════════════════════════════════════ ⑥ APPEARANCE ═════
+grpA = "⑥ Appearance"
+cBuy  = input.color(#00C853, "Buy — line and text", group = grpA)
+cSell = input.color(#FF3B3B, "Sell — line and text", group = grpA)
+entryWidth = input.int(2, "Entry line thickness", minval = 1, maxval = 16, group = grpA,
+     tooltip = "Thin by default so a long line reads as a level rather than a bar.")
+lineStyle  = input.string("Rejection dotted, breakout solid", "Entry line style",
+     options = ["Rejection dotted, breakout solid", "Rejection dashed, breakout solid", "Rejection solid, breakout dashed", "All solid"], group = grpA,
+     tooltip = "Which setup type gets the solid line.\n\nBreakouts outnumber rejections heavily on index CFDs, so giving them the solid line makes the common case the bold one and lets the rarer rejection stand out by being different rather than by being louder.\n\nWorth knowing which way round you have it: the rejection is the pattern the guide actually illustrates, so if you want the guide's own setup to be the visually dominant one, pick \"Rejection solid\" instead.\n\nA dotted line at high thickness renders as chunky blocks. If that bothers you, use the dashed variant or drop the entry thickness a little.")
+levelWidth = input.int(1, "Target / stop line thickness", minval = 1, maxval = 6, group = grpA)
+levelFade  = input.int(25, "Target / stop line fade", minval = 0, maxval = 90, group = grpA)
+minBars    = input.int(30, "Minimum line length, in bars", minval = 1, maxval = 400, group = grpA,
+     tooltip = "Most trades here exit within a few candles, which leaves a line too short to read. This stretches a short trade's line out to the right so it registers as a level on the chart.\n\nBe aware of what that costs: past its real exit the line no longer represents time in the trade. The result text sits at the far right end, so the line reads as a label rather than a duration. Set it to 1 to go back to true trade length.")
+showWord   = input.bool(true, "Word at the entry (BUY / SELL)", group = grpA)
+showType   = input.bool(true, "Setup type at the far end of the line", group = grpA,
+     tooltip = "Small text on the right-hand edge naming which setup it was — rejection or breakout — alongside the result.")
+showPrices = input.bool(false, "Price text on the levels", group = grpA)
+showResult = input.bool(true, "Result at the exit", group = grpA,
+     tooltip = "Shown in R when a stop is set, because R is a ratio to a defined risk. With no stop there is no defined risk, so the plain percentage move is shown instead.")
+txtSize    = input.string("Normal", "Text size on the lines", options = ["Tiny", "Small", "Normal", "Large", "Huge"], group = grpA,
+     tooltip = "Sets the BUY / SELL word at the entry, the setup type and result at the far end of the line, and the price text on the levels.\n\nTradingView's label sizes are fixed steps, not point values, so this jumps rather than slides. Normal is roughly double Tiny.")
+confBoost  = input.int(1, "Extra thickness on a confluence entry", minval = 0, maxval = 8, group = grpA)
+markConf   = input.bool(true, "Thicken the line on a confluence entry", group = grpA,
+     tooltip = "The guide's strongest signal — the candle wicks both the VWAP and the 9 EMA at once. Drawn two steps heavier rather than in a different colour, so green always means buy and red always means sell.")
+wording = input.string("CFD · BUY / SELL", "Wording", options = ["CFD · BUY / SELL", "Futures · LONG / SHORT", "Options · CALL / PUT"], group = grpA)
+showLines  = input.bool(true, "Plot VWAP and EMA", group = grpA)
+cVwap      = input.color(#FF9800, "VWAP line", group = grpA)
+wVwap      = input.int(2, "VWAP thickness", minval = 1, maxval = 8, group = grpA)
+cEma       = input.color(#7C4DFF, "EMA 9 line", group = grpA)
+wEma       = input.int(2, "EMA 9 thickness", minval = 1, maxval = 8, group = grpA)
+showStatus = input.bool(true, "Status panel", group = grpA)
+showDiag   = input.bool(false, "Diagnostics panel", group = grpA,
+     tooltip = "Counts how many setups each rule removed. Turn on when the chart is empty and you want to know why.")
+
+string wBuy = switch wording
+    "Futures · LONG / SHORT" => "LONG"
+    "Options · CALL / PUT"   => "CALL"
+    => "BUY"
+string wSell = switch wording
+    "Futures · LONG / SHORT" => "SHORT"
+    "Options · CALL / PUT"   => "PUT"
+    => "SELL"
+
+// Label size is a series string in Pine v6, so it can come from an input.
+// (plotshape's size cannot — that one needs a constant, which is why the old
+// arrow version had its sizes hard-coded.)
+string szTxt = switch txtSize
+    "Tiny"  => size.tiny
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ═══════════════════════════════════════════════════════ CORE CALCULATIONS ══
+float srcPx = switch srcChoice
+    "ohlc4" => ohlc4
+    "hlc3"  => hlc3
+    "hl2"   => hl2
+    => close
+
+// gaps_off, not gaps_on: with gaps_on a bar the borrowed symbol does not have
+// returns na, which would silently contribute zero to both VWAP accumulators
+// and drop that bar out of the average entirely.
+float extVol  = request.security(volSym, timeframe.period, volume, gaps = barmerge.gaps_off, ignore_invalid_symbol = true)
+float ownVol  = nz(volume, 0.0)
+bool  ownOK   = ownVol > 0
+bool  extSeen = not na(extVol) and extVol > 0
+
+var bool ownUsable = false
+var bool extUsable = false
+ownUsable := ownUsable or ownOK
+extUsable := extUsable or extSeen
+
+float volUsed = switch volMode
+    "Auto"                       => ownUsable ? ownVol : (extUsable ? nz(extVol, 1.0) : 1.0)
+    "This symbol"                => ownOK ? ownVol : 1.0
+    "Borrow from another symbol" => extUsable ? nz(extVol, 1.0) : 1.0
+    => 1.0
+
+string volActive = switch volMode
+    "Auto"                       => ownUsable ? "own ✓" : (extUsable ? "borrowed ✓" : "none — not a VWAP ⚠")
+    "This symbol"                => ownOK ? "own ✓" : "none — not a VWAP ⚠"
+    "Borrow from another symbol" => extUsable ? "borrowed ✓" : "none — not a VWAP ⚠"
+    => "time-weighted ⚠"
+
+bool hasRealVol = switch volMode
+    "Auto"                       => ownUsable or extUsable
+    "This symbol"                => ownOK
+    "Borrow from another symbol" => extUsable
+    => false
+
+int anchorMOD = switch preset
+    "Gold · XAUUSD"        => 8 * 60 + 20
+    "US stocks / indices"  => 9 * 60 + 30
+    => cAnchorHH * 60 + cAnchorMM
+int startMOD = switch preset
+    "Gold · XAUUSD"        => 8 * 60 + 20
+    "US stocks / indices"  => 9 * 60 + 30
+    => cStartHH * 60 + cStartMM
+int endMOD = switch preset
+    "Gold · XAUUSD"        => 11 * 60
+    "US stocks / indices"  => 11 * 60 + 30
+    => cEndHH * 60 + cEndMM
+
+string tz2 = switch sess2Mode
+    "Asian · Tokyo open" => "Asia/Tokyo"
+    "Asian · full Tokyo" => "Asia/Tokyo"
+    "London open"        => "Europe/London"
+    => tz2Custom
+int start2 = switch sess2Mode
+    "Asian · Tokyo open" => 9 * 60
+    "Asian · full Tokyo" => 9 * 60
+    "London open"        => 8 * 60
+    => c2StartHH * 60 + c2StartMM
+int end2 = switch sess2Mode
+    "Asian · Tokyo open" => 11 * 60 + 30
+    "Asian · full Tokyo" => 15 * 60
+    "London open"        => 10 * 60 + 30
+    => c2EndHH * 60 + c2EndMM
+
+int  barMOD      = hour(time, mktTZ) * 60 + minute(time, mktTZ)
+int  barMOD2     = hour(time, tz2) * 60 + minute(time, tz2)
+bool afterAnchor = barMOD >= anchorMOD
+bool dayWrapped  = barMOD < nz(barMOD[1], barMOD)
+bool marketGap   = (time - nz(time[1], time)) > 8 * 60 * 60 * 1000
+// The gap clause is tied to the anchor rather than standing alone, so a holiday
+// or a data hole cannot re-anchor the VWAP in the middle of the session.
+bool intradayAnc = dayWrapped or (afterAnchor and (not afterAnchor[1] or marketGap))
+
+bool inWindow  = startMOD <= endMOD ? (barMOD >= startMOD and barMOD < endMOD) : (barMOD >= startMOD or barMOD < endMOD)
+bool inWindow2 = use2 and (start2 <= end2 ? (barMOD2 >= start2 and barMOD2 < end2) : (barMOD2 >= start2 or barMOD2 < end2))
+bool inSession = not useSession or inWindow or inWindow2
+bool tfOK      = not enforceTF or timeframe.period == "3"
+
+// A window opening is a fresh start for the VWAP when re-anchoring is on.
+// These must come AFTER inWindow/inWindow2 exist — Pine has no forward
+// declarations, and using them earlier is a compile error.
+bool win1Open  = inWindow  and not inWindow[1]
+bool win2Open  = inWindow2 and not inWindow2[1]
+bool newAnchor = not timeframe.isintraday or intradayAnc or (reAnchor and (win1Open or win2Open))
+
+var float cumPV  = 0.0
+var float cumVol = 0.0
+if newAnchor
+    cumPV  := 0.0
+    cumVol := 0.0
+cumPV  := cumPV  + srcPx * volUsed
+cumVol := cumVol + volUsed
+float vwapVal = (timeframe.isintraday and cumVol > 0) ? cumPV / cumVol : na
+
+float emaVal = ta.ema(close, emaLen)
+float atr    = ta.atr(14)
+
+float rng     = math.max(high - low, syminfo.mintick)
+float bodyPct = math.abs(close - open) / rng * 100.0
+float lowWick = (math.min(open, close) - low) / rng * 100.0
+float upWick  = (high - math.max(open, close)) / rng * 100.0
+
+float volSum = math.sum(volUsed, volLen)
+float volCnt = math.sum(volUsed > 0 ? 1.0 : 0.0, volLen)
+float avgVol = volCnt > 0 ? volSum / volCnt : 0.0
+float avgRng = ta.sma(high - low, 20)
+float avgBody = ta.sma(math.abs(close - open), 20)
+
+bool volSpike   = hasRealVol and avgVol > 0 and volUsed >= avgVol * volMult
+bool rangeBurst = nz(avgRng, 0.0) > 0 and (high - low) >= avgRng * rangeMult
+// Guide, step 8: "a high-volume, OVERSIZED candle — significantly larger in body
+// than the surrounding bars AND accompanied by a visible spike in volume."
+// Volume is required when the instrument actually has it; range stands in only
+// when it does not.
+bool oversized  = nz(avgBody, 0.0) > 0 and math.abs(close - open) >= avgBody * rangeMult
+bool momentumBar = oversized and bodyPct >= 50.0 and (hasRealVol ? volSpike : rangeBurst)
+
+// ══════════════════════════════════════════════ THE CROSS — AN EVENT, NOT A STATE
+int sinceUp = nz(ta.barssince(ta.crossover(emaVal, vwapVal)),  99999)
+int sinceDn = nz(ta.barssince(ta.crossunder(emaVal, vwapVal)), 99999)
+
+// Inside the window AND after the wait. `sinceUp < sinceDn` stops a cross that
+// a later opposite cross has already superseded from confirming a trade.
+// The wait is skipped on an oversized high-volume candle — the guide's own
+// exception in step 8.
+int  waitNeed  = momentumBar ? 0 : waitBars
+// The far edge can never sit before the near edge — otherwise a wait longer
+// than the window silently kills every cross-confirmed signal with no warning.
+int  crossFar  = math.max(crossBars, waitNeed)
+bool crossedUp = sinceUp >= waitNeed and sinceUp <= crossFar and sinceUp < sinceDn
+bool crossedDn = sinceDn >= waitNeed and sinceDn <= crossFar and sinceDn < sinceUp
+
+// "you can act when you can see the EMA beginning to cross" — a curl only counts
+// if the gap is closing fast enough to actually cross inside the same window.
+float gapNow    = emaVal - vwapVal
+float gapPrev   = nz(emaVal[1], emaVal) - nz(vwapVal[1], vwapVal)
+float closeRate = math.abs(gapPrev) - math.abs(gapNow)
+float barsToX   = closeRate > 0 ? math.abs(gapNow) / closeRate : 1e9
+bool  onTrack   = barsToX <= math.max(crossBars, 1)
+bool  tight     = math.abs(gapNow) <= atr * curlGap
+bool  curlUp = allowCurl and gapNow < 0 and onTrack and tight and emaVal > nz(emaVal[1], emaVal)
+bool  curlDn = allowCurl and gapNow > 0 and onTrack and tight and emaVal < nz(emaVal[1], emaVal)
+
+bool confirmUp = crossedUp or curlUp
+bool confirmDn = crossedDn or curlDn
+
+// ═══════════════════════════════════════════════════════════ ENTRY LOGIC ════
+// "a candle that closes above or below the VWAP while the wick of that candle
+//  touches or crosses through the VWAP line"
+// Page 8, exactly: the candle CLOSES on one side of the VWAP and its WICK
+// touches or crosses the line. The open is not mentioned and is not tested,
+// unless you opt into the stricter reading above.
+// Two candles satisfy that sentence. Both are taken, drawn differently, and
+// each can be switched off on its own — they are not the same trade:
+//   REJECTION — open and close the same side, only the wick crosses. Refused.
+//   BREAKOUT  — open one side, close the other. Went straight through.
+bool rawLong  = low  <= vwapVal and close > vwapVal
+bool rawShort = high >= vwapVal and close < vwapVal
+bool rejLong  = rawLong  and open >= vwapVal
+bool rejShort = rawShort and open <= vwapVal
+bool touchLong  = rawLong  and (rejLong  ? takeReject : takeBreak)
+bool touchShort = rawShort and (rejShort ? takeReject : takeBreak)
+bool wickLong   = touchLong  and (lowWick >= xRej or momentumBar)
+bool wickShort  = touchShort and (upWick  >= xRej or momentumBar)
+bool bodyOK     = bodyPct >= xBody or momentumBar
+bool bigEnough  = xMinR <= 0.0 or (high - low) >= xMinR
+
+// "A candle that wicks BOTH the VWAP and the 9 EMA simultaneously is an even
+//  stronger signal." No volume condition attached to it in the guide.
+bool bothLong  = low  <= math.min(vwapVal, emaVal) and close > math.max(vwapVal, emaVal)
+bool bothShort = high >= math.max(vwapVal, emaVal) and close < math.min(vwapVal, emaVal)
+
+bool validLong  = tfOK and wickLong  and confirmUp and inSession and bodyOK and bigEnough
+bool validShort = tfOK and wickShort and confirmDn and inSession and bodyOK and bigEnough
+bool confLong   = validLong  and bothLong
+bool confShort  = validShort and bothShort
+
+bool confOnly  = tierMode == "Confluence only"
+bool sigLong   = confOnly ? confLong  : validLong
+bool sigShort  = confOnly ? confShort : validShort
+
+// ═════════════════════════════════════════════════════════════ FUNCTIONS ═════
+f_stop(bool isLong, float entryPx) =>
+    float raw = switch slMode
+        "Rejection wick" => isLong ? low : high
+        "Beyond VWAP"    => vwapVal
+        => isLong ? entryPx - atr * slAtrMult : entryPx + atr * slAtrMult
+    float buf = slMode == "ATR multiple" ? 0.0 : atr * slBuffer
+    isLong ? math.min(raw, entryPx) - buf : math.max(raw, entryPx) + buf
+
+f_row(table t, int r, string name, int n, int prev, string hint) =>
+    int lost = prev - n
+    table.cell(t, 0, r, name, text_color = color.silver, text_size = size.tiny)
+    table.cell(t, 1, r, str.tostring(n), text_color = n > 0 ? #3FA87A : #D0566A, text_size = size.tiny)
+    table.cell(t, 2, r, lost > 0 ? "−" + str.tostring(lost) + " " + hint : "", text_color = color.gray, text_size = size.tiny)
+
+// ═════════════════════════════════════════════════════════════ DIAGNOSTICS ═══
+var int dBars    = 0
+var int dVwapOK  = 0
+var int dTouch   = 0
+var int dConfirm = 0
+var int dCurl    = 0
+var int dSess    = 0
+var int dExtras  = 0
+var int dConf    = 0
+var int dTrades  = 0
+
+if barstate.isconfirmed
+    dBars += 1
+    if not na(vwapVal)
+        dVwapOK += 1
+        if touchLong or touchShort
+            dTouch += 1
+            if (touchLong and confirmUp) or (touchShort and confirmDn)
+                dConfirm += 1
+                if (touchLong and curlUp and not crossedUp) or (touchShort and curlDn and not crossedDn)
+                    dCurl += 1
+                if inSession and tfOK
+                    dSess += 1
+                    if (wickLong or wickShort) and bodyOK and bigEnough
+                        dExtras += 1
+                        if bothLong or bothShort
+                            dConf += 1
+
+// ══════════════════════════════════════════════════ TRADE STATE & DRAWING ════
+var int   tDir     = 0
+var float tEntry   = na
+var float tSL      = na
+var float tTP      = na
+var bool  emaArmed = false
+var bool  tWasRej  = false
+var int   tBar     = 0
+var float tRisk    = na
+var int   nReject  = 0
+var int   nBreak   = 0
+var int   lastExit = -99999
+var line  lEnt = na
+var line  lTP  = na
+var line  lSL  = na
+
+var array<line>  arrLine  = array.new<line>()
+var array<label> arrLbl   = array.new<label>()
+// Bar time of each drawing, so old ones can be aged out by date rather than
+// by a raw count — "the last three weeks" instead of "the last twenty".
+var array<int>   arrLineT = array.new<int>()
+var array<int>   arrLblT  = array.new<int>()
+var bool capped = false
+
+// Reset each bar, set on entry, read by alertcondition at the bottom — which
+// must fire on the trade the script actually takes, not on the raw signal.
+bool firedBuy  = false
+bool firedSell = false
+
+if barstate.isconfirmed
+    if tDir != 0
+        // The guide's exit assumes price was being held up by the EMA: "Price is
+        // no longer being supported by the EMA — the trend that justified your
+        // entry is now invalidated." A trade that never got to the right side of
+        // the EMA was never supported by it, so the exit only arms once it does.
+        emaArmed := emaArmed or (tDir == 1 ? close > emaVal : close < emaVal)
+        bool hitSL  = not na(tSL) and (tDir == 1 ? low  <= tSL : high >= tSL)
+        bool hitTP  = not na(tTP) and (tDir == 1 ? high >= tTP : low  <= tTP)
+        bool emaOut  = emaArmed and (tDir == 1 ? close < emaVal : close > emaVal)
+        bool armFail = not emaArmed and (bar_index - tBar) >= armWithin
+        bool dayEnd  = flatNewDay and newAnchor and bar_index > tBar
+        string res   = hitSL ? "SL" : hitTP ? "TP" : emaOut ? "EMA" : armFail ? "flat" : dayEnd ? "day" : ""
+        float exitPx = hitSL ? tSL : hitTP ? tTP : close
+
+        // While the trade runs the line simply tracks the current bar. The
+        // minimum length is applied once, at the exit, so an open trade is
+        // never drawn longer than it has actually lasted.
+        line.set_x2(lEnt, bar_index)
+        if not na(lTP)
+            line.set_x2(lTP, bar_index)
+        if not na(lSL)
+            line.set_x2(lSL, bar_index)
+
+        if res != ""
+            // Risk is frozen at entry. Measuring it at the exit against a moving
+            // EMA would make almost every trade read as exactly 1R, and collapse
+            // to a divide-by-almost-zero on the ones that die near breakeven.
+            float rr  = nz(tRisk, 0.0) > 0 ? (exitPx - tEntry) * tDir / tRisk : 0.0
+            float pct = tEntry != 0 ? (exitPx - tEntry) * tDir / tEntry * 100.0 : 0.0
+            // With no stop there is no defined risk, so R would be a ratio to
+            // nothing. Report the move itself instead.
+            string resTxt = na(tSL) ? (pct >= 0 ? "+" : "") + str.tostring(pct, "#.##") + "%"
+                 : (rr >= 0 ? "+" : "") + str.tostring(rr, "#.#") + "R"
+            // Stretch a short trade out to a readable length and hang the text
+            // off the far end of the line.
+            int endBar = math.max(bar_index, tBar + minBars)
+            line.set_x2(lEnt, endBar)
+            if not na(lTP)
+                line.set_x2(lTP, endBar)
+            if not na(lSL)
+                line.set_x2(lSL, endBar)
+            if showResult or showType
+                string tag = tWasRej ? "rejection" : "breakout"
+                array.push(arrLbl, label.new(endBar, tEntry,
+                     (showType ? tag : "") + (showType and showResult ? "  " : "") + (showResult ? resTxt : ""),
+                     style = label.style_none, textcolor = tDir == 1 ? cBuy : cSell, size = szTxt))
+                array.push(arrLblT, time)
+            tDir     := 0
+            tEntry   := na
+            tSL      := na
+            tTP      := na
+            emaArmed := false
+            tRisk    := na
+            lEnt     := na
+            lTP      := na
+            lSL      := na
+            lastExit := bar_index
+
+    bool cooled = bar_index - lastExit >= xCool
+    bool wantL = sigLong  and tradeLong  and tDir == 0 and cooled
+    bool wantS = sigShort and tradeShort and tDir == 0 and cooled
+    if wantL or wantS
+        int   d  = wantL ? 1 : -1
+        float en = close
+        bool  stopWanted = slMode != "None"
+        float sl   = stopWanted ? f_stop(wantL, en) : na
+        float risk = na(sl) ? na : math.abs(en - sl)
+        // f_stop returns na while ATR is still warming up. Without this the
+        // guard short-circuits and opens a trade with no stop even though one
+        // was asked for.
+        if stopWanted ? (not na(sl) and risk > syminfo.mintick) : true
+            float tp = (na(sl) or rMult <= 0.0) ? na : en + d * risk * rMult
+            bool  conf    = wantL ? confLong : confShort
+            bool  thisRej = wantL ? rejLong : rejShort
+            color ec      = d == 1 ? cBuy : cSell
+            int   w       = (markConf and conf) ? entryWidth + confBoost : entryWidth
+            if thisRej
+                nReject += 1
+            else
+                nBreak += 1
+
+            tDir     := d
+            tEntry   := en
+            tSL      := sl
+            tTP      := tp
+            emaArmed := d == 1 ? close > emaVal : close < emaVal
+            tWasRej  := thisRej
+            tBar     := bar_index
+            tRisk    := na(sl) ? math.max(math.abs(en - emaVal), atr * 0.25) : risk
+            firedBuy  := d == 1
+            firedSell := d == -1
+
+            // x2 = bar_index + 1 so the line is visible on the entry bar itself.
+            // A zero-length line renders as nothing, and with no arrows there
+            // would be no mark at all until the next bar closed.
+            string entStyle = switch lineStyle
+                "Rejection dotted, breakout solid" => thisRej ? line.style_dotted : line.style_solid
+                "Rejection dashed, breakout solid" => thisRej ? line.style_dashed : line.style_solid
+                "Rejection solid, breakout dashed" => thisRej ? line.style_solid  : line.style_dashed
+                => line.style_solid
+            lEnt := line.new(bar_index, en, bar_index + 1, en, color = ec, width = w, style = entStyle)
+            array.push(arrLine, lEnt)
+            array.push(arrLineT, time)
+            if not na(tp)
+                lTP := line.new(bar_index, tp, bar_index + 1, tp, color = color.new(ec, levelFade), width = levelWidth, style = line.style_dotted)
+                array.push(arrLine, lTP)
+                array.push(arrLineT, time)
+            if not na(sl)
+                lSL := line.new(bar_index, sl, bar_index + 1, sl, color = color.new(ec, levelFade), width = levelWidth, style = line.style_dotted)
+                array.push(arrLine, lSL)
+                array.push(arrLineT, time)
+
+            if showWord or showPrices
+                array.push(arrLbl, label.new(bar_index, en,
+                     (showWord ? (d == 1 ? wBuy : wSell) : "") + (showWord and showPrices ? "  " : "") +
+                     (showPrices ? str.tostring(en, format.mintick) : ""),
+                     style = label.style_none, textcolor = ec, size = szTxt))
+                array.push(arrLblT, time)
+            if showPrices
+                if not na(tp)
+                    array.push(arrLbl, label.new(bar_index, tp, "TP " + str.tostring(tp, format.mintick),
+                         style = label.style_none, textcolor = color.new(ec, 20), size = szTxt))
+                    array.push(arrLblT, time)
+                if not na(sl)
+                    array.push(arrLbl, label.new(bar_index, sl, "SL " + str.tostring(sl, format.mintick),
+                         style = label.style_none, textcolor = color.new(ec, 20), size = szTxt))
+                    array.push(arrLblT, time)
+            dTrades += 1
+
+    // Objects per trade vary with whether a stop and target exist, so both the
+    // age cut and the budget cap are computed rather than assumed.
+    int linesPer = 1 + (slMode == "None" ? 0 : 1) + ((slMode == "None" or rMult <= 0.0) ? 0 : 1)
+    int lblPer   = math.max(((showWord or showPrices) ? 1 : 0) + (showResult ? 1 : 0) + (showPrices ? linesPer - 1 : 0), 1)
+    // TradingView allows 500 of each. Leave headroom and work out how many
+    // whole trades that buys at the current settings.
+    int capTrades = math.min(490 / linesPer, 490 / lblPer)
+    int cutoff    = time - histDays * 86400000
+
+    // Age first. The guard keeps one trade's worth of objects so the OPEN trade
+    // can never have its line deleted out from under line.set_x2.
+    while array.size(arrLineT) > 0 and array.size(arrLine) > linesPer and array.get(arrLineT, 0) < cutoff
+        line.delete(array.shift(arrLine))
+        array.shift(arrLineT)
+    while array.size(arrLblT) > 0 and array.size(arrLbl) > lblPer and array.get(arrLblT, 0) < cutoff
+        label.delete(array.shift(arrLbl))
+        array.shift(arrLblT)
+
+    // Then the hard object budget.
+    while array.size(arrLine) > capTrades * linesPer
+        line.delete(array.shift(arrLine))
+        array.shift(arrLineT)
+    while array.size(arrLbl) > capTrades * lblPer
+        label.delete(array.shift(arrLbl))
+        array.shift(arrLblT)
+    // Standing state, not a one-bar event: are we sitting on the ceiling?
+    capped := array.size(arrLine) >= capTrades * linesPer or array.size(arrLbl) >= capTrades * lblPer
+
+// ═══════════════════════════════════════════════════════════════ PLOTTING ═══
+// linewidth needs a constant, so each thickness is its own plot gated by the
+// setting rather than passed as an argument. Only one of each ever draws.
+plot(showLines and wVwap == 1 ? vwapVal : na, "VWAP 1", color = cVwap, linewidth = 1)
+plot(showLines and wVwap == 2 ? vwapVal : na, "VWAP 2", color = cVwap, linewidth = 2)
+plot(showLines and wVwap == 3 ? vwapVal : na, "VWAP 3", color = cVwap, linewidth = 3)
+plot(showLines and wVwap == 4 ? vwapVal : na, "VWAP 4", color = cVwap, linewidth = 4)
+plot(showLines and wVwap == 5 ? vwapVal : na, "VWAP 5", color = cVwap, linewidth = 5)
+plot(showLines and wVwap == 6 ? vwapVal : na, "VWAP 6", color = cVwap, linewidth = 6)
+plot(showLines and wVwap == 7 ? vwapVal : na, "VWAP 7", color = cVwap, linewidth = 7)
+plot(showLines and wVwap == 8 ? vwapVal : na, "VWAP 8", color = cVwap, linewidth = 8)
+plot(showLines and wEma == 1 ? emaVal : na, "EMA 1", color = cEma, linewidth = 1)
+plot(showLines and wEma == 2 ? emaVal : na, "EMA 2", color = cEma, linewidth = 2)
+plot(showLines and wEma == 3 ? emaVal : na, "EMA 3", color = cEma, linewidth = 3)
+plot(showLines and wEma == 4 ? emaVal : na, "EMA 4", color = cEma, linewidth = 4)
+plot(showLines and wEma == 5 ? emaVal : na, "EMA 5", color = cEma, linewidth = 5)
+plot(showLines and wEma == 6 ? emaVal : na, "EMA 6", color = cEma, linewidth = 6)
+plot(showLines and wEma == 7 ? emaVal : na, "EMA 7", color = cEma, linewidth = 7)
+plot(showLines and wEma == 8 ? emaVal : na, "EMA 8", color = cEma, linewidth = 8)
+bgcolor(useSession and inWindow  ? color.new(#2962FF, 96) : na, title = "Primary session")
+bgcolor(useSession and inWindow2 ? color.new(#AB47BC, 96) : na, title = "Second session")
+
+// ═════════════════════════════════════════════════════════════════ PANELS ════
+var table st = table.new(position.top_right, 2, 7, border_width = 1)
+if showStatus and barstate.islast
+    string tf   = tfOK and timeframe.period == "3" ? "3 min ✓" : timeframe.period + (enforceTF ? "  ⛔ muted" : "  ⚠ use 3")
+    string bias = emaVal > vwapVal ? "EMA above VWAP" : emaVal < vwapVal ? "EMA below VWAP" : "flat"
+    int    age  = emaVal > vwapVal ? sinceUp : sinceDn
+    string ageS = age > 9000 ? "no cross yet" : str.tostring(age) + " bars since cross"
+    string posn = tDir == 1 ? wBuy + " open" : tDir == -1 ? wSell + " open" : "flat"
+    table.cell(st, 0, 0, "VWAP + EMA 9", text_color = color.white, bgcolor = #1E1E2E, text_size = size.small)
+    table.cell(st, 1, 0, tf, text_color = (tfOK and timeframe.period == "3") ? #3FA87A : #E0A030, bgcolor = #1E1E2E, text_size = size.small)
+    table.cell(st, 0, 1, "Volume", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 1, volActive, text_color = hasRealVol ? #3FA87A : #E0A030, text_size = size.small)
+    table.cell(st, 0, 2, "VWAP", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 2, na(vwapVal) ? "— n/a" : str.tostring(vwapVal, format.mintick), text_color = na(vwapVal) ? #E0A030 : cVwap, text_size = size.small)
+    table.cell(st, 0, 3, "Bias", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 3, bias, text_color = emaVal > vwapVal ? #3FA87A : #D0566A, text_size = size.small)
+    table.cell(st, 0, 4, "Cross", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 4, ageS, text_color = (crossedUp or crossedDn or curlUp or curlDn) ? #3FA87A : color.gray, text_size = size.small)
+    string sessTxt = not inSession ? "closed" : inWindow2 ? "OPEN ✓ · 2nd" : "OPEN ✓"
+    table.cell(st, 0, 5, "Session", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 5, sessTxt, text_color = inSession ? #3FA87A : color.gray, text_size = size.small)
+    table.cell(st, 0, 6, "Trades", text_color = color.gray, text_size = size.small)
+    table.cell(st, 1, 6, str.tostring(nReject) + " rej / " + str.tostring(nBreak) + " brk · " + posn + (capped ? " · capped" : ""),
+         text_color = tDir != 0 ? #3FA87A : color.silver, text_size = size.small)
+
+var table dg = table.new(position.bottom_right, 3, 9, border_width = 1)
+if showDiag and barstate.islast
+    table.cell(dg, 0, 0, "DIAGNOSTICS", text_color = color.white, bgcolor = #1E1E2E, text_size = size.tiny)
+    table.cell(dg, 1, 0, "left", text_color = color.gray, bgcolor = #1E1E2E, text_size = size.tiny)
+    table.cell(dg, 2, 0, "removed by", text_color = color.gray, bgcolor = #1E1E2E, text_size = size.tiny)
+    f_row(dg, 1, "bars loaded",         dBars,    dBars,    "")
+    f_row(dg, 2, "VWAP valid",          dVwapOK,  dBars,    "no volume yet")
+    f_row(dg, 3, "wicked the VWAP",     dTouch,   dVwapOK,  "never reached VWAP")
+    f_row(dg, 4, "cross + wait done",   dConfirm, dTouch,   "no cross, or too soon")
+    f_row(dg, 5, "   · via curl",       dCurl,    dCurl,    "")
+    f_row(dg, 6, "session + timeframe", dSess,    dConfirm, "outside hours / wrong TF")
+    f_row(dg, 7, "your extras",         dExtras,  dSess,    "section ⑤ filters")
+    f_row(dg, 8, "trades drawn",        dTrades,  confOnly ? dConf : dExtras, "already in a trade")
+
+// ═══════════════════════════════════════════════════════════════ ALERTS ═════
+alertcondition(firedBuy,  "Entry — buy",  "VWAP+EMA9: BUY entry at {{close}}")
+alertcondition(firedSell, "Entry — sell", "VWAP+EMA9: SELL entry at {{close}}")

@@ -1,0 +1,898 @@
+//@version=6
+indicator("EZ$ PB Blake v1.0", shorttitle="EZ$ PB", overlay=true,
+     max_boxes_count=120, max_lines_count=120, max_labels_count=250)
+
+// EZ$ PB Blake v1.0
+// Four-step model:
+// 1) HTF bias + draw on liquidity.
+// 2) Valid key level: FVG, ITL/ITH, CISD, rejection block.
+// 3) Highest-timeframe 1M-5M IFVG inside the manipulation leg.
+// 4) Enter after confirmed body close through that IFVG.
+//
+// Notes:
+// - SMT is intentionally context-only / not required in v1.0.
+// - 30-second IFVG is intentionally omitted from automation in v1.0.
+// - Auto bias/key selection are systematic interpretations of a discretionary model.
+
+// ───────────────────────── Inputs ─────────────────────────
+groupBias = "1. HTF Bias + Draw on Liquidity"
+biasMode = input.string("Auto FVG Respect", "Bias Mode",
+     options=["Auto FVG Respect", "Manual Bullish", "Manual Bearish"], group=groupBias)
+use15mBias = input.bool(true, "Include 15M in Bias Score", group=groupBias)
+biasMinScore = input.int(2, "Minimum Absolute Bias Score", minval=1, maxval=9, group=groupBias)
+dolTF = input.timeframe("60", "Draw-on-Liquidity Swing TF", group=groupBias)
+dolPivotStrength = input.int(3, "DOL Swing Strength", minval=1, maxval=10, group=groupBias)
+showDOL = input.bool(true, "Show BSL / SSL Draw", group=groupBias)
+
+groupKL = "2. Valid Key Levels"
+use3mKL = input.bool(true, "Use 3M Key Levels", group=groupKL)
+use5mKL = input.bool(true, "Use 5M Key Levels", group=groupKL)
+use15mKL = input.bool(true, "Use 15M Key Levels", group=groupKL)
+use30mKL = input.bool(true, "Use 30M Key Levels", group=groupKL)
+use1hKL = input.bool(true, "Use 1H Key Levels", group=groupKL)
+use4hKL = input.bool(true, "Use 4H Key Levels", group=groupKL)
+keyPivotStrength = input.int(2, "ITL / ITH Pivot Strength", minval=1, maxval=6, group=groupKL)
+cisdSeriesMax = input.int(6, "Max Opposing Candle Series for CISD", minval=1, maxval=12, group=groupKL)
+thinZoneATR = input.float(0.03, "Thin Level Half-Width × ATR", minval=0.0, maxval=0.25, step=0.01, group=groupKL)
+showKeyZone = input.bool(true, "Show Active Key-Level Zone", group=groupKL)
+
+groupIFVG = "3. IFVG Confirmation"
+manipLookback = input.int(30, "Manipulation Swing Lookback Bars", minval=5, maxval=200, group=groupIFVG)
+use1mIFVG = input.bool(true, "Scan 1M IFVG", group=groupIFVG)
+use2mIFVG = input.bool(true, "Scan 2M IFVG", group=groupIFVG)
+use3mIFVG = input.bool(true, "Scan 3M IFVG", group=groupIFVG)
+use4mIFVG = input.bool(true, "Scan 4M IFVG", group=groupIFVG)
+use5mIFVG = input.bool(true, "Scan 5M IFVG", group=groupIFVG)
+requireGapOpenAtTouch = input.bool(false, "Require Opposite FVG Uninverted at Key Touch", group=groupIFVG)
+showIFVG = input.bool(true, "Show Selected IFVG", group=groupIFVG)
+
+groupExec = "4. Execution / Risk"
+useGoldenHour = input.bool(true, "Only Signal During Golden Hour", group=groupExec)
+goldenHour = input.session("0930-1100", "Execution Window", group=groupExec)
+sessionTZ = input.string("America/New_York", "Session Time Zone", group=groupExec)
+maxSignalsPerSession = input.int(2, "Maximum Signals per Session", minval=1, maxval=5, group=groupExec)
+showSwingStop = input.bool(true, "Show Safest Swing Stop Reference", group=groupExec)
+showSignals = input.bool(true, "Show PB LONG / PB SHORT", group=groupExec)
+
+groupVis = "5. Display"
+showDashboard = input.bool(true, "Show PB Dashboard", group=groupVis)
+showBiasBreakdown = input.bool(true, "Show HTF Bias Rows", group=groupVis)
+showSetupLabels = input.bool(true, "Show Key Hit / IFVG Armed Labels", group=groupVis)
+bullColor = input.color(color.rgb(38, 170, 90), "Bull Color", group=groupVis)
+bearColor = input.color(color.rgb(215, 75, 75), "Bear Color", group=groupVis)
+keyColor = input.color(color.rgb(210, 170, 55), "Key-Level Color", group=groupVis)
+ifvgColor = input.color(color.rgb(55, 150, 210), "IFVG Color", group=groupVis)
+
+// ───────────────────────── Helpers ─────────────────────────
+f_type_label(int code) =>
+    switch code
+        1 => "FVG"
+        2 => "ITL/ITH"
+        3 => "CISD"
+        4 => "RB"
+        => "NONE"
+
+f_bias_word(int v) =>
+    v == 1 ? "BULL" : v == -1 ? "BEAR" : "NEUTRAL"
+
+// ───────────────────────── STEP 1: HTF Bias ─────────────────────────
+// Bull evidence: bullish FVG defended OR bearish FVG body-closed through.
+// Bear evidence: bearish FVG defended OR bullish FVG body-closed through.
+f_bias_state() =>
+    bool bullNew = low > high[2]
+    bool bearNew = high < low[2]
+
+    var float bullTop = na
+    var float bullBot = na
+    var bool bullTouched = false
+    var bool bullInvalid = false
+
+    var float bearTop = na
+    var float bearBot = na
+    var bool bearTouched = false
+    var bool bearInvalid = false
+
+    if bullNew
+        bullTop := low
+        bullBot := high[2]
+        bullTouched := false
+        bullInvalid := false
+
+    if bearNew
+        bearTop := low[2]
+        bearBot := high
+        bearTouched := false
+        bearInvalid := false
+
+    if not na(bullTop)
+        if low <= bullTop and high >= bullBot
+            bullTouched := true
+        if close < bullBot
+            bullInvalid := true
+
+    if not na(bearTop)
+        if high >= bearBot and low <= bearTop
+            bearTouched := true
+        if close > bearTop
+            bearInvalid := true
+
+    int bullEvidence = (bullTouched and not bullInvalid ? 1 : 0) + (bearInvalid ? 1 : 0)
+    int bearEvidence = (bearTouched and not bearInvalid ? 1 : 0) + (bullInvalid ? 1 : 0)
+    bullEvidence > bearEvidence ? 1 : bearEvidence > bullEvidence ? -1 : 0
+
+int dBias = request.security(syminfo.tickerid, "1D", f_bias_state(), lookahead=barmerge.lookahead_off)
+int h4Bias = request.security(syminfo.tickerid, "240", f_bias_state(), lookahead=barmerge.lookahead_off)
+int h1Bias = request.security(syminfo.tickerid, "60", f_bias_state(), lookahead=barmerge.lookahead_off)
+int m15Bias = request.security(syminfo.tickerid, "15", f_bias_state(), lookahead=barmerge.lookahead_off)
+
+int autoScore = dBias * 3 + h4Bias * 3 + h1Bias * 2 + (use15mBias ? m15Bias : 0)
+int biasDir = biasMode == "Manual Bullish" ? 1 :
+     biasMode == "Manual Bearish" ? -1 :
+     autoScore >= biasMinScore ? 1 :
+     autoScore <= -biasMinScore ? -1 : 0
+string biasText = biasDir == 1 ? "BULLISH" : biasDir == -1 ? "BEARISH" : "WAIT"
+
+// Draw on liquidity = recent confirmed swing in bias direction.
+f_recent_swings(int strength) =>
+    float ph = ta.pivothigh(high, strength, strength)
+    float pl = ta.pivotlow(low, strength, strength)
+    var float h1 = na
+    var float h2 = na
+    var float l1 = na
+    var float l2 = na
+    if not na(ph)
+        h2 := h1
+        h1 := ph
+    if not na(pl)
+        l2 := l1
+        l1 := pl
+    [h1, h2, l1, l2]
+
+[dolH1, dolH2, dolL1, dolL2] = request.security(syminfo.tickerid, dolTF,
+     f_recent_swings(dolPivotStrength), lookahead=barmerge.lookahead_off)
+
+float bullDOL = not na(dolH1) and dolH1 > close ? dolH1 :
+     not na(dolH2) and dolH2 > close ? dolH2 : na
+float bearDOL = not na(dolL1) and dolL1 < close ? dolL1 :
+     not na(dolL2) and dolL2 < close ? dolL2 : na
+float activeDOL = biasDir == 1 ? bullDOL : biasDir == -1 ? bearDOL : na
+string dolText = biasDir == 1 ? "BSL" : biasDir == -1 ? "SSL" : "WAIT"
+
+// ───────────────────────── STEP 2: Key Levels ─────────────────────────
+// Returns the nearest active bullish and bearish key-level candidate on one TF.
+// Type 1 FVG, 2 ITL/ITH, 3 CISD, 4 rejection block.
+f_key_levels(int pivotStrength, int seriesMax, float thinMult) =>
+    float atr = ta.atr(14)
+    float thin = math.max(atr * thinMult, syminfo.mintick * 2.0)
+
+    bool bullNew = low > high[2]
+    bool bearNew = high < low[2]
+
+    var float bullFTop = na
+    var float bullFBot = na
+    var int bullFTime = na
+    var bool bullFActive = false
+
+    var float bearFTop = na
+    var float bearFBot = na
+    var int bearFTime = na
+    var bool bearFActive = false
+
+    if bullNew
+        bullFTop := low
+        bullFBot := high[2]
+        bullFTime := time
+        bullFActive := true
+
+    if bearNew
+        bearFTop := low[2]
+        bearFBot := high
+        bearFTime := time
+        bearFActive := true
+
+    if bullFActive and close < bullFBot
+        bullFActive := false
+    if bearFActive and close > bearFTop
+        bearFActive := false
+
+    // Candidate internal pivots inside an FVG.
+    float pl = ta.pivotlow(low, pivotStrength, pivotStrength)
+    float ph = ta.pivothigh(high, pivotStrength, pivotStrength)
+
+    var float bullITLCandidate = na
+    var float bearITHCandidate = na
+    var float bullITL = na
+    var float bearITH = na
+    var int bullITLTime = na
+    var int bearITHTime = na
+    var bool bullITLActive = false
+    var bool bearITHActive = false
+
+    if bullFActive and not na(pl) and pl >= bullFBot and pl <= bullFTop
+        bullITLCandidate := pl
+
+    if bearFActive and not na(ph) and ph >= bearFBot and ph <= bearFTop
+        bearITHCandidate := ph
+
+    // PB note: after a gap has reacted, the internal low/high becomes useful
+    // after that internal liquidity is swept and reclaimed.
+    if not na(bullITLCandidate) and low < bullITLCandidate and close > bullITLCandidate
+        bullITL := bullITLCandidate
+        bullITLTime := time
+        bullITLActive := true
+
+    if not na(bearITHCandidate) and high > bearITHCandidate and close < bearITHCandidate
+        bearITH := bearITHCandidate
+        bearITHTime := time
+        bearITHActive := true
+
+    if bullITLActive and close < bullITL - thin
+        bullITLActive := false
+    if bearITHActive and close > bearITH + thin
+        bearITHActive := false
+
+    bool bullFVGTouch = bullFActive and low <= bullFTop and high >= bullFBot
+    bool bearFVGTouch = bearFActive and high >= bearFBot and low <= bearFTop
+    bool bullITLTouch = bullITLActive and low <= bullITL + thin and high >= bullITL - thin
+    bool bearITHTouch = bearITHActive and high >= bearITH - thin and low <= bearITH + thin
+    bool bullBaseTouch = bullFVGTouch or bullITLTouch
+    bool bearBaseTouch = bearFVGTouch or bearITHTouch
+
+    // Rejection block = rejection wick into FVG / ITL or FVG / ITH.
+    float bodyLow = math.min(open, close)
+    float bodyHigh = math.max(open, close)
+
+    var float bullRBTop = na
+    var float bullRBBot = na
+    var int bullRBTime = na
+    var bool bullRBActive = false
+
+    var float bearRBTop = na
+    var float bearRBBot = na
+    var int bearRBTime = na
+    var bool bearRBActive = false
+
+    bool bullReject = bullBaseTouch and close > open and low < bodyLow
+    bool bearReject = bearBaseTouch and close < open and high > bodyHigh
+
+    if bullReject
+        bullRBBot := low
+        bullRBTop := bodyLow
+        bullRBTime := time
+        bullRBActive := true
+
+    if bearReject
+        bearRBBot := bodyHigh
+        bearRBTop := high
+        bearRBTime := time
+        bearRBActive := true
+
+    if bullRBActive and close < bullRBBot
+        bullRBActive := false
+    if bearRBActive and close > bearRBTop
+        bearRBActive := false
+
+    // CISD = body close through opening price of the contiguous opposing
+    // candle/series that traded into the aligned FVG / ITL / ITH.
+    var float pendingBullCISD = na
+    var float pendingBearCISD = na
+    var float bullCISD = na
+    var float bearCISD = na
+    var int bullCISDTime = na
+    var int bearCISDTime = na
+    var bool bullCISDActive = false
+    var bool bearCISDActive = false
+
+    if bullBaseTouch and close < open
+        float oldestOpen = open
+        for i = 0 to seriesMax - 1
+            if close[i] < open[i]
+                oldestOpen := open[i]
+            else
+                break
+        pendingBullCISD := oldestOpen
+
+    if bearBaseTouch and close > open
+        float oldestOpen = open
+        for i = 0 to seriesMax - 1
+            if close[i] > open[i]
+                oldestOpen := open[i]
+            else
+                break
+        pendingBearCISD := oldestOpen
+
+    if not na(pendingBullCISD) and close > pendingBullCISD
+        bullCISD := pendingBullCISD
+        bullCISDTime := time
+        bullCISDActive := true
+        pendingBullCISD := na
+
+    if not na(pendingBearCISD) and close < pendingBearCISD
+        bearCISD := pendingBearCISD
+        bearCISDTime := time
+        bearCISDActive := true
+        pendingBearCISD := na
+
+    if bullCISDActive and close < bullCISD - thin
+        bullCISDActive := false
+    if bearCISDActive and close > bearCISD + thin
+        bearCISDActive := false
+
+    // Nearest bullish support candidate.
+    int bullType = 0
+    float bullTop = na
+    float bullBot = na
+    int bullTime = na
+    float bullBest = 1e20
+
+    if bullRBActive
+        float d = close >= bullRBBot ? math.max(close - bullRBTop, 0.0) : 1e20
+        if d < bullBest
+            bullBest := d
+            bullType := 4
+            bullTop := bullRBTop
+            bullBot := bullRBBot
+            bullTime := bullRBTime
+
+    if bullCISDActive
+        float top = bullCISD + thin
+        float bot = bullCISD - thin
+        float d = close >= bot ? math.max(close - top, 0.0) : 1e20
+        if d < bullBest
+            bullBest := d
+            bullType := 3
+            bullTop := top
+            bullBot := bot
+            bullTime := bullCISDTime
+
+    if bullITLActive
+        float top = bullITL + thin
+        float bot = bullITL - thin
+        float d = close >= bot ? math.max(close - top, 0.0) : 1e20
+        if d < bullBest
+            bullBest := d
+            bullType := 2
+            bullTop := top
+            bullBot := bot
+            bullTime := bullITLTime
+
+    if bullFActive
+        float d = close >= bullFBot ? math.max(close - bullFTop, 0.0) : 1e20
+        if d < bullBest
+            bullBest := d
+            bullType := 1
+            bullTop := bullFTop
+            bullBot := bullFBot
+            bullTime := bullFTime
+
+    // Nearest bearish resistance candidate.
+    int bearType = 0
+    float bearTop = na
+    float bearBot = na
+    int bearTime = na
+    float bearBest = 1e20
+
+    if bearRBActive
+        float d = close <= bearRBTop ? math.max(bearRBBot - close, 0.0) : 1e20
+        if d < bearBest
+            bearBest := d
+            bearType := 4
+            bearTop := bearRBTop
+            bearBot := bearRBBot
+            bearTime := bearRBTime
+
+    if bearCISDActive
+        float top = bearCISD + thin
+        float bot = bearCISD - thin
+        float d = close <= top ? math.max(bot - close, 0.0) : 1e20
+        if d < bearBest
+            bearBest := d
+            bearType := 3
+            bearTop := top
+            bearBot := bot
+            bearTime := bearCISDTime
+
+    if bearITHActive
+        float top = bearITH + thin
+        float bot = bearITH - thin
+        float d = close <= top ? math.max(bot - close, 0.0) : 1e20
+        if d < bearBest
+            bearBest := d
+            bearType := 2
+            bearTop := top
+            bearBot := bot
+            bearTime := bearITHTime
+
+    if bearFActive
+        float d = close <= bearFTop ? math.max(bearFBot - close, 0.0) : 1e20
+        if d < bearBest
+            bearBest := d
+            bearType := 1
+            bearTop := bearFTop
+            bearBot := bearFBot
+            bearTime := bearFTime
+
+    [bullType, bullTop, bullBot, bullTime, bearType, bearTop, bearBot, bearTime]
+
+// Pull all PB key-level timeframes.
+[bT3, bTop3, bBot3, bTime3, sT3, sTop3, sBot3, sTime3] = request.security(syminfo.tickerid, "3", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+[bT5, bTop5, bBot5, bTime5, sT5, sTop5, sBot5, sTime5] = request.security(syminfo.tickerid, "5", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+[bT15, bTop15, bBot15, bTime15, sT15, sTop15, sBot15, sTime15] = request.security(syminfo.tickerid, "15", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+[bT30, bTop30, bBot30, bTime30, sT30, sTop30, sBot30, sTime30] = request.security(syminfo.tickerid, "30", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+[bT60, bTop60, bBot60, bTime60, sT60, sTop60, sBot60, sTime60] = request.security(syminfo.tickerid, "60", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+[bT240, bTop240, bBot240, bTime240, sT240, sTop240, sBot240, sTime240] = request.security(syminfo.tickerid, "240", f_key_levels(keyPivotStrength, cisdSeriesMax, thinZoneATR), lookahead=barmerge.lookahead_off)
+
+// Pick closest level. If price is already in multiple zones, prefer the higher TF.
+int activeKeyType = 0
+float activeKeyTop = na
+float activeKeyBot = na
+int activeKeyTime = na
+string activeKeyTF = ""
+float bestDist = 1e20
+float bestSec = -1.0
+
+if biasDir == 1
+    if use3mKL and bT3 != 0 and not na(bTop3) and close >= bBot3
+        float d = math.max(close - bTop3, 0.0)
+        if d < bestDist or (d == bestDist and 180 > bestSec)
+            bestDist := d
+            bestSec := 180
+            activeKeyType := bT3
+            activeKeyTop := bTop3
+            activeKeyBot := bBot3
+            activeKeyTime := bTime3
+            activeKeyTF := "3M"
+    if use5mKL and bT5 != 0 and not na(bTop5) and close >= bBot5
+        float d = math.max(close - bTop5, 0.0)
+        if d < bestDist or (d == bestDist and 300 > bestSec)
+            bestDist := d
+            bestSec := 300
+            activeKeyType := bT5
+            activeKeyTop := bTop5
+            activeKeyBot := bBot5
+            activeKeyTime := bTime5
+            activeKeyTF := "5M"
+    if use15mKL and bT15 != 0 and not na(bTop15) and close >= bBot15
+        float d = math.max(close - bTop15, 0.0)
+        if d < bestDist or (d == bestDist and 900 > bestSec)
+            bestDist := d
+            bestSec := 900
+            activeKeyType := bT15
+            activeKeyTop := bTop15
+            activeKeyBot := bBot15
+            activeKeyTime := bTime15
+            activeKeyTF := "15M"
+    if use30mKL and bT30 != 0 and not na(bTop30) and close >= bBot30
+        float d = math.max(close - bTop30, 0.0)
+        if d < bestDist or (d == bestDist and 1800 > bestSec)
+            bestDist := d
+            bestSec := 1800
+            activeKeyType := bT30
+            activeKeyTop := bTop30
+            activeKeyBot := bBot30
+            activeKeyTime := bTime30
+            activeKeyTF := "30M"
+    if use1hKL and bT60 != 0 and not na(bTop60) and close >= bBot60
+        float d = math.max(close - bTop60, 0.0)
+        if d < bestDist or (d == bestDist and 3600 > bestSec)
+            bestDist := d
+            bestSec := 3600
+            activeKeyType := bT60
+            activeKeyTop := bTop60
+            activeKeyBot := bBot60
+            activeKeyTime := bTime60
+            activeKeyTF := "1H"
+    if use4hKL and bT240 != 0 and not na(bTop240) and close >= bBot240
+        float d = math.max(close - bTop240, 0.0)
+        if d < bestDist or (d == bestDist and 14400 > bestSec)
+            bestDist := d
+            bestSec := 14400
+            activeKeyType := bT240
+            activeKeyTop := bTop240
+            activeKeyBot := bBot240
+            activeKeyTime := bTime240
+            activeKeyTF := "4H"
+
+if biasDir == -1
+    if use3mKL and sT3 != 0 and not na(sTop3) and close <= sTop3
+        float d = math.max(sBot3 - close, 0.0)
+        if d < bestDist or (d == bestDist and 180 > bestSec)
+            bestDist := d
+            bestSec := 180
+            activeKeyType := sT3
+            activeKeyTop := sTop3
+            activeKeyBot := sBot3
+            activeKeyTime := sTime3
+            activeKeyTF := "3M"
+    if use5mKL and sT5 != 0 and not na(sTop5) and close <= sTop5
+        float d = math.max(sBot5 - close, 0.0)
+        if d < bestDist or (d == bestDist and 300 > bestSec)
+            bestDist := d
+            bestSec := 300
+            activeKeyType := sT5
+            activeKeyTop := sTop5
+            activeKeyBot := sBot5
+            activeKeyTime := sTime5
+            activeKeyTF := "5M"
+    if use15mKL and sT15 != 0 and not na(sTop15) and close <= sTop15
+        float d = math.max(sBot15 - close, 0.0)
+        if d < bestDist or (d == bestDist and 900 > bestSec)
+            bestDist := d
+            bestSec := 900
+            activeKeyType := sT15
+            activeKeyTop := sTop15
+            activeKeyBot := sBot15
+            activeKeyTime := sTime15
+            activeKeyTF := "15M"
+    if use30mKL and sT30 != 0 and not na(sTop30) and close <= sTop30
+        float d = math.max(sBot30 - close, 0.0)
+        if d < bestDist or (d == bestDist and 1800 > bestSec)
+            bestDist := d
+            bestSec := 1800
+            activeKeyType := sT30
+            activeKeyTop := sTop30
+            activeKeyBot := sBot30
+            activeKeyTime := sTime30
+            activeKeyTF := "30M"
+    if use1hKL and sT60 != 0 and not na(sTop60) and close <= sTop60
+        float d = math.max(sBot60 - close, 0.0)
+        if d < bestDist or (d == bestDist and 3600 > bestSec)
+            bestDist := d
+            bestSec := 3600
+            activeKeyType := sT60
+            activeKeyTop := sTop60
+            activeKeyBot := sBot60
+            activeKeyTime := sTime60
+            activeKeyTF := "1H"
+    if use4hKL and sT240 != 0 and not na(sTop240) and close <= sTop240
+        float d = math.max(sBot240 - close, 0.0)
+        if d < bestDist or (d == bestDist and 14400 > bestSec)
+            bestDist := d
+            bestSec := 14400
+            activeKeyType := sT240
+            activeKeyTop := sTop240
+            activeKeyBot := sBot240
+            activeKeyTime := sTime240
+            activeKeyTF := "4H"
+
+string activeKeyLabel = activeKeyType == 0 ? "NONE" : activeKeyTF + " " + f_type_label(activeKeyType)
+
+// ───────────────────────── STEP 3: IFVG Engine ─────────────────────────
+// Return latest bullish and bearish FVG for an execution timeframe.
+f_last_fvgs() =>
+    bool bullNew = low > high[2]
+    bool bearNew = high < low[2]
+
+    var float bullTop = na
+    var float bullBot = na
+    var int bullTime = na
+    var bool bullOpen = false
+
+    var float bearTop = na
+    var float bearBot = na
+    var int bearTime = na
+    var bool bearOpen = false
+
+    if bullNew
+        bullTop := low
+        bullBot := high[2]
+        bullTime := time
+        bullOpen := true
+    if bearNew
+        bearTop := low[2]
+        bearBot := high
+        bearTime := time
+        bearOpen := true
+
+    if bullOpen and close < bullBot
+        bullOpen := false
+    if bearOpen and close > bearTop
+        bearOpen := false
+
+    [bullTop, bullBot, bullTime, bullOpen ? 1 : 0,
+     bearTop, bearBot, bearTime, bearOpen ? 1 : 0]
+
+[igBTop1, igBBot1, igBTime1, igBOpen1, igSTop1, igSBot1, igSTime1, igSOpen1] = request.security(syminfo.tickerid, "1", f_last_fvgs(), lookahead=barmerge.lookahead_off)
+[igBTop2, igBBot2, igBTime2, igBOpen2, igSTop2, igSBot2, igSTime2, igSOpen2] = request.security(syminfo.tickerid, "2", f_last_fvgs(), lookahead=barmerge.lookahead_off)
+[igBTop3, igBBot3, igBTime3, igBOpen3, igSTop3, igSBot3, igSTime3, igSOpen3] = request.security(syminfo.tickerid, "3", f_last_fvgs(), lookahead=barmerge.lookahead_off)
+[igBTop4, igBBot4, igBTime4, igBOpen4, igSTop4, igSBot4, igSTime4, igSOpen4] = request.security(syminfo.tickerid, "4", f_last_fvgs(), lookahead=barmerge.lookahead_off)
+[igBTop5, igBBot5, igBTime5, igBOpen5, igSTop5, igSBot5, igSTime5, igSOpen5] = request.security(syminfo.tickerid, "5", f_last_fvgs(), lookahead=barmerge.lookahead_off)
+
+float confClose1 = request.security(syminfo.tickerid, "1", close[1], lookahead=barmerge.lookahead_on)
+float confClose2 = request.security(syminfo.tickerid, "2", close[1], lookahead=barmerge.lookahead_on)
+float confClose3 = request.security(syminfo.tickerid, "3", close[1], lookahead=barmerge.lookahead_on)
+float confClose4 = request.security(syminfo.tickerid, "4", close[1], lookahead=barmerge.lookahead_on)
+float confClose5 = request.security(syminfo.tickerid, "5", close[1], lookahead=barmerge.lookahead_on)
+
+bool new1 = ta.change(time("1")) != 0
+bool new2 = ta.change(time("2")) != 0
+bool new3 = ta.change(time("3")) != 0
+bool new4 = ta.change(time("4")) != 0
+bool new5 = ta.change(time("5")) != 0
+
+bool inSession = not useGoldenHour or not na(time(timeframe.period, goldenHour, sessionTZ))
+bool sessionStart = useGoldenHour and inSession and not inSession[1]
+bool newDay = ta.change(time("D")) != 0
+
+var int sessionSignals = 0
+if sessionStart or (not useGoldenHour and newDay)
+    sessionSignals := 0
+
+var bool setupArmed = false
+var int setupDir = 0
+var int setupKeyTime = na
+var string setupKeyLabel = ""
+var float setupKeyTop = na
+var float setupKeyBot = na
+var int manipStartTime = na
+var int manipTouchTime = na
+var float manipStop = na
+
+var int selectedIFVGSec = 0
+var string selectedIFVGTF = ""
+var float selectedIFVGTop = na
+var float selectedIFVGBot = na
+var int selectedIFVGTime = na
+
+bool keyTouch = activeKeyType != 0 and not na(activeKeyTop) and not na(activeKeyBot) and
+     low <= activeKeyTop and high >= activeKeyBot
+bool newSetupKey = activeKeyTime != setupKeyTime or biasDir != setupDir
+
+if keyTouch and biasDir != 0 and inSession and (not setupArmed or newSetupKey)
+    setupArmed := true
+    setupDir := biasDir
+    setupKeyTime := activeKeyTime
+    setupKeyLabel := activeKeyLabel
+    setupKeyTop := activeKeyTop
+    setupKeyBot := activeKeyBot
+    manipTouchTime := time
+
+    int bestIdx = 1
+    if biasDir == 1
+        float bestVal = high[1]
+        for i = 1 to manipLookback
+            if not na(high[i]) and (na(bestVal) or high[i] > bestVal)
+                bestVal := high[i]
+                bestIdx := i
+        manipStartTime := time[bestIdx]
+        manipStop := low
+    else
+        float bestVal = low[1]
+        for i = 1 to manipLookback
+            if not na(low[i]) and (na(bestVal) or low[i] < bestVal)
+                bestVal := low[i]
+                bestIdx := i
+        manipStartTime := time[bestIdx]
+        manipStop := high
+
+    selectedIFVGSec := 0
+    selectedIFVGTF := ""
+    selectedIFVGTop := na
+    selectedIFVGBot := na
+    selectedIFVGTime := na
+
+    if biasDir == 1
+        bool c5 = use5mIFVG and not na(igSTime5) and igSTime5 >= manipStartTime and igSTime5 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igSOpen5 == 1)
+        bool c4 = use4mIFVG and not na(igSTime4) and igSTime4 >= manipStartTime and igSTime4 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igSOpen4 == 1)
+        bool c3 = use3mIFVG and not na(igSTime3) and igSTime3 >= manipStartTime and igSTime3 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igSOpen3 == 1)
+        bool c2 = use2mIFVG and not na(igSTime2) and igSTime2 >= manipStartTime and igSTime2 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igSOpen2 == 1)
+        bool c1 = use1mIFVG and not na(igSTime1) and igSTime1 >= manipStartTime and igSTime1 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igSOpen1 == 1)
+        if c5
+            selectedIFVGSec := 300
+            selectedIFVGTF := "5M"
+            selectedIFVGTop := igSTop5
+            selectedIFVGBot := igSBot5
+            selectedIFVGTime := igSTime5
+        else if c4
+            selectedIFVGSec := 240
+            selectedIFVGTF := "4M"
+            selectedIFVGTop := igSTop4
+            selectedIFVGBot := igSBot4
+            selectedIFVGTime := igSTime4
+        else if c3
+            selectedIFVGSec := 180
+            selectedIFVGTF := "3M"
+            selectedIFVGTop := igSTop3
+            selectedIFVGBot := igSBot3
+            selectedIFVGTime := igSTime3
+        else if c2
+            selectedIFVGSec := 120
+            selectedIFVGTF := "2M"
+            selectedIFVGTop := igSTop2
+            selectedIFVGBot := igSBot2
+            selectedIFVGTime := igSTime2
+        else if c1
+            selectedIFVGSec := 60
+            selectedIFVGTF := "1M"
+            selectedIFVGTop := igSTop1
+            selectedIFVGBot := igSBot1
+            selectedIFVGTime := igSTime1
+
+    if biasDir == -1
+        bool c5 = use5mIFVG and not na(igBTime5) and igBTime5 >= manipStartTime and igBTime5 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igBOpen5 == 1)
+        bool c4 = use4mIFVG and not na(igBTime4) and igBTime4 >= manipStartTime and igBTime4 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igBOpen4 == 1)
+        bool c3 = use3mIFVG and not na(igBTime3) and igBTime3 >= manipStartTime and igBTime3 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igBOpen3 == 1)
+        bool c2 = use2mIFVG and not na(igBTime2) and igBTime2 >= manipStartTime and igBTime2 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igBOpen2 == 1)
+        bool c1 = use1mIFVG and not na(igBTime1) and igBTime1 >= manipStartTime and igBTime1 <= manipTouchTime and
+             (not requireGapOpenAtTouch or igBOpen1 == 1)
+        if c5
+            selectedIFVGSec := 300
+            selectedIFVGTF := "5M"
+            selectedIFVGTop := igBTop5
+            selectedIFVGBot := igBBot5
+            selectedIFVGTime := igBTime5
+        else if c4
+            selectedIFVGSec := 240
+            selectedIFVGTF := "4M"
+            selectedIFVGTop := igBTop4
+            selectedIFVGBot := igBBot4
+            selectedIFVGTime := igBTime4
+        else if c3
+            selectedIFVGSec := 180
+            selectedIFVGTF := "3M"
+            selectedIFVGTop := igBTop3
+            selectedIFVGBot := igBBot3
+            selectedIFVGTime := igBTime3
+        else if c2
+            selectedIFVGSec := 120
+            selectedIFVGTF := "2M"
+            selectedIFVGTop := igBTop2
+            selectedIFVGBot := igBBot2
+            selectedIFVGTime := igBTime2
+        else if c1
+            selectedIFVGSec := 60
+            selectedIFVGTF := "1M"
+            selectedIFVGTop := igBTop1
+            selectedIFVGBot := igBBot1
+            selectedIFVGTime := igBTime1
+
+    if showSetupLabels
+        label.new(bar_index, biasDir == 1 ? low : high,
+             "PB " + (biasDir == 1 ? "BULL" : "BEAR") + " KEY HIT\n" + activeKeyLabel,
+             style=biasDir == 1 ? label.style_label_up : label.style_label_down,
+             color=color.new(keyColor, 15), textcolor=color.white, size=size.tiny)
+        if selectedIFVGSec > 0
+            label.new(bar_index, biasDir == 1 ? low : high,
+                 "HIGHEST IFVG: " + selectedIFVGTF + "\nWAIT BODY CLOSE",
+                 style=biasDir == 1 ? label.style_label_up : label.style_label_down,
+                 color=color.new(ifvgColor, 15), textcolor=color.white, size=size.tiny)
+
+// Keep the stop at the actual manipulation extreme until entry.
+if setupArmed
+    if setupDir == 1
+        manipStop := na(manipStop) ? low : math.min(manipStop, low)
+    else if setupDir == -1
+        manipStop := na(manipStop) ? high : math.max(manipStop, high)
+
+bool hasIFVG = setupArmed and selectedIFVGSec > 0 and not na(selectedIFVGTop) and not na(selectedIFVGBot)
+
+bool selectedBarClosed = selectedIFVGSec == 60 ? new1 :
+     selectedIFVGSec == 120 ? new2 :
+     selectedIFVGSec == 180 ? new3 :
+     selectedIFVGSec == 240 ? new4 :
+     selectedIFVGSec == 300 ? new5 : false
+
+float selectedConfirmedClose = selectedIFVGSec == 60 ? confClose1 :
+     selectedIFVGSec == 120 ? confClose2 :
+     selectedIFVGSec == 180 ? confClose3 :
+     selectedIFVGSec == 240 ? confClose4 :
+     selectedIFVGSec == 300 ? confClose5 : na
+
+bool longConfirm = setupArmed and setupDir == 1 and hasIFVG and selectedBarClosed and selectedConfirmedClose > selectedIFVGTop
+bool shortConfirm = setupArmed and setupDir == -1 and hasIFVG and selectedBarClosed and selectedConfirmedClose < selectedIFVGBot
+
+bool signalAllowed = inSession and sessionSignals < maxSignalsPerSession
+bool pbLong = longConfirm and signalAllowed
+bool pbShort = shortConfirm and signalAllowed
+
+if pbLong or pbShort
+    sessionSignals += 1
+    if showSignals
+        label.new(bar_index, pbLong ? low : high,
+             (pbLong ? "PB LONG" : "PB SHORT") + "\n" + selectedIFVGTF + " IFVG BODY CLOSE",
+             style=pbLong ? label.style_label_up : label.style_label_down,
+             color=pbLong ? bullColor : bearColor, textcolor=color.white, size=size.small)
+    setupArmed := false
+
+// If the key level itself is body-invalidated before entry, cancel the setup.
+bool setupInvalid = setupArmed and setupDir == 1 and close < setupKeyBot or
+     setupArmed and setupDir == -1 and close > setupKeyTop
+if setupInvalid
+    setupArmed := false
+
+// ───────────────────────── Visuals ─────────────────────────
+plot(showDOL ? activeDOL : na, "PB Draw on Liquidity",
+     color=biasDir == 1 ? bullColor : biasDir == -1 ? bearColor : color.gray,
+     linewidth=2, style=plot.style_linebr)
+
+plot(showKeyZone and activeKeyType != 0 ? activeKeyTop : na, "PB Active Key Top",
+     color=color.new(keyColor, 5), linewidth=1, style=plot.style_linebr)
+plot(showKeyZone and activeKeyType != 0 ? activeKeyBot : na, "PB Active Key Bottom",
+     color=color.new(keyColor, 5), linewidth=1, style=plot.style_linebr)
+
+plot(showIFVG and setupArmed and hasIFVG ? selectedIFVGTop : na, "PB IFVG Top",
+     color=color.new(ifvgColor, 0), linewidth=2, style=plot.style_linebr)
+plot(showIFVG and setupArmed and hasIFVG ? selectedIFVGBot : na, "PB IFVG Bottom",
+     color=color.new(ifvgColor, 0), linewidth=2, style=plot.style_linebr)
+
+plot(showSwingStop and setupArmed ? manipStop : na, "PB Swing Stop Reference",
+     color=color.new(color.gray, 35), linewidth=1, style=plot.style_linebr)
+
+var label dolLabel = na
+if barstate.islast
+    if not na(dolLabel)
+        label.delete(dolLabel)
+    if showDOL and not na(activeDOL) and biasDir != 0
+        dolLabel := label.new(bar_index + 3, activeDOL, dolText + " • DOL",
+             xloc=xloc.bar_index, style=label.style_label_left,
+             color=color.new(biasDir == 1 ? bullColor : bearColor, 10),
+             textcolor=color.white, size=size.tiny)
+
+// ───────────────────────── Dashboard ─────────────────────────
+var table dash = table.new(position.bottom_right, 2, 9,
+     bgcolor=color.new(color.black, 72), border_width=1, border_color=color.new(color.gray, 70))
+
+if barstate.islast
+    table.clear(dash, 0, 0, 1, 8)
+    if showDashboard
+        color biasBg = biasDir == 1 ? color.new(bullColor, 20) :
+             biasDir == -1 ? color.new(bearColor, 20) : color.new(color.gray, 55)
+
+        table.cell(dash, 0, 0, "PB BIAS", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, 0, biasText + (biasMode == "Auto FVG Respect" ? " • " + str.tostring(autoScore) : " • MANUAL"),
+             text_color=color.white, bgcolor=biasBg, text_size=size.tiny)
+
+        int row = 1
+        if showBiasBreakdown
+            table.cell(dash, 0, row, "1D / 4H", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+            table.cell(dash, 1, row, f_bias_word(dBias) + " / " + f_bias_word(h4Bias),
+                 text_color=color.white, bgcolor=color.new(color.gray, 55), text_size=size.tiny)
+            row += 1
+            table.cell(dash, 0, row, "1H / 15M", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+            table.cell(dash, 1, row, f_bias_word(h1Bias) + " / " + f_bias_word(m15Bias),
+                 text_color=color.white, bgcolor=color.new(color.gray, 55), text_size=size.tiny)
+            row += 1
+
+        table.cell(dash, 0, row, "DOL", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, row, biasDir == 0 ? "WAIT" : dolText,
+             text_color=color.white, bgcolor=biasBg, text_size=size.tiny)
+        row += 1
+
+        table.cell(dash, 0, row, "KEY", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, row, activeKeyLabel,
+             text_color=color.white, bgcolor=activeKeyType == 0 ? color.new(color.gray, 55) : color.new(keyColor, 35), text_size=size.tiny)
+        row += 1
+
+        string stage = biasDir == 0 ? "WAIT BIAS" :
+             activeKeyType == 0 ? "WAIT KEY" :
+             not setupArmed ? "WAIT TOUCH" :
+             not hasIFVG ? "NO 1-5M IFVG IN LEG" :
+             "WAIT " + selectedIFVGTF + " CLOSE"
+
+        table.cell(dash, 0, row, "MODEL", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, row, stage,
+             text_color=color.white, bgcolor=setupArmed ? color.new(ifvgColor, 35) : color.new(color.gray, 55), text_size=size.tiny)
+        row += 1
+
+        table.cell(dash, 0, row, "SESSION", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, row, inSession ? "GOLDEN HOUR" : "OUTSIDE",
+             text_color=color.white, bgcolor=inSession ? color.new(bullColor, 45) : color.new(color.gray, 60), text_size=size.tiny)
+        row += 1
+
+        table.cell(dash, 0, row, "SIGNALS", text_color=color.white, bgcolor=color.new(color.black, 25), text_size=size.tiny)
+        table.cell(dash, 1, row, str.tostring(sessionSignals) + " / " + str.tostring(maxSignalsPerSession),
+             text_color=color.white, bgcolor=color.new(color.gray, 55), text_size=size.tiny)
+
+alertcondition(pbLong, "EZ$ PB Long",
+     "EZ$ PB Blake: bullish HTF narrative + valid key level + highest-TF manipulation-leg IFVG body-close confirmation.")
+alertcondition(pbShort, "EZ$ PB Short",
+     "EZ$ PB Blake: bearish HTF narrative + valid key level + highest-TF manipulation-leg IFVG body-close confirmation.")

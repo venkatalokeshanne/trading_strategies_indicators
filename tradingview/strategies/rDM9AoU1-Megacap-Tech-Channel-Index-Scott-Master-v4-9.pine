@@ -1,0 +1,214 @@
+//@version=6
+strategy("Megacap Tech Channel & Index [Scott Master v4.93]",
+     overlay=true,
+     initial_capital=115000,
+     default_qty_type=strategy.fixed,
+     currency=currency.USD, 
+     calc_on_every_tick=true,
+     commission_type=strategy.commission.cash_per_order, 
+     commission_value=1.0)
+
+// ==========================================
+// CANON SETUP CHECKLIST (TradingView Settings)
+// 1. Properties -> Recalculate -> On every tick: [CHECKED]
+// 2. Properties -> Recalculate -> After order is filled: [CHECKED]
+// 3. Backtesting -> Use Bar Magnifier: [CHECKED]
+// ==========================================
+
+// ==========================================
+// 1. Inputs & Canon Operational Controls
+// ==========================================
+gp_canon  = "Pillar 11: Execution Buffer Standard"
+float  bufferPct     = input.float(0.2, "Limit Order Buffer (%)", minval=0.0, step=0.05, group=gp_canon, tooltip="Percentage above current price for limit order. Canon standard is 0.2%.")
+
+gp_macro  = "Global Macro Overrides"
+bool   macroPause        = input.bool(false, "Global Macro Pause (War/Tariffs)", group=gp_macro)
+float  vixBuyBlock       = input.float(27.0, "VIX Buy Block (Hard Stop)", minval=10.0, step=0.5, group=gp_macro, tooltip="Blocks all new buy entries when VIX exceeds this level. Canon default is 27.0.")
+bool   useEarningsGuard  = input.bool(true, "Enable Earnings Blackout Guard (Pillar 13)", group=gp_macro, tooltip="When disabled, entries are allowed through earnings windows. Disable if Pillar 13 is blocking too many valid setups for this ticker.")
+
+gp_stop   = "Selectable Loss Limiter (New)"
+bool   useAtrStop    = input.bool(true, "Use ATR-Based Hard Stop", group=gp_stop, tooltip="Sets the initial hard stop at a multiple of ATR-20 below entry. Recommended for high-ATR names like NVDA/TSLA where a fixed % stop fires on normal volatility.")
+float  atrStopMult   = input.float(1.0, "ATR Stop Multiplier", minval=0.1, step=0.1, group=gp_stop, tooltip="Hard stop = entry price − (ATR-20 × multiplier). Default 1.0x ATR is a reasonable floor for daily mega-cap tech.")
+float  lossLimitPct  = input.float(4.0, "Fixed Hard Stop (%)", minval=0.1, step=0.1, group=gp_stop, tooltip="Used when ATR stop is disabled. 4.0% suits high-ATR mega-cap names; tighten for lower-volatility holdings.")
+
+gp_sizing = "Pillar 10: Portfolio Scaling"
+float tradeBudget  = input.float(5000.0, "Budget per Trade ($)",        minval=1.0, step=100.0, group=gp_sizing, tooltip="Fixed dollar amount per trade. Qty = floor(budget × regimeMult / buffered price).")
+float priceBuffer  = input.float(1.0,    "Price Slip Buffer (%)",       minval=0.0, maxval=5.0, step=0.1, group=gp_sizing, tooltip="Buffer above close when calculating share count. Default 1%.") / 100
+bool  useCommGuard = input.bool(true,    "Skip if ATR < 3× Commission", group=gp_sizing, tooltip="Blocks entry when ATR × qty < $6 (3× $1/side round-trip).")
+float accelMult     = input.float(1.2, "Accel Multiplier (Leader/Confidence)", minval=1.0, step=0.1, group=gp_sizing)
+float skepticMult   = input.float(0.5, "Skeptic Multiplier (VIX Panic)", minval=0.1, step=0.1, group=gp_sizing)
+
+gp_tuning = "Pillar 8 & 9: Quarterly Self-Tuning"
+bool   useAutoTuning = input.bool(true, "Enable 90-Day Cycle Tuning", group=gp_tuning)
+float  fallbackOS    = input.float(37.0, "Manual Oversold Fallback", group=gp_tuning)
+float  fallbackOB    = input.float(70.0, "Manual Overbought Fallback", group=gp_tuning)
+float  warmOS_pct    = input.float(35.0, "Warm Start OS Percentile (15D)", minval=1.0, maxval=49.0, step=1.0, group=gp_tuning, tooltip="Percentile used for oversold gate during 15-day warm start before full 90-day tuning activates.")
+float  warmOB_pct    = input.float(70.0, "Warm Start OB Percentile (15D)", minval=51.0, maxval=99.0, step=1.0, group=gp_tuning, tooltip="Percentile used for overbought gate during 15-day warm start before full 90-day tuning activates.")
+
+gp_regime = "Market Regime Sensor (Anti-Repaint)"
+string techIndex   = input.symbol("NASDAQ:NDXT", "Sector Guard Index", group=gp_regime)
+float vixAccelLimit = input.float(21.0, "VIX Confidence Threshold", group=gp_regime)
+float vixSkepticLimit = input.float(25.0, "VIX Panic Threshold", group=gp_regime)
+
+gp_vocal = "Core Engine Tuning"
+float channelMult  = input.float(1.7, "Channel Width (Lower)", step=0.1, group=gp_vocal) 
+float trailMult    = input.float(2.5, "ATR Trail Multiplier", step=0.1, group=gp_vocal) 
+int   holdBarsMin  = input.int(3, "Min Hold Bars (Sticky)", group=gp_vocal)
+
+// ==========================================
+// 2. The Self-Tuning Engine (90-Day Logic)
+// ==========================================
+float barsPerDay      = (60 * 6.5) / timeframe.multiplier
+int   quarterLookback = math.round(barsPerDay * 90)
+int   warmLookback    = int(math.round(barsPerDay * 15))
+
+int autoRsiLen = timeframe.isintraday and timeframe.multiplier <= 120 ? 7 : 14
+float rsiVal   = ta.rsi(close, useAutoTuning ? autoRsiLen : 14)
+float vrsi     = ta.sma(rsiVal, 3)
+
+float rawAutoOS = ta.percentile_linear_interpolation(vrsi, quarterLookback, 25)
+float rawAutoOB = ta.percentile_linear_interpolation(vrsi, quarterLookback, 75)
+
+float rawWarmOS = ta.percentile_linear_interpolation(vrsi, warmLookback, warmOS_pct)
+float rawWarmOB = ta.percentile_linear_interpolation(vrsi, warmLookback, warmOB_pct)
+
+bool  isSystemStable = bar_index >= quarterLookback
+bool  isWarmStable   = bar_index >= warmLookback
+
+float activeOS = useAutoTuning ? (isSystemStable ? rawAutoOS : (isWarmStable ? rawWarmOS : fallbackOS)) : fallbackOS
+float activeOB = useAutoTuning ? (isSystemStable ? rawAutoOB : (isWarmStable ? rawWarmOB : fallbackOB)) : fallbackOB
+
+// ==========================================
+// 3. Regime & Session Guards
+// ==========================================
+t = time(timeframe.period, "0930-1600:1234567", "America/New_York")
+bool is_ny_session = not na(t)
+
+if hour == 15 and minute >= 58
+    strategy.cancel_all()
+
+float idxClose = request.security(techIndex, "D", close[1], lookahead=barmerge.lookahead_off)
+float idxEma   = request.security(techIndex, "D", ta.ema(close, 12)[1], lookahead=barmerge.lookahead_off)
+bool  indexUp  = idxClose > idxEma
+float vixVal = request.security("CBOE:VIX", "D", close[1], lookahead=barmerge.lookahead_off)
+bool  isConfidenceZone = vixVal < vixAccelLimit and indexUp
+bool  isSkepticZone    = vixVal >= vixSkepticLimit
+
+// ==========================================
+// Pillar 13: Earnings Blackout Guard
+// ==========================================
+int msPerDay = 86400000
+
+float epsActual   = request.earnings(syminfo.tickerid, earnings.actual,   barmerge.gaps_on, barmerge.lookahead_off)
+float epsEstimate = request.earnings(syminfo.tickerid, earnings.estimate, barmerge.gaps_on, barmerge.lookahead_off)
+float epsSurprise = not na(epsActual) and not na(epsEstimate) and epsEstimate != 0 ? ((epsActual - epsEstimate) / math.abs(epsEstimate)) * 100 : na
+
+bool earningsBar = not na(epsActual)
+
+var int  lastEarningsTime          = na
+var bool lastEarningsWasGoldilocks = false
+
+if earningsBar
+    lastEarningsTime          := time
+    lastEarningsWasGoldilocks := not na(epsSurprise) and epsSurprise > 1.0 and epsSurprise < 4.0
+
+int estimatedNextEarnings = na(lastEarningsTime) ? na : lastEarningsTime + (90 * msPerDay)
+
+bool preEarningsBlackout  = not na(estimatedNextEarnings) and time < estimatedNextEarnings and (estimatedNextEarnings - time) <= (4 * msPerDay)
+bool postEarningsBlackout = not na(estimatedNextEarnings) and time >= estimatedNextEarnings and (time - estimatedNextEarnings) <= (4 * msPerDay) and not lastEarningsWasGoldilocks
+bool earningsBlackout     = useEarningsGuard and (preEarningsBlackout or postEarningsBlackout)
+
+// ==========================================
+// 4. Execution & Entry Logic
+// ==========================================
+float basis = ta.ema(close, 20)
+float span  = ta.atr(20)
+
+var bool hasReset = true
+if close <= basis * 1.025
+    hasReset := true
+
+bool buySignal = indexUp and (low <= (basis - (span * channelMult))) and (close > open) and (vrsi <= activeOS) and hasReset and vixVal <= vixBuyBlock and not earningsBlackout
+
+// Dynamic Sizing
+float activeMult      = isSkepticZone ? skepticMult : (isConfidenceZone ? accelMult : 1.0)
+float effectiveBudget = tradeBudget * activeMult
+
+// Canon Production Guards
+float priceWithBuffer = close * (1 + priceBuffer)
+int   qty             = math.floor(effectiveBudget / priceWithBuffer)
+bool  canAfford       = qty >= 1 and (qty * priceWithBuffer <= strategy.equity)
+bool  commGuard       = useCommGuard ? (span * qty > 6.0) : true
+bool  notChasing      = close < basis * 1.015
+
+// --- CANON ENTRY (Pillar 11 Buffer) ---
+var float  txnSL           = 0.0
+var float  initialHardStop = na
+
+if buySignal and canAfford and commGuard and notChasing and strategy.position_size == 0 and is_ny_session and barstate.isconfirmed
+    float slPrice = useAtrStop ? close - (span * atrStopMult) : close * (1 - (lossLimitPct / 100))
+    float limitPrice = close * (1.0 + bufferPct / 100.0)
+    initialHardStop := slPrice
+    txnSL := slPrice
+
+    string entryJSON = '{"ticker": "{{ticker}}", "action": "{{strategy.order.action}}", "quantity": ' + str.tostring(qty, "#") + ', "quantityType": "fixed_quantity", "limitPrice": {{strategy.order.price}}, "sentiment": "{{strategy.market_position}}", "orderType": "limit", "stopLoss": {"type": "stop", "stopPrice": ' + str.tostring(txnSL, "#.##") + '}}'
+
+    strategy.entry("Tech Entry", strategy.long, qty=qty, limit=limitPrice, alert_message=entryJSON)
+    hasReset := false
+    txnSL    := 0.0
+
+// ==========================================
+// 5. Exit Logic & Protection
+// ==========================================
+float entryPrice = strategy.opentrades.entry_price(0)
+var float trailStop = na
+float profitPct = strategy.position_size > 0 ? (close - entryPrice) / entryPrice * 100 : 0
+
+if strategy.position_size > 0
+    float rawTrail = close - (span * trailMult)
+    trailStop := na(trailStop) ? rawTrail : math.max(trailStop, rawTrail)
+    if profitPct > 2.0
+        trailStop := math.max(trailStop, entryPrice + (span * 0.1))
+else
+    trailStop := na
+    initialHardStop := na
+
+string exitJSON = '{"ticker": "{{ticker}}", "action": "{{strategy.order.action}}", "quantity": 100, "quantityType": "percent_of_position", "signalPrice": {{strategy.order.price}}, "sentiment": "{{strategy.market_position}}", "orderType": "market"}'
+bool isExhausted = vrsi >= activeOB or close >= (basis + (span * 2.5))
+
+if strategy.position_size > 0 and isExhausted and is_ny_session and (bar_index - strategy.opentrades.entry_bar_index(0) >= holdBarsMin) and barstate.isconfirmed
+    strategy.close("Tech Entry", comment="Climax Harvest", alert_message=exitJSON)
+
+if strategy.position_size > 0
+    strategy.exit("Protection", "Tech Entry", stop=math.max(nz(initialHardStop, 0), nz(trailStop, 0)), comment="Stop/Trail", alert_message=exitJSON)
+
+// ==========================================
+// 6. Stats & Dashboard (Pillar 10)
+// ==========================================
+float netProfit = strategy.netprofit
+float roic = (netProfit / (tradeBudget > 0 ? tradeBudget : 1)) * 100
+
+var table board = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 20), border_width=1)
+if barstate.islast
+    table.cell(board, 0, 0, "Engine ROIC", text_color=color.aqua)
+    table.cell(board, 1, 0, str.format("{0,number,#.##}%", roic), text_color=color.white)
+    table.cell(board, 0, 1, "Loss Limit", text_color=color.white)
+    table.cell(board, 1, 1, str.tostring(lossLimitPct, "#.#") + "%", text_color=color.orange)
+    table.cell(board, 0, 2, "Active Size", text_color=color.white)
+    table.cell(board, 1, 2, "$" + str.tostring(effectiveBudget, "#") + " (" + str.tostring(activeMult, "#.##") + "x)", text_color=color.aqua)
+    table.cell(board, 0, 3, "Quarterly Gates", text_color=color.white)
+    table.cell(board, 1, 3, "OS:" + str.tostring(activeOS, "#.#") + " / OB:" + str.tostring(activeOB, "#.#"), text_color=color.lime)
+    table.cell(board, 0, 4, "Limit Buffer", text_color=color.white)
+    table.cell(board, 1, 4, str.tostring(bufferPct, "#.##") + "%", text_color=color.aqua)
+    table.cell(board, 0, 5, "Broker SL", text_color=color.white)
+    table.cell(board, 1, 5, "INJECTED", text_color=color.aqua)
+    table.cell(board, 0, 6, "Net P/L ($)", text_color=color.white)
+    table.cell(board, 1, 6, str.tostring(netProfit, "#"), text_color=netProfit >= 0 ? color.lime : color.red)
+    string tuningLabel = not isWarmStable ? "COLD START" : (not isSystemStable ? "WARM (15D)" : "AUTO (90D)")
+    color  tuningColor = not isWarmStable ? color.orange : (not isSystemStable ? color.yellow : color.aqua)
+    table.cell(board, 0, 7, "Tuning Status", text_color=color.white)
+    table.cell(board, 1, 7, tuningLabel, text_color=tuningColor)
+    string earningsLabel = preEarningsBlackout ? "PRE-LOCK" : postEarningsBlackout ? "POST-LOCK" : earningsBar ? "GOLDILOCKS" : "CLEAR"
+    color  earningsColor = preEarningsBlackout ? color.red : postEarningsBlackout ? color.orange : earningsBar ? color.lime : color.white
+    table.cell(board, 0, 8, "Earnings ±4d", text_color=color.white)
+    table.cell(board, 1, 8, earningsLabel,  text_color=earningsColor)

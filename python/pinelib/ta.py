@@ -174,7 +174,7 @@ def hma(source: Any, length: Any) -> float:
     n = _n(length)
     half = wma(source, n // 2)
     full = wma(source, n)
-    return wma(2 * half - full, int(math.floor(math.sqrt(n))))
+    return wma(2 * half - full, int(math.floor(math.sqrt(n) + 0.5)))      # Hull's definition: round(sqrt(length)), ties up
 
 
 def alma(series: Any, length: Any, offset: float, sigma: float, floor: bool = False) -> float:
@@ -656,7 +656,7 @@ def bbw(series: Any, length: Any, mult: float) -> float:
 def kc(series: Any, length: Any, mult: float, use_true_range: bool = True) -> tuple[float, float, float]:
     c = ctx()
     basis = ema(series, length)
-    rng = tr(True) if use_true_range else c.high_arr[c.bar_index] - c.low_arr[c.bar_index]
+    rng = tr() if use_true_range else c.high_arr[c.bar_index] - c.low_arr[c.bar_index]
     r = ema(rng, length)
     return basis, basis + r * mult, basis - r * mult
 
@@ -713,7 +713,7 @@ def sar(start: float, inc: float, maximum: float) -> float:
             result = H[0]
         is_first_trend_bar = True
         acc = start
-    elif i > 1:
+    if i >= 1:
         result = result + acc * (max_min - result)
         if is_below:
             if result > L[i]:

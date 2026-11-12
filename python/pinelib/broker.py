@@ -181,6 +181,10 @@ class Broker:
             raise ValueError(f"unknown default_qty_type {c.default_qty_type!r}")
         return self.sym.round_qty(q)
 
+    def default_entry_qty(self, fill_price: float) -> float:
+        """``strategy.default_entry_qty(fill_price)``: the quantity an entry with no ``qty`` would trade at that price."""
+        return self.default_qty(fill_price)
+
     def entry(self, id: str, direction: int, qty: Any = NA, limit: Any = NA, stop: Any = NA,
               oca_name: str = "", oca_type: str = "none", comment: str = "", **_: Any) -> None:
         q = NA if _isna(qty) else float(qty)
@@ -246,7 +250,9 @@ class Broker:
                                 seq=self._next_seq()))
 
     def cancel(self, id: str) -> None:
-        self.pending = [o for o in self.pending if o.id != id]
+        # strategy.cancel() removes entry / order / exit orders by id; the market orders made by close() / close_all()
+        # are listed by TradingView as "Close entry(ies) order <id>", so they are not matched by the entry id.
+        self.pending = [o for o in self.pending if o.id != id or o.kind in ("close", "close_all")]
         self.exits = [o for o in self.exits if o.id != id]
 
     def cancel_all(self) -> None:
@@ -442,21 +448,21 @@ class Broker:
         return min(t.qty, max(0.0, want - ex.filled.get(key, 0.0)))
 
     def _exit_levels(self, ex: Order, t: OpenTrade) -> tuple[float, float]:
+        """Take-profit and stop levels of one exit order on one trade. A price level (``limit`` / ``stop``) takes precedence over its tick form (``profit`` / ``loss``), as the manual states."""
         tick = self.sym.mintick
         d = t.direction
-        tp_candidates = []
         if not _isna(ex.limit):
-            tp_candidates.append(ex.limit)
-        if not _isna(ex.profit):
-            tp_candidates.append(t.price + d * ex.profit * tick)
-        sl_candidates = []
+            tp = ex.limit
+        elif not _isna(ex.profit):
+            tp = t.price + d * ex.profit * tick
+        else:
+            tp = NA
         if not _isna(ex.stop):
-            sl_candidates.append(ex.stop)
-        if not _isna(ex.loss):
-            sl_candidates.append(t.price - d * ex.loss * tick)
-        # [VERIFY] both price and tick forms given: the level reached first (nearest entry) wins
-        tp = (min(tp_candidates) if d == LONG else max(tp_candidates)) if tp_candidates else NA
-        sl = (max(sl_candidates) if d == LONG else min(sl_candidates)) if sl_candidates else NA
+            sl = ex.stop
+        elif not _isna(ex.loss):
+            sl = t.price - d * ex.loss * tick
+        else:
+            sl = NA
         return tp, sl
 
     def _trail_level(self, ex: Order, t: OpenTrade, p0: float, p1: float, opening: bool) -> float | None:
